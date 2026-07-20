@@ -1,0 +1,251 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  USER
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+enum MovieStatus {
+  DRAFT
+  PROCESSING
+  PUBLISHED
+  ARCHIVED
+}
+
+enum VideoStatus {
+  UPLOADING
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum UploadStatus {
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+}
+
+enum TransactionType {
+  DEPOSIT
+  PURCHASE
+  REFUND
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id        String     @id @default(uuid())
+  username  String     @unique
+  email     String     @unique
+  password  String
+  avatar    String?
+  role      Role       @default(USER)
+  status    UserStatus @default(ACTIVE)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  wallet        Wallet?
+  purchases     Purchase[]
+  transactions  Transaction[]
+  watchHistory  WatchHistory[]
+  refreshTokens RefreshToken[]
+
+  @@map("users")
+}
+
+/// Server-side record of issued refresh tokens so /auth/logout can revoke a
+/// session instead of only relying on short-lived access tokens expiring.
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  tokenHash String
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model Movie {
+  id          String      @id @default(uuid())
+  title       String
+  description String
+  posterUrl   String?
+  coverUrl    String?
+  genre       String
+  language    String
+  releaseYear Int
+  duration    Int // minutes
+  rating      Float       @default(0)
+  price       Decimal     @db.Decimal(12, 2)
+  isPremium   Boolean     @default(true)
+  status      MovieStatus @default(DRAFT)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  categories    Category[]
+  videos        Video[]
+  purchases     Purchase[]
+  watchHistory  WatchHistory[]
+  uploadSessions UploadSession[]
+
+  @@index([status])
+  @@map("movies")
+}
+
+model Category {
+  id          String  @id @default(uuid())
+  name        String  @unique
+  description String?
+
+  movies Movie[]
+
+  @@map("categories")
+}
+
+// ---------------------------------------------------------------------------
+// Video pipeline
+// ---------------------------------------------------------------------------
+
+/// Metadata only — the actual bytes live on local disk under STORAGE_PATH.
+model Video {
+  id               String      @id @default(uuid())
+  movieId          String
+  originalFilename String
+  originalPath     String
+  duration         Int? // seconds, populated after ffprobe inspection
+  resolution       String? // source resolution, e.g. "1920x1080"
+  status           VideoStatus @default(UPLOADING)
+  hlsMasterPath    String? // path to master.m3u8 once processing finishes
+  renditions       Json? // [{ resolution: "1080p", playlistPath, segmentDir }, ...]
+  failureReason    String?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  movie Movie @relation(fields: [movieId], references: [id], onDelete: Cascade)
+
+  @@index([movieId])
+  @@map("videos")
+}
+
+/// Tracks an in-progress chunked upload so it can be resumed after a client
+/// disconnect. Rows are cleaned up once the upload completes.
+model UploadSession {
+  id              String       @id @default(uuid())
+  movieId         String
+  filename        String
+  fileSize        BigInt
+  chunkSize       Int
+  totalChunks     Int
+  uploadedChunks  Int[]        @default([])
+  tempDir         String
+  status          UploadStatus @default(IN_PROGRESS)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  movie Movie @relation(fields: [movieId], references: [id], onDelete: Cascade)
+
+  @@index([movieId])
+  @@map("upload_sessions")
+}
+
+// ---------------------------------------------------------------------------
+// Commerce
+// ---------------------------------------------------------------------------
+
+model Purchase {
+  id        String   @id @default(uuid())
+  userId    String
+  movieId   String
+  amount    Decimal  @db.Decimal(12, 2)
+  createdAt DateTime @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  movie Movie @relation(fields: [movieId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, movieId])
+  @@index([movieId])
+  @@map("purchases")
+}
+
+model Wallet {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  balance   Decimal  @default(0) @db.Decimal(12, 2)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("wallets")
+}
+
+model Transaction {
+  id        String            @id @default(uuid())
+  userId    String
+  type      TransactionType
+  amount    Decimal           @db.Decimal(12, 2)
+  status    TransactionStatus @default(COMPLETED)
+  movieId   String?
+  createdAt DateTime          @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([createdAt])
+  @@map("transactions")
+}
+
+// ---------------------------------------------------------------------------
+// Engagement
+// ---------------------------------------------------------------------------
+
+model WatchHistory {
+  id           String   @id @default(uuid())
+  userId       String
+  movieId      String
+  progress     Float    @default(0) // percent 0-100
+  lastPosition Int      @default(0) // seconds
+  updatedAt    DateTime @updatedAt
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  movie Movie @relation(fields: [movieId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, movieId])
+  @@index([movieId])
+  @@map("watch_history")
+}

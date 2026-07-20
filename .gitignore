@@ -1,0 +1,33 @@
+# dependencies
+node_modules
+
+# build output
+dist
+/src/generated
+
+# env
+.env
+.env.*
+!.env.example
+
+# logs
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# storage
+/storage
+
+# media files
+*.mp4
+*.m3u8
+*.ts
+*.mov
+*.mkv
+
+# editor/OS
+.DS_Store
+
+# tests
+/coverage
