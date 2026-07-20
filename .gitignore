@@ -1,11 +1,11 @@
 # dependencies
-node_modules
+node_modules/
 
 # build output
-dist
-/src/generated
+dist/
+/src/generated/
 
-# env
+# environment files
 .env
 .env.*
 !.env.example
@@ -16,13 +16,12 @@ pnpm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# storage
-/storage
+# storage (uploaded/processed media)
+/storage/
 
 # media files
 *.mp4
 *.m3u8
-*.ts
 *.mov
 *.mkv
 
@@ -30,4 +29,4 @@ yarn-error.log*
 .DS_Store
 
 # tests
-/coverage
+/coverage/
