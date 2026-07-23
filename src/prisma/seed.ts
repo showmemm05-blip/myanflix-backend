@@ -55,7 +55,9 @@ async function seedCategories() {
 
   const categories = await Promise.all(
     names.map((name) =>
-      prisma.category.create({ data: { name, description: `${name} movies and series` } }),
+      prisma.category.create({
+        data: { name, description: `${name} movies and series` },
+      }),
     ),
   );
 
@@ -63,7 +65,10 @@ async function seedCategories() {
 }
 
 async function seedUsers() {
-  const passwordHash = await bcrypt.hash(DEFAULT_PASSWORD, PASSWORD_SALT_ROUNDS);
+  const passwordHash = await bcrypt.hash(
+    DEFAULT_PASSWORD,
+    PASSWORD_SALT_ROUNDS,
+  );
 
   const staff = await Promise.all([
     prisma.user.create({
@@ -95,17 +100,29 @@ async function seedUsers() {
     }),
   ]);
 
-  const regularUserSeed: { username: string; email: string; status?: UserStatus }[] = [
+  const regularUserSeed: {
+    username: string;
+    email: string;
+    status?: UserStatus;
+  }[] = [
     { username: 'john.smith', email: 'john.smith@gmail.com' },
     { username: 'sarah.williams', email: 'sarah.williams@outlook.com' },
     { username: 'michael.chen', email: 'michael.chen@yahoo.com' },
     { username: 'susu.hlaing', email: 'susu.hlaing@gmail.com' },
-    { username: 'emily.davis', email: 'emily.davis@icloud.com', status: UserStatus.SUSPENDED },
+    {
+      username: 'emily.davis',
+      email: 'emily.davis@icloud.com',
+      status: UserStatus.SUSPENDED,
+    },
     { username: 'kaungmyat.soe', email: 'kaungmyat.soe@gmail.com' },
     { username: 'david.kim', email: 'david.kim@naver.com' },
     { username: 'zawlin.htut', email: 'zawlin.htut@gmail.com' },
     { username: 'amara.okafor', email: 'amara.okafor@gmail.com' },
-    { username: 'rachel.green', email: 'rachel.green@gmail.com', status: UserStatus.BANNED },
+    {
+      username: 'rachel.green',
+      email: 'rachel.green@gmail.com',
+      status: UserStatus.BANNED,
+    },
   ];
 
   const users = await Promise.all(
@@ -163,7 +180,8 @@ const MOVIE_SEEDS: MovieSeed[] = [
   },
   {
     title: 'Avengers: Endgame',
-    description: 'The remaining Avengers assemble once more to reverse the damage caused by Thanos.',
+    description:
+      'The remaining Avengers assemble once more to reverse the damage caused by Thanos.',
     genre: 'Action',
     language: 'English',
     releaseYear: 2019,
@@ -190,7 +208,8 @@ const MOVIE_SEEDS: MovieSeed[] = [
   },
   {
     title: 'The Dark Knight',
-    description: 'When the Joker wreaks havoc on Gotham, Batman must accept one of the greatest tests.',
+    description:
+      'When the Joker wreaks havoc on Gotham, Batman must accept one of the greatest tests.',
     genre: 'Action',
     language: 'English',
     releaseYear: 2008,
@@ -203,7 +222,8 @@ const MOVIE_SEEDS: MovieSeed[] = [
   },
   {
     title: 'Interstellar',
-    description: 'A team of explorers travel through a wormhole in space to ensure humanity survival.',
+    description:
+      'A team of explorers travel through a wormhole in space to ensure humanity survival.',
     genre: 'Sci-Fi',
     language: 'English',
     releaseYear: 2014,
@@ -216,7 +236,8 @@ const MOVIE_SEEDS: MovieSeed[] = [
   },
   {
     title: 'Parasite',
-    description: 'Greed and class discrimination threaten the relationship between two families.',
+    description:
+      'Greed and class discrimination threaten the relationship between two families.',
     genre: 'Drama',
     language: 'Korean',
     releaseYear: 2019,
@@ -229,7 +250,8 @@ const MOVIE_SEEDS: MovieSeed[] = [
   },
   {
     title: 'Spider-Man: Across the Spider-Verse',
-    description: 'Miles Morales catapults across the multiverse to meet a team of Spider-People.',
+    description:
+      'Miles Morales catapults across the multiverse to meet a team of Spider-People.',
     genre: 'Animation',
     language: 'English',
     releaseYear: 2023,
@@ -255,7 +277,8 @@ const MOVIE_SEEDS: MovieSeed[] = [
   },
   {
     title: 'Joker',
-    description: 'A mentally troubled comedian embarks on a downward spiral that leads to the birth of an icon.',
+    description:
+      'A mentally troubled comedian embarks on a downward spiral that leads to the birth of an icon.',
     genre: 'Crime',
     language: 'English',
     releaseYear: 2019,
@@ -268,7 +291,8 @@ const MOVIE_SEEDS: MovieSeed[] = [
   },
   {
     title: 'Frozen II',
-    description: 'Anna, Elsa and friends travel to an ancient forest to fulfil the promise of the past.',
+    description:
+      'Anna, Elsa and friends travel to an ancient forest to fulfil the promise of the past.',
     genre: 'Animation',
     language: 'English',
     releaseYear: 2019,
@@ -295,7 +319,8 @@ const MOVIE_SEEDS: MovieSeed[] = [
   },
   {
     title: 'The Last Chess Game',
-    description: 'A retired grandmaster is pulled back for one final match that could change his family fate.',
+    description:
+      'A retired grandmaster is pulled back for one final match that could change his family fate.',
     genre: 'Drama',
     language: 'English',
     releaseYear: 2021,
@@ -308,7 +333,8 @@ const MOVIE_SEEDS: MovieSeed[] = [
   },
   {
     title: 'Monsoon Diaries',
-    description: 'A coming-of-age drama set across a rainy season in Yangon, following three friends.',
+    description:
+      'A coming-of-age drama set across a rainy season in Yangon, following three friends.',
     genre: 'Drama',
     language: 'Burmese',
     releaseYear: 2026,
@@ -321,7 +347,8 @@ const MOVIE_SEEDS: MovieSeed[] = [
   },
   {
     title: 'Twilight of the Wolves',
-    description: 'A noir thriller following a detective unraveling a conspiracy in a rain-soaked coastal city.',
+    description:
+      'A noir thriller following a detective unraveling a conspiracy in a rain-soaked coastal city.',
     genre: 'Thriller',
     language: 'English',
     releaseYear: 2026,
@@ -376,12 +403,23 @@ async function seedMovies(categoriesByName: Map<string, { id: string }>) {
             status: ready ? VideoStatus.READY : VideoStatus.PROCESSING,
             duration: ready ? movie.duration * 60 : null,
             resolution: ready ? '1920x1080' : null,
-            hlsMasterPath: ready ? `/storage/videos/${movie.id}/hls/master.m3u8` : null,
+            hlsMasterPath: ready
+              ? `/storage/videos/${movie.id}/hls/master.m3u8`
+              : null,
             renditions: ready
               ? [
-                  { resolution: '1080p', playlistPath: `videos/${movie.id}/hls/1080p/index.m3u8` },
-                  { resolution: '720p', playlistPath: `videos/${movie.id}/hls/720p/index.m3u8` },
-                  { resolution: '480p', playlistPath: `videos/${movie.id}/hls/480p/index.m3u8` },
+                  {
+                    resolution: '1080p',
+                    playlistPath: `videos/${movie.id}/hls/1080p/index.m3u8`,
+                  },
+                  {
+                    resolution: '720p',
+                    playlistPath: `videos/${movie.id}/hls/720p/index.m3u8`,
+                  },
+                  {
+                    resolution: '480p',
+                    playlistPath: `videos/${movie.id}/hls/480p/index.m3u8`,
+                  },
                 ]
               : undefined,
           },
@@ -405,7 +443,9 @@ async function seedCommerceAndHistory(
   const premiumPublished = movies.filter(
     (m) => m.isPremium && m.status === MovieStatus.PUBLISHED,
   );
-  const freePublished = movies.filter((m) => !m.isPremium && m.status === MovieStatus.PUBLISHED);
+  const freePublished = movies.filter(
+    (m) => !m.isPremium && m.status === MovieStatus.PUBLISHED,
+  );
 
   for (const [index, user] of users.entries()) {
     // Each user buys a handful of premium titles, deterministically varied per user.
@@ -415,11 +455,17 @@ async function seedCommerceAndHistory(
       .concat(premiumPublished.slice(0, index % premiumPublished.length))
       .slice(0, purchaseCount);
 
-    const totalSpent = purchasedMovies.reduce((sum, m) => sum + m.price.toNumber(), 0);
+    const totalSpent = purchasedMovies.reduce(
+      (sum, m) => sum + m.price.toNumber(),
+      0,
+    );
     const leftoverBalance = 5000 + (index % 5) * 3000;
     const depositAmount = totalSpent + leftoverBalance;
 
-    await prisma.wallet.update({ where: { userId: user.id }, data: { balance: leftoverBalance } });
+    await prisma.wallet.update({
+      where: { userId: user.id },
+      data: { balance: leftoverBalance },
+    });
 
     await prisma.transaction.create({
       data: {
@@ -434,7 +480,12 @@ async function seedCommerceAndHistory(
     for (const [pIndex, movie] of purchasedMovies.entries()) {
       const purchasedAt = daysAgo(20 - pIndex * 3);
       await prisma.purchase.create({
-        data: { userId: user.id, movieId: movie.id, amount: movie.price, createdAt: purchasedAt },
+        data: {
+          userId: user.id,
+          movieId: movie.id,
+          amount: movie.price,
+          createdAt: purchasedAt,
+        },
       });
       await prisma.transaction.create({
         data: {
@@ -452,7 +503,9 @@ async function seedCommerceAndHistory(
           userId: user.id,
           movieId: movie.id,
           progress: pIndex === 0 ? 100 : 30 + pIndex * 15,
-          lastPosition: Math.round((movie.duration * 60 * (pIndex === 0 ? 1 : 0.4)) / (pIndex + 1)),
+          lastPosition: Math.round(
+            (movie.duration * 60 * (pIndex === 0 ? 1 : 0.4)) / (pIndex + 1),
+          ),
         },
       });
     }
@@ -462,7 +515,12 @@ async function seedCommerceAndHistory(
     if (freeSample) {
       await prisma.watchHistory.upsert({
         where: { userId_movieId: { userId: user.id, movieId: freeSample.id } },
-        create: { userId: user.id, movieId: freeSample.id, progress: 65, lastPosition: 1200 },
+        create: {
+          userId: user.id,
+          movieId: freeSample.id,
+          progress: 65,
+          lastPosition: 1200,
+        },
         update: {},
       });
     }
@@ -484,9 +542,13 @@ async function main() {
 
   console.log('Seed complete:');
   console.log(`  categories: ${categoriesByName.size}`);
-  console.log(`  users: ${staff.length + users.length} (${staff.length} staff, ${users.length} regular)`);
+  console.log(
+    `  users: ${staff.length + users.length} (${staff.length} staff, ${users.length} regular)`,
+  );
   console.log(`  movies: ${movies.length}`);
-  console.log(`  default password for every seeded account: ${DEFAULT_PASSWORD}`);
+  console.log(
+    `  default password for every seeded account: ${DEFAULT_PASSWORD}`,
+  );
 }
 
 main()

@@ -138,6 +138,25 @@ export class MoviesService {
     });
   }
 
+  /** Published movies ranked by how many users have purchased them. */
+  async getMostPurchased(limit = 12): Promise<MovieWithCategories[]> {
+    const grouped = await this.prisma.purchase.groupBy({
+      by: ['movieId'],
+      _count: { movieId: true },
+      orderBy: { _count: { movieId: 'desc' } },
+      take: limit,
+    });
+    if (grouped.length === 0) return [];
+
+    const movies = await this.prisma.movie.findMany({
+      where: { id: { in: grouped.map((g) => g.movieId) }, status: MovieStatus.PUBLISHED },
+      include: CATALOG_INCLUDE,
+    });
+
+    const orderById = new Map(grouped.map((g, index) => [g.movieId, index]));
+    return movies.sort((a, b) => (orderById.get(a.id) ?? 0) - (orderById.get(b.id) ?? 0));
+  }
+
   /** Purchase history for a user (own profile, or an admin viewing any user). */
   async getPurchasesForUser(userId: string, pagination: PaginationQueryDto) {
     const page = pagination.page ?? 1;

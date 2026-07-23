@@ -40,6 +40,13 @@ export class MoviesController {
     return this.moviesService.getPurchasesForUser(user.id, pagination);
   }
 
+  /** Registered before ':id' so "most-purchased" is never parsed as a movie UUID. */
+  @Get('most-purchased')
+  async getMostPurchased() {
+    const movies = await this.moviesService.getMostPurchased();
+    return movies.map((m) => MovieResponseDto.fromEntity(m));
+  }
+
   @Get(':id')
   async findOne(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthenticatedUser) {
     const movie = await this.moviesService.findByIdOrThrow(id, user.role);
