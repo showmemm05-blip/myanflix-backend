@@ -4,13 +4,23 @@ import { mkdir } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 
 /**
- * Central place that knows the on-disk layout under STORAGE_PATH:
+ * Central place that knows two things:
+ *  - the LOCAL on-disk scratch layout under STORAGE_PATH, used only
+ *    transiently (in-flight chunk uploads, ffmpeg's working directory —
+ *    everything here gets deleted once it's no longer needed):
  *
- *   storage/
- *     uploads/<uploadId>/chunk_<n>      (transient, deleted after merge)
- *     videos/<movieId>/original.<ext>
- *     videos/<movieId>/hls/master.m3u8
- *     videos/<movieId>/hls/<resolution>/index.m3u8 + segments
+ *      storage/
+ *        uploads/<uploadId>/chunk_<n>
+ *        videos/<movieId>/original.<ext>   (until archived)
+ *        videos/<movieId>/hls/...          (until archived)
+ *
+ *  - the MinIO object key layout, which is where everything actually ends
+ *    up living:
+ *
+ *      images/<imageId>.<ext>
+ *      videos/<movieId>/original.<ext>
+ *      videos/<movieId>/hls/master.m3u8
+ *      videos/<movieId>/hls/<resolution>/index.m3u8 + segments
  */
 @Injectable()
 export class StorageService {
@@ -41,18 +51,24 @@ export class StorageService {
     return join(this.videoDir(movieId), 'hls');
   }
 
-  imagesDir(): string {
-    return join(this.root, 'images');
+  /** MinIO object key for a movie's master playlist — mirrors hlsDir()'s local layout, without the local-disk root. */
+  hlsMasterKey(movieId: string): string {
+    return `videos/${movieId}/hls/master.m3u8`;
   }
 
-  imagePath(imageId: string, extension: string): string {
-    return join(this.imagesDir(), `${imageId}${extension}`);
+  /** MinIO object key for the original (pre-transcode) upload — archived there so it doesn't have to live on local disk. */
+  originalObjectKey(movieId: string, extension: string): string {
+    return `videos/${movieId}/original${extension}`;
   }
 
-  /** Path clients will be served under, e.g. /storage/videos/<id>/hls/master.m3u8 */
-  toPublicPath(absolutePath: string): string {
-    const relative = absolutePath.slice(this.root.length).replace(/\\/g, '/');
-    return `/storage${relative.startsWith('/') ? '' : '/'}${relative}`;
+  /** MinIO object key prefix for one rendition's segments + its own playlist. */
+  hlsRenditionKeyPrefix(movieId: string, renditionName: string): string {
+    return `videos/${movieId}/hls/${renditionName}`;
+  }
+
+  /** MinIO object key for a poster/cover image. */
+  imageObjectKey(imageId: string, extension: string): string {
+    return `images/${imageId}${extension}`;
   }
 
   async ensureDir(path: string): Promise<void> {

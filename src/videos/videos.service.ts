@@ -1,7 +1,7 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { Role, VideoStatus, type Prisma, type Video } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { StorageService } from '../common/storage/storage.service';
+import { MinioService } from '../common/storage/minio.service';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 
 export interface CreateVideoInput {
@@ -19,7 +19,7 @@ export interface RenditionInfo {
 export class VideosService {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly storageService: StorageService,
+    private readonly minioService: MinioService,
   ) {}
 
   create(input: CreateVideoInput): Promise<Video> {
@@ -47,6 +47,11 @@ export class VideosService {
       where: { id },
       data: { status: VideoStatus.PROCESSING },
     });
+  }
+
+  /** Called once the original upload has been archived to the storage server — replaces the (now-deleted) local disk path. */
+  updateOriginalPath(id: string, originalPath: string): Promise<Video> {
+    return this.prisma.video.update({ where: { id }, data: { originalPath } });
   }
 
   markReady(
@@ -95,7 +100,7 @@ export class VideosService {
       throw new NotFoundException('This movie is not ready for streaming yet');
     }
 
-    return { playlistUrl: this.storageService.toPublicPath(video.hlsMasterPath) };
+    return { playlistUrl: this.minioService.publicUrl(video.hlsMasterPath) };
   }
 
   /** Upserts the caller's watch progress for a movie — feeds analytics (views, completion rate). */
@@ -154,7 +159,7 @@ export class VideosService {
       failureReason: video.failureReason,
       duration: video.duration,
       resolution: video.resolution,
-      hlsMasterPath: video.hlsMasterPath ? this.storageService.toPublicPath(video.hlsMasterPath) : null,
+      hlsMasterPath: video.hlsMasterPath ? this.minioService.publicUrl(video.hlsMasterPath) : null,
       renditions: video.renditions,
       createdAt: video.createdAt,
       updatedAt: video.updatedAt,

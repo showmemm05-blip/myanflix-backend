@@ -6,17 +6,22 @@ import { extname } from 'node:path';
 import { UploadStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
+import { MinioService } from '../common/storage/minio.service';
 import { VideosService } from '../videos/videos.service';
 import { ProcessingService } from '../processing/processing.service';
 import type { InitUploadDto } from './dto/init-upload.dto';
 
-export const DEFAULT_CHUNK_SIZE = 16 * 1024 * 1024; // 16 MB — fewer requests per upload
+// 5 MB — small enough that one chunk still finishes comfortably within the
+// server's request timeout on a throttled/mobile connection, and a failed
+// chunk only costs 5 MB of retried work instead of 16.
+export const DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024;
 
 @Injectable()
 export class UploadsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly storageService: StorageService,
+    private readonly minioService: MinioService,
     private readonly videosService: VideosService,
     private readonly processingService: ProcessingService,
   ) {}
@@ -110,14 +115,12 @@ export class UploadsService {
     return { videoId: video.id, status: video.status };
   }
 
-  /** Saves a poster/cover image and returns its public URL path. */
+  /** Uploads a poster/cover image straight to the storage server (no local disk involved) and returns its public URL. */
   async saveImage(originalFilename: string, buffer: Buffer): Promise<string> {
     const extension = extname(originalFilename) || '.jpg';
-    const imageId = randomUUID();
-    const destination = this.storageService.imagePath(imageId, extension);
-    await this.storageService.ensureDir(this.storageService.imagesDir());
-    await writeFile(destination, buffer);
-    return this.storageService.toPublicPath(destination);
+    const key = this.storageService.imageObjectKey(randomUUID(), extension);
+    await this.minioService.uploadBuffer(key, buffer);
+    return this.minioService.publicUrl(key);
   }
 
   private async mergeChunks(uploadId: string, totalChunks: number, destination: string): Promise<void> {

@@ -41,6 +41,26 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   STORAGE_PATH: string = './storage';
+
+  @IsString()
+  @MinLength(1)
+  MINIO_ENDPOINT!: string;
+
+  @IsString()
+  @MinLength(1)
+  MINIO_ACCESS_KEY!: string;
+
+  @IsString()
+  @MinLength(1)
+  MINIO_SECRET_KEY!: string;
+
+  @IsOptional()
+  @IsString()
+  MINIO_BUCKET: string = 'movies';
+
+  @IsString()
+  @MinLength(1)
+  STREAM_PUBLIC_BASE_URL!: string;
 }
 
 export function validateEnv(config: Record<string, unknown>): EnvironmentVariables {

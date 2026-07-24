@@ -18,7 +18,7 @@ import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { InitUploadDto } from './dto/init-upload.dto';
 import { UploadsService } from './uploads.service';
 
-const MAX_CHUNK_BYTES = 32 * 1024 * 1024; // safety cap, well above the 16 MB default chunk size
+const MAX_CHUNK_BYTES = 10 * 1024 * 1024; // safety cap, well above the 5 MB default chunk size
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
 @Controller('uploads')

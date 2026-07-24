@@ -1,9 +1,6 @@
 import { Module } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
-import { ServeStaticModule } from '@nestjs/serve-static';
 import { ValidationPipe } from '@nestjs/common';
-import { isAbsolute, resolve } from 'node:path';
 
 import { ConfigModule } from './config/config.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -32,16 +29,6 @@ import { AppService } from './app.service';
   imports: [
     ConfigModule,
     PrismaModule,
-    ServeStaticModule.forRootAsync({
-      inject: [ConfigService],
-      useFactory: (configService: ConfigService) => {
-        const configuredPath = configService.get<string>('STORAGE_PATH') ?? './storage';
-        const rootPath = isAbsolute(configuredPath)
-          ? configuredPath
-          : resolve(process.cwd(), configuredPath);
-        return [{ rootPath, serveRoot: '/storage' }];
-      },
-    }),
 
     AuthModule,
     UsersModule,

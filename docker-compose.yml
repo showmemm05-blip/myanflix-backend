@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-myanflix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      POSTGRES_DB: ${POSTGRES_DB:-myanflix}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+  backend:
+    build: .
+    depends_on:
+      - postgres
+    environment:
+      # postgres:5432 is this compose network's internal address for the
+      # service above — always correct here regardless of what host/port the
+      # outside world reaches it on.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-myanflix}:${POSTGRES_PASSWORD:-change-me-locally}@postgres:5432/${POSTGRES_DB:-myanflix}?schema=public
+      NODE_ENV: production
+      PORT: 3001
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      JWT_ACCESS_EXPIRES_IN: ${JWT_ACCESS_EXPIRES_IN:-15m}
+      JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-7d}
+      STORAGE_PATH: /app/storage
+      # Local: reaches ../storage-server's MinIO via the host machine's
+      # published port. Real deployment: point this at the Movie Storage
+      # Server VPS's address instead — nothing else here changes.
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://host.docker.internal:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET:-movies}
+      # Local: ../cacheserver. Real deployment: the cache server VPS's public
+      # domain — end users' browsers fetch video bytes from here, not from
+      # this backend.
+      STREAM_PUBLIC_BASE_URL: ${STREAM_PUBLIC_BASE_URL:-http://localhost:8080}
+    extra_hosts:
+      # host.docker.internal is automatic on Docker Desktop (macOS/Windows);
+      # this makes it also resolve on Linux Docker engines.
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${PORT:-3001}:3001"
+    volumes:
+      # Uploads/ffmpeg scratch space — HLS output is pushed to MinIO and
+      # deleted from here once processed; this only ever holds transient
+      # in-flight data now, not what actually gets streamed.
+      - backend-storage:/app/storage
+
+volumes:
+  postgres-data:
+  backend-storage:

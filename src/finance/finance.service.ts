@@ -5,7 +5,18 @@ import type { Prisma } from '../generated/prisma/client';
 
 const TOP_N = 5;
 const MONTH_LABELS = [
-  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
 ];
 
 function startOfToday(): Date {
@@ -24,7 +35,9 @@ function startOfMonth(): Date {
 /** ISO-ish week number (Mon-start) — only needs to be consistent, not calendar-perfect. */
 function weekNumber(date: Date): number {
   const first = new Date(date.getFullYear(), 0, 1);
-  const days = Math.floor((date.getTime() - first.getTime()) / (24 * 60 * 60 * 1000));
+  const days = Math.floor(
+    (date.getTime() - first.getTime()) / (24 * 60 * 60 * 1000),
+  );
   return Math.ceil((days + first.getDay() + 1) / 7);
 }
 
@@ -36,14 +49,17 @@ interface RevenueBucketGranularity {
 
 const DAILY_GRANULARITY: RevenueBucketGranularity = {
   key: (date) => date.toISOString().slice(0, 10),
-  label: (date) => `${MONTH_LABELS[date.getMonth()]} ${String(date.getDate()).padStart(2, '0')}`,
-  stepBack: (date, steps) => new Date(date.getTime() - steps * 24 * 60 * 60 * 1000),
+  label: (date) =>
+    `${MONTH_LABELS[date.getMonth()]} ${String(date.getDate()).padStart(2, '0')}`,
+  stepBack: (date, steps) =>
+    new Date(date.getTime() - steps * 24 * 60 * 60 * 1000),
 };
 
 const WEEKLY_GRANULARITY: RevenueBucketGranularity = {
   key: (date) => `${date.getFullYear()}-W${weekNumber(date)}`,
   label: (date) => `Wk ${weekNumber(date)}`,
-  stepBack: (date, steps) => new Date(date.getTime() - steps * 7 * 24 * 60 * 60 * 1000),
+  stepBack: (date, steps) =>
+    new Date(date.getTime() - steps * 7 * 24 * 60 * 60 * 1000),
 };
 
 const MONTHLY_GRANULARITY: RevenueBucketGranularity = {
@@ -61,20 +77,25 @@ export class FinanceService {
   constructor(private readonly prisma: PrismaService) {}
 
   async getDashboard() {
-    const [totalRevenueAgg, monthlyRevenueAgg, dailyRevenueAgg, topMovies, topUsers] =
-      await Promise.all([
-        this.prisma.purchase.aggregate({ _sum: { amount: true } }),
-        this.prisma.purchase.aggregate({
-          _sum: { amount: true },
-          where: { createdAt: { gte: startOfMonth() } },
-        }),
-        this.prisma.purchase.aggregate({
-          _sum: { amount: true },
-          where: { createdAt: { gte: startOfToday() } },
-        }),
-        this.getTopMovies(),
-        this.getTopUsers(),
-      ]);
+    const [
+      totalRevenueAgg,
+      monthlyRevenueAgg,
+      dailyRevenueAgg,
+      topMovies,
+      topUsers,
+    ] = await Promise.all([
+      this.prisma.purchase.aggregate({ _sum: { amount: true } }),
+      this.prisma.purchase.aggregate({
+        _sum: { amount: true },
+        where: { createdAt: { gte: startOfMonth() } },
+      }),
+      this.prisma.purchase.aggregate({
+        _sum: { amount: true },
+        where: { createdAt: { gte: startOfToday() } },
+      }),
+      this.getTopMovies(),
+      this.getTopUsers(),
+    ]);
 
     return {
       totalRevenue: decimalToNumber(totalRevenueAgg._sum.amount),
@@ -107,7 +128,10 @@ export class FinanceService {
     bucketCount: number,
     granularity: RevenueBucketGranularity,
   ) {
-    const buckets = new Map<string, { label: string; revenue: number; sortDate: Date }>();
+    const buckets = new Map<
+      string,
+      { label: string; revenue: number; sortDate: Date }
+    >();
     const now = new Date();
 
     // Seed every bucket (including empty ones) so the chart has a continuous axis.
@@ -115,7 +139,11 @@ export class FinanceService {
       const date = granularity.stepBack(now, i);
       const key = granularity.key(date);
       if (!buckets.has(key)) {
-        buckets.set(key, { label: granularity.label(date), revenue: 0, sortDate: date });
+        buckets.set(key, {
+          label: granularity.label(date),
+          revenue: 0,
+          sortDate: date,
+        });
       }
     }
 

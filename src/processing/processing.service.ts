@@ -1,9 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { rm, writeFile } from 'node:fs/promises';
+import { extname, join } from 'node:path';
 import { MovieStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
+import { MinioService } from '../common/storage/minio.service';
 import { VideosService } from '../videos/videos.service';
 import { probeVideo, transcodeToHls } from './ffmpeg.util';
 import { approximateWidth, pickRenditions } from './rendition-tiers';
@@ -15,6 +16,7 @@ export class ProcessingService {
   constructor(
     private readonly videosService: VideosService,
     private readonly storageService: StorageService,
+    private readonly minioService: MinioService,
     private readonly prisma: PrismaService,
   ) {}
 
@@ -27,6 +29,16 @@ export class ProcessingService {
 
     try {
       const probe = await probeVideo(inputPath);
+
+      // Archive the original upload too — same reasoning as the HLS output
+      // below, just earlier: the Flokinet VPS has limited disk, so nothing
+      // that needs to persist should end up staying there. Kept in MinIO
+      // (rather than deleted outright) in case a future re-transcode at
+      // different settings is ever wanted.
+      const originalKey = this.storageService.originalObjectKey(movieId, extname(inputPath));
+      await this.minioService.uploadFile(originalKey, inputPath);
+      await this.videosService.updateOriginalPath(videoId, originalKey);
+
       const renditions = pickRenditions(probe.height);
       const hlsDir = this.storageService.hlsDir(movieId);
       await this.storageService.ensureDir(hlsDir);
@@ -46,6 +58,14 @@ export class ProcessingService {
           videoBitrate: tier.videoBitrate,
         });
 
+        // ffmpeg can only write to a real local path, so outputDir is
+        // scratch space — push the finished rendition (playlist + segments)
+        // to the storage server, then it's no longer needed on local disk.
+        await this.minioService.uploadDirectory(
+          outputDir,
+          this.storageService.hlsRenditionKeyPrefix(movieId, tier.name),
+        );
+
         variantEntries.push({
           name: tier.name,
           bandwidth: tier.bandwidth,
@@ -58,14 +78,21 @@ export class ProcessingService {
 
       const masterPath = join(hlsDir, 'master.m3u8');
       await writeFile(masterPath, buildMasterPlaylist(variantEntries), 'utf-8');
+      await this.minioService.uploadFile(this.storageService.hlsMasterKey(movieId), masterPath);
+
+      // Everything this movie needs — the original and every rendition —
+      // is on the storage server now. Both local copies were only ever
+      // needed for ffmpeg to read from / write to.
+      await rm(hlsDir, { recursive: true, force: true });
+      await rm(inputPath, { force: true });
 
       await this.videosService.markReady(videoId, {
         duration: probe.durationSeconds,
         resolution: `${probe.width}x${probe.height}`,
-        hlsMasterPath: masterPath,
+        hlsMasterPath: this.storageService.hlsMasterKey(movieId),
         renditions: variantEntries.map((v) => ({
           resolution: v.name,
-          playlistPath: join(hlsDir, v.name, 'index.m3u8'),
+          playlistPath: `${this.storageService.hlsRenditionKeyPrefix(movieId, v.name)}/index.m3u8`,
         })),
       });
 
