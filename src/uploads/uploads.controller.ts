@@ -41,11 +41,15 @@ export class UploadsController {
     return { url };
   }
 
-  @Post(':uploadId/chunk/:chunkNumber')
+  // chunkNumber travels as a form field, not a URL segment — every chunk
+  // then hits the exact same URL, so the browser's CORS preflight cache
+  // (keyed per-URL) actually applies across the whole upload instead of
+  // forcing a fresh OPTIONS round-trip for every single chunk.
+  @Post(':uploadId/chunk')
   @UseInterceptors(FileInterceptor('chunk', { limits: { fileSize: MAX_CHUNK_BYTES } }))
   async uploadChunk(
     @Param('uploadId', ParseUUIDPipe) uploadId: string,
-    @Param('chunkNumber', ParseIntPipe) chunkNumber: number,
+    @Body('chunkNumber', ParseIntPipe) chunkNumber: number,
     @UploadedFile() file: Express.Multer.File | undefined,
   ) {
     if (!file) throw new BadRequestException('No chunk file received (expected field "chunk")');

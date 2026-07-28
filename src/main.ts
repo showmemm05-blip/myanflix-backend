@@ -12,7 +12,10 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const configService = app.get(ConfigService);
 
-  app.enableCors();
+  // maxAge (seconds) lets the browser cache a preflight instead of repeating
+  // it on every request to the same URL — without it, browsers default to a
+  // few seconds at most.
+  app.enableCors({ maxAge: 86400 });
   app.setGlobalPrefix('api');
   (app.getHttpServer() as Server).requestTimeout = REQUEST_TIMEOUT_MS;
 
