@@ -86,4 +86,23 @@ export class WalletService {
       data: { balance: { decrement: amount } },
     });
   }
+
+  /**
+   * Credits a wallet within an existing transaction context (used by the
+   * deposit-approval flow, which must also flip the Deposit row and create
+   * the Transaction record atomically).
+   */
+  async creditWithinTransaction(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    amount: number,
+  ): Promise<Wallet> {
+    const wallet = await tx.wallet.findUnique({ where: { userId } });
+    if (!wallet) throw new NotFoundException('Wallet not found for this user');
+
+    return tx.wallet.update({
+      where: { userId },
+      data: { balance: { increment: amount } },
+    });
+  }
 }

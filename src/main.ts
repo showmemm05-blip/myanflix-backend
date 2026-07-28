@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
+import { IoAdapter } from '@nestjs/platform-socket.io';
 import type { Server } from 'node:http';
 import { AppModule } from './app.module';
 
@@ -17,6 +18,9 @@ async function bootstrap() {
   // few seconds at most.
   app.enableCors({ maxAge: 86400 });
   app.setGlobalPrefix('api');
+  // Nest defaults to this once @nestjs/platform-socket.io is installed —
+  // set explicitly anyway as cheap insurance against that default changing.
+  app.useWebSocketAdapter(new IoAdapter(app));
   (app.getHttpServer() as Server).requestTimeout = REQUEST_TIMEOUT_MS;
 
   const port = configService.get<number>('PORT') ?? 3001;

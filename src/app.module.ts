@@ -18,6 +18,9 @@ import { WalletModule } from './wallet/wallet.module';
 import { TransactionsModule } from './transactions/transactions.module';
 import { FinanceModule } from './finance/finance.module';
 import { AnalyticsModule } from './analytics/analytics.module';
+import { DepositsModule } from './deposits/deposits.module';
+import { NotificationsModule } from './notifications/notifications.module';
+import { RealtimeModule } from './realtime/realtime.module';
 
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
@@ -42,6 +45,9 @@ import { AppService } from './app.service';
     TransactionsModule,
     FinanceModule,
     AnalyticsModule,
+    DepositsModule,
+    NotificationsModule,
+    RealtimeModule,
   ],
   controllers: [AppController],
   providers: [
