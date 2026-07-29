@@ -1,9 +1,9 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { rm, writeFile } from 'node:fs/promises';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { access, rm, writeFile } from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { extname } from 'node:path';
-import { UploadStatus } from '../generated/prisma/client';
+import { UploadStatus, VideoStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
@@ -26,9 +26,36 @@ export class UploadsService {
     private readonly processingService: ProcessingService,
   ) {}
 
+  /**
+   * Resumable: an in-progress session for the exact same movie/filename/size
+   * means the client is re-attempting an upload that never finished (a
+   * dropped connection, a closed tab, a retry) rather than starting a new
+   * one — reuse it and hand back what's already been received so the caller
+   * can skip those chunks, instead of silently starting over from zero every
+   * time and abandoning whatever was already sent.
+   */
   async initUpload(dto: InitUploadDto) {
     const movie = await this.prisma.movie.findUnique({ where: { id: dto.movieId } });
     if (!movie) throw new NotFoundException('Movie not found');
+
+    const existing = await this.prisma.uploadSession.findFirst({
+      where: {
+        movieId: dto.movieId,
+        filename: dto.filename,
+        fileSize: BigInt(dto.filesize),
+        status: UploadStatus.IN_PROGRESS,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (existing) {
+      return {
+        uploadId: existing.id,
+        chunkSize: existing.chunkSize,
+        totalChunks: existing.totalChunks,
+        uploadedChunks: [...existing.uploadedChunks].sort((a, b) => a - b),
+      };
+    }
 
     const totalChunks = Math.ceil(dto.filesize / DEFAULT_CHUNK_SIZE);
 
@@ -51,6 +78,7 @@ export class UploadsService {
       uploadId: session.id,
       chunkSize: DEFAULT_CHUNK_SIZE,
       totalChunks,
+      uploadedChunks: [] as number[],
     };
   }
 
@@ -121,6 +149,89 @@ export class UploadsService {
     const key = this.storageService.imageObjectKey(randomUUID(), extension);
     await this.minioService.uploadBuffer(key, buffer);
     return this.minioService.publicUrl(key);
+  }
+
+  /**
+   * Retries transcoding for a movie whose video already failed — or whose
+   * video is stuck at PROCESSING because whatever was working on it died
+   * (a crash, a restart, a redeploy) — without the client re-uploading the
+   * original. A transcode failure (a bad codec edge case, an OOM, a dropped
+   * connection to the storage server mid-rendition) shouldn't cost the user
+   * a multi-GB re-upload from their own browser just to try again, and a
+   * genuinely stuck video shouldn't require waiting out a timeout either.
+   *
+   * PROCESSING is only accepted when ProcessingService confirms this exact
+   * process isn't actually still working on it — that's the one reliable
+   * way to tell "orphaned" apart from "genuinely still running," since two
+   * concurrent processVideo() runs for the same movie would race on the
+   * same scratch files and DB rows.
+   *
+   * The original is normally already archived on the storage server by the
+   * time transcoding starts (that's the very first step in processVideo()),
+   * so this just pulls it back down to local scratch disk and re-runs the
+   * same pipeline — processVideo() itself skips re-archiving the original,
+   * and skips re-transcoding any rendition, that's already there (see
+   * MinioService.objectExists()), so a retry only redoes whatever tier was
+   * actually in flight or never started.
+   */
+  async reprocessVideo(movieId: string) {
+    const video = await this.videosService.findLatestForMovie(movieId);
+    if (!video) throw new NotFoundException('No video found for this movie');
+
+    if (video.status === VideoStatus.PROCESSING) {
+      if (this.processingService.isActivelyProcessing(video.id)) {
+        throw new ConflictException(
+          'This video is actively processing right now — wait for it to finish, or restart the backend first if you believe it is stuck.',
+        );
+      }
+      // Status says PROCESSING but nothing in this process is actually
+      // working on it — orphaned. Safe to reprocess immediately.
+    } else if (video.status !== VideoStatus.FAILED) {
+      throw new BadRequestException('Only a failed or stuck video can be reprocessed');
+    }
+
+    if (!video.originalPath) {
+      throw new BadRequestException('No original file was recorded for this video — a new upload is required');
+    }
+
+    const inputPath = await this.resolveOriginalForReprocessing(movieId, video);
+
+    // Fire-and-forget, matching the exact same pattern completeUpload() uses
+    // to kick off processing after a normal upload.
+    void this.processingService.processVideo(video.id, movieId, inputPath);
+
+    return { videoId: video.id, status: VideoStatus.PROCESSING };
+  }
+
+  /**
+   * A failed Video's originalPath is either still a local scratch path (the
+   * failure happened before/at archiving, so cleanupScratch() never got a
+   * chance to remove it) or already a MinIO object key (archiving
+   * succeeded; a later rendition or ffmpeg step is what failed) — in which
+   * case it needs to be pulled back down before ffmpeg can read it again.
+   */
+  private async resolveOriginalForReprocessing(
+    movieId: string,
+    video: { originalPath: string; originalFilename: string },
+  ): Promise<string> {
+    if (await this.pathExistsLocally(video.originalPath)) {
+      return video.originalPath;
+    }
+
+    const extension = extname(video.originalFilename) || '.mp4';
+    const localPath = this.storageService.originalVideoPath(movieId, extension);
+    await this.storageService.ensureDir(this.storageService.videoDir(movieId));
+    await this.minioService.downloadFile(video.originalPath, localPath);
+    return localPath;
+  }
+
+  private async pathExistsLocally(path: string): Promise<boolean> {
+    try {
+      await access(path);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async mergeChunks(uploadId: string, totalChunks: number, destination: string): Promise<void> {

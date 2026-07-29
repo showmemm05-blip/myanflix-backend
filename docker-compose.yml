@@ -1,6 +1,9 @@
 services:
   postgres:
     image: postgres:17-alpine
+    # Without this, a crash or host reboot leaves the service down until
+    # someone notices and starts it by hand.
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-myanflix}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
@@ -12,6 +15,7 @@ services:
 
   backend:
     build: .
+    restart: unless-stopped
     depends_on:
       - postgres
     environment:

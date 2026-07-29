@@ -67,4 +67,10 @@ export class UploadsController {
   completeUpload(@Param('uploadId', ParseUUIDPipe) uploadId: string) {
     return this.uploadsService.completeUpload(uploadId);
   }
+
+  /** Retries transcoding for a movie whose video failed — no re-upload required. */
+  @Post(':movieId/reprocess')
+  reprocess(@Param('movieId', ParseUUIDPipe) movieId: string) {
+    return this.uploadsService.reprocessVideo(movieId);
+  }
 }

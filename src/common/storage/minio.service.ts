@@ -2,15 +2,20 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   CreateBucketCommand,
+  GetObjectCommand,
   HeadBucketCommand,
+  HeadObjectCommand,
+  NotFound,
   PutBucketPolicyCommand,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
-import { createReadStream } from 'node:fs';
+import { createReadStream, createWriteStream } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
+import { pipeline } from 'node:stream/promises';
+import type { Readable } from 'node:stream';
 
 // Multipart tuning for streamed file uploads. Memory held per upload is
 // roughly UPLOAD_PART_SIZE * UPLOAD_QUEUE_SIZE (~32 MB), regardless of how
@@ -120,6 +125,29 @@ export class MinioService {
 
   private contentTypeFor(extension: string): string {
     return CONTENT_TYPES[extension] ?? 'application/octet-stream';
+  }
+
+  /** Whether `key` already exists — lets a reprocess/retry skip re-uploading bytes that are already archived. */
+  async objectExists(key: string): Promise<boolean> {
+    try {
+      await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
+      return true;
+    } catch (error) {
+      if (error instanceof NotFound) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Downloads `key` to `localFilePath`, streaming straight to disk — the
+   * download-side counterpart to uploadFile()'s streamed upload, so pulling
+   * a multi-GB archived original back down for reprocessing never buffers
+   * the whole thing in memory either.
+   */
+  async downloadFile(key: string, localFilePath: string): Promise<void> {
+    const response = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
+    const body = response.Body as Readable;
+    await pipeline(body, createWriteStream(localFilePath));
   }
 
   /** Uploads every file in `localDir` (non-recursive — HLS rendition dirs are flat) under `keyPrefix`. */
