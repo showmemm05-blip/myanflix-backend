@@ -7,8 +7,21 @@ import {
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
-import { readdir, readFile } from 'node:fs/promises';
+import { Upload } from '@aws-sdk/lib-storage';
+import { createReadStream } from 'node:fs';
+import { readdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
+
+// Multipart tuning for streamed file uploads. Memory held per upload is
+// roughly UPLOAD_PART_SIZE * UPLOAD_QUEUE_SIZE (~32 MB), regardless of how
+// large the file itself is — that bound is the whole point of streaming.
+const UPLOAD_PART_SIZE = 8 * 1024 * 1024; // S3's minimum part size is 5 MB
+const UPLOAD_QUEUE_SIZE = 4; // parts uploaded concurrently within one file
+
+// Ceiling on how many files upload at once in uploadDirectory(). An HLS
+// rendition can be ~900 segments for a feature-length movie; uploading them
+// all concurrently is what previously spiked memory on the backend VPS.
+const DIRECTORY_UPLOAD_CONCURRENCY = 4;
 
 const CONTENT_TYPES: Record<string, string> = {
   '.m3u8': 'application/vnd.apple.mpegurl',
@@ -68,31 +81,64 @@ export class MinioService {
     return `${base.replace(/\/$/, '')}/${this.bucket}/${objectKey}`;
   }
 
-  /** Uploads a single local file to `key`, creating/configuring the bucket first if needed. */
+  /**
+   * Uploads a single local file to `key`, creating/configuring the bucket
+   * first if needed. Streams from disk rather than reading the file into
+   * memory — fs.readFile() cannot read anything larger than 2 GiB at all
+   * (a hard Node limit, independent of available RAM), which movie files
+   * routinely exceed. Multipart also means a dropped part retries on its
+   * own instead of failing the whole multi-GB transfer.
+   */
   async uploadFile(key: string, localFilePath: string): Promise<void> {
-    await this.putObject(key, await readFile(localFilePath), extname(localFilePath));
+    await this.ensureBucket();
+    const upload = new Upload({
+      client: this.client,
+      params: {
+        Bucket: this.bucket,
+        Key: key,
+        Body: createReadStream(localFilePath),
+        ContentType: this.contentTypeFor(extname(localFilePath)),
+      },
+      partSize: UPLOAD_PART_SIZE,
+      queueSize: UPLOAD_QUEUE_SIZE,
+    });
+    await upload.done();
   }
 
   /** Uploads in-memory bytes straight to `key` — no local disk involved at all (e.g. poster/cover images from multer's memory storage). */
   async uploadBuffer(key: string, buffer: Buffer): Promise<void> {
-    await this.putObject(key, buffer, extname(key));
+    await this.ensureBucket();
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+        Body: buffer,
+        ContentType: this.contentTypeFor(extname(key)),
+      }),
+    );
   }
 
-  private async putObject(key: string, body: Buffer, extension: string): Promise<void> {
-    await this.ensureBucket();
-    const contentType = CONTENT_TYPES[extension] ?? 'application/octet-stream';
-    await this.client.send(
-      new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: body, ContentType: contentType }),
-    );
+  private contentTypeFor(extension: string): string {
+    return CONTENT_TYPES[extension] ?? 'application/octet-stream';
   }
 
   /** Uploads every file in `localDir` (non-recursive — HLS rendition dirs are flat) under `keyPrefix`. */
   async uploadDirectory(localDir: string, keyPrefix: string): Promise<void> {
     const entries = await readdir(localDir, { withFileTypes: true });
+    const files = entries.filter((entry) => entry.isFile());
+
+    let next = 0;
+    const worker = async () => {
+      for (;;) {
+        const index = next++;
+        if (index >= files.length) return;
+        const { name } = files[index];
+        await this.uploadFile(`${keyPrefix}/${name}`, join(localDir, name));
+      }
+    };
+
     await Promise.all(
-      entries
-        .filter((entry) => entry.isFile())
-        .map((entry) => this.uploadFile(`${keyPrefix}/${entry.name}`, join(localDir, entry.name))),
+      Array.from({ length: Math.min(DIRECTORY_UPLOAD_CONCURRENCY, files.length) }, worker),
     );
   }
 
