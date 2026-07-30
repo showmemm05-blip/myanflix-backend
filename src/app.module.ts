@@ -21,6 +21,7 @@ import { AnalyticsModule } from './analytics/analytics.module';
 import { DepositsModule } from './deposits/deposits.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { RealtimeModule } from './realtime/realtime.module';
+import { SubtitlesModule } from './subtitles/subtitles.module';
 
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
@@ -48,6 +49,7 @@ import { AppService } from './app.service';
     DepositsModule,
     NotificationsModule,
     RealtimeModule,
+    SubtitlesModule,
   ],
   controllers: [AppController],
   providers: [

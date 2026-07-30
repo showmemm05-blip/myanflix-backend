@@ -2,19 +2,48 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { access, rm, writeFile } from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { extname } from 'node:path';
-import { UploadStatus, VideoStatus } from '../generated/prisma/client';
+import { basename, extname, join } from 'node:path';
+import { MovieStatus, UploadStatus, VideoStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
 import { VideosService } from '../videos/videos.service';
 import { ProcessingService } from '../processing/processing.service';
+import { SubtitlesService, EXTENSION_TO_FORMAT } from '../subtitles/subtitles.service';
 import type { InitUploadDto } from './dto/init-upload.dto';
+import type { ValidateExternalBundleDto } from './dto/validate-external-bundle.dto';
 
 // 5 MB — small enough that one chunk still finishes comfortably within the
 // server's request timeout on a throttled/mobile connection, and a failed
 // chunk only costs 5 MB of retried work instead of 16.
 export const DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024;
+
+// The externally-pre-transcoded bundle's folder structure is a fixed
+// contract (see the admin upload-external page) — these are the only
+// rendition names it recognizes when deriving what to publish.
+const KNOWN_RENDITIONS = ['240p', '360p', '480p', '720p', '1080p'];
+const SUBTITLE_EXTENSIONS = new Set(['.srt', '.vtt', '.ass']);
+
+// Filenames the other PC is expected to use for its subtitle tracks (e.g.
+// "english.vtt", "myanmar.vtt") — mapped to ISO codes where recognized, else
+// the filename stem itself is used as the language code.
+const LANGUAGE_NAME_TO_CODE: Record<string, string> = {
+  english: 'en',
+  myanmar: 'my',
+  burmese: 'my',
+  japanese: 'ja',
+  korean: 'ko',
+  chinese: 'zh',
+  spanish: 'es',
+  french: 'fr',
+  hindi: 'hi',
+};
+
+interface BundleStructure {
+  renditions: string[];
+  subtitlePaths: string[];
+  errors: string[];
+}
 
 @Injectable()
 export class UploadsService {
@@ -24,6 +53,7 @@ export class UploadsService {
     private readonly minioService: MinioService,
     private readonly videosService: VideosService,
     private readonly processingService: ProcessingService,
+    private readonly subtitlesService: SubtitlesService,
   ) {}
 
   /**
@@ -38,11 +68,18 @@ export class UploadsService {
     const movie = await this.prisma.movie.findUnique({ where: { id: dto.movieId } });
     if (!movie) throw new NotFoundException('Movie not found');
 
+    // relativePath is part of the match — without this, two different files
+    // in an externally-transcoded bundle sharing a bare filename (every
+    // rendition's playlist is named "index.m3u8") would collide and resume
+    // against the wrong session. `relativePath ?? null` keeps the classic
+    // single-file flow's existing behavior exactly as it was: those
+    // sessions only ever match other relativePath-less requests.
     const existing = await this.prisma.uploadSession.findFirst({
       where: {
         movieId: dto.movieId,
         filename: dto.filename,
         fileSize: BigInt(dto.filesize),
+        relativePath: dto.relativePath ?? null,
         status: UploadStatus.IN_PROGRESS,
       },
       orderBy: { createdAt: 'desc' },
@@ -66,6 +103,7 @@ export class UploadsService {
         fileSize: BigInt(dto.filesize),
         chunkSize: DEFAULT_CHUNK_SIZE,
         totalChunks,
+        relativePath: dto.relativePath,
         tempDir: '', // filled in below once we know the id
       },
     });
@@ -109,7 +147,15 @@ export class UploadsService {
     return { uploadedChunks, remainingChunks, totalChunks: session.totalChunks, status: session.status };
   }
 
-  /** Merge chunks -> save original video -> update video status -> start FFmpeg processing. */
+  /**
+   * Merge chunks -> save original video -> update video status -> start
+   * FFmpeg processing. Unless this session has a `relativePath` (the
+   * externally-pre-transcoded bundle flow) — then it merges the chunks and
+   * uploads the result straight to `videos/<movieId>/<relativePath>` in
+   * MinIO, using the exact same key convention `StorageService`'s helpers
+   * already produce, and stops there: no `Video` row, no transcoding. This
+   * is what lets one chunked-upload mechanism serve both flows.
+   */
   async completeUpload(uploadId: string) {
     const session = await this.getActiveSessionOrThrow(uploadId);
 
@@ -117,6 +163,10 @@ export class UploadsService {
       throw new BadRequestException(
         `Upload incomplete: ${session.uploadedChunks.length}/${session.totalChunks} chunks received`,
       );
+    }
+
+    if (session.relativePath) {
+      return this.completeExternalAssetUpload(uploadId, session.movieId, session.relativePath, session.totalChunks);
     }
 
     const extension = extname(session.filename) || '.mp4';
@@ -141,6 +191,159 @@ export class UploadsService {
     void this.processingService.processVideo(video.id, session.movieId, originalPath);
 
     return { videoId: video.id, status: video.status };
+  }
+
+  private async completeExternalAssetUpload(
+    uploadId: string,
+    movieId: string,
+    relativePath: string,
+    totalChunks: number,
+  ): Promise<{ relativePath: string; status: UploadStatus }> {
+    const tempPath = join(this.storageService.uploadSessionDir(uploadId), 'merged');
+    await this.mergeChunks(uploadId, totalChunks, tempPath);
+
+    await this.minioService.uploadFile(`videos/${movieId}/${relativePath}`, tempPath);
+
+    await this.prisma.uploadSession.update({
+      where: { id: uploadId },
+      data: { status: UploadStatus.COMPLETED },
+    });
+    await this.cleanupChunks(uploadId);
+
+    return { relativePath, status: UploadStatus.COMPLETED };
+  }
+
+  /**
+   * Cross-checks the admin frontend's own checklist of uploaded files
+   * against what's actually in MinIO before allowing Publish — a real
+   * server-side check, not a rubber stamp on the client's word — and also
+   * confirms the bundle matches the fixed folder-structure contract (see
+   * parseBundleStructure()), so a missing original/master/rendition is
+   * caught here rather than surfacing as a confusing failure at publish.
+   */
+  async validateExternalBundle(movieId: string, dto: ValidateExternalBundleDto) {
+    const movie = await this.prisma.movie.findUnique({ where: { id: movieId } });
+    if (!movie) throw new NotFoundException('Movie not found');
+
+    const results = await Promise.all(
+      dto.relativePaths.map(async (relativePath) => ({
+        relativePath,
+        exists: await this.minioService.objectExists(`videos/${movieId}/${relativePath}`),
+      })),
+    );
+    const missing = results.filter((r) => !r.exists).map((r) => r.relativePath);
+
+    const { errors: structureErrors } = this.parseBundleStructure(dto.relativePaths);
+
+    return { missing, structureErrors, valid: missing.length === 0 && structureErrors.length === 0 };
+  }
+
+  /**
+   * Publishes a movie whose video was transcoded entirely externally —
+   * never runs ffmpeg. The admin uploads one root folder (see
+   * parseBundleStructure() for the fixed contract this expects); this
+   * derives which renditions and subtitles actually exist from the
+   * uploaded relativePaths, re-validates all of it server-side (never
+   * trusts the client's last validate call alone), then creates the Video
+   * row directly in the READY state using the exact same
+   * `hlsMasterKey()`/`originalObjectKey()` helpers the transcode-based flow
+   * already uses — the reason streaming (`GET /videos/:movieId/stream`)
+   * needs zero changes to serve this video.
+   */
+  async publishExternalVideo(movieId: string, dto: ValidateExternalBundleDto) {
+    const movie = await this.prisma.movie.findUnique({ where: { id: movieId } });
+    if (!movie) throw new NotFoundException('Movie not found');
+
+    const { renditions, subtitlePaths, errors } = this.parseBundleStructure(dto.relativePaths);
+    if (errors.length > 0) {
+      throw new BadRequestException(`Cannot publish — invalid bundle structure: ${errors.join('; ')}`);
+    }
+
+    const originalKey = this.storageService.originalObjectKey(movieId, '.mp4');
+    const masterKey = this.storageService.hlsMasterKey(movieId);
+    const requiredKeys = [
+      originalKey,
+      masterKey,
+      ...renditions.map((r) => `${this.storageService.hlsRenditionKeyPrefix(movieId, r)}/index.m3u8`),
+      ...subtitlePaths.map((p) => `videos/${movieId}/${p}`),
+    ];
+
+    const existence = await Promise.all(
+      requiredKeys.map(async (key) => ({ key, exists: await this.minioService.objectExists(key) })),
+    );
+    const missing = existence.filter((e) => !e.exists).map((e) => e.key);
+    if (missing.length > 0) {
+      throw new BadRequestException(`Cannot publish — missing required files: ${missing.join(', ')}`);
+    }
+
+    const video = await this.videosService.create({
+      movieId,
+      originalFilename: 'original.mp4',
+      originalPath: originalKey,
+    });
+
+    await this.videosService.markReady(video.id, {
+      duration: null,
+      resolution: null,
+      hlsMasterPath: masterKey,
+      renditions: renditions.map((resolution) => ({
+        resolution,
+        playlistPath: `${this.storageService.hlsRenditionKeyPrefix(movieId, resolution)}/index.m3u8`,
+      })),
+    });
+
+    for (const relativePath of subtitlePaths) {
+      const filename = basename(relativePath);
+      const extension = extname(filename).toLowerCase();
+      const stem = filename.slice(0, filename.length - extension.length);
+      const code = LANGUAGE_NAME_TO_CODE[stem.toLowerCase()];
+
+      await this.subtitlesService.createFromExistingKey({
+        videoId: video.id,
+        language: code ?? stem.toLowerCase(),
+        label: stem.charAt(0).toUpperCase() + stem.slice(1).toLowerCase(),
+        format: EXTENSION_TO_FORMAT[extension],
+        objectKey: `videos/${movieId}/${relativePath}`,
+      });
+    }
+
+    // Matches the classic transcode flow (ProcessingService.runPipeline()) —
+    // a READY video alone doesn't make the movie live; the movie itself has
+    // to flip to PUBLISHED, or it stays DRAFT forever.
+    await this.prisma.movie.update({
+      where: { id: movieId },
+      data: { status: MovieStatus.PUBLISHED },
+    });
+
+    return { videoId: video.id, status: VideoStatus.READY };
+  }
+
+  /**
+   * The fixed folder-structure contract the other PC's output must follow:
+   *   original.mp4, hls/master.m3u8, hls/<resolution>/index.m3u8 (for any
+   *   of the known renditions), subtitles/<name>.<srt|vtt|ass> (optional).
+   * relativePaths already carry the "hls/" prefix for the master playlist
+   * and every rendition — see stripDirectoryRoot()/the admin page, which
+   * maps the single selected root folder onto this exact key convention so
+   * `StorageService`'s existing helpers keep producing the right MinIO keys.
+   */
+  private parseBundleStructure(relativePaths: string[]): BundleStructure {
+    const set = new Set(relativePaths);
+    const errors: string[] = [];
+
+    if (!set.has('original.mp4')) errors.push('original.mp4 is missing');
+    if (!set.has('hls/master.m3u8')) errors.push('master.m3u8 is missing');
+
+    const renditions = KNOWN_RENDITIONS.filter((r) => set.has(`hls/${r}/index.m3u8`));
+    if (renditions.length === 0) {
+      errors.push('no valid rendition folder (240p, 360p, 480p, 720p, or 1080p) with an index.m3u8 was found');
+    }
+
+    const subtitlePaths = relativePaths.filter(
+      (p) => p.startsWith('subtitles/') && SUBTITLE_EXTENSIONS.has(extname(p).toLowerCase()),
+    );
+
+    return { renditions, subtitlePaths, errors };
   }
 
   /** Uploads a poster/cover image straight to the storage server (no local disk involved) and returns its public URL. */

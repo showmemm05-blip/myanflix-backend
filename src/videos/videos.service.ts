@@ -15,6 +15,15 @@ export interface RenditionInfo {
   playlistPath: string;
 }
 
+export interface SubtitleInfo {
+  id: string;
+  language: string;
+  label: string;
+  format: string;
+  isDefault: boolean;
+  url: string;
+}
+
 @Injectable()
 export class VideosService {
   constructor(
@@ -56,7 +65,12 @@ export class VideosService {
 
   markReady(
     id: string,
-    data: { duration: number; resolution: string; hlsMasterPath: string; renditions: RenditionInfo[] },
+    data: {
+      duration: number | null;
+      resolution: string | null;
+      hlsMasterPath: string;
+      renditions: RenditionInfo[];
+    },
   ): Promise<Video> {
     return this.prisma.video.update({
       where: { id },
@@ -80,9 +94,15 @@ export class VideosService {
 
   /**
    * Resolves the streaming playlist for a movie, enforcing that premium
-   * titles require either a completed purchase or staff access.
+   * titles require either a completed purchase or staff access. Subtitles
+   * are gated by the exact same purchase check (queried after it passes),
+   * not a separate rule — a subtitle track is part of the same title.
    */
-  async getStreamInfo(movieId: string, userId: string, role: Role): Promise<{ playlistUrl: string }> {
+  async getStreamInfo(
+    movieId: string,
+    userId: string,
+    role: Role,
+  ): Promise<{ playlistUrl: string; subtitles: SubtitleInfo[] }> {
     const movie = await this.prisma.movie.findUnique({ where: { id: movieId } });
     if (!movie) throw new NotFoundException('Movie not found');
 
@@ -100,7 +120,19 @@ export class VideosService {
       throw new NotFoundException('This movie is not ready for streaming yet');
     }
 
-    return { playlistUrl: this.minioService.publicUrl(video.hlsMasterPath) };
+    const subtitles = await this.prisma.subtitle.findMany({ where: { videoId: video.id } });
+
+    return {
+      playlistUrl: this.minioService.publicUrl(video.hlsMasterPath),
+      subtitles: subtitles.map((s) => ({
+        id: s.id,
+        language: s.language,
+        label: s.label,
+        format: s.format,
+        isDefault: s.isDefault,
+        url: this.minioService.publicUrl(s.objectKey),
+      })),
+    };
   }
 
   /** Upserts the caller's watch progress for a movie — feeds analytics (views, completion rate). */

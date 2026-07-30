@@ -2,11 +2,12 @@ import { Module } from '@nestjs/common';
 import { RolesModule } from '../roles/roles.module';
 import { VideosModule } from '../videos/videos.module';
 import { ProcessingModule } from '../processing/processing.module';
+import { SubtitlesModule } from '../subtitles/subtitles.module';
 import { UploadsController } from './uploads.controller';
 import { UploadsService } from './uploads.service';
 
 @Module({
-  imports: [RolesModule, VideosModule, ProcessingModule],
+  imports: [RolesModule, VideosModule, ProcessingModule, SubtitlesModule],
   controllers: [UploadsController],
   providers: [UploadsService],
 })

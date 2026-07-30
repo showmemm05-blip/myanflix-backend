@@ -16,6 +16,7 @@ import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { InitUploadDto } from './dto/init-upload.dto';
+import { ValidateExternalBundleDto } from './dto/validate-external-bundle.dto';
 import { UploadsService } from './uploads.service';
 
 const MAX_CHUNK_BYTES = 10 * 1024 * 1024; // safety cap, well above the 5 MB default chunk size
@@ -72,5 +73,17 @@ export class UploadsController {
   @Post(':movieId/reprocess')
   reprocess(@Param('movieId', ParseUUIDPipe) movieId: string) {
     return this.uploadsService.reprocessVideo(movieId);
+  }
+
+  /** Cross-checks an externally-pre-transcoded bundle's uploaded files against what's actually in MinIO. */
+  @Post(':movieId/validate-external')
+  validateExternal(@Param('movieId', ParseUUIDPipe) movieId: string, @Body() dto: ValidateExternalBundleDto) {
+    return this.uploadsService.validateExternalBundle(movieId, dto);
+  }
+
+  /** Publishes a movie whose video was transcoded entirely externally — never runs ffmpeg. */
+  @Post(':movieId/publish-external')
+  publishExternal(@Param('movieId', ParseUUIDPipe) movieId: string, @Body() dto: ValidateExternalBundleDto) {
+    return this.uploadsService.publishExternalVideo(movieId, dto);
   }
 }

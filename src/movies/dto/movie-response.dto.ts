@@ -11,6 +11,7 @@ export class MovieResponseDto {
       description: movie.description,
       posterUrl: movie.posterUrl,
       coverUrl: movie.coverUrl,
+      thumbnailUrl: movie.thumbnailUrl,
       genre: movie.genre,
       language: movie.language,
       releaseYear: movie.releaseYear,

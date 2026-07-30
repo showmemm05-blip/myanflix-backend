@@ -44,6 +44,12 @@ enum UploadStatus {
   FAILED
 }
 
+enum SubtitleFormat {
+  SRT
+  VTT
+  ASS
+}
+
 enum TransactionType {
   DEPOSIT
   PURCHASE
@@ -115,26 +121,27 @@ model RefreshToken {
 // ---------------------------------------------------------------------------
 
 model Movie {
-  id          String      @id @default(uuid())
-  title       String
-  description String
-  posterUrl   String?
-  coverUrl    String?
-  genre       String
-  language    String
-  releaseYear Int
-  duration    Int // minutes
-  rating      Float       @default(0)
-  price       Decimal     @db.Decimal(12, 2)
-  isPremium   Boolean     @default(true)
-  status      MovieStatus @default(DRAFT)
-  createdAt   DateTime    @default(now())
-  updatedAt   DateTime    @updatedAt
+  id           String      @id @default(uuid())
+  title        String
+  description  String
+  posterUrl    String?
+  coverUrl     String?
+  thumbnailUrl String?
+  genre        String
+  language     String
+  releaseYear  Int
+  duration     Int // minutes
+  rating       Float       @default(0)
+  price        Decimal     @db.Decimal(12, 2)
+  isPremium    Boolean     @default(true)
+  status       MovieStatus @default(DRAFT)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
 
-  categories    Category[]
-  videos        Video[]
-  purchases     Purchase[]
-  watchHistory  WatchHistory[]
+  categories     Category[]
+  videos         Video[]
+  purchases      Purchase[]
+  watchHistory   WatchHistory[]
   uploadSessions UploadSession[]
 
   @@index([status])
@@ -170,26 +177,57 @@ model Video {
   createdAt        DateTime    @default(now())
   updatedAt        DateTime    @updatedAt
 
-  movie Movie @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  movie     Movie      @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  subtitles Subtitle[]
 
   @@index([movieId])
   @@map("videos")
 }
 
+/// A subtitle track for a Video — either uploaded by an admin against the
+/// classic transcode flow, or as part of an externally pre-transcoded
+/// bundle. Not yet consumed by the player (no format conversion, no
+/// language-switch UI) — this just stores and exposes the tracks via the
+/// video API response.
+model Subtitle {
+  id        String         @id @default(uuid())
+  videoId   String
+  language  String // e.g. "en", "my"
+  label     String // e.g. "English", "Myanmar"
+  format    SubtitleFormat
+  objectKey String // MinIO key, e.g. subtitles/<subtitleId>/original.<ext>
+  isDefault Boolean        @default(false)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  video Video @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@index([videoId])
+  @@map("subtitles")
+}
+
 /// Tracks an in-progress chunked upload so it can be resumed after a client
 /// disconnect. Rows are cleaned up once the upload completes.
 model UploadSession {
-  id              String       @id @default(uuid())
-  movieId         String
-  filename        String
-  fileSize        BigInt
-  chunkSize       Int
-  totalChunks     Int
-  uploadedChunks  Int[]        @default([])
-  tempDir         String
-  status          UploadStatus @default(IN_PROGRESS)
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+  id             String       @id @default(uuid())
+  movieId        String
+  filename       String
+  fileSize       BigInt
+  chunkSize      Int
+  totalChunks    Int
+  uploadedChunks Int[]        @default([])
+  tempDir        String
+  status         UploadStatus @default(IN_PROGRESS)
+  /// Set only for the externally-pre-transcoded upload flow — e.g.
+  /// "original.mp4", "hls/720p/index.m3u8", "hls/720p/segment_000.ts".
+  /// Null means the classic single-video-file flow (unchanged behavior):
+  /// completeUpload() merges into the movie's original file and kicks off
+  /// transcoding. When set, completeUpload() instead uploads the merged
+  /// file straight to `videos/<movieId>/<relativePath>` and does nothing
+  /// else — no Video row, no processVideo() call.
+  relativePath   String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
 
   movie Movie @relation(fields: [movieId], references: [id], onDelete: Cascade)
 

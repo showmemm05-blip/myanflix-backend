@@ -16,6 +16,7 @@ export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
     Permission.MOVIE_DELETE,
     Permission.VIDEO_UPLOAD,
     Permission.DEPOSIT_MANAGE,
+    Permission.SUBTITLE_MANAGE,
   ],
   [Role.USER]: [],
 };

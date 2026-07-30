@@ -33,6 +33,10 @@ export class CreateMovieDto {
   @IsUrl({ require_tld: false })
   coverUrl?: string;
 
+  @IsOptional()
+  @IsUrl({ require_tld: false })
+  thumbnailUrl?: string;
+
   @IsString()
   @MinLength(1)
   @MaxLength(64)
