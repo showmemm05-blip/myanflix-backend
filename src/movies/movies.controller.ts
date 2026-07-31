@@ -19,6 +19,7 @@ import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { CreateMovieDto } from './dto/create-movie.dto';
+import { CreateUploadPlaceholderDto } from './dto/create-upload-placeholder.dto';
 import { MovieQueryDto } from './dto/movie-query.dto';
 import { MovieResponseDto } from './dto/movie-response.dto';
 import { UpdateMovieDto } from './dto/update-movie.dto';
@@ -58,6 +59,19 @@ export class MoviesController {
   @RequirePermissions(Permission.MOVIE_CREATE)
   async create(@Body() dto: CreateMovieDto) {
     const movie = await this.moviesService.create(dto);
+    return MovieResponseDto.fromEntity(movie);
+  }
+
+  /**
+   * Bootstraps a movie for the bulk pre-transcoded upload flow — title only,
+   * status UPLOADING. Everything else is filled in later via PUT /movies/:id
+   * once the upload finishes and the admin edits it.
+   */
+  @Post('upload-placeholder')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions(Permission.MOVIE_CREATE)
+  async createUploadPlaceholder(@Body() dto: CreateUploadPlaceholderDto) {
+    const movie = await this.moviesService.createUploadPlaceholder(dto.title);
     return MovieResponseDto.fromEntity(movie);
   }
 

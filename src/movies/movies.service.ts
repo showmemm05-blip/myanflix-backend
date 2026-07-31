@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
   MovieStatus,
   Prisma,
@@ -9,6 +9,7 @@ import {
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
+import { MinioService } from '../common/storage/minio.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { CreateMovieDto } from './dto/create-movie.dto';
@@ -21,9 +22,12 @@ type MovieWithCategories = Movie & { categories: Category[] };
 
 @Injectable()
 export class MoviesService {
+  private readonly logger = new Logger(MoviesService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly walletService: WalletService,
+    private readonly minioService: MinioService,
   ) {}
 
   async findAll(query: MovieQueryDto, viewerRole: Role) {
@@ -83,6 +87,29 @@ export class MoviesService {
     });
   }
 
+  /**
+   * Bootstrap row for the bulk pre-transcoded upload flow — the admin has
+   * only picked a folder at this point, so only its extracted title is
+   * known. Starts at UPLOADING; everything else (description, genre,
+   * categories, price, release date, images) gets filled in later via
+   * update() once the admin edits it, after the upload finishes.
+   */
+  async createUploadPlaceholder(title: string): Promise<Movie> {
+    return this.prisma.movie.create({
+      data: {
+        title,
+        description: '',
+        genre: '',
+        language: '',
+        releaseYear: new Date().getFullYear(),
+        duration: 0,
+        price: 0,
+        isPremium: true,
+        status: MovieStatus.UPLOADING,
+      },
+    });
+  }
+
   async update(id: string, dto: UpdateMovieDto): Promise<Movie> {
     await this.assertExists(id);
     const { categoryIds, ...data } = dto;
@@ -97,9 +124,48 @@ export class MoviesService {
     });
   }
 
+  /**
+   * Deletes the movie row (cascading to its Video/Subtitle/UploadSession
+   * rows) and then best-effort cleans up its actual bytes in storage —
+   * without this, every deleted movie would leak its original file, every
+   * HLS rendition, its subtitles, and its poster/banner/thumbnail forever.
+   * Storage cleanup runs AFTER the DB delete (the catalog removal is the
+   * primary, user-facing action and shouldn't be blocked by a storage
+   * hiccup) and is logged rather than thrown on failure — a partial cleanup
+   * just leaves orphaned bytes behind, it's not a functional problem.
+   */
   async remove(id: string): Promise<void> {
-    await this.assertExists(id);
+    const movie = await this.prisma.movie.findUnique({
+      where: { id },
+      include: { videos: { include: { subtitles: true } } },
+    });
+    if (!movie) throw new NotFoundException('Movie not found');
+
     await this.prisma.movie.delete({ where: { id } });
+
+    try {
+      await this.minioService.deleteByPrefix(`videos/${id}/`);
+
+      for (const url of [movie.posterUrl, movie.coverUrl, movie.thumbnailUrl]) {
+        if (!url) continue;
+        const key = this.minioService.keyFromPublicUrl(url);
+        if (key) await this.minioService.deleteObject(key);
+      }
+
+      for (const video of movie.videos) {
+        for (const subtitle of video.subtitles) {
+          // Bundle-detected subtitles already live under videos/<movieId>/...
+          // and were just caught by the prefix delete above; manually
+          // uploaded ones live under the separate global subtitles/<id>/
+          // prefix and need deleting individually.
+          if (!subtitle.objectKey.startsWith(`videos/${id}/`)) {
+            await this.minioService.deleteObject(subtitle.objectKey);
+          }
+        }
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to clean up storage for deleted movie ${id}: ${(error as Error).message}`);
+    }
   }
 
   /** User wallet -> purchase movie -> create transaction -> grant movie access. */

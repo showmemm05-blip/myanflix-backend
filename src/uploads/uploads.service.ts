@@ -239,24 +239,29 @@ export class UploadsService {
   }
 
   /**
-   * Publishes a movie whose video was transcoded entirely externally —
-   * never runs ffmpeg. The admin uploads one root folder (see
-   * parseBundleStructure() for the fixed contract this expects); this
-   * derives which renditions and subtitles actually exist from the
-   * uploaded relativePaths, re-validates all of it server-side (never
-   * trusts the client's last validate call alone), then creates the Video
-   * row directly in the READY state using the exact same
-   * `hlsMasterKey()`/`originalObjectKey()` helpers the transcode-based flow
-   * already uses — the reason streaming (`GET /videos/:movieId/stream`)
-   * needs zero changes to serve this video.
+   * Runs automatically once the admin's bundle upload finishes — never runs
+   * ffmpeg. The admin uploads one root folder (see parseBundleStructure()
+   * for the fixed contract this expects); this derives which renditions and
+   * subtitles actually exist from the uploaded relativePaths, re-validates
+   * all of it server-side (never trusts the client's last upload-progress
+   * state alone), then creates the Video row directly in the READY state
+   * using the exact same `hlsMasterKey()`/`originalObjectKey()` helpers the
+   * transcode-based flow already uses — the reason streaming
+   * (`GET /videos/:movieId/stream`) needs zero changes to serve this video.
+   *
+   * The movie itself only ever moves to READY_TO_PUBLISH here (or FAILED if
+   * the bundle turns out incomplete) — never PUBLISHED. Publishing is
+   * always a separate, explicit admin action (see MoviesService.update()),
+   * matching the bulk-upload flow's status lifecycle.
    */
-  async publishExternalVideo(movieId: string, dto: ValidateExternalBundleDto) {
+  async finalizeExternalUpload(movieId: string, dto: ValidateExternalBundleDto) {
     const movie = await this.prisma.movie.findUnique({ where: { id: movieId } });
     if (!movie) throw new NotFoundException('Movie not found');
 
     const { renditions, subtitlePaths, errors } = this.parseBundleStructure(dto.relativePaths);
     if (errors.length > 0) {
-      throw new BadRequestException(`Cannot publish — invalid bundle structure: ${errors.join('; ')}`);
+      await this.markMovieFailed(movieId);
+      throw new BadRequestException(`Cannot finalize — invalid bundle structure: ${errors.join('; ')}`);
     }
 
     const originalKey = this.storageService.originalObjectKey(movieId, '.mp4');
@@ -273,7 +278,8 @@ export class UploadsService {
     );
     const missing = existence.filter((e) => !e.exists).map((e) => e.key);
     if (missing.length > 0) {
-      throw new BadRequestException(`Cannot publish — missing required files: ${missing.join(', ')}`);
+      await this.markMovieFailed(movieId);
+      throw new BadRequestException(`Cannot finalize — missing required files: ${missing.join(', ')}`);
     }
 
     const video = await this.videosService.create({
@@ -307,15 +313,16 @@ export class UploadsService {
       });
     }
 
-    // Matches the classic transcode flow (ProcessingService.runPipeline()) —
-    // a READY video alone doesn't make the movie live; the movie itself has
-    // to flip to PUBLISHED, or it stays DRAFT forever.
     await this.prisma.movie.update({
       where: { id: movieId },
-      data: { status: MovieStatus.PUBLISHED },
+      data: { status: MovieStatus.READY_TO_PUBLISH },
     });
 
     return { videoId: video.id, status: VideoStatus.READY };
+  }
+
+  private async markMovieFailed(movieId: string): Promise<void> {
+    await this.prisma.movie.update({ where: { id: movieId }, data: { status: MovieStatus.FAILED } });
   }
 
   /**

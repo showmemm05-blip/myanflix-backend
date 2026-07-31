@@ -2,9 +2,12 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   CreateBucketCommand,
+  DeleteObjectCommand,
+  DeleteObjectsCommand,
   GetObjectCommand,
   HeadBucketCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   NotFound,
   PutBucketPolicyCommand,
   PutObjectCommand,
@@ -139,6 +142,40 @@ export class MinioService {
     } catch (error) {
       if (error instanceof NotFound) return false;
       throw error;
+    }
+  }
+
+  /** Deletes a single object — a no-op (not an error) if it's already gone, matching S3-compatible delete semantics. */
+  async deleteObject(key: string): Promise<void> {
+    await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
+  }
+
+  /** Deletes every object under `prefix` — e.g. a movie's whole `videos/<movieId>/` tree (original + every rendition + bundle subtitles) when the movie itself is deleted. */
+  async deleteByPrefix(prefix: string): Promise<void> {
+    let continuationToken: string | undefined;
+    do {
+      const page = await this.client.send(
+        new ListObjectsV2Command({ Bucket: this.bucket, Prefix: prefix, ContinuationToken: continuationToken }),
+      );
+      const keys = (page.Contents ?? []).map((o) => o.Key).filter((k): k is string => Boolean(k));
+      if (keys.length > 0) {
+        await this.client.send(
+          new DeleteObjectsCommand({ Bucket: this.bucket, Delete: { Objects: keys.map((Key) => ({ Key })) } }),
+        );
+      }
+      continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+    } while (continuationToken);
+  }
+
+  /** Inverse of publicUrl() — recovers the object key from a URL this service previously produced, or null if it doesn't look like one of ours (e.g. a stale external URL). */
+  keyFromPublicUrl(url: string): string | null {
+    try {
+      const { pathname } = new URL(url);
+      const parts = pathname.split('/').filter(Boolean);
+      if (parts[0] !== this.bucket) return null;
+      return parts.slice(1).join('/');
+    } catch {
+      return null;
     }
   }
 

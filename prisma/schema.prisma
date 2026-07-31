@@ -29,6 +29,13 @@ enum MovieStatus {
   PROCESSING
   PUBLISHED
   ARCHIVED
+  /// The bulk pre-transcoded upload flow's own lifecycle — a movie starts
+  /// here the instant its folder is picked, moves to READY_TO_PUBLISH once
+  /// every file is uploaded and validated (or FAILED if it isn't), and only
+  /// reaches PUBLISHED via an explicit admin action. Never visible to users.
+  UPLOADING
+  FAILED
+  READY_TO_PUBLISH
 }
 
 enum VideoStatus {

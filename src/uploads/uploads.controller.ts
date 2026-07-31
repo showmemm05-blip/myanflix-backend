@@ -81,9 +81,13 @@ export class UploadsController {
     return this.uploadsService.validateExternalBundle(movieId, dto);
   }
 
-  /** Publishes a movie whose video was transcoded entirely externally — never runs ffmpeg. */
-  @Post(':movieId/publish-external')
-  publishExternal(@Param('movieId', ParseUUIDPipe) movieId: string, @Body() dto: ValidateExternalBundleDto) {
-    return this.uploadsService.publishExternalVideo(movieId, dto);
+  /**
+   * Runs automatically once the admin's bundle upload finishes — never runs
+   * ffmpeg. Moves the movie to READY_TO_PUBLISH (or FAILED if the bundle is
+   * incomplete); it never publishes the movie itself.
+   */
+  @Post(':movieId/finalize')
+  finalize(@Param('movieId', ParseUUIDPipe) movieId: string, @Body() dto: ValidateExternalBundleDto) {
+    return this.uploadsService.finalizeExternalUpload(movieId, dto);
   }
 }
