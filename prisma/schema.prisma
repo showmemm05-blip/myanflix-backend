@@ -89,6 +89,8 @@ model User {
   username  String     @unique
   email     String     @unique
   password  String
+  /// Set for phone+OTP accounts. Nullable so existing email/password users are unaffected.
+  phone     String?    @unique
   avatar    String?
   role      Role       @default(USER)
   status    UserStatus @default(ACTIVE)
@@ -97,6 +99,7 @@ model User {
 
   wallet           Wallet?
   purchases        Purchase[]
+  seriesPurchases  SeriesPurchase[]
   transactions     Transaction[]
   watchHistory     WatchHistory[]
   refreshTokens    RefreshToken[]
@@ -123,10 +126,37 @@ model RefreshToken {
   @@map("refresh_tokens")
 }
 
+/// A one-time code for phone+OTP signup/login. Not tied to a userId — the
+/// phone number itself is the identity, since verifying it is what creates
+/// or authenticates the account.
+///
+/// `code` is stored in plaintext (unlike RefreshToken's hashed tokens) as a
+/// deliberate, temporary testing-stage choice: no SMS provider is wired in
+/// yet (see SmsService), so this is how the code is actually retrieved
+/// during development. Once a real provider sends the code over SMS, this
+/// should switch to a hash, matching RefreshToken's pattern.
+model OtpCode {
+  id           String    @id @default(uuid())
+  phone        String
+  code         String
+  expiresAt    DateTime
+  consumedAt   DateTime?
+  attemptCount Int       @default(0)
+  createdAt    DateTime  @default(now())
+
+  @@index([phone])
+  @@map("otp_codes")
+}
+
 // ---------------------------------------------------------------------------
 // Catalog
 // ---------------------------------------------------------------------------
 
+/// A movie — or, when `seriesId` is set, one episode of a series. Episodes
+/// deliberately reuse this model rather than getting their own: the entire
+/// upload/validate/publish pipeline (UploadSession, Video, Subtitle,
+/// streaming) is keyed on movieId, and an episode needs every bit of it
+/// unchanged. Series-ness is purely additive metadata on top.
 model Movie {
   id           String      @id @default(uuid())
   title        String
@@ -142,6 +172,10 @@ model Movie {
   price        Decimal     @db.Decimal(12, 2)
   isPremium    Boolean     @default(true)
   status       MovieStatus @default(DRAFT)
+  /// Set only for episodes — null means a standalone movie.
+  seriesId      String?
+  seasonNumber  Int?
+  episodeNumber Int?
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt
 
@@ -150,9 +184,57 @@ model Movie {
   purchases      Purchase[]
   watchHistory   WatchHistory[]
   uploadSessions UploadSession[]
+  series         Series?         @relation(fields: [seriesId], references: [id], onDelete: SetNull)
 
   @@index([status])
+  @@index([seriesId, seasonNumber, episodeNumber])
   @@map("movies")
+}
+
+/// Show-level metadata for a series. Episodes are Movie rows pointing here
+/// via seriesId — deleting a series detaches its episodes (SetNull) rather
+/// than cascading, so uploaded content is never destroyed by a metadata
+/// cleanup; orphaned episodes stay manageable from the movies table.
+model Series {
+  id          String   @id @default(uuid())
+  title       String
+  description String
+  posterUrl   String?
+  coverUrl    String?
+  genre       String
+  language    String
+  releaseYear Int
+  /// The whole show is one purchasable product — episodes are never sold
+  /// individually; owning the series unlocks every season and episode,
+  /// including ones added later.
+  price       Decimal  @default(0) @db.Decimal(12, 2)
+  isPremium   Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  episodes   Movie[]
+  categories Category[]
+  purchases  SeriesPurchase[]
+
+  @@map("series")
+}
+
+/// One user's ownership of a whole series — the series-level counterpart of
+/// Purchase. Episode access is derived from this (via Movie.seriesId), never
+/// from per-episode Purchase rows.
+model SeriesPurchase {
+  id        String   @id @default(uuid())
+  userId    String
+  seriesId  String
+  amount    Decimal  @db.Decimal(12, 2)
+  createdAt DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  series Series @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, seriesId])
+  @@index([seriesId])
+  @@map("series_purchases")
 }
 
 model Category {
@@ -161,6 +243,7 @@ model Category {
   description String?
 
   movies Movie[]
+  series Series[]
 
   @@map("categories")
 }

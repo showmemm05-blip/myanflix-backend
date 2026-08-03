@@ -39,10 +39,15 @@ export class MoviesService {
     // Regular users can only browse published content; staff can filter freely.
     if (viewerRole === Role.USER) {
       where.status = MovieStatus.PUBLISHED;
+      // Episodes never surface in the public movies catalog — they're
+      // reached through their series (GET /series/:id/episodes). Staff
+      // still see them here so the admin tables can manage everything.
+      where.seriesId = null;
     } else if (query.status) {
       where.status = query.status;
     }
 
+    if (query.seriesId && viewerRole !== Role.USER) where.seriesId = query.seriesId;
     if (query.genre) where.genre = { equals: query.genre, mode: 'insensitive' };
     if (query.categoryId) where.categories = { some: { id: query.categoryId } };
     if (query.search) {
@@ -93,19 +98,36 @@ export class MoviesService {
    * known. Starts at UPLOADING; everything else (description, genre,
    * categories, price, release date, images) gets filled in later via
    * update() once the admin edits it, after the upload finishes.
+   *
+   * With `series` set, the placeholder is an episode: it inherits the show's
+   * genre/language/releaseYear so the row is coherent from birth even before
+   * the admin edits it, and carries its season/episode position.
    */
-  async createUploadPlaceholder(title: string): Promise<Movie> {
+  async createUploadPlaceholder(
+    title: string,
+    series?: { seriesId: string; seasonNumber: number; episodeNumber: number },
+  ): Promise<Movie> {
+    let inherited: { genre: string; language: string; releaseYear: number } | null = null;
+    if (series) {
+      const show = await this.prisma.series.findUnique({ where: { id: series.seriesId } });
+      if (!show) throw new NotFoundException('Series not found');
+      inherited = { genre: show.genre, language: show.language, releaseYear: show.releaseYear };
+    }
+
     return this.prisma.movie.create({
       data: {
         title,
         description: '',
-        genre: '',
-        language: '',
-        releaseYear: new Date().getFullYear(),
+        genre: inherited?.genre ?? '',
+        language: inherited?.language ?? '',
+        releaseYear: inherited?.releaseYear ?? new Date().getFullYear(),
         duration: 0,
         price: 0,
         isPremium: true,
         status: MovieStatus.UPLOADING,
+        seriesId: series?.seriesId,
+        seasonNumber: series?.seasonNumber,
+        episodeNumber: series?.episodeNumber,
       },
     });
   }
@@ -173,6 +195,12 @@ export class MoviesService {
     const movie = await this.prisma.movie.findUnique({ where: { id: movieId } });
     if (!movie || movie.status !== MovieStatus.PUBLISHED) {
       throw new NotFoundException('Movie not found');
+    }
+
+    // Episodes are never sold individually — the series is the product, and
+    // one SeriesPurchase unlocks every episode (SeriesService.purchase).
+    if (movie.seriesId) {
+      throw new ConflictException('Episodes are unlocked by purchasing the whole series');
     }
 
     const alreadyOwned = await this.prisma.purchase.findUnique({

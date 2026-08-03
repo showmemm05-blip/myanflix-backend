@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { NotFoundException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { MoviesService } from './movies.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
@@ -8,7 +8,10 @@ import { MovieStatus } from '../generated/prisma/client';
 
 describe('MoviesService', () => {
   let service: MoviesService;
-  let prisma: { movie: { create: jest.Mock; findUnique: jest.Mock; delete: jest.Mock } };
+  let prisma: {
+    movie: { create: jest.Mock; findUnique: jest.Mock; delete: jest.Mock };
+    series: { findUnique: jest.Mock };
+  };
   let minioService: {
     deleteByPrefix: jest.Mock;
     deleteObject: jest.Mock;
@@ -18,7 +21,10 @@ describe('MoviesService', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
 
-    prisma = { movie: { create: jest.fn(), findUnique: jest.fn(), delete: jest.fn() } };
+    prisma = {
+      movie: { create: jest.fn(), findUnique: jest.fn(), delete: jest.fn() },
+      series: { findUnique: jest.fn() },
+    };
     minioService = {
       deleteByPrefix: jest.fn().mockResolvedValue(undefined),
       deleteObject: jest.fn().mockResolvedValue(undefined),
@@ -70,6 +76,64 @@ describe('MoviesService', () => {
       const callData = prisma.movie.create.mock.calls[0][0].data;
       expect(callData.status).toBe(MovieStatus.UPLOADING);
       expect(callData.status).not.toBe(MovieStatus.PUBLISHED);
+    });
+
+    it('as an episode: throws NotFoundException when the series does not exist, without creating anything', async () => {
+      prisma.series.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.createUploadPlaceholder('Episode 1', { seriesId: 'series-1', seasonNumber: 1, episodeNumber: 1 }),
+      ).rejects.toThrow(NotFoundException);
+      expect(prisma.movie.create).not.toHaveBeenCalled();
+    });
+
+    it('as an episode: carries season/episode position and inherits genre/language/releaseYear from the show', async () => {
+      prisma.series.findUnique.mockResolvedValue({
+        id: 'series-1',
+        genre: 'Drama',
+        language: 'Burmese',
+        releaseYear: 2020,
+      });
+      prisma.movie.create.mockResolvedValue({ id: 'movie-1' });
+
+      await service.createUploadPlaceholder('Episode 3', { seriesId: 'series-1', seasonNumber: 2, episodeNumber: 3 });
+
+      expect(prisma.movie.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          title: 'Episode 3',
+          seriesId: 'series-1',
+          seasonNumber: 2,
+          episodeNumber: 3,
+          genre: 'Drama',
+          language: 'Burmese',
+          releaseYear: 2020,
+          status: MovieStatus.UPLOADING,
+        }),
+      });
+    });
+
+    it('as a standalone movie: leaves every series field unset', async () => {
+      prisma.movie.create.mockResolvedValue({ id: 'movie-1' });
+
+      await service.createUploadPlaceholder('Just A Movie');
+
+      const callData = prisma.movie.create.mock.calls[0][0].data;
+      expect(callData.seriesId).toBeUndefined();
+      expect(callData.seasonNumber).toBeUndefined();
+      expect(callData.episodeNumber).toBeUndefined();
+      expect(prisma.series.findUnique).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('purchase', () => {
+    it('rejects buying an individual episode — the whole series is the product, never single episodes', async () => {
+      prisma.movie.findUnique.mockResolvedValue({
+        id: 'movie-1',
+        status: MovieStatus.PUBLISHED,
+        seriesId: 'series-1',
+      });
+
+      await expect(service.purchase('user-1', 'movie-1')).rejects.toThrow(ConflictException);
     });
   });
 

@@ -152,7 +152,10 @@ export class DepositsService {
         },
       });
 
-      const updated = await tx.deposit.findUniqueOrThrow({ where: { id: depositId } });
+      const updated = await tx.deposit.findUniqueOrThrow({
+        where: { id: depositId },
+        include: { user: { select: { id: true, username: true, email: true } } },
+      });
       const wallet = await tx.wallet.findUniqueOrThrow({ where: { userId: deposit.userId } });
 
       return { deposit: updated, notification, balance: wallet.balance };
@@ -177,7 +180,7 @@ export class DepositsService {
     });
     this.realtimeGateway.notifyUserBalanceUpdated(result.deposit.userId, decimalToNumber(result.balance));
 
-    return this.toResponse(result.deposit);
+    return { ...this.toResponse(result.deposit), user: result.deposit.user };
   }
 
   /** Same atomic claim pattern as approve() — never touches the wallet or ledger. */
@@ -209,7 +212,10 @@ export class DepositsService {
         },
       });
 
-      const updated = await tx.deposit.findUniqueOrThrow({ where: { id: depositId } });
+      const updated = await tx.deposit.findUniqueOrThrow({
+        where: { id: depositId },
+        include: { user: { select: { id: true, username: true, email: true } } },
+      });
       return { deposit: updated, notification };
     });
 
@@ -231,7 +237,7 @@ export class DepositsService {
       createdAt: result.notification.createdAt,
     });
 
-    return this.toResponse(result.deposit);
+    return { ...this.toResponse(result.deposit), user: result.deposit.user };
   }
 
   private toResponse(deposit: {

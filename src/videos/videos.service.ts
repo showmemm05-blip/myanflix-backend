@@ -103,15 +103,29 @@ export class VideosService {
     userId: string,
     role: Role,
   ): Promise<{ playlistUrl: string; subtitles: SubtitleInfo[] }> {
-    const movie = await this.prisma.movie.findUnique({ where: { id: movieId } });
+    const movie = await this.prisma.movie.findUnique({ where: { id: movieId }, include: { series: true } });
     if (!movie) throw new NotFoundException('Movie not found');
 
-    if (movie.isPremium && role === Role.USER) {
-      const purchase = await this.prisma.purchase.findUnique({
-        where: { userId_movieId: { userId, movieId } },
-      });
-      if (!purchase) {
-        throw new ForbiddenException('Purchase this movie to start streaming');
+    if (role === Role.USER) {
+      if (movie.series) {
+        // Episodes inherit access from the parent series — one SeriesPurchase
+        // unlocks every episode, including ones added after the purchase.
+        // The episode's own isPremium/price are irrelevant by design.
+        if (movie.series.isPremium) {
+          const purchase = await this.prisma.seriesPurchase.findUnique({
+            where: { userId_seriesId: { userId, seriesId: movie.series.id } },
+          });
+          if (!purchase) {
+            throw new ForbiddenException('Purchase this series to start streaming');
+          }
+        }
+      } else if (movie.isPremium) {
+        const purchase = await this.prisma.purchase.findUnique({
+          where: { userId_movieId: { userId, movieId } },
+        });
+        if (!purchase) {
+          throw new ForbiddenException('Purchase this movie to start streaming');
+        }
       }
     }
 

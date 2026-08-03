@@ -194,6 +194,34 @@ describe('DepositsService', () => {
       expect(gateway.notifyUserBalanceUpdated).toHaveBeenCalledWith('user-1', 10000);
     });
 
+    it('includes the depositing user on the response, so the admin table never shows "Unknown user" right after approving', async () => {
+      prisma.deposit.findUnique.mockResolvedValue(makeDeposit());
+      prisma.deposit.updateMany.mockResolvedValue({ count: 1 });
+      prisma.deposit.findUniqueOrThrow.mockResolvedValue(
+        makeDeposit({
+          status: DepositStatus.APPROVED,
+          user: { id: 'user-1', username: 'john', email: 'john@example.com' },
+        }),
+      );
+      prisma.wallet.findUniqueOrThrow.mockResolvedValue({ balance: new Prisma.Decimal(10000) });
+      prisma.notification.create.mockResolvedValue({
+        id: 'notif-1',
+        type: 'DEPOSIT_APPROVED',
+        title: 't',
+        message: 'm',
+        payload: {},
+        isRead: false,
+        createdAt: new Date(),
+      });
+
+      const result = await service.approve('deposit-1', admin);
+
+      expect(prisma.deposit.findUniqueOrThrow).toHaveBeenCalledWith(
+        expect.objectContaining({ include: { user: { select: { id: true, username: true, email: true } } } }),
+      );
+      expect(result.user).toEqual({ id: 'user-1', username: 'john', email: 'john@example.com' });
+    });
+
     it('throws ConflictException and never credits the wallet when the deposit is no longer PENDING', async () => {
       prisma.deposit.findUnique.mockResolvedValue(makeDeposit({ status: DepositStatus.APPROVED }));
       // The atomic updateMany's WHERE clause (status: PENDING) matches 0
@@ -247,6 +275,33 @@ describe('DepositsService', () => {
       prisma.deposit.updateMany.mockResolvedValue({ count: 0 });
 
       await expect(service.reject('deposit-1', admin, { reason: 'x' })).rejects.toThrow(ConflictException);
+    });
+
+    it('includes the depositing user on the response, so the admin table never shows "Unknown user" right after rejecting', async () => {
+      prisma.deposit.findUnique.mockResolvedValue(makeDeposit());
+      prisma.deposit.updateMany.mockResolvedValue({ count: 1 });
+      prisma.deposit.findUniqueOrThrow.mockResolvedValue(
+        makeDeposit({
+          status: DepositStatus.REJECTED,
+          user: { id: 'user-1', username: 'john', email: 'john@example.com' },
+        }),
+      );
+      prisma.notification.create.mockResolvedValue({
+        id: 'notif-2',
+        type: 'DEPOSIT_REJECTED',
+        title: 't',
+        message: 'm',
+        payload: {},
+        isRead: false,
+        createdAt: new Date(),
+      });
+
+      const result = await service.reject('deposit-1', admin, { reason: 'x' });
+
+      expect(prisma.deposit.findUniqueOrThrow).toHaveBeenCalledWith(
+        expect.objectContaining({ include: { user: { select: { id: true, username: true, email: true } } } }),
+      );
+      expect(result.user).toEqual({ id: 'user-1', username: 'john', email: 'john@example.com' });
     });
   });
 });

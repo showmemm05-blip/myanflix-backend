@@ -71,7 +71,12 @@ export class MoviesController {
   @UseGuards(PermissionsGuard)
   @RequirePermissions(Permission.MOVIE_CREATE)
   async createUploadPlaceholder(@Body() dto: CreateUploadPlaceholderDto) {
-    const movie = await this.moviesService.createUploadPlaceholder(dto.title);
+    const movie = await this.moviesService.createUploadPlaceholder(
+      dto.title,
+      dto.seriesId
+        ? { seriesId: dto.seriesId, seasonNumber: dto.seasonNumber!, episodeNumber: dto.episodeNumber! }
+        : undefined,
+    );
     return MovieResponseDto.fromEntity(movie);
   }
 

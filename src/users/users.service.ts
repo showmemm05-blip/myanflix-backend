@@ -9,6 +9,7 @@ export interface CreateUserInput {
   username: string;
   email: string;
   password: string;
+  phone?: string;
 }
 
 export interface WalletSummary {
@@ -36,6 +37,11 @@ export class UsersService {
 
   async findByEmailOrUsername(email: string, username: string): Promise<User | null> {
     return this.prisma.user.findFirst({ where: { OR: [{ email }, { username }] } });
+  }
+
+  /** Expects an already-normalized phone (see normalizePhone). */
+  async findByPhone(phone: string): Promise<User | null> {
+    return this.prisma.user.findUnique({ where: { phone } });
   }
 
   async findById(id: string): Promise<User | null> {

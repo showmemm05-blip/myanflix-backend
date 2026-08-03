@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
@@ -6,6 +6,7 @@ import type { StringValue } from 'ms';
 import { createHash, randomUUID } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
+import { OtpService } from '../otp/otp.service';
 import type { RegisterDto } from './dto/register.dto';
 import type { LoginDto } from './dto/login.dto';
 import type { AuthenticatedUser } from './types/authenticated-user.type';
@@ -29,6 +30,7 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly otpService: OtpService,
   ) {}
 
   async register(dto: RegisterDto): Promise<{ user: AuthenticatedUser } & AuthTokens> {
@@ -63,6 +65,78 @@ export class AuthService {
     const passwordMatches = await bcrypt.compare(dto.password, user.password);
     if (!passwordMatches) {
       throw new UnauthorizedException('Invalid email or password');
+    }
+
+    if (user.status !== 'ACTIVE') {
+      throw new UnauthorizedException('This account is no longer active');
+    }
+
+    const authenticatedUser: AuthenticatedUser = {
+      id: user.id,
+      email: user.email,
+      username: user.username,
+      role: user.role,
+    };
+    const tokens = await this.issueTokens(authenticatedUser);
+    return { user: authenticatedUser, ...tokens };
+  }
+
+  /** Step 1: does an account already exist for this phone? Drives the frontend's "enter your password" vs "create a password" branch. Expects an already-normalized phone. */
+  async checkPhoneExists(phone: string): Promise<{ exists: boolean }> {
+    const user = await this.usersService.findByPhone(phone);
+    return { exists: Boolean(user) };
+  }
+
+  /**
+   * Step 2 for a returning phone: checks the password before an OTP is even
+   * sent. Deliberately the same generic message on both "no such phone" and
+   * "wrong password" — same reasoning as the email/password login() below.
+   */
+  async verifyPhonePassword(phone: string, password: string): Promise<{ valid: true }> {
+    const user = await this.usersService.findByPhone(phone);
+    if (!user) throw new UnauthorizedException('Invalid phone or password');
+
+    const passwordMatches = await bcrypt.compare(password, user.password);
+    if (!passwordMatches) throw new UnauthorizedException('Invalid phone or password');
+
+    if (user.status !== 'ACTIVE') throw new UnauthorizedException('This account is no longer active');
+
+    return { valid: true };
+  }
+
+  /** Expects an already-normalized phone (RequestOtpDto normalizes it). */
+  requestPhoneOtp(phone: string): Promise<void> {
+    return this.otpService.requestOtp(phone);
+  }
+
+  /**
+   * Step 3: verifies the code, then logs into the existing account (its
+   * password was already checked in step 2, not re-checked here) or creates
+   * a new one using the password chosen in step 2 — required in that case,
+   * since a brand-new account has nothing else to set it from.
+   */
+  async verifyPhoneOtp(
+    phone: string,
+    code: string,
+    password?: string,
+  ): Promise<{ user: AuthenticatedUser } & AuthTokens> {
+    await this.otpService.verifyOtp(phone, code);
+
+    let user = await this.usersService.findByPhone(phone);
+    if (!user) {
+      if (!password) {
+        throw new BadRequestException('A password is required to create a new account');
+      }
+      // Username/email have no independent meaning for a phone account —
+      // synthesize unique placeholders (the digits make them unique per
+      // phone) so the existing required columns stay satisfied.
+      const digits = phone.replace(/\D/g, '');
+      user = await this.usersService.create({
+        username: `user_${digits}`,
+        email: `${digits}@phone.myanflix.local`,
+        password: await bcrypt.hash(password, PASSWORD_SALT_ROUNDS),
+        phone,
+      });
     }
 
     if (user.status !== 'ACTIVE') {
