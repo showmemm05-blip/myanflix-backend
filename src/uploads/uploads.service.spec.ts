@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
-import { access } from 'node:fs/promises';
+import { access, readdir } from 'node:fs/promises';
 import { UploadsService } from './uploads.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
@@ -13,9 +13,11 @@ import { UploadStatus, VideoStatus } from '../generated/prisma/client';
 jest.mock('node:fs/promises', () => ({
   ...jest.requireActual('node:fs/promises'),
   access: jest.fn(),
+  readdir: jest.fn(),
 }));
 
 const accessMock = access as jest.Mock;
+const readdirMock = readdir as jest.Mock;
 
 describe('UploadsService', () => {
   let service: UploadsService;
@@ -112,16 +114,34 @@ describe('UploadsService', () => {
           id: 'session-existing',
           chunkSize: 5 * 1024 * 1024,
           totalChunks: 3,
-          uploadedChunks: [2, 0],
         });
+        // Uploaded-chunk bookkeeping is derived from which chunk files are
+        // actually on disk (see listUploadedChunks) rather than a stored
+        // list — 'merged' is the leftover temp file from a previous
+        // completeUpload() attempt on this session and must be ignored.
+        readdirMock.mockResolvedValue(['chunk_2', 'chunk_0', 'merged']);
 
         const result = await service.initUpload(dto);
 
         expect(prisma.uploadSession.create).not.toHaveBeenCalled();
         expect(result.uploadId).toBe('session-existing');
-        expect(result.uploadedChunks).toEqual([0, 2]); // sorted
+        expect(result.uploadedChunks).toEqual([0, 2]); // sorted, 'merged' excluded
       },
     );
+
+    it('reports no uploaded chunks yet when the session folder does not exist on disk (e.g. right after creation)', async () => {
+      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+      prisma.uploadSession.findFirst.mockResolvedValue({
+        id: 'session-existing',
+        chunkSize: 5 * 1024 * 1024,
+        totalChunks: 3,
+      });
+      readdirMock.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+
+      const result = await service.initUpload(dto);
+
+      expect(result.uploadedChunks).toEqual([]);
+    });
 
     it('only matches sessions with an exact filename+filesize match (a different file for the same movie starts fresh)', async () => {
       prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });

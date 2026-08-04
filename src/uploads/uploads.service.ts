@@ -1,5 +1,5 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { access, rm, writeFile } from 'node:fs/promises';
+import { access, readdir, rm, writeFile } from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { basename, extname, join } from 'node:path';
@@ -44,6 +44,8 @@ interface BundleStructure {
   subtitlePaths: string[];
   errors: string[];
 }
+
+type CompleteUploadResult = { videoId: string; status: VideoStatus } | { relativePath: string; status: UploadStatus };
 
 @Injectable()
 export class UploadsService {
@@ -90,7 +92,7 @@ export class UploadsService {
         uploadId: existing.id,
         chunkSize: existing.chunkSize,
         totalChunks: existing.totalChunks,
-        uploadedChunks: [...existing.uploadedChunks].sort((a, b) => a - b),
+        uploadedChunks: await this.listUploadedChunks(existing.id),
       };
     }
 
@@ -130,21 +132,60 @@ export class UploadsService {
     }
 
     await writeFile(this.storageService.chunkPath(uploadId, chunkNumber), buffer);
-
-    if (!session.uploadedChunks.includes(chunkNumber)) {
-      await this.prisma.uploadSession.update({
-        where: { id: uploadId },
-        data: { uploadedChunks: { push: chunkNumber } },
-      });
-    }
   }
 
   async getStatus(uploadId: string) {
     const session = await this.getSessionOrThrow(uploadId);
-    const uploadedChunks = [...session.uploadedChunks].sort((a, b) => a - b);
+    const uploadedChunks = await this.listUploadedChunks(uploadId);
     const remainingChunks = session.totalChunks - uploadedChunks.length;
 
     return { uploadedChunks, remainingChunks, totalChunks: session.totalChunks, status: session.status };
+  }
+
+  /**
+   * The chunk files a completed `writeFile` in `saveChunk` already leaves on
+   * disk ARE the record of what's been received — no separate bookkeeping
+   * needed. This replaced a Postgres `Int[]` column that used to get pushed
+   * to on every single chunk: each push rewrote the entire (growing) array
+   * for the row, making every chunk progressively more expensive than the
+   * last as the upload went on. Listing files here instead makes a chunk
+   * write O(1) regardless of how many chunks came before it, and removes a
+   * second source of truth that could drift from the actual files (e.g. if
+   * the process died between the file write and the old DB update).
+   */
+  private async listUploadedChunks(uploadId: string): Promise<number[]> {
+    let entries: string[];
+    try {
+      entries = await readdir(this.storageService.uploadSessionDir(uploadId));
+    } catch {
+      return []; // session dir not created yet, or already cleaned up after completion
+    }
+    return entries
+      .filter((name) => name.startsWith('chunk_'))
+      .map((name) => Number(name.slice('chunk_'.length)))
+      .filter((n) => Number.isInteger(n))
+      .sort((a, b) => a - b);
+  }
+
+  /**
+   * A retry landing while a previous completeUpload() attempt for the same
+   * uploadId is still running (e.g. the client retrying after a slow MinIO
+   * push looked like a timeout) must never start a second concurrent
+   * merge — two mergeChunks() calls writing the same temp file at once
+   * would corrupt it. Single-flight: a call that arrives mid-flight joins
+   * the same in-flight promise instead of starting its own.
+   */
+  private readonly completingUploads = new Map<string, Promise<CompleteUploadResult>>();
+
+  async completeUpload(uploadId: string): Promise<CompleteUploadResult> {
+    const inFlight = this.completingUploads.get(uploadId);
+    if (inFlight) return inFlight;
+
+    const promise = this.runCompleteUpload(uploadId).finally(() => {
+      this.completingUploads.delete(uploadId);
+    });
+    this.completingUploads.set(uploadId, promise);
+    return promise;
   }
 
   /**
@@ -156,13 +197,12 @@ export class UploadsService {
    * already produce, and stops there: no `Video` row, no transcoding. This
    * is what lets one chunked-upload mechanism serve both flows.
    */
-  async completeUpload(uploadId: string) {
+  private async runCompleteUpload(uploadId: string): Promise<CompleteUploadResult> {
     const session = await this.getActiveSessionOrThrow(uploadId);
 
-    if (session.uploadedChunks.length < session.totalChunks) {
-      throw new BadRequestException(
-        `Upload incomplete: ${session.uploadedChunks.length}/${session.totalChunks} chunks received`,
-      );
+    const uploadedCount = (await this.listUploadedChunks(uploadId)).length;
+    if (uploadedCount < session.totalChunks) {
+      throw new BadRequestException(`Upload incomplete: ${uploadedCount}/${session.totalChunks} chunks received`);
     }
 
     if (session.relativePath) {

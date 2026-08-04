@@ -3,6 +3,8 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
+  HttpStatus,
   Param,
   ParseIntPipe,
   ParseUUIDPipe,
@@ -46,17 +48,22 @@ export class UploadsController {
   // then hits the exact same URL, so the browser's CORS preflight cache
   // (keyed per-URL) actually applies across the whole upload instead of
   // forcing a fresh OPTIONS round-trip for every single chunk.
+  // No response body: the client already knows what it just sent and never
+  // reads this response (chunkNumber travels with each chunk, so nothing
+  // here needs echoing back). Returning getStatus() used to run a second
+  // session lookup plus a readdir+sort of every chunk received so far on
+  // EVERY chunk request — pure O(n) waste per chunk that nothing consumed.
   @Post(':uploadId/chunk')
+  @HttpCode(HttpStatus.NO_CONTENT)
   @UseInterceptors(FileInterceptor('chunk', { limits: { fileSize: MAX_CHUNK_BYTES } }))
   async uploadChunk(
     @Param('uploadId', ParseUUIDPipe) uploadId: string,
     @Body('chunkNumber', ParseIntPipe) chunkNumber: number,
     @UploadedFile() file: Express.Multer.File | undefined,
-  ) {
+  ): Promise<void> {
     if (!file) throw new BadRequestException('No chunk file received (expected field "chunk")');
 
     await this.uploadsService.saveChunk(uploadId, chunkNumber, file.buffer);
-    return this.uploadsService.getStatus(uploadId);
   }
 
   @Get(':uploadId/status')

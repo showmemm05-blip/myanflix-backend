@@ -306,7 +306,6 @@ model UploadSession {
   fileSize       BigInt
   chunkSize      Int
   totalChunks    Int
-  uploadedChunks Int[]        @default([])
   tempDir        String
   status         UploadStatus @default(IN_PROGRESS)
   /// Set only for the externally-pre-transcoded upload flow — e.g.

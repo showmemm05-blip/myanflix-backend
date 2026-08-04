@@ -14,6 +14,7 @@ import {
   S3Client,
 } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { extname, join } from 'node:path';
@@ -30,6 +31,16 @@ const UPLOAD_QUEUE_SIZE = 4; // parts uploaded concurrently within one file
 // rendition can be ~900 segments for a feature-length movie; uploading them
 // all concurrently is what previously spiked memory on the backend VPS.
 const DIRECTORY_UPLOAD_CONCURRENCY = 4;
+
+// Without these, the AWS SDK's default HTTP handler has no timeout at all —
+// a stalled connection to MinIO (a dropped packet, a brief network blip)
+// hangs the request forever instead of failing and retrying. A multipart
+// upload's individual part requests are at most UPLOAD_PART_SIZE, so
+// REQUEST_TIMEOUT_MS only has to cover one part, not the whole file —
+// generous even on a slow connection without masking a genuinely stalled one.
+const CONNECTION_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 60_000;
+const MAX_ATTEMPTS = 3;
 
 const CONTENT_TYPES: Record<string, string> = {
   '.m3u8': 'application/vnd.apple.mpegurl',
@@ -76,6 +87,11 @@ export class MinioService {
       // MinIO (and the cache server proxying to it) expect /<bucket>/<key>
       // paths, not <bucket>.<host> virtual-hosted addressing.
       forcePathStyle: true,
+      requestHandler: new NodeHttpHandler({
+        connectionTimeout: CONNECTION_TIMEOUT_MS,
+        requestTimeout: REQUEST_TIMEOUT_MS,
+      }),
+      maxAttempts: MAX_ATTEMPTS,
     });
   }
 
