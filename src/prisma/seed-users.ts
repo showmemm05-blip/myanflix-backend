@@ -29,6 +29,7 @@ const USER_SEEDS: UserSeed[] = [
   { username: 'superadmin', email: 'superadmin@myanflix.com', role: Role.SUPER_ADMIN, status: UserStatus.ACTIVE },
   { username: 'admin.thiha', email: 'thiha.aung@myanflix.com', role: Role.ADMIN, status: UserStatus.ACTIVE },
   { username: 'admin.sarah', email: 'sarah.johnson@myanflix.com', role: Role.ADMIN, status: UserStatus.ACTIVE },
+  { username: 'uploader.maung', email: 'uploader@myanflix.com', role: Role.CONTENT_UPLOADER, status: UserStatus.ACTIVE },
   { username: 'john.smith', email: 'john.smith@gmail.com', role: Role.USER, status: UserStatus.ACTIVE },
   { username: 'sarah.williams', email: 'sarah.williams@outlook.com', role: Role.USER, status: UserStatus.ACTIVE },
   { username: 'michael.chen', email: 'michael.chen@yahoo.com', role: Role.USER, status: UserStatus.ACTIVE },

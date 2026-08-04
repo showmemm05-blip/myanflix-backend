@@ -16,6 +16,7 @@ enum Role {
   SUPER_ADMIN
   ADMIN
   USER
+  CONTENT_UPLOADER
 }
 
 enum UserStatus {
