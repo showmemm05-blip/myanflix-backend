@@ -1,4 +1,8 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import {
   MovieStatus,
   Prisma,
@@ -50,7 +54,10 @@ export class SeriesService {
     ]);
 
     return {
-      items: items.map(({ _count, ...series }) => ({ ...this.serialize(series), episodeCount: _count.episodes })),
+      items: items.map(({ _count, ...series }) => ({
+        ...this.serialize(series),
+        episodeCount: _count.episodes,
+      })),
       total,
       page,
       limit,
@@ -58,7 +65,10 @@ export class SeriesService {
   }
 
   async findByIdOrThrow(id: string): Promise<SeriesWithCategories> {
-    const series = await this.prisma.series.findUnique({ where: { id }, include: { categories: true } });
+    const series = await this.prisma.series.findUnique({
+      where: { id },
+      include: { categories: true },
+    });
     if (!series) throw new NotFoundException('Series not found');
     return series;
   }
@@ -66,7 +76,10 @@ export class SeriesService {
   /** Detail shape for a viewer — staff always count as owning (they never see a Buy button). */
   async getForViewer(id: string, userId: string, role: Role) {
     const series = await this.findByIdOrThrow(id);
-    const isPurchased = role !== Role.USER || !series.isPremium || (await this.isPurchased(userId, id));
+    const isPurchased =
+      role !== Role.USER ||
+      !series.isPremium ||
+      (await this.isPurchased(userId, id));
     return { ...this.serialize(series), isPurchased };
   }
 
@@ -75,7 +88,9 @@ export class SeriesService {
     const created = await this.prisma.series.create({
       data: {
         ...data,
-        categories: categoryIds ? { connect: categoryIds.map((id) => ({ id })) } : undefined,
+        categories: categoryIds
+          ? { connect: categoryIds.map((id) => ({ id })) }
+          : undefined,
       },
       include: { categories: true },
     });
@@ -89,7 +104,9 @@ export class SeriesService {
       where: { id },
       data: {
         ...data,
-        categories: categoryIds ? { set: categoryIds.map((cid) => ({ id: cid })) } : undefined,
+        categories: categoryIds
+          ? { set: categoryIds.map((cid) => ({ id: cid })) }
+          : undefined,
       },
       include: { categories: true },
     });
@@ -117,7 +134,10 @@ export class SeriesService {
       _count: { seasonNumber: true },
       orderBy: { seasonNumber: 'asc' },
     });
-    return grouped.map((g) => ({ seasonNumber: g.seasonNumber!, episodeCount: g._count.seasonNumber }));
+    return grouped.map((g) => ({
+      seasonNumber: g.seasonNumber!,
+      episodeCount: g._count.seasonNumber,
+    }));
   }
 
   /**
@@ -135,7 +155,11 @@ export class SeriesService {
     return this.prisma.movie.findMany({
       where,
       include: { categories: true },
-      orderBy: [{ seasonNumber: 'asc' }, { episodeNumber: 'asc' }, { createdAt: 'asc' }],
+      orderBy: [
+        { seasonNumber: 'asc' },
+        { episodeNumber: 'asc' },
+        { createdAt: 'asc' },
+      ],
     });
   }
 
@@ -153,20 +177,29 @@ export class SeriesService {
    * wallet debit + purchase row + ledger transaction, atomically.
    */
   async purchase(userId: string, seriesId: string) {
-    const series = await this.prisma.series.findUnique({ where: { id: seriesId } });
+    const series = await this.prisma.series.findUnique({
+      where: { id: seriesId },
+    });
     if (!series) throw new NotFoundException('Series not found');
 
     const alreadyOwned = await this.isPurchased(userId, seriesId);
-    if (alreadyOwned) throw new ConflictException('You already own this series');
+    if (alreadyOwned)
+      throw new ConflictException('You already own this series');
 
     return this.prisma.$transaction(async (tx) => {
       const amount = series.isPremium ? series.price : new Prisma.Decimal(0);
 
       if (series.isPremium) {
-        await this.walletService.debitWithinTransaction(tx, userId, amount.toNumber());
+        await this.walletService.debitWithinTransaction(
+          tx,
+          userId,
+          amount.toNumber(),
+        );
       }
 
-      const purchase = await tx.seriesPurchase.create({ data: { userId, seriesId, amount } });
+      const purchase = await tx.seriesPurchase.create({
+        data: { userId, seriesId, amount },
+      });
       await tx.transaction.create({
         data: {
           userId,
@@ -185,7 +218,9 @@ export class SeriesService {
     const purchases = await this.prisma.seriesPurchase.findMany({
       where: { userId },
       orderBy: { createdAt: 'desc' },
-      include: { series: { select: { id: true, title: true, posterUrl: true } } },
+      include: {
+        series: { select: { id: true, title: true, posterUrl: true } },
+      },
     });
     return purchases.map((p) => ({
       id: p.id,

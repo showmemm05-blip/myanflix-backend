@@ -1,4 +1,10 @@
-import { ArrayMinSize, IsArray, IsString, Matches, MinLength } from 'class-validator';
+import {
+  ArrayMinSize,
+  IsArray,
+  IsString,
+  Matches,
+  MinLength,
+} from 'class-validator';
 
 export class ValidateExternalBundleDto {
   @IsArray()

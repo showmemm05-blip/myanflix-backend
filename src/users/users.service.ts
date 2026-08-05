@@ -35,8 +35,13 @@ export class UsersService {
     return this.prisma.user.findUnique({ where: { email } });
   }
 
-  async findByEmailOrUsername(email: string, username: string): Promise<User | null> {
-    return this.prisma.user.findFirst({ where: { OR: [{ email }, { username }] } });
+  async findByEmailOrUsername(
+    email: string,
+    username: string,
+  ): Promise<User | null> {
+    return this.prisma.user.findFirst({
+      where: { OR: [{ email }, { username }] },
+    });
   }
 
   /** Expects an already-normalized phone (see normalizePhone). */
@@ -54,9 +59,11 @@ export class UsersService {
     return user;
   }
 
-  async findAll(
-    pagination: PaginationQueryDto,
-  ): Promise<{ items: User[]; total: number; walletByUserId: Map<string, WalletSummary> }> {
+  async findAll(pagination: PaginationQueryDto): Promise<{
+    items: User[];
+    total: number;
+    walletByUserId: Map<string, WalletSummary>;
+  }> {
     const page = pagination.page ?? 1;
     const limit = pagination.limit ?? 20;
 
@@ -69,24 +76,36 @@ export class UsersService {
       this.prisma.user.count(),
     ]);
 
-    const walletByUserId = await this.getWalletSummaries(items.map((u) => u.id));
+    const walletByUserId = await this.getWalletSummaries(
+      items.map((u) => u.id),
+    );
     return { items, total, walletByUserId };
   }
 
   /** Batched version of getWalletSummary for list views — avoids N+1 queries per page. */
-  async getWalletSummaries(userIds: string[]): Promise<Map<string, WalletSummary>> {
+  async getWalletSummaries(
+    userIds: string[],
+  ): Promise<Map<string, WalletSummary>> {
     if (userIds.length === 0) return new Map();
 
     const [wallets, spent, deposited, purchaseCounts] = await Promise.all([
       this.prisma.wallet.findMany({ where: { userId: { in: userIds } } }),
       this.prisma.transaction.groupBy({
         by: ['userId'],
-        where: { userId: { in: userIds }, type: TransactionType.PURCHASE, status: 'COMPLETED' },
+        where: {
+          userId: { in: userIds },
+          type: TransactionType.PURCHASE,
+          status: 'COMPLETED',
+        },
         _sum: { amount: true },
       }),
       this.prisma.transaction.groupBy({
         by: ['userId'],
-        where: { userId: { in: userIds }, type: TransactionType.DEPOSIT, status: 'COMPLETED' },
+        where: {
+          userId: { in: userIds },
+          type: TransactionType.DEPOSIT,
+          status: 'COMPLETED',
+        },
         _sum: { amount: true },
       }),
       this.prisma.purchase.groupBy({
@@ -96,10 +115,18 @@ export class UsersService {
       }),
     ]);
 
-    const balanceById = new Map(wallets.map((w) => [w.userId, decimalToNumber(w.balance)]));
-    const spentById = new Map(spent.map((s) => [s.userId, decimalToNumber(s._sum.amount)]));
-    const depositedById = new Map(deposited.map((d) => [d.userId, decimalToNumber(d._sum.amount)]));
-    const purchaseCountById = new Map(purchaseCounts.map((p) => [p.userId, p._count._all]));
+    const balanceById = new Map(
+      wallets.map((w) => [w.userId, decimalToNumber(w.balance)]),
+    );
+    const spentById = new Map(
+      spent.map((s) => [s.userId, decimalToNumber(s._sum.amount)]),
+    );
+    const depositedById = new Map(
+      deposited.map((d) => [d.userId, decimalToNumber(d._sum.amount)]),
+    );
+    const purchaseCountById = new Map(
+      purchaseCounts.map((p) => [p.userId, p._count._all]),
+    );
 
     return new Map(
       userIds.map((id) => [

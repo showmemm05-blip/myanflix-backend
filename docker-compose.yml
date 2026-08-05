@@ -34,6 +34,10 @@ services:
       # published port. Real deployment: point this at the Movie Storage
       # Server VPS's address instead — nothing else here changes.
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://host.docker.internal:9000}
+      # Browser-reachable — used only for signing direct-upload presigned
+      # URLs, never for the backend's own server-side MinIO calls above.
+      # Points at storage-server/upload-proxy, not MinIO's own port.
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:8443}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_BUCKET: ${MINIO_BUCKET:-movies}

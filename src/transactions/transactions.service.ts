@@ -18,12 +18,18 @@ export class TransactionsService {
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
-        include: { user: { select: { id: true, username: true, email: true } } },
+        include: {
+          user: { select: { id: true, username: true, email: true } },
+        },
       }),
       this.prisma.transaction.count({ where }),
     ]);
 
-    const movieIds = [...new Set(items.map((t) => t.movieId).filter((id): id is string => !!id))];
+    const movieIds = [
+      ...new Set(
+        items.map((t) => t.movieId).filter((id): id is string => !!id),
+      ),
+    ];
     const movies = movieIds.length
       ? await this.prisma.movie.findMany({
           where: { id: { in: movieIds } },

@@ -15,12 +15,21 @@ export const RENDITION_TIERS: RenditionTier[] = [
 
 /** Never upscale past the source resolution; always produce at least one rendition. */
 export function pickRenditions(sourceHeight: number): RenditionTier[] {
-  const eligible = RENDITION_TIERS.filter((tier) => tier.height <= sourceHeight);
-  return eligible.length > 0 ? eligible : [RENDITION_TIERS[RENDITION_TIERS.length - 1]];
+  const eligible = RENDITION_TIERS.filter(
+    (tier) => tier.height <= sourceHeight,
+  );
+  return eligible.length > 0
+    ? eligible
+    : [RENDITION_TIERS[RENDITION_TIERS.length - 1]];
 }
 
 /** Approximates an aspect-correct width for the master playlist's RESOLUTION attribute. */
-export function approximateWidth(sourceWidth: number, sourceHeight: number, targetHeight: number): number {
-  if (!sourceWidth || !sourceHeight) return Math.round((targetHeight * 16) / 9 / 2) * 2;
-  return Math.round(((sourceWidth * targetHeight) / sourceHeight / 2)) * 2;
+export function approximateWidth(
+  sourceWidth: number,
+  sourceHeight: number,
+  targetHeight: number,
+): number {
+  if (!sourceWidth || !sourceHeight)
+    return Math.round((targetHeight * 16) / 9 / 2) * 2;
+  return Math.round((sourceWidth * targetHeight) / sourceHeight / 2) * 2;
 }

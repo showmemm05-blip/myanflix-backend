@@ -1,5 +1,13 @@
 import { Type, plainToInstance } from 'class-transformer';
-import { IsIn, IsInt, IsOptional, IsString, Min, MinLength, validateSync } from 'class-validator';
+import {
+  IsIn,
+  IsInt,
+  IsOptional,
+  IsString,
+  Min,
+  MinLength,
+  validateSync,
+} from 'class-validator';
 
 export enum Environment {
   Development = 'development',
@@ -27,7 +35,9 @@ class EnvironmentVariables {
   JWT_SECRET!: string;
 
   @IsString()
-  @MinLength(16, { message: 'JWT_REFRESH_SECRET must be at least 16 characters' })
+  @MinLength(16, {
+    message: 'JWT_REFRESH_SECRET must be at least 16 characters',
+  })
   JWT_REFRESH_SECRET!: string;
 
   @IsOptional()
@@ -63,7 +73,9 @@ class EnvironmentVariables {
   STREAM_PUBLIC_BASE_URL!: string;
 }
 
-export function validateEnv(config: Record<string, unknown>): EnvironmentVariables {
+export function validateEnv(
+  config: Record<string, unknown>,
+): EnvironmentVariables {
   const validated = plainToInstance(EnvironmentVariables, config, {
     enableImplicitConversion: true,
   });

@@ -26,26 +26,99 @@ interface UserSeed {
 }
 
 const USER_SEEDS: UserSeed[] = [
-  { username: 'superadmin', email: 'superadmin@myanflix.com', role: Role.SUPER_ADMIN, status: UserStatus.ACTIVE },
-  { username: 'admin.thiha', email: 'thiha.aung@myanflix.com', role: Role.ADMIN, status: UserStatus.ACTIVE },
-  { username: 'admin.sarah', email: 'sarah.johnson@myanflix.com', role: Role.ADMIN, status: UserStatus.ACTIVE },
-  { username: 'uploader.maung', email: 'uploader@myanflix.com', role: Role.CONTENT_UPLOADER, status: UserStatus.ACTIVE },
-  { username: 'john.smith', email: 'john.smith@gmail.com', role: Role.USER, status: UserStatus.ACTIVE },
-  { username: 'sarah.williams', email: 'sarah.williams@outlook.com', role: Role.USER, status: UserStatus.ACTIVE },
-  { username: 'michael.chen', email: 'michael.chen@yahoo.com', role: Role.USER, status: UserStatus.ACTIVE },
-  { username: 'susu.hlaing', email: 'susu.hlaing@gmail.com', role: Role.USER, status: UserStatus.ACTIVE },
-  { username: 'emily.davis', email: 'emily.davis@icloud.com', role: Role.USER, status: UserStatus.SUSPENDED },
-  { username: 'kaungmyat.soe', email: 'kaungmyat.soe@gmail.com', role: Role.USER, status: UserStatus.ACTIVE },
-  { username: 'david.kim', email: 'david.kim@naver.com', role: Role.USER, status: UserStatus.ACTIVE },
-  { username: 'zawlin.htut', email: 'zawlin.htut@gmail.com', role: Role.USER, status: UserStatus.ACTIVE },
-  { username: 'amara.okafor', email: 'amara.okafor@gmail.com', role: Role.USER, status: UserStatus.ACTIVE },
-  { username: 'rachel.green', email: 'rachel.green@gmail.com', role: Role.USER, status: UserStatus.BANNED },
+  {
+    username: 'superadmin',
+    email: 'superadmin@myanflix.com',
+    role: Role.SUPER_ADMIN,
+    status: UserStatus.ACTIVE,
+  },
+  {
+    username: 'admin.thiha',
+    email: 'thiha.aung@myanflix.com',
+    role: Role.ADMIN,
+    status: UserStatus.ACTIVE,
+  },
+  {
+    username: 'admin.sarah',
+    email: 'sarah.johnson@myanflix.com',
+    role: Role.ADMIN,
+    status: UserStatus.ACTIVE,
+  },
+  {
+    username: 'uploader.maung',
+    email: 'uploader@myanflix.com',
+    role: Role.CONTENT_UPLOADER,
+    status: UserStatus.ACTIVE,
+  },
+  {
+    username: 'john.smith',
+    email: 'john.smith@gmail.com',
+    role: Role.USER,
+    status: UserStatus.ACTIVE,
+  },
+  {
+    username: 'sarah.williams',
+    email: 'sarah.williams@outlook.com',
+    role: Role.USER,
+    status: UserStatus.ACTIVE,
+  },
+  {
+    username: 'michael.chen',
+    email: 'michael.chen@yahoo.com',
+    role: Role.USER,
+    status: UserStatus.ACTIVE,
+  },
+  {
+    username: 'susu.hlaing',
+    email: 'susu.hlaing@gmail.com',
+    role: Role.USER,
+    status: UserStatus.ACTIVE,
+  },
+  {
+    username: 'emily.davis',
+    email: 'emily.davis@icloud.com',
+    role: Role.USER,
+    status: UserStatus.SUSPENDED,
+  },
+  {
+    username: 'kaungmyat.soe',
+    email: 'kaungmyat.soe@gmail.com',
+    role: Role.USER,
+    status: UserStatus.ACTIVE,
+  },
+  {
+    username: 'david.kim',
+    email: 'david.kim@naver.com',
+    role: Role.USER,
+    status: UserStatus.ACTIVE,
+  },
+  {
+    username: 'zawlin.htut',
+    email: 'zawlin.htut@gmail.com',
+    role: Role.USER,
+    status: UserStatus.ACTIVE,
+  },
+  {
+    username: 'amara.okafor',
+    email: 'amara.okafor@gmail.com',
+    role: Role.USER,
+    status: UserStatus.ACTIVE,
+  },
+  {
+    username: 'rachel.green',
+    email: 'rachel.green@gmail.com',
+    role: Role.USER,
+    status: UserStatus.BANNED,
+  },
 ];
 
 async function main() {
   console.log('Seeding users (non-destructive upsert by email)...');
 
-  const passwordHash = await bcrypt.hash(DEFAULT_PASSWORD, PASSWORD_SALT_ROUNDS);
+  const passwordHash = await bcrypt.hash(
+    DEFAULT_PASSWORD,
+    PASSWORD_SALT_ROUNDS,
+  );
 
   for (const seed of USER_SEEDS) {
     const user = await prisma.user.upsert({

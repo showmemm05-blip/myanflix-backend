@@ -27,8 +27,11 @@ export class StorageService {
   readonly root: string;
 
   constructor(configService: ConfigService) {
-    const configuredPath = configService.get<string>('STORAGE_PATH') ?? './storage';
-    this.root = isAbsolute(configuredPath) ? configuredPath : resolve(process.cwd(), configuredPath);
+    const configuredPath =
+      configService.get<string>('STORAGE_PATH') ?? './storage';
+    this.root = isAbsolute(configuredPath)
+      ? configuredPath
+      : resolve(process.cwd(), configuredPath);
   }
 
   uploadSessionDir(uploadId: string): string {

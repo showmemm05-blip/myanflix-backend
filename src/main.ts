@@ -36,7 +36,7 @@ async function bootstrap() {
 
   const port = configService.get<number>('PORT') ?? 3001;
   await app.listen(port);
-  // eslint-disable-next-line no-console
+
   console.log(`MyanFlix API listening on http://localhost:${port}/api`);
 }
 

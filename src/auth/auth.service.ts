@@ -1,4 +1,9 @@
-import { BadRequestException, ConflictException, Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
@@ -33,8 +38,13 @@ export class AuthService {
     private readonly otpService: OtpService,
   ) {}
 
-  async register(dto: RegisterDto): Promise<{ user: AuthenticatedUser } & AuthTokens> {
-    const existing = await this.usersService.findByEmailOrUsername(dto.email, dto.username);
+  async register(
+    dto: RegisterDto,
+  ): Promise<{ user: AuthenticatedUser } & AuthTokens> {
+    const existing = await this.usersService.findByEmailOrUsername(
+      dto.email,
+      dto.username,
+    );
     if (existing) {
       throw new ConflictException('Email or username is already registered');
     }
@@ -56,7 +66,9 @@ export class AuthService {
     return { user: authenticatedUser, ...tokens };
   }
 
-  async login(dto: LoginDto): Promise<{ user: AuthenticatedUser } & AuthTokens> {
+  async login(
+    dto: LoginDto,
+  ): Promise<{ user: AuthenticatedUser } & AuthTokens> {
     const user = await this.usersService.findByEmail(dto.email);
     if (!user) {
       throw new UnauthorizedException('Invalid email or password');
@@ -92,14 +104,19 @@ export class AuthService {
    * sent. Deliberately the same generic message on both "no such phone" and
    * "wrong password" — same reasoning as the email/password login() below.
    */
-  async verifyPhonePassword(phone: string, password: string): Promise<{ valid: true }> {
+  async verifyPhonePassword(
+    phone: string,
+    password: string,
+  ): Promise<{ valid: true }> {
     const user = await this.usersService.findByPhone(phone);
     if (!user) throw new UnauthorizedException('Invalid phone or password');
 
     const passwordMatches = await bcrypt.compare(password, user.password);
-    if (!passwordMatches) throw new UnauthorizedException('Invalid phone or password');
+    if (!passwordMatches)
+      throw new UnauthorizedException('Invalid phone or password');
 
-    if (user.status !== 'ACTIVE') throw new UnauthorizedException('This account is no longer active');
+    if (user.status !== 'ACTIVE')
+      throw new UnauthorizedException('This account is no longer active');
 
     return { valid: true };
   }
@@ -125,7 +142,9 @@ export class AuthService {
     let user = await this.usersService.findByPhone(phone);
     if (!user) {
       if (!password) {
-        throw new BadRequestException('A password is required to create a new account');
+        throw new BadRequestException(
+          'A password is required to create a new account',
+        );
       }
       // Username/email have no independent meaning for a phone account —
       // synthesize unique placeholders (the digits make them unique per
@@ -156,14 +175,19 @@ export class AuthService {
   async refresh(refreshToken: string): Promise<AuthTokens> {
     let payload: RefreshPayload;
     try {
-      payload = await this.jwtService.verifyAsync<RefreshPayload>(refreshToken, {
-        secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
-      });
+      payload = await this.jwtService.verifyAsync<RefreshPayload>(
+        refreshToken,
+        {
+          secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
+        },
+      );
     } catch {
       throw new UnauthorizedException('Invalid or expired refresh token');
     }
 
-    const stored = await this.prisma.refreshToken.findUnique({ where: { id: payload.jti } });
+    const stored = await this.prisma.refreshToken.findUnique({
+      where: { id: payload.jti },
+    });
     if (
       !stored ||
       stored.revoked ||
@@ -192,10 +216,13 @@ export class AuthService {
   async logout(refreshToken: string): Promise<void> {
     let payload: RefreshPayload;
     try {
-      payload = await this.jwtService.verifyAsync<RefreshPayload>(refreshToken, {
-        secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
-        ignoreExpiration: true,
-      });
+      payload = await this.jwtService.verifyAsync<RefreshPayload>(
+        refreshToken,
+        {
+          secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
+          ignoreExpiration: true,
+        },
+      );
     } catch {
       return;
     }
@@ -210,11 +237,15 @@ export class AuthService {
     const accessPayload: JwtPayload = { sub: user.id, email: user.email };
     const accessToken = await this.jwtService.signAsync(accessPayload, {
       secret: this.configService.get<string>('JWT_SECRET'),
-      expiresIn: this.configService.get<string>('JWT_ACCESS_EXPIRES_IN') as StringValue,
+      expiresIn: this.configService.get<string>(
+        'JWT_ACCESS_EXPIRES_IN',
+      ) as StringValue,
     });
 
     const jti = randomUUID();
-    const refreshExpiresIn = this.configService.get<string>('JWT_REFRESH_EXPIRES_IN')! as StringValue;
+    const refreshExpiresIn = this.configService.get<string>(
+      'JWT_REFRESH_EXPIRES_IN',
+    )! as StringValue;
     const refreshPayload: RefreshPayload = { sub: user.id, jti };
     const refreshToken = await this.jwtService.signAsync(refreshPayload, {
       secret: this.configService.get<string>('JWT_REFRESH_SECRET'),

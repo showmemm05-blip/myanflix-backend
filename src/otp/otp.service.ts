@@ -1,4 +1,8 @@
-import { ConflictException, Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { randomInt } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { SmsService } from '../sms/sms.service';
@@ -10,7 +14,9 @@ const MAX_REQUESTS_PER_HOUR = 5;
 const MAX_VERIFY_ATTEMPTS = 5;
 
 function generateCode(): string {
-  return randomInt(0, 10 ** CODE_LENGTH).toString().padStart(CODE_LENGTH, '0');
+  return randomInt(0, 10 ** CODE_LENGTH)
+    .toString()
+    .padStart(CODE_LENGTH, '0');
 }
 
 @Injectable()
@@ -26,7 +32,10 @@ export class OtpService {
       where: { phone },
       orderBy: { createdAt: 'desc' },
     });
-    if (mostRecent && Date.now() - mostRecent.createdAt.getTime() < RESEND_COOLDOWN_MS) {
+    if (
+      mostRecent &&
+      Date.now() - mostRecent.createdAt.getTime() < RESEND_COOLDOWN_MS
+    ) {
       throw new ConflictException('Please wait before requesting another code');
     }
 
@@ -35,7 +44,9 @@ export class OtpService {
       where: { phone, createdAt: { gte: windowStart } },
     });
     if (requestsThisHour >= MAX_REQUESTS_PER_HOUR) {
-      throw new ConflictException('Too many code requests — please try again later');
+      throw new ConflictException(
+        'Too many code requests — please try again later',
+      );
     }
 
     const code = generateCode();
@@ -43,7 +54,10 @@ export class OtpService {
       data: { phone, code, expiresAt: new Date(Date.now() + CODE_TTL_MS) },
     });
 
-    await this.smsService.send(phone, `Your MyanFlix verification code is ${code}. It expires in 5 minutes.`);
+    await this.smsService.send(
+      phone,
+      `Your MyanFlix verification code is ${code}. It expires in 5 minutes.`,
+    );
   }
 
   /** Throws on any invalid/expired/exhausted code; resolves (no return value) on success and marks the code consumed. */
@@ -57,7 +71,9 @@ export class OtpService {
       throw new UnauthorizedException('Invalid or expired code');
     }
     if (otp.attemptCount >= MAX_VERIFY_ATTEMPTS) {
-      throw new UnauthorizedException('Too many incorrect attempts — request a new code');
+      throw new UnauthorizedException(
+        'Too many incorrect attempts — request a new code',
+      );
     }
     if (otp.code !== code) {
       await this.prisma.otpCode.update({
@@ -67,6 +83,9 @@ export class OtpService {
       throw new UnauthorizedException('Invalid or expired code');
     }
 
-    await this.prisma.otpCode.update({ where: { id: otp.id }, data: { consumedAt: new Date() } });
+    await this.prisma.otpCode.update({
+      where: { id: otp.id },
+      data: { consumedAt: new Date() },
+    });
   }
 }

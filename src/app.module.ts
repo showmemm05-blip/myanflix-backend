@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { ScheduleModule } from '@nestjs/schedule';
 
 import { ConfigModule } from './config/config.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -34,6 +35,9 @@ import { AppService } from './app.service';
   imports: [
     ConfigModule,
     PrismaModule,
+    // Powers UploadCleanupService's daily abandoned-multipart-upload sweep —
+    // the first scheduled/cron job anywhere in this backend.
+    ScheduleModule.forRoot(),
 
     AuthModule,
     UsersModule,

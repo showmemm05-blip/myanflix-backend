@@ -32,9 +32,17 @@ export class SubtitlesController {
   constructor(private readonly subtitlesService: SubtitlesService) {}
 
   @Post()
-  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: MAX_SUBTITLE_BYTES } }))
-  create(@Body() dto: CreateSubtitleDto, @UploadedFile() file: Express.Multer.File | undefined) {
-    if (!file) throw new BadRequestException('No subtitle file received (expected field "file")');
+  @UseInterceptors(
+    FileInterceptor('file', { limits: { fileSize: MAX_SUBTITLE_BYTES } }),
+  )
+  create(
+    @Body() dto: CreateSubtitleDto,
+    @UploadedFile() file: Express.Multer.File | undefined,
+  ) {
+    if (!file)
+      throw new BadRequestException(
+        'No subtitle file received (expected field "file")',
+      );
     return this.subtitlesService.create(dto, file.originalname, file.buffer);
   }
 
@@ -44,7 +52,10 @@ export class SubtitlesController {
   }
 
   @Patch(':id')
-  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateSubtitleDto) {
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateSubtitleDto,
+  ) {
     return this.subtitlesService.update(id, dto);
   }
 

@@ -1,4 +1,8 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
@@ -34,7 +38,9 @@ export class DepositsService {
       },
     });
     if (duplicate) {
-      throw new ConflictException('A deposit with this transaction reference already exists');
+      throw new ConflictException(
+        'A deposit with this transaction reference already exists',
+      );
     }
 
     const deposit = await this.prisma.deposit.create({
@@ -80,7 +86,9 @@ export class DepositsService {
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
-        include: { user: { select: { id: true, username: true, email: true } } },
+        include: {
+          user: { select: { id: true, username: true, email: true } },
+        },
       }),
       this.prisma.deposit.count({ where }),
     ]);
@@ -125,13 +133,23 @@ export class DepositsService {
 
       const claim = await tx.deposit.updateMany({
         where: { id: depositId, status: DepositStatus.PENDING },
-        data: { status: DepositStatus.APPROVED, approvedByUserId: admin.id, approvedAt: new Date() },
+        data: {
+          status: DepositStatus.APPROVED,
+          approvedByUserId: admin.id,
+          approvedAt: new Date(),
+        },
       });
       if (claim.count !== 1) {
-        throw new ConflictException('This deposit has already been approved or rejected');
+        throw new ConflictException(
+          'This deposit has already been approved or rejected',
+        );
       }
 
-      await this.walletService.creditWithinTransaction(tx, deposit.userId, deposit.amount.toNumber());
+      await this.walletService.creditWithinTransaction(
+        tx,
+        deposit.userId,
+        deposit.amount.toNumber(),
+      );
 
       await tx.transaction.create({
         data: {
@@ -154,9 +172,13 @@ export class DepositsService {
 
       const updated = await tx.deposit.findUniqueOrThrow({
         where: { id: depositId },
-        include: { user: { select: { id: true, username: true, email: true } } },
+        include: {
+          user: { select: { id: true, username: true, email: true } },
+        },
       });
-      const wallet = await tx.wallet.findUniqueOrThrow({ where: { userId: deposit.userId } });
+      const wallet = await tx.wallet.findUniqueOrThrow({
+        where: { userId: deposit.userId },
+      });
 
       return { deposit: updated, notification, balance: wallet.balance };
     });
@@ -178,13 +200,20 @@ export class DepositsService {
       isRead: result.notification.isRead,
       createdAt: result.notification.createdAt,
     });
-    this.realtimeGateway.notifyUserBalanceUpdated(result.deposit.userId, decimalToNumber(result.balance));
+    this.realtimeGateway.notifyUserBalanceUpdated(
+      result.deposit.userId,
+      decimalToNumber(result.balance),
+    );
 
     return { ...this.toResponse(result.deposit), user: result.deposit.user };
   }
 
   /** Same atomic claim pattern as approve() — never touches the wallet or ledger. */
-  async reject(depositId: string, admin: AuthenticatedUser, dto: RejectDepositDto) {
+  async reject(
+    depositId: string,
+    admin: AuthenticatedUser,
+    dto: RejectDepositDto,
+  ) {
     const result = await this.prisma.$transaction(async (tx) => {
       const deposit = await tx.deposit.findUnique({ where: { id: depositId } });
       if (!deposit) throw new NotFoundException('Deposit not found');
@@ -199,7 +228,9 @@ export class DepositsService {
         },
       });
       if (claim.count !== 1) {
-        throw new ConflictException('This deposit has already been approved or rejected');
+        throw new ConflictException(
+          'This deposit has already been approved or rejected',
+        );
       }
 
       const notification = await tx.notification.create({
@@ -214,7 +245,9 @@ export class DepositsService {
 
       const updated = await tx.deposit.findUniqueOrThrow({
         where: { id: depositId },
-        include: { user: { select: { id: true, username: true, email: true } } },
+        include: {
+          user: { select: { id: true, username: true, email: true } },
+        },
       });
       return { deposit: updated, notification };
     });

@@ -1,4 +1,8 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { extname } from 'node:path';
 import { PrismaService } from '../prisma/prisma.service';
@@ -20,8 +24,14 @@ export class SubtitlesService {
     private readonly minioService: MinioService,
   ) {}
 
-  async create(dto: CreateSubtitleDto, originalFilename: string, buffer: Buffer) {
-    const video = await this.prisma.video.findUnique({ where: { id: dto.videoId } });
+  async create(
+    dto: CreateSubtitleDto,
+    originalFilename: string,
+    buffer: Buffer,
+  ) {
+    const video = await this.prisma.video.findUnique({
+      where: { id: dto.videoId },
+    });
     if (!video) throw new NotFoundException('Video not found');
 
     // Format is derived server-side from the actual file extension, not
@@ -30,7 +40,9 @@ export class SubtitlesService {
     const extension = extname(originalFilename).toLowerCase();
     const format = EXTENSION_TO_FORMAT[extension];
     if (!format) {
-      throw new BadRequestException('Subtitle file must be .srt, .vtt, or .ass');
+      throw new BadRequestException(
+        'Subtitle file must be .srt, .vtt, or .ass',
+      );
     }
 
     // Generated up front so the object key (keyed by subtitle id, not
@@ -84,7 +96,10 @@ export class SubtitlesService {
   }
 
   findAllForVideo(videoId: string) {
-    return this.prisma.subtitle.findMany({ where: { videoId }, orderBy: { createdAt: 'asc' } });
+    return this.prisma.subtitle.findMany({
+      where: { videoId },
+      orderBy: { createdAt: 'asc' },
+    });
   }
 
   async update(id: string, dto: UpdateSubtitleDto) {
@@ -96,7 +111,11 @@ export class SubtitlesService {
 
     return this.prisma.subtitle.update({
       where: { id },
-      data: { language: dto.language, label: dto.label, isDefault: dto.isDefault },
+      data: {
+        language: dto.language,
+        label: dto.label,
+        isDefault: dto.isDefault,
+      },
     });
   }
 
@@ -120,9 +139,16 @@ export class SubtitlesService {
     return this.prisma.subtitle.findUniqueOrThrow({ where: { id } });
   }
 
-  private async clearExistingDefault(videoId: string, excludeId?: string): Promise<void> {
+  private async clearExistingDefault(
+    videoId: string,
+    excludeId?: string,
+  ): Promise<void> {
     await this.prisma.subtitle.updateMany({
-      where: { videoId, isDefault: true, ...(excludeId ? { NOT: { id: excludeId } } : {}) },
+      where: {
+        videoId,
+        isDefault: true,
+        ...(excludeId ? { NOT: { id: excludeId } } : {}),
+      },
       data: { isDefault: false },
     });
   }

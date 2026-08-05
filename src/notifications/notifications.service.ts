@@ -1,7 +1,14 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
-import type { Notification, NotificationType } from '../generated/prisma/client';
+import type {
+  Notification,
+  NotificationType,
+} from '../generated/prisma/client';
 import type { Prisma } from '../generated/prisma/client';
 
 @Injectable()
@@ -30,13 +37,20 @@ export class NotificationsService {
   }
 
   async markAsRead(id: string, userId: string): Promise<Notification> {
-    const notification = await this.prisma.notification.findUnique({ where: { id } });
+    const notification = await this.prisma.notification.findUnique({
+      where: { id },
+    });
     if (!notification) throw new NotFoundException('Notification not found');
     if (notification.userId !== userId) {
-      throw new ForbiddenException('You do not have access to this notification');
+      throw new ForbiddenException(
+        'You do not have access to this notification',
+      );
     }
 
-    return this.prisma.notification.update({ where: { id }, data: { isRead: true } });
+    return this.prisma.notification.update({
+      where: { id },
+      data: { isRead: true },
+    });
   }
 
   async markAllAsRead(userId: string): Promise<void> {
@@ -49,7 +63,13 @@ export class NotificationsService {
   /** Used by DepositsService — creation always happens inside its own $transaction. */
   async createWithinTransaction(
     tx: Prisma.TransactionClient,
-    data: { userId: string; type: NotificationType; title: string; message: string; payload?: object },
+    data: {
+      userId: string;
+      type: NotificationType;
+      title: string;
+      message: string;
+      payload?: object;
+    },
   ): Promise<Notification> {
     return tx.notification.create({ data });
   }

@@ -1,4 +1,9 @@
-import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import {
   MovieStatus,
   Prisma,
@@ -47,7 +52,8 @@ export class MoviesService {
       where.status = query.status;
     }
 
-    if (query.seriesId && viewerRole !== Role.USER) where.seriesId = query.seriesId;
+    if (query.seriesId && viewerRole !== Role.USER)
+      where.seriesId = query.seriesId;
     if (query.genre) where.genre = { equals: query.genre, mode: 'insensitive' };
     if (query.categoryId) where.categories = { some: { id: query.categoryId } };
     if (query.search) {
@@ -71,10 +77,19 @@ export class MoviesService {
     return { items, total, page, limit };
   }
 
-  async findByIdOrThrow(id: string, viewerRole: Role): Promise<MovieWithCategories> {
-    const movie = await this.prisma.movie.findUnique({ where: { id }, include: CATALOG_INCLUDE });
+  async findByIdOrThrow(
+    id: string,
+    viewerRole: Role,
+  ): Promise<MovieWithCategories> {
+    const movie = await this.prisma.movie.findUnique({
+      where: { id },
+      include: CATALOG_INCLUDE,
+    });
 
-    if (!movie || (viewerRole === Role.USER && movie.status !== MovieStatus.PUBLISHED)) {
+    if (
+      !movie ||
+      (viewerRole === Role.USER && movie.status !== MovieStatus.PUBLISHED)
+    ) {
       throw new NotFoundException('Movie not found');
     }
 
@@ -86,7 +101,9 @@ export class MoviesService {
     return this.prisma.movie.create({
       data: {
         ...data,
-        categories: categoryIds ? { connect: categoryIds.map((id) => ({ id })) } : undefined,
+        categories: categoryIds
+          ? { connect: categoryIds.map((id) => ({ id })) }
+          : undefined,
       },
       include: CATALOG_INCLUDE,
     });
@@ -107,11 +124,21 @@ export class MoviesService {
     title: string,
     series?: { seriesId: string; seasonNumber: number; episodeNumber: number },
   ): Promise<Movie> {
-    let inherited: { genre: string; language: string; releaseYear: number } | null = null;
+    let inherited: {
+      genre: string;
+      language: string;
+      releaseYear: number;
+    } | null = null;
     if (series) {
-      const show = await this.prisma.series.findUnique({ where: { id: series.seriesId } });
+      const show = await this.prisma.series.findUnique({
+        where: { id: series.seriesId },
+      });
       if (!show) throw new NotFoundException('Series not found');
-      inherited = { genre: show.genre, language: show.language, releaseYear: show.releaseYear };
+      inherited = {
+        genre: show.genre,
+        language: show.language,
+        releaseYear: show.releaseYear,
+      };
     }
 
     return this.prisma.movie.create({
@@ -140,7 +167,9 @@ export class MoviesService {
       where: { id },
       data: {
         ...data,
-        categories: categoryIds ? { set: categoryIds.map((cid) => ({ id: cid })) } : undefined,
+        categories: categoryIds
+          ? { set: categoryIds.map((cid) => ({ id: cid })) }
+          : undefined,
       },
       include: CATALOG_INCLUDE,
     });
@@ -186,13 +215,17 @@ export class MoviesService {
         }
       }
     } catch (error) {
-      this.logger.warn(`Failed to clean up storage for deleted movie ${id}: ${(error as Error).message}`);
+      this.logger.warn(
+        `Failed to clean up storage for deleted movie ${id}: ${(error as Error).message}`,
+      );
     }
   }
 
   /** User wallet -> purchase movie -> create transaction -> grant movie access. */
   async purchase(userId: string, movieId: string) {
-    const movie = await this.prisma.movie.findUnique({ where: { id: movieId } });
+    const movie = await this.prisma.movie.findUnique({
+      where: { id: movieId },
+    });
     if (!movie || movie.status !== MovieStatus.PUBLISHED) {
       throw new NotFoundException('Movie not found');
     }
@@ -200,7 +233,9 @@ export class MoviesService {
     // Episodes are never sold individually — the series is the product, and
     // one SeriesPurchase unlocks every episode (SeriesService.purchase).
     if (movie.seriesId) {
-      throw new ConflictException('Episodes are unlocked by purchasing the whole series');
+      throw new ConflictException(
+        'Episodes are unlocked by purchasing the whole series',
+      );
     }
 
     const alreadyOwned = await this.prisma.purchase.findUnique({
@@ -214,10 +249,16 @@ export class MoviesService {
       const amount = movie.isPremium ? movie.price : new Prisma.Decimal(0);
 
       if (movie.isPremium) {
-        await this.walletService.debitWithinTransaction(tx, userId, amount.toNumber());
+        await this.walletService.debitWithinTransaction(
+          tx,
+          userId,
+          amount.toNumber(),
+        );
       }
 
-      const purchase = await tx.purchase.create({ data: { userId, movieId, amount } });
+      const purchase = await tx.purchase.create({
+        data: { userId, movieId, amount },
+      });
       await tx.transaction.create({
         data: {
           userId,
@@ -243,12 +284,17 @@ export class MoviesService {
     if (grouped.length === 0) return [];
 
     const movies = await this.prisma.movie.findMany({
-      where: { id: { in: grouped.map((g) => g.movieId) }, status: MovieStatus.PUBLISHED },
+      where: {
+        id: { in: grouped.map((g) => g.movieId) },
+        status: MovieStatus.PUBLISHED,
+      },
       include: CATALOG_INCLUDE,
     });
 
     const orderById = new Map(grouped.map((g, index) => [g.movieId, index]));
-    return movies.sort((a, b) => (orderById.get(a.id) ?? 0) - (orderById.get(b.id) ?? 0));
+    return movies.sort(
+      (a, b) => (orderById.get(a.id) ?? 0) - (orderById.get(b.id) ?? 0),
+    );
   }
 
   /** Purchase history for a user (own profile, or an admin viewing any user). */
@@ -262,7 +308,9 @@ export class MoviesService {
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
-        include: { movie: { select: { id: true, title: true, posterUrl: true } } },
+        include: {
+          movie: { select: { id: true, title: true, posterUrl: true } },
+        },
       }),
       this.prisma.purchase.count({ where: { userId } }),
     ]);
@@ -283,7 +331,10 @@ export class MoviesService {
   }
 
   private async assertExists(id: string): Promise<void> {
-    const exists = await this.prisma.movie.findUnique({ where: { id }, select: { id: true } });
+    const exists = await this.prisma.movie.findUnique({
+      where: { id },
+      select: { id: true },
+    });
     if (!exists) throw new NotFoundException('Movie not found');
   }
 }

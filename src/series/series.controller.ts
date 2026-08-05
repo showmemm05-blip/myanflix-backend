@@ -40,13 +40,19 @@ export class SeriesController {
   }
 
   @Get(':id')
-  findOne(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthenticatedUser) {
+  findOne(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
     return this.seriesService.getForViewer(id, user.id, user.role);
   }
 
   /** One purchase for the whole show — episodes are never bought individually. */
   @Post(':id/purchase')
-  purchase(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthenticatedUser) {
+  purchase(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
     return this.seriesService.purchase(user.id, id);
   }
 
@@ -59,9 +65,14 @@ export class SeriesController {
   async getEpisodes(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthenticatedUser,
-    @Query('seasonNumber', new ParseIntPipe({ optional: true })) seasonNumber?: number,
+    @Query('seasonNumber', new ParseIntPipe({ optional: true }))
+    seasonNumber?: number,
   ) {
-    const episodes = await this.seriesService.getEpisodes(id, user.role, seasonNumber);
+    const episodes = await this.seriesService.getEpisodes(
+      id,
+      user.role,
+      seasonNumber,
+    );
     return episodes.map((e) => MovieResponseDto.fromEntity(e));
   }
 

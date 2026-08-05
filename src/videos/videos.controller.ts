@@ -25,7 +25,10 @@ export class VideosController {
 
   /** Registered before ':movieId/*' routes so "me" is never parsed as a movie UUID. */
   @Get('me/watch-history')
-  getMyWatchHistory(@CurrentUser() user: AuthenticatedUser, @Query() pagination: PaginationQueryDto) {
+  getMyWatchHistory(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query() pagination: PaginationQueryDto,
+  ) {
     return this.videosService.getWatchHistoryForUser(user.id, pagination);
   }
 
@@ -51,6 +54,11 @@ export class VideosController {
     @Body() dto: UpdateWatchProgressDto,
     @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.videosService.recordWatchProgress(user.id, movieId, dto.progress, dto.lastPosition);
+    return this.videosService.recordWatchProgress(
+      user.id,
+      movieId,
+      dto.progress,
+      dto.lastPosition,
+    );
   }
 }

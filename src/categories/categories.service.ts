@@ -1,4 +1,8 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import type { CreateCategoryDto } from './dto/create-category.dto';
 import type { UpdateCategoryDto } from './dto/update-category.dto';
@@ -51,11 +55,17 @@ export class CategoriesService {
   }
 
   private async assertExists(id: string): Promise<void> {
-    const exists = await this.prisma.category.findUnique({ where: { id }, select: { id: true } });
+    const exists = await this.prisma.category.findUnique({
+      where: { id },
+      select: { id: true },
+    });
     if (!exists) throw new NotFoundException('Category not found');
   }
 
-  private async assertNameAvailable(name: string, excludeId?: string): Promise<void> {
+  private async assertNameAvailable(
+    name: string,
+    excludeId?: string,
+  ): Promise<void> {
     const existing = await this.prisma.category.findUnique({ where: { name } });
     if (existing && existing.id !== excludeId) {
       throw new ConflictException('A category with this name already exists');

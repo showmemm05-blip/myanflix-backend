@@ -325,6 +325,43 @@ model UploadSession {
   @@map("upload_sessions")
 }
 
+/// Tracks a direct browser->MinIO multipart upload (the presigned-URL flow
+/// that bypasses UploadSession/local disk entirely for pre-transcoded
+/// assets — see backend/src/uploads/multipart-upload.service.ts). Rows only
+/// ever exist for the one large file in a bundle (typically original.mp4);
+/// small files (playlists, subtitles, segments) go through a single
+/// presigned PUT with no row at all. MinIO's own ListPartsCommand is always
+/// the source of truth for which parts have landed — this table
+/// deliberately never stores a per-part list, only enough to reconstruct
+/// what MinIO already knows (mirrors why UploadSession.uploadedChunks was
+/// removed in favor of a disk listing).
+model MultipartUploadSession {
+  id            String       @id @default(uuid())
+  /// Open string, not an enum — a new resource type (e.g. "book") needs a
+  /// new key-builder + permission mapping in application code, never a
+  /// migration. "movie" is the only value that exists today.
+  resourceType  String
+  /// The owning row's id in whatever table resourceType names. Deliberately
+  /// not a Prisma @relation — a hard FK can only ever point at one table,
+  /// which would defeat the point of this being resource-type-generic.
+  /// Existence is validated in application code before a session is
+  /// created; the cleanup cron's age-based sweep bounds the blast radius of
+  /// any bug that lets that check slip.
+  resourceId    String
+  /// Full MinIO object key, e.g. "videos/<movieId>/original.mp4".
+  objectKey     String
+  fileSize      BigInt
+  partSize      Int
+  totalParts    Int
+  minioUploadId String
+  status        UploadStatus @default(IN_PROGRESS)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@index([resourceType, resourceId])
+  @@map("multipart_upload_sessions")
+}
+
 // ---------------------------------------------------------------------------
 // Commerce
 // ---------------------------------------------------------------------------

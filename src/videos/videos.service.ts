@@ -1,5 +1,14 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { Role, VideoStatus, type Prisma, type Video } from '../generated/prisma/client';
+import {
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import {
+  Role,
+  VideoStatus,
+  type Prisma,
+  type Video,
+} from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
@@ -48,7 +57,10 @@ export class VideosService {
 
   /** Most recently created video for a movie — the one currently being processed or served. */
   findLatestForMovie(movieId: string): Promise<Video | null> {
-    return this.prisma.video.findFirst({ where: { movieId }, orderBy: { createdAt: 'desc' } });
+    return this.prisma.video.findFirst({
+      where: { movieId },
+      orderBy: { createdAt: 'desc' },
+    });
   }
 
   markProcessing(id: string): Promise<Video> {
@@ -103,7 +115,10 @@ export class VideosService {
     userId: string,
     role: Role,
   ): Promise<{ playlistUrl: string; subtitles: SubtitleInfo[] }> {
-    const movie = await this.prisma.movie.findUnique({ where: { id: movieId }, include: { series: true } });
+    const movie = await this.prisma.movie.findUnique({
+      where: { id: movieId },
+      include: { series: true },
+    });
     if (!movie) throw new NotFoundException('Movie not found');
 
     if (role === Role.USER) {
@@ -116,7 +131,9 @@ export class VideosService {
             where: { userId_seriesId: { userId, seriesId: movie.series.id } },
           });
           if (!purchase) {
-            throw new ForbiddenException('Purchase this series to start streaming');
+            throw new ForbiddenException(
+              'Purchase this series to start streaming',
+            );
           }
         }
       } else if (movie.isPremium) {
@@ -124,7 +141,9 @@ export class VideosService {
           where: { userId_movieId: { userId, movieId } },
         });
         if (!purchase) {
-          throw new ForbiddenException('Purchase this movie to start streaming');
+          throw new ForbiddenException(
+            'Purchase this movie to start streaming',
+          );
         }
       }
     }
@@ -134,7 +153,9 @@ export class VideosService {
       throw new NotFoundException('This movie is not ready for streaming yet');
     }
 
-    const subtitles = await this.prisma.subtitle.findMany({ where: { videoId: video.id } });
+    const subtitles = await this.prisma.subtitle.findMany({
+      where: { videoId: video.id },
+    });
 
     return {
       playlistUrl: this.minioService.publicUrl(video.hlsMasterPath),
@@ -150,8 +171,16 @@ export class VideosService {
   }
 
   /** Upserts the caller's watch progress for a movie — feeds analytics (views, completion rate). */
-  async recordWatchProgress(userId: string, movieId: string, progress: number, lastPosition: number) {
-    const movie = await this.prisma.movie.findUnique({ where: { id: movieId }, select: { id: true } });
+  async recordWatchProgress(
+    userId: string,
+    movieId: string,
+    progress: number,
+    lastPosition: number,
+  ) {
+    const movie = await this.prisma.movie.findUnique({
+      where: { id: movieId },
+      select: { id: true },
+    });
     if (!movie) throw new NotFoundException('Movie not found');
 
     return this.prisma.watchHistory.upsert({
@@ -172,7 +201,11 @@ export class VideosService {
         orderBy: { updatedAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
-        include: { movie: { select: { id: true, title: true, posterUrl: true, duration: true } } },
+        include: {
+          movie: {
+            select: { id: true, title: true, posterUrl: true, duration: true },
+          },
+        },
       }),
       this.prisma.watchHistory.count({ where: { userId } }),
     ]);
@@ -197,7 +230,8 @@ export class VideosService {
   /** Latest video (upload/processing) status for a movie — polled by the admin upload UI. */
   async getLatestStatusForMovie(movieId: string) {
     const video = await this.findLatestForMovie(movieId);
-    if (!video) throw new NotFoundException('No video uploaded for this movie yet');
+    if (!video)
+      throw new NotFoundException('No video uploaded for this movie yet');
 
     return {
       id: video.id,
@@ -205,7 +239,9 @@ export class VideosService {
       failureReason: video.failureReason,
       duration: video.duration,
       resolution: video.resolution,
-      hlsMasterPath: video.hlsMasterPath ? this.minioService.publicUrl(video.hlsMasterPath) : null,
+      hlsMasterPath: video.hlsMasterPath
+        ? this.minioService.publicUrl(video.hlsMasterPath)
+        : null,
       renditions: video.renditions,
       createdAt: video.createdAt,
       updatedAt: video.updatedAt,

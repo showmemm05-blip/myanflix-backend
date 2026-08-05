@@ -5,7 +5,18 @@ import { decimalToNumber } from '../common/utils/decimal.util';
 const TOP_N = 5;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MONTH_LABELS = [
-  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
 ];
 
 @Injectable()
@@ -29,7 +40,9 @@ export class AnalyticsService {
       activeUsers,
     ] = await Promise.all([
       this.prisma.watchHistory.count(),
-      this.prisma.watchHistory.aggregate({ _avg: { progress: true, lastPosition: true } }),
+      this.prisma.watchHistory.aggregate({
+        _avg: { progress: true, lastPosition: true },
+      }),
       this.getPopularMovies(),
       this.prisma.user.count({ where: { createdAt: { gte: sevenDaysAgo } } }),
       this.prisma.user.count({ where: { createdAt: { gte: thirtyDaysAgo } } }),
@@ -41,8 +54,11 @@ export class AnalyticsService {
 
     return {
       totalViews,
-      averageCompletionRate: Math.round((completionAgg._avg.progress ?? 0) * 100) / 100,
-      averageWatchDurationSeconds: Math.round(completionAgg._avg.lastPosition ?? 0),
+      averageCompletionRate:
+        Math.round((completionAgg._avg.progress ?? 0) * 100) / 100,
+      averageWatchDurationSeconds: Math.round(
+        completionAgg._avg.lastPosition ?? 0,
+      ),
       popularMovies,
       userRegistrations: {
         last7Days: registrationsLast7Days,
@@ -58,7 +74,11 @@ export class AnalyticsService {
   /** New signups per month + a running total (proxy for "active users") for the growth chart. */
   async getUserGrowthTrend(monthsBack = 12) {
     const now = new Date();
-    const start = new Date(now.getFullYear(), now.getMonth() - (monthsBack - 1), 1);
+    const start = new Date(
+      now.getFullYear(),
+      now.getMonth() - (monthsBack - 1),
+      1,
+    );
 
     const [usersInRange, activeBeforeRange] = await Promise.all([
       this.prisma.user.findMany({
@@ -75,13 +95,18 @@ export class AnalyticsService {
     }
 
     let runningTotal = activeBeforeRange;
-    const result: { label: string; newUsers: number; activeUsers: number }[] = [];
+    const result: { label: string; newUsers: number; activeUsers: number }[] =
+      [];
     for (let i = 0; i < monthsBack; i++) {
       const date = new Date(start.getFullYear(), start.getMonth() + i, 1);
       const key = `${date.getFullYear()}-${date.getMonth()}`;
       const newUsers = newUsersByMonthKey.get(key) ?? 0;
       runningTotal += newUsers;
-      result.push({ label: MONTH_LABELS[date.getMonth()], newUsers, activeUsers: runningTotal });
+      result.push({
+        label: MONTH_LABELS[date.getMonth()],
+        newUsers,
+        activeUsers: runningTotal,
+      });
     }
 
     return result;

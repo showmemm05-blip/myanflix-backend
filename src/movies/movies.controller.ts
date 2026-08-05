@@ -30,14 +30,28 @@ export class MoviesController {
   constructor(private readonly moviesService: MoviesService) {}
 
   @Get()
-  async findAll(@Query() query: MovieQueryDto, @CurrentUser() user: AuthenticatedUser) {
-    const { items, total, page, limit } = await this.moviesService.findAll(query, user.role);
-    return { items: items.map((m) => MovieResponseDto.fromEntity(m)), total, page, limit };
+  async findAll(
+    @Query() query: MovieQueryDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    const { items, total, page, limit } = await this.moviesService.findAll(
+      query,
+      user.role,
+    );
+    return {
+      items: items.map((m) => MovieResponseDto.fromEntity(m)),
+      total,
+      page,
+      limit,
+    };
   }
 
   /** Registered before ':id' so "me" is never parsed as a movie UUID. */
   @Get('me/purchases')
-  getMyPurchases(@CurrentUser() user: AuthenticatedUser, @Query() pagination: PaginationQueryDto) {
+  getMyPurchases(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query() pagination: PaginationQueryDto,
+  ) {
     return this.moviesService.getPurchasesForUser(user.id, pagination);
   }
 
@@ -49,7 +63,10 @@ export class MoviesController {
   }
 
   @Get(':id')
-  async findOne(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthenticatedUser) {
+  async findOne(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
     const movie = await this.moviesService.findByIdOrThrow(id, user.role);
     return MovieResponseDto.fromEntity(movie);
   }
@@ -74,7 +91,11 @@ export class MoviesController {
     const movie = await this.moviesService.createUploadPlaceholder(
       dto.title,
       dto.seriesId
-        ? { seriesId: dto.seriesId, seasonNumber: dto.seasonNumber!, episodeNumber: dto.episodeNumber! }
+        ? {
+            seriesId: dto.seriesId,
+            seasonNumber: dto.seasonNumber!,
+            episodeNumber: dto.episodeNumber!,
+          }
         : undefined,
     );
     return MovieResponseDto.fromEntity(movie);
@@ -83,7 +104,10 @@ export class MoviesController {
   @Put(':id')
   @UseGuards(PermissionsGuard)
   @RequirePermissions(Permission.MOVIE_UPDATE)
-  async update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateMovieDto) {
+  async update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateMovieDto,
+  ) {
     const movie = await this.moviesService.update(id, dto);
     return MovieResponseDto.fromEntity(movie);
   }
@@ -97,7 +121,10 @@ export class MoviesController {
   }
 
   @Post(':id/purchase')
-  async purchase(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthenticatedUser) {
+  async purchase(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
     return this.moviesService.purchase(user.id, id);
   }
 }

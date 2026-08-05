@@ -20,10 +20,8 @@ export class WalletController {
     @CurrentUser() user: AuthenticatedUser,
     @Query() pagination: PaginationQueryDto,
   ) {
-    const { items, total, page, limit } = await this.walletService.getTransactions(
-      user.id,
-      pagination,
-    );
+    const { items, total, page, limit } =
+      await this.walletService.getTransactions(user.id, pagination);
     return {
       items: items.map((t) => ({ ...t, amount: decimalToNumber(t.amount) })),
       total,

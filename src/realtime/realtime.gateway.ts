@@ -59,7 +59,9 @@ export interface NotificationCreatedPayload {
  */
 @Injectable()
 @WebSocketGateway({ cors: { origin: '*' } })
-export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect {
+export class RealtimeGateway
+  implements OnGatewayConnection, OnGatewayDisconnect
+{
   private readonly logger = new Logger(RealtimeGateway.name);
 
   @WebSocketServer()
@@ -81,7 +83,8 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       });
 
       const user = await this.usersService.findByIdOrThrow(payload.sub);
-      if (user.status !== UserStatus.ACTIVE) throw new Error('Account is not active');
+      if (user.status !== UserStatus.ACTIVE)
+        throw new Error('Account is not active');
 
       client.data.userId = user.id;
       client.data.role = user.role;
@@ -91,7 +94,9 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
         await client.join(adminRoom());
       }
     } catch (error) {
-      this.logger.debug(`Rejecting socket connection: ${(error as Error).message}`);
+      this.logger.debug(
+        `Rejecting socket connection: ${(error as Error).message}`,
+      );
       client.disconnect(true);
     }
   }
@@ -114,11 +119,17 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.server.to(adminRoom()).emit('deposit.created', payload);
   }
 
-  notifyUserDepositUpdated(userId: string, payload: DepositUpdatedPayload): void {
+  notifyUserDepositUpdated(
+    userId: string,
+    payload: DepositUpdatedPayload,
+  ): void {
     this.server.to(userRoom(userId)).emit('deposit.updated', payload);
   }
 
-  notifyUserNotificationCreated(userId: string, payload: NotificationCreatedPayload): void {
+  notifyUserNotificationCreated(
+    userId: string,
+    payload: NotificationCreatedPayload,
+  ): void {
     this.server.to(userRoom(userId)).emit('notification.created', payload);
   }
 

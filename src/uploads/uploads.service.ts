@@ -1,15 +1,27 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { access, readdir, rm, writeFile } from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { basename, extname, join } from 'node:path';
-import { MovieStatus, UploadStatus, VideoStatus } from '../generated/prisma/client';
+import {
+  MovieStatus,
+  UploadStatus,
+  VideoStatus,
+} from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
 import { VideosService } from '../videos/videos.service';
 import { ProcessingService } from '../processing/processing.service';
-import { SubtitlesService, EXTENSION_TO_FORMAT } from '../subtitles/subtitles.service';
+import {
+  SubtitlesService,
+  EXTENSION_TO_FORMAT,
+} from '../subtitles/subtitles.service';
 import type { InitUploadDto } from './dto/init-upload.dto';
 import type { ValidateExternalBundleDto } from './dto/validate-external-bundle.dto';
 
@@ -45,7 +57,9 @@ interface BundleStructure {
   errors: string[];
 }
 
-type CompleteUploadResult = { videoId: string; status: VideoStatus } | { relativePath: string; status: UploadStatus };
+type CompleteUploadResult =
+  | { videoId: string; status: VideoStatus }
+  | { relativePath: string; status: UploadStatus };
 
 @Injectable()
 export class UploadsService {
@@ -67,7 +81,9 @@ export class UploadsService {
    * time and abandoning whatever was already sent.
    */
   async initUpload(dto: InitUploadDto) {
-    const movie = await this.prisma.movie.findUnique({ where: { id: dto.movieId } });
+    const movie = await this.prisma.movie.findUnique({
+      where: { id: dto.movieId },
+    });
     if (!movie) throw new NotFoundException('Movie not found');
 
     // relativePath is part of the match — without this, two different files
@@ -112,7 +128,10 @@ export class UploadsService {
 
     const tempDir = this.storageService.uploadSessionDir(session.id);
     await this.storageService.ensureDir(tempDir);
-    await this.prisma.uploadSession.update({ where: { id: session.id }, data: { tempDir } });
+    await this.prisma.uploadSession.update({
+      where: { id: session.id },
+      data: { tempDir },
+    });
 
     return {
       uploadId: session.id,
@@ -122,7 +141,11 @@ export class UploadsService {
     };
   }
 
-  async saveChunk(uploadId: string, chunkNumber: number, buffer: Buffer): Promise<void> {
+  async saveChunk(
+    uploadId: string,
+    chunkNumber: number,
+    buffer: Buffer,
+  ): Promise<void> {
     const session = await this.getActiveSessionOrThrow(uploadId);
 
     if (chunkNumber < 0 || chunkNumber >= session.totalChunks) {
@@ -131,7 +154,10 @@ export class UploadsService {
       );
     }
 
-    await writeFile(this.storageService.chunkPath(uploadId, chunkNumber), buffer);
+    await writeFile(
+      this.storageService.chunkPath(uploadId, chunkNumber),
+      buffer,
+    );
   }
 
   async getStatus(uploadId: string) {
@@ -139,7 +165,12 @@ export class UploadsService {
     const uploadedChunks = await this.listUploadedChunks(uploadId);
     const remainingChunks = session.totalChunks - uploadedChunks.length;
 
-    return { uploadedChunks, remainingChunks, totalChunks: session.totalChunks, status: session.status };
+    return {
+      uploadedChunks,
+      remainingChunks,
+      totalChunks: session.totalChunks,
+      status: session.status,
+    };
   }
 
   /**
@@ -175,7 +206,10 @@ export class UploadsService {
    * would corrupt it. Single-flight: a call that arrives mid-flight joins
    * the same in-flight promise instead of starting its own.
    */
-  private readonly completingUploads = new Map<string, Promise<CompleteUploadResult>>();
+  private readonly completingUploads = new Map<
+    string,
+    Promise<CompleteUploadResult>
+  >();
 
   async completeUpload(uploadId: string): Promise<CompleteUploadResult> {
     const inFlight = this.completingUploads.get(uploadId);
@@ -197,21 +231,35 @@ export class UploadsService {
    * already produce, and stops there: no `Video` row, no transcoding. This
    * is what lets one chunked-upload mechanism serve both flows.
    */
-  private async runCompleteUpload(uploadId: string): Promise<CompleteUploadResult> {
+  private async runCompleteUpload(
+    uploadId: string,
+  ): Promise<CompleteUploadResult> {
     const session = await this.getActiveSessionOrThrow(uploadId);
 
     const uploadedCount = (await this.listUploadedChunks(uploadId)).length;
     if (uploadedCount < session.totalChunks) {
-      throw new BadRequestException(`Upload incomplete: ${uploadedCount}/${session.totalChunks} chunks received`);
+      throw new BadRequestException(
+        `Upload incomplete: ${uploadedCount}/${session.totalChunks} chunks received`,
+      );
     }
 
     if (session.relativePath) {
-      return this.completeExternalAssetUpload(uploadId, session.movieId, session.relativePath, session.totalChunks);
+      return this.completeExternalAssetUpload(
+        uploadId,
+        session.movieId,
+        session.relativePath,
+        session.totalChunks,
+      );
     }
 
     const extension = extname(session.filename) || '.mp4';
-    const originalPath = this.storageService.originalVideoPath(session.movieId, extension);
-    await this.storageService.ensureDir(this.storageService.videoDir(session.movieId));
+    const originalPath = this.storageService.originalVideoPath(
+      session.movieId,
+      extension,
+    );
+    await this.storageService.ensureDir(
+      this.storageService.videoDir(session.movieId),
+    );
     await this.mergeChunks(uploadId, session.totalChunks, originalPath);
 
     const video = await this.videosService.create({
@@ -228,7 +276,11 @@ export class UploadsService {
     await this.cleanupChunks(uploadId);
 
     // Kick off transcoding without blocking the HTTP response.
-    void this.processingService.processVideo(video.id, session.movieId, originalPath);
+    void this.processingService.processVideo(
+      video.id,
+      session.movieId,
+      originalPath,
+    );
 
     return { videoId: video.id, status: video.status };
   }
@@ -239,10 +291,16 @@ export class UploadsService {
     relativePath: string,
     totalChunks: number,
   ): Promise<{ relativePath: string; status: UploadStatus }> {
-    const tempPath = join(this.storageService.uploadSessionDir(uploadId), 'merged');
+    const tempPath = join(
+      this.storageService.uploadSessionDir(uploadId),
+      'merged',
+    );
     await this.mergeChunks(uploadId, totalChunks, tempPath);
 
-    await this.minioService.uploadFile(`videos/${movieId}/${relativePath}`, tempPath);
+    await this.minioService.uploadFile(
+      `videos/${movieId}/${relativePath}`,
+      tempPath,
+    );
 
     await this.prisma.uploadSession.update({
       where: { id: uploadId },
@@ -261,21 +319,34 @@ export class UploadsService {
    * parseBundleStructure()), so a missing original/master/rendition is
    * caught here rather than surfacing as a confusing failure at publish.
    */
-  async validateExternalBundle(movieId: string, dto: ValidateExternalBundleDto) {
-    const movie = await this.prisma.movie.findUnique({ where: { id: movieId } });
+  async validateExternalBundle(
+    movieId: string,
+    dto: ValidateExternalBundleDto,
+  ) {
+    const movie = await this.prisma.movie.findUnique({
+      where: { id: movieId },
+    });
     if (!movie) throw new NotFoundException('Movie not found');
 
     const results = await Promise.all(
       dto.relativePaths.map(async (relativePath) => ({
         relativePath,
-        exists: await this.minioService.objectExists(`videos/${movieId}/${relativePath}`),
+        exists: await this.minioService.objectExists(
+          `videos/${movieId}/${relativePath}`,
+        ),
       })),
     );
     const missing = results.filter((r) => !r.exists).map((r) => r.relativePath);
 
-    const { errors: structureErrors } = this.parseBundleStructure(dto.relativePaths);
+    const { errors: structureErrors } = this.parseBundleStructure(
+      dto.relativePaths,
+    );
 
-    return { missing, structureErrors, valid: missing.length === 0 && structureErrors.length === 0 };
+    return {
+      missing,
+      structureErrors,
+      valid: missing.length === 0 && structureErrors.length === 0,
+    };
   }
 
   /**
@@ -294,14 +365,23 @@ export class UploadsService {
    * always a separate, explicit admin action (see MoviesService.update()),
    * matching the bulk-upload flow's status lifecycle.
    */
-  async finalizeExternalUpload(movieId: string, dto: ValidateExternalBundleDto) {
-    const movie = await this.prisma.movie.findUnique({ where: { id: movieId } });
+  async finalizeExternalUpload(
+    movieId: string,
+    dto: ValidateExternalBundleDto,
+  ) {
+    const movie = await this.prisma.movie.findUnique({
+      where: { id: movieId },
+    });
     if (!movie) throw new NotFoundException('Movie not found');
 
-    const { renditions, subtitlePaths, errors } = this.parseBundleStructure(dto.relativePaths);
+    const { renditions, subtitlePaths, errors } = this.parseBundleStructure(
+      dto.relativePaths,
+    );
     if (errors.length > 0) {
       await this.markMovieFailed(movieId);
-      throw new BadRequestException(`Cannot finalize — invalid bundle structure: ${errors.join('; ')}`);
+      throw new BadRequestException(
+        `Cannot finalize — invalid bundle structure: ${errors.join('; ')}`,
+      );
     }
 
     const originalKey = this.storageService.originalObjectKey(movieId, '.mp4');
@@ -309,17 +389,25 @@ export class UploadsService {
     const requiredKeys = [
       originalKey,
       masterKey,
-      ...renditions.map((r) => `${this.storageService.hlsRenditionKeyPrefix(movieId, r)}/index.m3u8`),
+      ...renditions.map(
+        (r) =>
+          `${this.storageService.hlsRenditionKeyPrefix(movieId, r)}/index.m3u8`,
+      ),
       ...subtitlePaths.map((p) => `videos/${movieId}/${p}`),
     ];
 
     const existence = await Promise.all(
-      requiredKeys.map(async (key) => ({ key, exists: await this.minioService.objectExists(key) })),
+      requiredKeys.map(async (key) => ({
+        key,
+        exists: await this.minioService.objectExists(key),
+      })),
     );
     const missing = existence.filter((e) => !e.exists).map((e) => e.key);
     if (missing.length > 0) {
       await this.markMovieFailed(movieId);
-      throw new BadRequestException(`Cannot finalize — missing required files: ${missing.join(', ')}`);
+      throw new BadRequestException(
+        `Cannot finalize — missing required files: ${missing.join(', ')}`,
+      );
     }
 
     const video = await this.videosService.create({
@@ -362,7 +450,10 @@ export class UploadsService {
   }
 
   private async markMovieFailed(movieId: string): Promise<void> {
-    await this.prisma.movie.update({ where: { id: movieId }, data: { status: MovieStatus.FAILED } });
+    await this.prisma.movie.update({
+      where: { id: movieId },
+      data: { status: MovieStatus.FAILED },
+    });
   }
 
   /**
@@ -381,13 +472,19 @@ export class UploadsService {
     if (!set.has('original.mp4')) errors.push('original.mp4 is missing');
     if (!set.has('hls/master.m3u8')) errors.push('master.m3u8 is missing');
 
-    const renditions = KNOWN_RENDITIONS.filter((r) => set.has(`hls/${r}/index.m3u8`));
+    const renditions = KNOWN_RENDITIONS.filter((r) =>
+      set.has(`hls/${r}/index.m3u8`),
+    );
     if (renditions.length === 0) {
-      errors.push('no valid rendition folder (240p, 360p, 480p, 720p, or 1080p) with an index.m3u8 was found');
+      errors.push(
+        'no valid rendition folder (240p, 360p, 480p, 720p, or 1080p) with an index.m3u8 was found',
+      );
     }
 
     const subtitlePaths = relativePaths.filter(
-      (p) => p.startsWith('subtitles/') && SUBTITLE_EXTENSIONS.has(extname(p).toLowerCase()),
+      (p) =>
+        p.startsWith('subtitles/') &&
+        SUBTITLE_EXTENSIONS.has(extname(p).toLowerCase()),
     );
 
     return { renditions, subtitlePaths, errors };
@@ -437,11 +534,15 @@ export class UploadsService {
       // Status says PROCESSING but nothing in this process is actually
       // working on it — orphaned. Safe to reprocess immediately.
     } else if (video.status !== VideoStatus.FAILED) {
-      throw new BadRequestException('Only a failed or stuck video can be reprocessed');
+      throw new BadRequestException(
+        'Only a failed or stuck video can be reprocessed',
+      );
     }
 
     if (!video.originalPath) {
-      throw new BadRequestException('No original file was recorded for this video — a new upload is required');
+      throw new BadRequestException(
+        'No original file was recorded for this video — a new upload is required',
+      );
     }
 
     const inputPath = await this.resolveOriginalForReprocessing(movieId, video);
@@ -484,7 +585,11 @@ export class UploadsService {
     }
   }
 
-  private async mergeChunks(uploadId: string, totalChunks: number, destination: string): Promise<void> {
+  private async mergeChunks(
+    uploadId: string,
+    totalChunks: number,
+    destination: string,
+  ): Promise<void> {
     await new Promise<void>((resolvePromise, rejectPromise) => {
       const output = createWriteStream(destination);
       output.on('error', rejectPromise);
@@ -495,7 +600,9 @@ export class UploadsService {
           output.end();
           return;
         }
-        const chunkStream = createReadStream(this.storageService.chunkPath(uploadId, index));
+        const chunkStream = createReadStream(
+          this.storageService.chunkPath(uploadId, index),
+        );
         chunkStream.on('error', rejectPromise);
         chunkStream.on('end', () => appendChunk(index + 1));
         chunkStream.pipe(output, { end: false });
@@ -506,11 +613,16 @@ export class UploadsService {
   }
 
   private async cleanupChunks(uploadId: string): Promise<void> {
-    await rm(this.storageService.uploadSessionDir(uploadId), { recursive: true, force: true });
+    await rm(this.storageService.uploadSessionDir(uploadId), {
+      recursive: true,
+      force: true,
+    });
   }
 
   private async getSessionOrThrow(uploadId: string) {
-    const session = await this.prisma.uploadSession.findUnique({ where: { id: uploadId } });
+    const session = await this.prisma.uploadSession.findUnique({
+      where: { id: uploadId },
+    });
     if (!session) throw new NotFoundException('Upload session not found');
     return session;
   }

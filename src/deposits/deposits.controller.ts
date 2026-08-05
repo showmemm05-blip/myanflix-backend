@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  ParseUUIDPipe,
+  Patch,
+  Post,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
@@ -21,12 +31,18 @@ export class DepositsController {
   constructor(private readonly depositsService: DepositsService) {}
 
   @Post()
-  create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateDepositDto) {
+  create(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: CreateDepositDto,
+  ) {
     return this.depositsService.create(user.id, dto);
   }
 
   @Get('me')
-  findMine(@CurrentUser() user: AuthenticatedUser, @Query() query: DepositQueryDto) {
+  findMine(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query() query: DepositQueryDto,
+  ) {
     return this.depositsService.findAllForUser(user.id, query);
   }
 
@@ -40,7 +56,10 @@ export class DepositsController {
   @Patch(':id/approve')
   @UseGuards(PermissionsGuard)
   @RequirePermissions(Permission.DEPOSIT_MANAGE)
-  approve(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() admin: AuthenticatedUser) {
+  approve(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() admin: AuthenticatedUser,
+  ) {
     return this.depositsService.approve(id, admin);
   }
 

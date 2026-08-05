@@ -37,7 +37,11 @@ export class ProcessingService {
    * Original video -> ffmpeg -> HLS renditions -> master playlist.
    * Runs in the background; upload completion does not wait on this.
    */
-  async processVideo(videoId: string, movieId: string, inputPath: string): Promise<void> {
+  async processVideo(
+    videoId: string,
+    movieId: string,
+    inputPath: string,
+  ): Promise<void> {
     this.activeVideoIds.add(videoId);
     try {
       await this.runPipeline(videoId, movieId, inputPath);
@@ -46,7 +50,11 @@ export class ProcessingService {
     }
   }
 
-  private async runPipeline(videoId: string, movieId: string, inputPath: string): Promise<void> {
+  private async runPipeline(
+    videoId: string,
+    movieId: string,
+    inputPath: string,
+  ): Promise<void> {
     await this.videosService.markProcessing(videoId);
 
     try {
@@ -60,7 +68,10 @@ export class ProcessingService {
       // (a reprocess() run re-downloaded this exact object to feed ffmpeg) —
       // otherwise every retry would re-upload the same multi-GB file back to
       // the storage server for no reason.
-      const originalKey = this.storageService.originalObjectKey(movieId, extname(inputPath));
+      const originalKey = this.storageService.originalObjectKey(
+        movieId,
+        extname(inputPath),
+      );
       if (!(await this.minioService.objectExists(originalKey))) {
         await this.minioService.uploadFile(originalKey, inputPath);
       }
@@ -70,16 +81,26 @@ export class ProcessingService {
       const hlsDir = this.storageService.hlsDir(movieId);
       await this.storageService.ensureDir(hlsDir);
 
-      const variantEntries: { name: string; bandwidth: number; width: number; height: number }[] = [];
+      const variantEntries: {
+        name: string;
+        bandwidth: number;
+        width: number;
+        height: number;
+      }[] = [];
 
       for (const tier of renditions) {
-        const renditionKeyPrefix = this.storageService.hlsRenditionKeyPrefix(movieId, tier.name);
+        const renditionKeyPrefix = this.storageService.hlsRenditionKeyPrefix(
+          movieId,
+          tier.name,
+        );
 
         // A retry after a partial failure shouldn't redo tiers that already
         // finished transcoding *and* uploading — on a big file those earlier
         // tiers can represent most of an hour of work. Only the tier that
         // was still in flight (or never started) actually needs redoing.
-        const alreadyUploaded = await this.minioService.objectExists(`${renditionKeyPrefix}/index.m3u8`);
+        const alreadyUploaded = await this.minioService.objectExists(
+          `${renditionKeyPrefix}/index.m3u8`,
+        );
 
         if (!alreadyUploaded) {
           const outputDir = join(hlsDir, tier.name);
@@ -100,10 +121,15 @@ export class ProcessingService {
           // ffmpeg can only write to a real local path, so outputDir is
           // scratch space — push the finished rendition (playlist + segments)
           // to the storage server, then it's no longer needed on local disk.
-          await this.minioService.uploadDirectory(outputDir, renditionKeyPrefix);
+          await this.minioService.uploadDirectory(
+            outputDir,
+            renditionKeyPrefix,
+          );
           this.logger.log(`Rendition ${tier.name} ready for movie ${movieId}`);
         } else {
-          this.logger.log(`Rendition ${tier.name} already uploaded for movie ${movieId} — skipping re-transcode`);
+          this.logger.log(
+            `Rendition ${tier.name} already uploaded for movie ${movieId} — skipping re-transcode`,
+          );
         }
 
         variantEntries.push({
@@ -116,7 +142,10 @@ export class ProcessingService {
 
       const masterPath = join(hlsDir, 'master.m3u8');
       await writeFile(masterPath, buildMasterPlaylist(variantEntries), 'utf-8');
-      await this.minioService.uploadFile(this.storageService.hlsMasterKey(movieId), masterPath);
+      await this.minioService.uploadFile(
+        this.storageService.hlsMasterKey(movieId),
+        masterPath,
+      );
 
       // Everything this movie needs — the original and every rendition —
       // is on the storage server now. Both local copies were only ever
@@ -138,9 +167,12 @@ export class ProcessingService {
         data: { status: MovieStatus.PUBLISHED },
       });
 
-      this.logger.log(`Video ${videoId} processed successfully for movie ${movieId}`);
+      this.logger.log(
+        `Video ${videoId} processed successfully for movie ${movieId}`,
+      );
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown processing error';
+      const message =
+        error instanceof Error ? error.message : 'Unknown processing error';
       this.logger.error(`Processing failed for video ${videoId}: ${message}`);
 
       // The movie — and, by cascade, this Video row — can be deleted while
@@ -155,7 +187,8 @@ export class ProcessingService {
           data: { status: MovieStatus.DRAFT },
         });
       } catch (recordError) {
-        const reason = recordError instanceof Error ? recordError.message : 'unknown error';
+        const reason =
+          recordError instanceof Error ? recordError.message : 'unknown error';
         this.logger.warn(
           `Could not record failure for video ${videoId} (its movie was likely deleted mid-processing): ${reason}`,
         );
@@ -176,19 +209,32 @@ export class ProcessingService {
    * on both the success and failure paths, and a cleanup problem must never
    * turn into the error the caller sees (or, worse, an unhandled rejection).
    */
-  private async cleanupScratch(movieId: string, inputPath: string): Promise<void> {
+  private async cleanupScratch(
+    movieId: string,
+    inputPath: string,
+  ): Promise<void> {
     try {
-      await rm(this.storageService.hlsDir(movieId), { recursive: true, force: true });
+      await rm(this.storageService.hlsDir(movieId), {
+        recursive: true,
+        force: true,
+      });
       await rm(inputPath, { force: true });
     } catch (error) {
       const reason = error instanceof Error ? error.message : 'unknown error';
-      this.logger.warn(`Could not clean scratch files for movie ${movieId}: ${reason}`);
+      this.logger.warn(
+        `Could not clean scratch files for movie ${movieId}: ${reason}`,
+      );
     }
   }
 }
 
 function buildMasterPlaylist(
-  variants: { name: string; bandwidth: number; width: number; height: number }[],
+  variants: {
+    name: string;
+    bandwidth: number;
+    width: number;
+    height: number;
+  }[],
 ): string {
   const lines = ['#EXTM3U', '#EXT-X-VERSION:3'];
 

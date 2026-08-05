@@ -23,7 +23,8 @@ export class MovieResponseDto {
       seriesId: movie.seriesId,
       seasonNumber: movie.seasonNumber,
       episodeNumber: movie.episodeNumber,
-      categories: movie.categories?.map((c) => ({ id: c.id, name: c.name })) ?? [],
+      categories:
+        movie.categories?.map((c) => ({ id: c.id, name: c.name })) ?? [],
       createdAt: movie.createdAt,
       updatedAt: movie.updatedAt,
     };

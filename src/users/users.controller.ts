@@ -48,9 +48,12 @@ export class UsersController {
 
   @Get()
   async findAll(@Query() pagination: PaginationQueryDto) {
-    const { items, total, walletByUserId } = await this.usersService.findAll(pagination);
+    const { items, total, walletByUserId } =
+      await this.usersService.findAll(pagination);
     return {
-      items: items.map((user) => UserResponseDto.fromEntity(user, walletByUserId.get(user.id))),
+      items: items.map((user) =>
+        UserResponseDto.fromEntity(user, walletByUserId.get(user.id)),
+      ),
       total,
       page: pagination.page ?? 1,
       limit: pagination.limit ?? 20,
@@ -67,23 +70,35 @@ export class UsersController {
   }
 
   @Get(':id/purchases')
-  getPurchases(@Param('id', ParseUUIDPipe) id: string, @Query() pagination: PaginationQueryDto) {
+  getPurchases(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() pagination: PaginationQueryDto,
+  ) {
     return this.moviesService.getPurchasesForUser(id, pagination);
   }
 
   @Get(':id/watch-history')
-  getWatchHistory(@Param('id', ParseUUIDPipe) id: string, @Query() pagination: PaginationQueryDto) {
+  getWatchHistory(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() pagination: PaginationQueryDto,
+  ) {
     return this.videosService.getWatchHistoryForUser(id, pagination);
   }
 
   @Patch(':id/role')
-  async updateRole(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateRoleDto) {
+  async updateRole(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateRoleDto,
+  ) {
     const user = await this.usersService.updateRole(id, dto.role);
     return UserResponseDto.fromEntity(user);
   }
 
   @Patch(':id/status')
-  async updateStatus(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateStatusDto) {
+  async updateStatus(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateStatusDto,
+  ) {
     const user = await this.usersService.updateStatus(id, dto.status);
     return UserResponseDto.fromEntity(user);
   }

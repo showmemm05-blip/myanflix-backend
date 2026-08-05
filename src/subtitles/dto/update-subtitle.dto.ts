@@ -1,4 +1,10 @@
-import { IsBoolean, IsOptional, MaxLength, MinLength, IsString } from 'class-validator';
+import {
+  IsBoolean,
+  IsOptional,
+  MaxLength,
+  MinLength,
+  IsString,
+} from 'class-validator';
 
 export class UpdateSubtitleDto {
   @IsOptional()

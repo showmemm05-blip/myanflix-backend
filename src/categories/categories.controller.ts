@@ -42,7 +42,10 @@ export class CategoriesController {
   @Put(':id')
   @UseGuards(PermissionsGuard)
   @RequirePermissions(Permission.MOVIE_UPDATE)
-  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateCategoryDto) {
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateCategoryDto,
+  ) {
     return this.categoriesService.update(id, dto);
   }
 

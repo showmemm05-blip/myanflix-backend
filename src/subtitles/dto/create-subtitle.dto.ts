@@ -1,4 +1,11 @@
-import { IsBoolean, IsOptional, IsUUID, MaxLength, MinLength, IsString } from 'class-validator';
+import {
+  IsBoolean,
+  IsOptional,
+  IsUUID,
+  MaxLength,
+  MinLength,
+  IsString,
+} from 'class-validator';
 
 export class CreateSubtitleDto {
   @IsUUID('4')

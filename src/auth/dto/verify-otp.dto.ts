@@ -1,9 +1,17 @@
 import { Transform } from 'class-transformer';
-import { IsOptional, IsString, Length, Matches, MinLength } from 'class-validator';
+import {
+  IsOptional,
+  IsString,
+  Length,
+  Matches,
+  MinLength,
+} from 'class-validator';
 import { normalizePhone } from '../../common/utils/phone.util';
 
 export class VerifyOtpDto {
-  @Transform(({ value }) => (typeof value === 'string' ? normalizePhone(value) : value))
+  @Transform(({ value }) =>
+    typeof value === 'string' ? normalizePhone(value) : value,
+  )
   @IsString()
   @Matches(/^\+95\d{7,10}$/, { message: 'Enter a valid Myanmar phone number' })
   phone!: string;

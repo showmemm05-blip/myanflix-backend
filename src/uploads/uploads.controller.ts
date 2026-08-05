@@ -37,10 +37,18 @@ export class UploadsController {
 
   @Post('image')
   @RequirePermissions(Permission.MOVIE_CREATE)
-  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: MAX_IMAGE_BYTES } }))
+  @UseInterceptors(
+    FileInterceptor('file', { limits: { fileSize: MAX_IMAGE_BYTES } }),
+  )
   async uploadImage(@UploadedFile() file: Express.Multer.File | undefined) {
-    if (!file) throw new BadRequestException('No image file received (expected field "file")');
-    const url = await this.uploadsService.saveImage(file.originalname, file.buffer);
+    if (!file)
+      throw new BadRequestException(
+        'No image file received (expected field "file")',
+      );
+    const url = await this.uploadsService.saveImage(
+      file.originalname,
+      file.buffer,
+    );
     return { url };
   }
 
@@ -55,13 +63,18 @@ export class UploadsController {
   // EVERY chunk request — pure O(n) waste per chunk that nothing consumed.
   @Post(':uploadId/chunk')
   @HttpCode(HttpStatus.NO_CONTENT)
-  @UseInterceptors(FileInterceptor('chunk', { limits: { fileSize: MAX_CHUNK_BYTES } }))
+  @UseInterceptors(
+    FileInterceptor('chunk', { limits: { fileSize: MAX_CHUNK_BYTES } }),
+  )
   async uploadChunk(
     @Param('uploadId', ParseUUIDPipe) uploadId: string,
     @Body('chunkNumber', ParseIntPipe) chunkNumber: number,
     @UploadedFile() file: Express.Multer.File | undefined,
   ): Promise<void> {
-    if (!file) throw new BadRequestException('No chunk file received (expected field "chunk")');
+    if (!file)
+      throw new BadRequestException(
+        'No chunk file received (expected field "chunk")',
+      );
 
     await this.uploadsService.saveChunk(uploadId, chunkNumber, file.buffer);
   }
@@ -84,7 +97,10 @@ export class UploadsController {
 
   /** Cross-checks an externally-pre-transcoded bundle's uploaded files against what's actually in MinIO. */
   @Post(':movieId/validate-external')
-  validateExternal(@Param('movieId', ParseUUIDPipe) movieId: string, @Body() dto: ValidateExternalBundleDto) {
+  validateExternal(
+    @Param('movieId', ParseUUIDPipe) movieId: string,
+    @Body() dto: ValidateExternalBundleDto,
+  ) {
     return this.uploadsService.validateExternalBundle(movieId, dto);
   }
 
@@ -94,7 +110,10 @@ export class UploadsController {
    * incomplete); it never publishes the movie itself.
    */
   @Post(':movieId/finalize')
-  finalize(@Param('movieId', ParseUUIDPipe) movieId: string, @Body() dto: ValidateExternalBundleDto) {
+  finalize(
+    @Param('movieId', ParseUUIDPipe) movieId: string,
+    @Body() dto: ValidateExternalBundleDto,
+  ) {
     return this.uploadsService.finalizeExternalUpload(movieId, dto);
   }
 }

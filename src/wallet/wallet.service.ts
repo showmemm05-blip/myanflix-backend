@@ -1,4 +1,8 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { Prisma, TransactionType } from '../generated/prisma/client';
 import type { Wallet } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -28,7 +32,11 @@ export class WalletService {
       this.prisma.transaction.count({ where: { userId } }),
     ]);
 
-    const movieIds = [...new Set(items.map((t) => t.movieId).filter((id): id is string => !!id))];
+    const movieIds = [
+      ...new Set(
+        items.map((t) => t.movieId).filter((id): id is string => !!id),
+      ),
+    ];
     const movies = movieIds.length
       ? await this.prisma.movie.findMany({
           where: { id: { in: movieIds } },
@@ -50,7 +58,8 @@ export class WalletService {
 
   /** Adds funds to a user's wallet and records a DEPOSIT transaction. */
   async deposit(userId: string, amount: number): Promise<Wallet> {
-    if (amount <= 0) throw new BadRequestException('Deposit amount must be positive');
+    if (amount <= 0)
+      throw new BadRequestException('Deposit amount must be positive');
 
     return this.prisma.$transaction(async (tx) => {
       const wallet = await tx.wallet.update({
@@ -58,7 +67,12 @@ export class WalletService {
         data: { balance: { increment: amount } },
       });
       await tx.transaction.create({
-        data: { userId, type: TransactionType.DEPOSIT, amount, status: 'COMPLETED' },
+        data: {
+          userId,
+          type: TransactionType.DEPOSIT,
+          amount,
+          status: 'COMPLETED',
+        },
       });
       return wallet;
     });
