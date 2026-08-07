@@ -1,10 +1,9 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { NotFoundException } from '@nestjs/common';
 import { MoviesService } from './movies.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { WalletService } from '../wallet/wallet.service';
 import { MinioService } from '../common/storage/minio.service';
-import { MovieStatus } from '../generated/prisma/client';
+import { AccessType, MovieStatus } from '../generated/prisma/client';
 
 describe('MoviesService', () => {
   let service: MoviesService;
@@ -35,7 +34,6 @@ describe('MoviesService', () => {
       providers: [
         MoviesService,
         { provide: PrismaService, useValue: prisma },
-        { provide: WalletService, useValue: {} },
         { provide: MinioService, useValue: minioService },
       ],
     }).compile();
@@ -59,8 +57,7 @@ describe('MoviesService', () => {
             genre: '',
             language: '',
             duration: 0,
-            price: 0,
-            isPremium: true,
+            accessType: AccessType.SUBSCRIPTION,
             status: MovieStatus.UPLOADING,
           }),
         });
@@ -122,18 +119,6 @@ describe('MoviesService', () => {
       expect(callData.seasonNumber).toBeUndefined();
       expect(callData.episodeNumber).toBeUndefined();
       expect(prisma.series.findUnique).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('purchase', () => {
-    it('rejects buying an individual episode — the whole series is the product, never single episodes', async () => {
-      prisma.movie.findUnique.mockResolvedValue({
-        id: 'movie-1',
-        status: MovieStatus.PUBLISHED,
-        seriesId: 'series-1',
-      });
-
-      await expect(service.purchase('user-1', 'movie-1')).rejects.toThrow(ConflictException);
     });
   });
 

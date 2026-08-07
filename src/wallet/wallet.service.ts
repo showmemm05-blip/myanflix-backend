@@ -80,25 +80,32 @@ export class WalletService {
 
   /**
    * Debits a wallet within an existing transaction context (used by the
-   * purchase flow, which must also create the Purchase row atomically).
-   * Throws if the balance is insufficient.
+   * subscribe flow, which must also create the UserSubscription row
+   * atomically). Throws if the balance is insufficient.
+   *
+   * The check and the write happen in one conditional UPDATE (`balance >=
+   * amount`) rather than a separate read-then-check-then-write — two
+   * concurrent debits (e.g. a double-tap Subscribe) could otherwise both
+   * read the same balance before either write commits, both pass the check,
+   * and both apply, letting the balance go negative.
    */
   async debitWithinTransaction(
     tx: Prisma.TransactionClient,
     userId: string,
     amount: number,
   ): Promise<Wallet> {
-    const wallet = await tx.wallet.findUnique({ where: { userId } });
-    if (!wallet) throw new NotFoundException('Wallet not found for this user');
+    const result = await tx.wallet.updateMany({
+      where: { userId, balance: { gte: amount } },
+      data: { balance: { decrement: amount } },
+    });
 
-    if (wallet.balance.lessThan(amount)) {
+    if (result.count === 0) {
+      const wallet = await tx.wallet.findUnique({ where: { userId } });
+      if (!wallet) throw new NotFoundException('Wallet not found for this user');
       throw new BadRequestException('Insufficient wallet balance');
     }
 
-    return tx.wallet.update({
-      where: { userId },
-      data: { balance: { decrement: amount } },
-    });
+    return tx.wallet.findUniqueOrThrow({ where: { userId } });
   }
 
   /**

@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  AccessType,
   Role,
   VideoStatus,
   type Prisma,
@@ -105,10 +106,11 @@ export class VideosService {
   }
 
   /**
-   * Resolves the streaming playlist for a movie, enforcing that premium
-   * titles require either a completed purchase or staff access. Subtitles
-   * are gated by the exact same purchase check (queried after it passes),
-   * not a separate rule — a subtitle track is part of the same title.
+   * Resolves the streaming playlist for a movie, enforcing that
+   * SUBSCRIPTION-access titles require either an active subscription or
+   * staff access. Subtitles are gated by the exact same check (queried
+   * after it passes), not a separate rule — a subtitle track is part of the
+   * same title.
    */
   async getStreamInfo(
     movieId: string,
@@ -122,27 +124,20 @@ export class VideosService {
     if (!movie) throw new NotFoundException('Movie not found');
 
     if (role === Role.USER) {
-      if (movie.series) {
-        // Episodes inherit access from the parent series — one SeriesPurchase
-        // unlocks every episode, including ones added after the purchase.
-        // The episode's own isPremium/price are irrelevant by design.
-        if (movie.series.isPremium) {
-          const purchase = await this.prisma.seriesPurchase.findUnique({
-            where: { userId_seriesId: { userId, seriesId: movie.series.id } },
-          });
-          if (!purchase) {
-            throw new ForbiddenException(
-              'Purchase this series to start streaming',
-            );
-          }
-        }
-      } else if (movie.isPremium) {
-        const purchase = await this.prisma.purchase.findUnique({
-          where: { userId_movieId: { userId, movieId } },
+      // Episodes inherit access from the parent series — one active
+      // subscription unlocks every episode, including ones added later. The
+      // episode's own accessType is irrelevant by design.
+      const accessType = movie.series
+        ? movie.series.accessType
+        : movie.accessType;
+
+      if (accessType === AccessType.SUBSCRIPTION) {
+        const activeSubscription = await this.prisma.userSubscription.findFirst({
+          where: { userId, expiresAt: { gt: new Date() } },
         });
-        if (!purchase) {
+        if (!activeSubscription) {
           throw new ForbiddenException(
-            'Purchase this movie to start streaming',
+            'An active subscription is required to start streaming',
           );
         }
       }

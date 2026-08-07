@@ -18,6 +18,7 @@ export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
     Permission.DEPOSIT_MANAGE,
     Permission.SUBTITLE_MANAGE,
     Permission.SERIES_MANAGE,
+    Permission.SUBSCRIPTION_MANAGE,
   ],
   // Content ingestion only — no MOVIE_DELETE (least privilege; the role's
   // pages only ever offer create/edit), no USER_MANAGE/FINANCE_VIEW/

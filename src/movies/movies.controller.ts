@@ -119,12 +119,4 @@ export class MoviesController {
   async remove(@Param('id', ParseUUIDPipe) id: string) {
     await this.moviesService.remove(id);
   }
-
-  @Post(':id/purchase')
-  async purchase(
-    @Param('id', ParseUUIDPipe) id: string,
-    @CurrentUser() user: AuthenticatedUser,
-  ) {
-    return this.moviesService.purchase(user.id, id);
-  }
 }

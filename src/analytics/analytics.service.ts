@@ -1,6 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
+import { TransactionType } from '../generated/prisma/client';
+
+/** Revenue-bearing transaction types — purchases (historical) and subscriptions (current). */
+const REVENUE_TRANSACTION_TYPES = [
+  TransactionType.PURCHASE,
+  TransactionType.SUBSCRIPTION,
+];
 
 const TOP_N = 5;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -46,7 +53,10 @@ export class AnalyticsService {
       this.getPopularMovies(),
       this.prisma.user.count({ where: { createdAt: { gte: sevenDaysAgo } } }),
       this.prisma.user.count({ where: { createdAt: { gte: thirtyDaysAgo } } }),
-      this.prisma.purchase.aggregate({ _sum: { amount: true } }),
+      this.prisma.transaction.aggregate({
+        _sum: { amount: true },
+        where: { type: { in: REVENUE_TRANSACTION_TYPES } },
+      }),
       this.prisma.movie.count(),
       this.prisma.user.count(),
       this.prisma.user.count({ where: { status: 'ACTIVE' } }),

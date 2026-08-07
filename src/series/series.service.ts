@@ -1,61 +1,52 @@
-import {
-  ConflictException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import {
   MovieStatus,
   Prisma,
   Role,
-  TransactionType,
   type Category,
   type Series,
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { WalletService } from '../wallet/wallet.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
-import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { CreateSeriesDto } from './dto/create-series.dto';
+import type { EpisodeQueryDto } from './dto/episode-query.dto';
+import type { SeriesQueryDto } from './dto/series-query.dto';
 import type { UpdateSeriesDto } from './dto/update-series.dto';
 
 type SeriesWithCategories = Series & { categories?: Category[] };
 
 /**
- * Show-level metadata CRUD plus series-level purchasing. Seasons are
+ * Show-level metadata CRUD plus series-level access. Seasons are
  * deliberately NOT rows anywhere — a "season" is just the distinct
  * seasonNumber values across a series' episodes. The whole show is one
- * purchasable product: SeriesPurchase is what unlocks every episode
- * (including future ones), episodes are never sold individually.
+ * product: its own accessType governs every season and episode (including
+ * future ones), episodes are never gated individually.
  */
 @Injectable()
 export class SeriesService {
-  constructor(
-    private readonly prisma: PrismaService,
-    private readonly walletService: WalletService,
-  ) {}
+  constructor(private readonly prisma: PrismaService) {}
 
-  /** Prisma Decimal doesn't JSON-serialize as a number — every outward-facing series passes through here. */
-  private serialize<T extends SeriesWithCategories>(series: T) {
-    return { ...series, price: decimalToNumber(series.price) };
-  }
+  async findAll(query: SeriesQueryDto) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
 
-  async findAll(pagination: PaginationQueryDto) {
-    const page = pagination.page ?? 1;
-    const limit = pagination.limit ?? 20;
+    const where: Prisma.SeriesWhereInput = {};
+    if (query.accessType) where.accessType = query.accessType;
 
     const [items, total] = await this.prisma.$transaction([
       this.prisma.series.findMany({
+        where,
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
         include: { categories: true, _count: { select: { episodes: true } } },
       }),
-      this.prisma.series.count(),
+      this.prisma.series.count({ where }),
     ]);
 
     return {
       items: items.map(({ _count, ...series }) => ({
-        ...this.serialize(series),
+        ...series,
         episodeCount: _count.episodes,
       })),
       total,
@@ -73,14 +64,9 @@ export class SeriesService {
     return series;
   }
 
-  /** Detail shape for a viewer — staff always count as owning (they never see a Buy button). */
-  async getForViewer(id: string, userId: string, role: Role) {
-    const series = await this.findByIdOrThrow(id);
-    const isPurchased =
-      role !== Role.USER ||
-      !series.isPremium ||
-      (await this.isPurchased(userId, id));
-    return { ...this.serialize(series), isPurchased };
+  /** Detail shape for a viewer — access is a global per-user subscription flag, not per-item, so it isn't computed here. */
+  async getForViewer(id: string, _userId: string, _role: Role) {
+    return this.findByIdOrThrow(id);
   }
 
   async create(dto: CreateSeriesDto) {
@@ -94,7 +80,7 @@ export class SeriesService {
       },
       include: { categories: true },
     });
-    return this.serialize(created);
+    return created;
   }
 
   async update(id: string, dto: UpdateSeriesDto) {
@@ -110,7 +96,7 @@ export class SeriesService {
       },
       include: { categories: true },
     });
-    return this.serialize(updated);
+    return updated;
   }
 
   /**
@@ -163,57 +149,132 @@ export class SeriesService {
     });
   }
 
-  async isPurchased(userId: string, seriesId: string): Promise<boolean> {
-    const purchase = await this.prisma.seriesPurchase.findUnique({
-      where: { userId_seriesId: { userId, seriesId } },
+  /**
+   * Episodes grouped by season for the player page's "Episodes" section,
+   * each annotated with the caller's own watch progress. Two queries total
+   * regardless of episode count — the episode list, then one batched
+   * watch-history lookup keyed by movieId — never N+1 per episode. Mirrors
+   * UsersService.getWalletSummaries' batching pattern (findMany with `{in}`
+   * + a Map for O(1) lookup while assembling the response).
+   */
+  async getPlayerEpisodes(seriesId: string, userId: string, viewerRole: Role) {
+    await this.findByIdOrThrow(seriesId);
+
+    const where: Prisma.MovieWhereInput = { seriesId };
+    if (viewerRole === Role.USER) where.status = MovieStatus.PUBLISHED;
+
+    const episodes = await this.prisma.movie.findMany({
+      where,
+      select: {
+        id: true,
+        title: true,
+        seasonNumber: true,
+        episodeNumber: true,
+        duration: true,
+        thumbnailUrl: true,
+        posterUrl: true,
+      },
+      orderBy: [
+        { seasonNumber: 'asc' },
+        { episodeNumber: 'asc' },
+        { createdAt: 'asc' },
+      ],
     });
-    return Boolean(purchase);
+
+    const episodeIds = episodes.map((e) => e.id);
+    const watchHistory = episodeIds.length
+      ? await this.prisma.watchHistory.findMany({
+          where: { userId, movieId: { in: episodeIds } },
+          select: { movieId: true, progress: true, lastPosition: true },
+        })
+      : [];
+    const progressByMovieId = new Map(
+      watchHistory.map((w) => [
+        w.movieId,
+        { progressPercent: w.progress, lastPositionSeconds: w.lastPosition },
+      ]),
+    );
+
+    const seasons = new Map<number, typeof episodes>();
+    for (const episode of episodes) {
+      // A real episode always has a seasonNumber (assigned at upload time,
+      // see admin's addFolders) — anything without one can't be grouped
+      // usefully here and is skipped, same defensive filter getSeasons()
+      // already applies.
+      if (episode.seasonNumber == null) continue;
+      if (!seasons.has(episode.seasonNumber)) {
+        seasons.set(episode.seasonNumber, []);
+      }
+      seasons.get(episode.seasonNumber)!.push(episode);
+    }
+
+    return {
+      seasons: Array.from(seasons.entries())
+        .sort(([a], [b]) => a - b)
+        .map(([seasonNumber, seasonEpisodes]) => ({
+          seasonNumber,
+          episodes: seasonEpisodes.map((e) => ({
+            id: e.id,
+            title: e.title,
+            episodeNumber: e.episodeNumber,
+            duration: e.duration,
+            thumbnailUrl: e.thumbnailUrl,
+            posterUrl: e.posterUrl,
+            watchProgress: progressByMovieId.get(e.id) ?? null,
+          })),
+        })),
+    };
+  }
+
+  private buildEpisodeWhere(filters: {
+    seriesId?: string;
+    seasonNumber?: number;
+    status?: MovieStatus;
+  }): Prisma.MovieWhereInput {
+    const where: Prisma.MovieWhereInput = {
+      seriesId: filters.seriesId ?? { not: null },
+    };
+    if (filters.seasonNumber !== undefined)
+      where.seasonNumber = filters.seasonNumber;
+    if (filters.status) where.status = filters.status;
+    return where;
   }
 
   /**
-   * One purchase unlocks the entire show — every season and episode,
-   * including any added later, since episode access is derived from this
-   * row rather than anything per-episode. Mirrors MoviesService.purchase():
-   * wallet debit + purchase row + ledger transaction, atomically.
+   * Cross-series episode listing for the admin's Series > Ready to Publish
+   * tab. Episodes are just Movie rows with seriesId set, so this queries
+   * Movie directly (with the owning series' title attached) rather than
+   * living per-series the way getEpisodes()/getPlayerEpisodes() do.
    */
-  async purchase(userId: string, seriesId: string) {
-    const series = await this.prisma.series.findUnique({
-      where: { id: seriesId },
-    });
-    if (!series) throw new NotFoundException('Series not found');
+  async findEpisodesForAdmin(query: EpisodeQueryDto) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const where = this.buildEpisodeWhere(query);
 
-    const alreadyOwned = await this.isPurchased(userId, seriesId);
-    if (alreadyOwned)
-      throw new ConflictException('You already own this series');
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.movie.findMany({
+        where,
+        include: { series: { select: { id: true, title: true } } },
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.movie.count({ where }),
+    ]);
 
-    return this.prisma.$transaction(async (tx) => {
-      const amount = series.isPremium ? series.price : new Prisma.Decimal(0);
-
-      if (series.isPremium) {
-        await this.walletService.debitWithinTransaction(
-          tx,
-          userId,
-          amount.toNumber(),
-        );
-      }
-
-      const purchase = await tx.seriesPurchase.create({
-        data: { userId, seriesId, amount },
-      });
-      await tx.transaction.create({
-        data: {
-          userId,
-          type: TransactionType.PURCHASE,
-          amount,
-          status: 'COMPLETED',
-        },
-      });
-
-      return purchase;
-    });
+    return { items, total, page, limit };
   }
 
-  /** The caller's owned series — what the userwebsite's library context loads to know which shows are unlocked. */
+  /** Count-only counterpart to findEpisodesForAdmin(), for the sidebar badge. */
+  async countEpisodesForAdmin(filters: {
+    seriesId?: string;
+    seasonNumber?: number;
+    status?: MovieStatus;
+  }): Promise<number> {
+    return this.prisma.movie.count({ where: this.buildEpisodeWhere(filters) });
+  }
+
+  /** The caller's owned series — historical purchase records from before the subscription model. */
   async getPurchasesForUser(userId: string) {
     const purchases = await this.prisma.seriesPurchase.findMany({
       where: { userId },

@@ -17,7 +17,10 @@ import {
   MovieStatus,
   VideoStatus,
   TransactionType,
+  AccessType,
 } from '../generated/prisma/client';
+
+const SUBSCRIPTION_DURATION_DAYS = 30;
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
@@ -29,6 +32,8 @@ async function resetData() {
   await prisma.watchHistory.deleteMany();
   await prisma.transaction.deleteMany();
   await prisma.purchase.deleteMany();
+  await prisma.userSubscription.deleteMany();
+  await prisma.subscriptionPlan.deleteMany();
   await prisma.uploadSession.deleteMany();
   await prisma.video.deleteMany();
   await prisma.refreshToken.deleteMany();
@@ -156,8 +161,7 @@ interface MovieSeed {
   language: string;
   releaseYear: number;
   duration: number;
-  price: number;
-  isPremium: boolean;
+  accessType: AccessType;
   status: MovieStatus;
   rating: number;
   categories: string[];
@@ -172,8 +176,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'English',
     releaseYear: 2022,
     duration: 192,
-    price: 15000,
-    isPremium: true,
+    accessType: AccessType.SUBSCRIPTION,
     status: MovieStatus.PUBLISHED,
     rating: 4.7,
     categories: ['Sci-Fi', 'Action'],
@@ -186,8 +189,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'English',
     releaseYear: 2019,
     duration: 181,
-    price: 12000,
-    isPremium: true,
+    accessType: AccessType.SUBSCRIPTION,
     status: MovieStatus.PUBLISHED,
     rating: 4.9,
     categories: ['Action', 'Sci-Fi'],
@@ -200,8 +202,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'English',
     releaseYear: 2010,
     duration: 148,
-    price: 9000,
-    isPremium: true,
+    accessType: AccessType.SUBSCRIPTION,
     status: MovieStatus.PUBLISHED,
     rating: 4.8,
     categories: ['Sci-Fi', 'Thriller'],
@@ -214,8 +215,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'English',
     releaseYear: 2008,
     duration: 152,
-    price: 7500,
-    isPremium: true,
+    accessType: AccessType.SUBSCRIPTION,
     status: MovieStatus.PUBLISHED,
     rating: 4.9,
     categories: ['Action', 'Crime', 'Drama'],
@@ -228,8 +228,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'English',
     releaseYear: 2014,
     duration: 169,
-    price: 10000,
-    isPremium: true,
+    accessType: AccessType.SUBSCRIPTION,
     status: MovieStatus.PUBLISHED,
     rating: 4.8,
     categories: ['Sci-Fi', 'Drama'],
@@ -242,8 +241,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'Korean',
     releaseYear: 2019,
     duration: 132,
-    price: 7500,
-    isPremium: true,
+    accessType: AccessType.SUBSCRIPTION,
     status: MovieStatus.PUBLISHED,
     rating: 4.9,
     categories: ['Drama', 'Thriller'],
@@ -256,8 +254,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'English',
     releaseYear: 2023,
     duration: 140,
-    price: 0,
-    isPremium: false,
+    accessType: AccessType.FREE,
     status: MovieStatus.PUBLISHED,
     rating: 4.9,
     categories: ['Animation', 'Action'],
@@ -269,8 +266,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'English',
     releaseYear: 2016,
     duration: 128,
-    price: 0,
-    isPremium: false,
+    accessType: AccessType.FREE,
     status: MovieStatus.PUBLISHED,
     rating: 4.6,
     categories: ['Romance', 'Comedy'],
@@ -283,8 +279,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'English',
     releaseYear: 2019,
     duration: 122,
-    price: 7500,
-    isPremium: true,
+    accessType: AccessType.SUBSCRIPTION,
     status: MovieStatus.PUBLISHED,
     rating: 4.7,
     categories: ['Crime', 'Drama', 'Thriller'],
@@ -297,8 +292,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'English',
     releaseYear: 2019,
     duration: 103,
-    price: 6000,
-    isPremium: true,
+    accessType: AccessType.SUBSCRIPTION,
     status: MovieStatus.PUBLISHED,
     rating: 4.5,
     categories: ['Animation'],
@@ -311,8 +305,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'English',
     releaseYear: 2023,
     duration: 180,
-    price: 13500,
-    isPremium: true,
+    accessType: AccessType.SUBSCRIPTION,
     status: MovieStatus.PUBLISHED,
     rating: 4.8,
     categories: ['Drama', 'Documentary'],
@@ -325,8 +318,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'English',
     releaseYear: 2021,
     duration: 114,
-    price: 4500,
-    isPremium: true,
+    accessType: AccessType.SUBSCRIPTION,
     status: MovieStatus.PUBLISHED,
     rating: 4.1,
     categories: ['Drama'],
@@ -339,8 +331,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'Burmese',
     releaseYear: 2026,
     duration: 109,
-    price: 5000,
-    isPremium: true,
+    accessType: AccessType.SUBSCRIPTION,
     status: MovieStatus.DRAFT,
     rating: 0,
     categories: ['Drama', 'Romance'],
@@ -353,8 +344,7 @@ const MOVIE_SEEDS: MovieSeed[] = [
     language: 'English',
     releaseYear: 2026,
     duration: 118,
-    price: 8000,
-    isPremium: true,
+    accessType: AccessType.SUBSCRIPTION,
     status: MovieStatus.PROCESSING,
     rating: 0,
     categories: ['Thriller', 'Crime'],
@@ -372,8 +362,7 @@ async function seedMovies(categoriesByName: Map<string, { id: string }>) {
           language: seed.language,
           releaseYear: seed.releaseYear,
           duration: seed.duration,
-          price: seed.price,
-          isPremium: seed.isPremium,
+          accessType: seed.accessType,
           status: seed.status,
           rating: seed.rating,
           posterUrl: `https://picsum.photos/seed/${encodeURIComponent(seed.title)}/400/600`,
@@ -430,37 +419,69 @@ async function seedMovies(categoriesByName: Map<string, { id: string }>) {
   return movies;
 }
 
+async function seedSubscriptionPlans() {
+  const plans = await Promise.all([
+    prisma.subscriptionPlan.create({
+      data: { name: 'Basic', price: 5000, isActive: true },
+    }),
+    prisma.subscriptionPlan.create({
+      data: { name: 'Premium', price: 9000, isActive: true },
+    }),
+    prisma.subscriptionPlan.create({
+      data: { name: 'Family (retired)', price: 12000, isActive: false },
+    }),
+  ]);
+  return plans;
+}
+
+/**
+ * A handful of users get historical per-movie Purchase rows, predating the
+ * switch to subscriptions — this is frozen audit-trail data, no longer how
+ * access is granted, so the amounts are synthetic (Movie no longer carries
+ * a price). The rest of the users get an active UserSubscription instead,
+ * which is what actually gates SUBSCRIPTION content today.
+ */
 async function seedCommerceAndHistory(
   users: { id: string }[],
   movies: {
     id: string;
-    price: Prisma.Decimal;
-    isPremium: boolean;
+    accessType: AccessType;
     status: MovieStatus;
     duration: number;
   }[],
+  plans: { id: string; price: Prisma.Decimal }[],
 ) {
-  const premiumPublished = movies.filter(
-    (m) => m.isPremium && m.status === MovieStatus.PUBLISHED,
+  const subscriptionPublished = movies.filter(
+    (m) => m.accessType === AccessType.SUBSCRIPTION && m.status === MovieStatus.PUBLISHED,
   );
   const freePublished = movies.filter(
-    (m) => !m.isPremium && m.status === MovieStatus.PUBLISHED,
+    (m) => m.accessType === AccessType.FREE && m.status === MovieStatus.PUBLISHED,
   );
 
   for (const [index, user] of users.entries()) {
-    // Each user buys a handful of premium titles, deterministically varied per user.
-    const purchaseCount = 2 + (index % 4);
-    const purchasedMovies = premiumPublished
-      .slice(index % premiumPublished.length)
-      .concat(premiumPublished.slice(0, index % premiumPublished.length))
-      .slice(0, purchaseCount);
+    // Even-indexed users get historical individual purchases; odd-indexed
+    // users get an active subscription — both cohorts also get a deposit
+    // large enough to cover whichever path they're on.
+    const isHistoricalBuyer = index % 2 === 0;
+    const plan = plans[index % plans.length];
 
-    const totalSpent = purchasedMovies.reduce(
-      (sum, m) => sum + m.price.toNumber(),
-      0,
+    const purchaseCount = 2 + (index % 4);
+    const purchasedMovies = isHistoricalBuyer
+      ? subscriptionPublished
+          .slice(index % subscriptionPublished.length)
+          .concat(
+            subscriptionPublished.slice(0, index % subscriptionPublished.length),
+          )
+          .slice(0, purchaseCount)
+      : [];
+
+    const syntheticAmounts = purchasedMovies.map(
+      (_, pIndex) => 4500 + (pIndex % 4) * 2500,
     );
+    const totalSpent = syntheticAmounts.reduce((sum, a) => sum + a, 0);
+    const subscriptionSpent = isHistoricalBuyer ? 0 : plan.price.toNumber();
     const leftoverBalance = 5000 + (index % 5) * 3000;
-    const depositAmount = totalSpent + leftoverBalance;
+    const depositAmount = totalSpent + subscriptionSpent + leftoverBalance;
 
     await prisma.wallet.update({
       where: { userId: user.id },
@@ -478,12 +499,13 @@ async function seedCommerceAndHistory(
     });
 
     for (const [pIndex, movie] of purchasedMovies.entries()) {
-      const purchasedAt = daysAgo(20 - pIndex * 3);
+      const purchasedAt = daysAgo(60 - pIndex * 3);
+      const amount = syntheticAmounts[pIndex];
       await prisma.purchase.create({
         data: {
           userId: user.id,
           movieId: movie.id,
-          amount: movie.price,
+          amount,
           createdAt: purchasedAt,
         },
       });
@@ -492,7 +514,7 @@ async function seedCommerceAndHistory(
           userId: user.id,
           movieId: movie.id,
           type: TransactionType.PURCHASE,
-          amount: movie.price,
+          amount,
           status: 'COMPLETED',
           createdAt: purchasedAt,
         },
@@ -510,7 +532,49 @@ async function seedCommerceAndHistory(
       });
     }
 
-    // Everyone can freely sample the non-premium catalog too.
+    if (!isHistoricalBuyer) {
+      const startedAt = daysAgo(5 + (index % 10));
+      const expiresAt = new Date(
+        startedAt.getTime() + SUBSCRIPTION_DURATION_DAYS * 24 * 60 * 60 * 1000,
+      );
+      await prisma.userSubscription.create({
+        data: {
+          userId: user.id,
+          planId: plan.id,
+          amount: plan.price,
+          startedAt,
+          expiresAt,
+        },
+      });
+      await prisma.transaction.create({
+        data: {
+          userId: user.id,
+          type: TransactionType.SUBSCRIPTION,
+          amount: plan.price,
+          status: 'COMPLETED',
+          createdAt: startedAt,
+        },
+      });
+
+      // Subscribers get a taste of a couple of subscription-only titles too.
+      const watched = subscriptionPublished
+        .slice(index % subscriptionPublished.length)
+        .slice(0, 2);
+      for (const [wIndex, movie] of watched.entries()) {
+        await prisma.watchHistory.upsert({
+          where: { userId_movieId: { userId: user.id, movieId: movie.id } },
+          create: {
+            userId: user.id,
+            movieId: movie.id,
+            progress: wIndex === 0 ? 80 : 25,
+            lastPosition: Math.round((movie.duration * 60 * 0.5) / (wIndex + 1)),
+          },
+          update: {},
+        });
+      }
+    }
+
+    // Everyone, subscribed or not, can freely sample the free catalog.
     const freeSample = freePublished[index % freePublished.length];
     if (freeSample) {
       await prisma.watchHistory.upsert({
@@ -538,7 +602,9 @@ async function main() {
   const categoriesByName = await seedCategories();
   const { staff, users } = await seedUsers();
   const movies = await seedMovies(categoriesByName);
-  await seedCommerceAndHistory(users, movies);
+  const plans = await seedSubscriptionPlans();
+  const activePlans = plans.filter((p) => p.isActive);
+  await seedCommerceAndHistory(users, movies, activePlans);
 
   console.log('Seed complete:');
   console.log(`  categories: ${categoriesByName.size}`);
@@ -546,6 +612,7 @@ async function main() {
     `  users: ${staff.length + users.length} (${staff.length} staff, ${users.length} regular)`,
   );
   console.log(`  movies: ${movies.length}`);
+  console.log(`  subscription plans: ${plans.length}`);
   console.log(
     `  default password for every seeded account: ${DEFAULT_PASSWORD}`,
   );

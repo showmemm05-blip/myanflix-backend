@@ -1,4 +1,3 @@
-import { decimalToNumber } from '../../common/utils/decimal.util';
 import type { Category, Movie } from '../../generated/prisma/client';
 
 type MovieWithCategories = Movie & { categories?: Category[] };
@@ -17,8 +16,7 @@ export class MovieResponseDto {
       releaseYear: movie.releaseYear,
       duration: movie.duration,
       rating: movie.rating,
-      price: decimalToNumber(movie.price),
-      isPremium: movie.isPremium,
+      accessType: movie.accessType,
       status: movie.status,
       seriesId: movie.seriesId,
       seasonNumber: movie.seasonNumber,

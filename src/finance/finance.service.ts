@@ -1,7 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
-import type { Prisma } from '../generated/prisma/client';
+import { TransactionType, type Prisma } from '../generated/prisma/client';
+
+/** Revenue-bearing transaction types — everything that ever put money in, purchases (historical) and subscriptions (current). */
+const REVENUE_TRANSACTION_TYPES = [
+  TransactionType.PURCHASE,
+  TransactionType.SUBSCRIPTION,
+];
 
 const TOP_N = 5;
 const MONTH_LABELS = [
@@ -84,14 +90,23 @@ export class FinanceService {
       topMovies,
       topUsers,
     ] = await Promise.all([
-      this.prisma.purchase.aggregate({ _sum: { amount: true } }),
-      this.prisma.purchase.aggregate({
+      this.prisma.transaction.aggregate({
         _sum: { amount: true },
-        where: { createdAt: { gte: startOfMonth() } },
+        where: { type: { in: REVENUE_TRANSACTION_TYPES } },
       }),
-      this.prisma.purchase.aggregate({
+      this.prisma.transaction.aggregate({
         _sum: { amount: true },
-        where: { createdAt: { gte: startOfToday() } },
+        where: {
+          type: { in: REVENUE_TRANSACTION_TYPES },
+          createdAt: { gte: startOfMonth() },
+        },
+      }),
+      this.prisma.transaction.aggregate({
+        _sum: { amount: true },
+        where: {
+          type: { in: REVENUE_TRANSACTION_TYPES },
+          createdAt: { gte: startOfToday() },
+        },
       }),
       this.getTopMovies(),
       this.getTopUsers(),
@@ -111,20 +126,23 @@ export class FinanceService {
     const oneYearAgo = new Date();
     oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
 
-    const purchases = await this.prisma.purchase.findMany({
-      where: { createdAt: { gte: oneYearAgo } },
+    const transactions = await this.prisma.transaction.findMany({
+      where: {
+        type: { in: REVENUE_TRANSACTION_TYPES },
+        createdAt: { gte: oneYearAgo },
+      },
       select: { amount: true, createdAt: true },
     });
 
     return {
-      daily: this.bucketRevenue(purchases, 14, DAILY_GRANULARITY),
-      weekly: this.bucketRevenue(purchases, 12, WEEKLY_GRANULARITY),
-      monthly: this.bucketRevenue(purchases, 12, MONTHLY_GRANULARITY),
+      daily: this.bucketRevenue(transactions, 14, DAILY_GRANULARITY),
+      weekly: this.bucketRevenue(transactions, 12, WEEKLY_GRANULARITY),
+      monthly: this.bucketRevenue(transactions, 12, MONTHLY_GRANULARITY),
     };
   }
 
   private bucketRevenue(
-    purchases: { amount: Prisma.Decimal; createdAt: Date }[],
+    transactions: { amount: Prisma.Decimal; createdAt: Date }[],
     bucketCount: number,
     granularity: RevenueBucketGranularity,
   ) {
@@ -147,10 +165,10 @@ export class FinanceService {
       }
     }
 
-    for (const purchase of purchases) {
-      const key = granularity.key(purchase.createdAt);
+    for (const transaction of transactions) {
+      const key = granularity.key(transaction.createdAt);
       const bucket = buckets.get(key);
-      if (bucket) bucket.revenue += decimalToNumber(purchase.amount);
+      if (bucket) bucket.revenue += decimalToNumber(transaction.amount);
     }
 
     return [...buckets.values()]
@@ -158,6 +176,11 @@ export class FinanceService {
       .map(({ label, revenue }) => ({ label, revenue: Math.round(revenue) }));
   }
 
+  /**
+   * Stays sourced from the (now-historical, frozen) Purchase table —
+   * subscription revenue has no per-movie attribution, so "top movies by
+   * revenue" can only ever reflect direct-purchase history going forward.
+   */
   private async getTopMovies() {
     const grouped = await this.prisma.purchase.groupBy({
       by: ['movieId'],

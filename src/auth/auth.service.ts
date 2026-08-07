@@ -69,14 +69,14 @@ export class AuthService {
   async login(
     dto: LoginDto,
   ): Promise<{ user: AuthenticatedUser } & AuthTokens> {
-    const user = await this.usersService.findByEmail(dto.email);
+    const user = await this.usersService.findByUsername(dto.username);
     if (!user) {
-      throw new UnauthorizedException('Invalid email or password');
+      throw new UnauthorizedException('Invalid username or password');
     }
 
     const passwordMatches = await bcrypt.compare(dto.password, user.password);
     if (!passwordMatches) {
-      throw new UnauthorizedException('Invalid email or password');
+      throw new UnauthorizedException('Invalid username or password');
     }
 
     if (user.status !== 'ACTIVE') {
@@ -89,7 +89,10 @@ export class AuthService {
       username: user.username,
       role: user.role,
     };
-    const tokens = await this.issueTokens(authenticatedUser);
+    const [tokens] = await Promise.all([
+      this.issueTokens(authenticatedUser),
+      this.usersService.updateLastLogin(user.id),
+    ]);
     return { user: authenticatedUser, ...tokens };
   }
 

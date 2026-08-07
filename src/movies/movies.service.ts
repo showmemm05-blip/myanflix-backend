@@ -1,19 +1,13 @@
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
-  ConflictException,
-  Injectable,
-  Logger,
-  NotFoundException,
-} from '@nestjs/common';
-import {
+  AccessType,
   MovieStatus,
   Prisma,
   Role,
-  TransactionType,
   type Category,
   type Movie,
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { WalletService } from '../wallet/wallet.service';
 import { MinioService } from '../common/storage/minio.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
@@ -31,7 +25,6 @@ export class MoviesService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly walletService: WalletService,
     private readonly minioService: MinioService,
   ) {}
 
@@ -45,15 +38,18 @@ export class MoviesService {
     if (viewerRole === Role.USER) {
       where.status = MovieStatus.PUBLISHED;
       // Episodes never surface in the public movies catalog — they're
-      // reached through their series (GET /series/:id/episodes). Staff
-      // still see them here so the admin tables can manage everything.
+      // reached through their series (GET /series/:id/episodes).
       where.seriesId = null;
-    } else if (query.status) {
-      where.status = query.status;
+    } else {
+      if (query.status) where.status = query.status;
+      // The Movies module (All Movies, Movies Ready to Publish) manages
+      // standalone movies only — episodes belong to the Series module's own
+      // Ready to Publish view (GET /series/episodes). Passing seriesId
+      // explicitly still lets staff tooling look up one series' episodes.
+      where.seriesId = query.seriesId ?? null;
     }
 
-    if (query.seriesId && viewerRole !== Role.USER)
-      where.seriesId = query.seriesId;
+    if (query.accessType) where.accessType = query.accessType;
     if (query.genre) where.genre = { equals: query.genre, mode: 'insensitive' };
     if (query.categoryId) where.categories = { some: { id: query.categoryId } };
     if (query.search) {
@@ -149,8 +145,7 @@ export class MoviesService {
         language: inherited?.language ?? '',
         releaseYear: inherited?.releaseYear ?? new Date().getFullYear(),
         duration: 0,
-        price: 0,
-        isPremium: true,
+        accessType: AccessType.SUBSCRIPTION,
         status: MovieStatus.UPLOADING,
         seriesId: series?.seriesId,
         seasonNumber: series?.seasonNumber,
@@ -219,58 +214,6 @@ export class MoviesService {
         `Failed to clean up storage for deleted movie ${id}: ${(error as Error).message}`,
       );
     }
-  }
-
-  /** User wallet -> purchase movie -> create transaction -> grant movie access. */
-  async purchase(userId: string, movieId: string) {
-    const movie = await this.prisma.movie.findUnique({
-      where: { id: movieId },
-    });
-    if (!movie || movie.status !== MovieStatus.PUBLISHED) {
-      throw new NotFoundException('Movie not found');
-    }
-
-    // Episodes are never sold individually — the series is the product, and
-    // one SeriesPurchase unlocks every episode (SeriesService.purchase).
-    if (movie.seriesId) {
-      throw new ConflictException(
-        'Episodes are unlocked by purchasing the whole series',
-      );
-    }
-
-    const alreadyOwned = await this.prisma.purchase.findUnique({
-      where: { userId_movieId: { userId, movieId } },
-    });
-    if (alreadyOwned) {
-      throw new ConflictException('You already own this movie');
-    }
-
-    return this.prisma.$transaction(async (tx) => {
-      const amount = movie.isPremium ? movie.price : new Prisma.Decimal(0);
-
-      if (movie.isPremium) {
-        await this.walletService.debitWithinTransaction(
-          tx,
-          userId,
-          amount.toNumber(),
-        );
-      }
-
-      const purchase = await tx.purchase.create({
-        data: { userId, movieId, amount },
-      });
-      await tx.transaction.create({
-        data: {
-          userId,
-          movieId,
-          type: TransactionType.PURCHASE,
-          amount,
-          status: 'COMPLETED',
-        },
-      });
-
-      return purchase;
-    });
   }
 
   /** Published movies ranked by how many users have purchased them. */

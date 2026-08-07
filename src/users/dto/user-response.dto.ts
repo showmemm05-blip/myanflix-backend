@@ -13,7 +13,8 @@ export class UserResponseDto {
   balance?: number;
   totalDeposited?: number;
   totalSpent?: number;
-  moviesPurchased?: number;
+  isSubscribed?: boolean;
+  subscriptionExpiresAt?: Date | null;
 
   static fromEntity(user: User, wallet?: WalletSummary): UserResponseDto {
     const dto = new UserResponseDto();
@@ -29,7 +30,8 @@ export class UserResponseDto {
       dto.balance = wallet.balance;
       dto.totalDeposited = wallet.totalDeposited;
       dto.totalSpent = wallet.totalSpent;
-      dto.moviesPurchased = wallet.moviesPurchased;
+      dto.isSubscribed = wallet.isSubscribed;
+      dto.subscriptionExpiresAt = wallet.subscriptionExpiresAt;
     }
     return dto;
   }

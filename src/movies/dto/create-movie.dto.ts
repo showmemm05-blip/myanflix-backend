@@ -1,7 +1,7 @@
 import {
   ArrayUnique,
   IsArray,
-  IsBoolean,
+  IsEnum,
   IsInt,
   IsOptional,
   IsString,
@@ -13,6 +13,7 @@ import {
   MinLength,
 } from 'class-validator';
 import { Type } from 'class-transformer';
+import { AccessType } from '../../generated/prisma/client';
 
 export class CreateMovieDto {
   @IsString()
@@ -58,13 +59,9 @@ export class CreateMovieDto {
   @Min(1)
   duration!: number;
 
-  @Type(() => Number)
-  @Min(0)
-  price!: number;
-
   @IsOptional()
-  @IsBoolean()
-  isPremium?: boolean = true;
+  @IsEnum(AccessType)
+  accessType?: AccessType = AccessType.SUBSCRIPTION;
 
   @IsOptional()
   @IsArray()

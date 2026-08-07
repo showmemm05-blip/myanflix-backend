@@ -14,13 +14,14 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { MovieResponseDto } from '../movies/dto/movie-response.dto';
 import { CreateSeriesDto } from './dto/create-series.dto';
+import { EpisodeQueryDto } from './dto/episode-query.dto';
+import { SeriesQueryDto } from './dto/series-query.dto';
 import { UpdateSeriesDto } from './dto/update-series.dto';
 import { SeriesService } from './series.service';
 
@@ -29,8 +30,8 @@ export class SeriesController {
   constructor(private readonly seriesService: SeriesService) {}
 
   @Get()
-  findAll(@Query() pagination: PaginationQueryDto) {
-    return this.seriesService.findAll(pagination);
+  findAll(@Query() query: SeriesQueryDto) {
+    return this.seriesService.findAll(query);
   }
 
   /** Registered before ':id' so "me" is never parsed as a series UUID. */
@@ -39,21 +40,43 @@ export class SeriesController {
     return this.seriesService.getPurchasesForUser(user.id);
   }
 
+  /**
+   * Cross-series episode listing for the admin's Series > Ready to Publish
+   * tab, filterable by series/season/status. Registered before ':id' so
+   * "episodes" is never parsed as a series UUID.
+   */
+  @Get('episodes')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions(Permission.SERIES_MANAGE)
+  async findEpisodes(@Query() query: EpisodeQueryDto) {
+    const { items, total, page, limit } =
+      await this.seriesService.findEpisodesForAdmin(query);
+    return {
+      items: items.map((episode) => ({
+        ...MovieResponseDto.fromEntity(episode),
+        seriesTitle: episode.series?.title ?? null,
+      })),
+      total,
+      page,
+      limit,
+    };
+  }
+
+  /** Count-only counterpart to GET /series/episodes, for the sidebar badge. */
+  @Get('episodes/count')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions(Permission.SERIES_MANAGE)
+  async countEpisodes(@Query() query: EpisodeQueryDto) {
+    const count = await this.seriesService.countEpisodesForAdmin(query);
+    return { count };
+  }
+
   @Get(':id')
   findOne(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.seriesService.getForViewer(id, user.id, user.role);
-  }
-
-  /** One purchase for the whole show — episodes are never bought individually. */
-  @Post(':id/purchase')
-  purchase(
-    @Param('id', ParseUUIDPipe) id: string,
-    @CurrentUser() user: AuthenticatedUser,
-  ) {
-    return this.seriesService.purchase(user.id, id);
   }
 
   @Get(':id/seasons')
@@ -74,6 +97,15 @@ export class SeriesController {
       seasonNumber,
     );
     return episodes.map((e) => MovieResponseDto.fromEntity(e));
+  }
+
+  /** Grouped-by-season episode list + the caller's own watch progress, for the player page's "Episodes" section. */
+  @Get(':id/player-episodes')
+  getPlayerEpisodes(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.seriesService.getPlayerEpisodes(id, user.id, user.role);
   }
 
   @Post()

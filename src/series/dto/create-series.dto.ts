@@ -1,7 +1,7 @@
 import {
   ArrayUnique,
   IsArray,
-  IsBoolean,
+  IsEnum,
   IsInt,
   IsOptional,
   IsString,
@@ -13,6 +13,7 @@ import {
   MinLength,
 } from 'class-validator';
 import { Type } from 'class-transformer';
+import { AccessType } from '../../generated/prisma/client';
 
 export class CreateSeriesDto {
   @IsString()
@@ -49,15 +50,10 @@ export class CreateSeriesDto {
   @Max(2100)
   releaseYear!: number;
 
-  /** One price for the whole show — episodes are never sold individually. */
+  /** One access type for the whole show — episodes are never gated individually. */
   @IsOptional()
-  @Type(() => Number)
-  @Min(0)
-  price?: number;
-
-  @IsOptional()
-  @IsBoolean()
-  isPremium?: boolean;
+  @IsEnum(AccessType)
+  accessType?: AccessType = AccessType.SUBSCRIPTION;
 
   @IsOptional()
   @IsArray()

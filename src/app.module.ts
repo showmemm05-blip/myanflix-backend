@@ -10,6 +10,7 @@ import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard';
 import { UsersModule } from './users/users.module';
 import { RolesModule } from './roles/roles.module';
+import { StaffModule } from './staff/staff.module';
 import { CategoriesModule } from './categories/categories.module';
 import { MoviesModule } from './movies/movies.module';
 import { VideosModule } from './videos/videos.module';
@@ -24,6 +25,7 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { SubtitlesModule } from './subtitles/subtitles.module';
 import { SeriesModule } from './series/series.module';
+import { SubscriptionsModule } from './subscriptions/subscriptions.module';
 
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
@@ -42,6 +44,7 @@ import { AppService } from './app.service';
     AuthModule,
     UsersModule,
     RolesModule,
+    StaffModule,
     CategoriesModule,
     MoviesModule,
     VideosModule,
@@ -56,6 +59,7 @@ import { AppService } from './app.service';
     RealtimeModule,
     SubtitlesModule,
     SeriesModule,
+    SubscriptionsModule,
   ],
   controllers: [AppController],
   providers: [
