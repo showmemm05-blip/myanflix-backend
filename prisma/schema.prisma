@@ -63,6 +63,7 @@ enum TransactionType {
   PURCHASE
   REFUND
   SUBSCRIPTION
+  WITHDRAWAL
 }
 
 /// FREE content is streamable by anyone; SUBSCRIPTION content requires an
@@ -85,9 +86,20 @@ enum DepositStatus {
   REJECTED
 }
 
+/// Declared in this order deliberately — Postgres native enums sort by
+/// declaration order, not alphabetically, so `ORDER BY status ASC` puts
+/// PENDING rows first without any raw SQL or extra sort key.
+enum WithdrawalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 enum NotificationType {
   DEPOSIT_APPROVED
   DEPOSIT_REJECTED
+  WITHDRAWAL_APPROVED
+  WITHDRAWAL_REJECTED
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +130,11 @@ model User {
   deposits         Deposit[]
   depositApprovals Deposit[]      @relation("DepositApprovals")
   notifications    Notification[]
+  paymentAccountsCreated PaymentAccount[] @relation("PaymentAccountCreatedBy")
+  paymentAccountsUpdated PaymentAccount[] @relation("PaymentAccountUpdatedBy")
+  withdrawals         Withdrawal[]
+  withdrawalApprovals Withdrawal[] @relation("WithdrawalApprovals")
+  financeSettingsUpdates FinanceSettings[] @relation("FinanceSettingsUpdatedBy")
 
   @@map("users")
 }
@@ -430,6 +447,12 @@ model Deposit {
   userId           String
   amount           Decimal       @db.Decimal(12, 2)
   paymentMethod    String
+  /// The PaymentAccount.accountName the depositor says they sent to, as a
+  /// plain snapshot string (same free-text convention as paymentMethod) —
+  /// not a foreign key, so it survives that PaymentAccount later being
+  /// renamed or deleted. Null for deposits submitted before this field
+  /// existed, or from a client that hasn't been updated to send it.
+  accountName      String?
   /// 6-digit payment reference, e.g. "000123" — stored as a string so
   /// leading zeros survive; validated at the DTO layer, not the DB.
   reference        String
@@ -448,6 +471,116 @@ model Deposit {
   @@index([reference])
   @@index([createdAt])
   @@map("deposits")
+}
+
+/// A user-submitted payout request awaiting admin review — the mirror image
+/// of Deposit. Approving one debits the Wallet and creates a matching
+/// WITHDRAWAL Transaction; the withdrawal row itself never touches the
+/// ledger directly, so a rejected request leaves no trace on Wallet or
+/// Transaction. Unlike Deposit's `accountName` (who the user says they sent
+/// FROM), these three fields describe where the admin should send money TO.
+model Withdrawal {
+  id               String           @id @default(uuid())
+  userId           String
+  amount           Decimal          @db.Decimal(12, 2)
+  /// Free string, same convention as PaymentAccount.type / PaymentMethodType
+  /// — not a foreign key. Typically one of the known payment method labels
+  /// (KBZPay, Bank Account, ...) but not enforced against that catalog,
+  /// since it describes the user's own external account, not a platform one.
+  accountType      String
+  accountName      String
+  accountNumber    String
+  status           WithdrawalStatus @default(PENDING)
+  rejectionReason  String?
+  approvedByUserId String?
+  approvedAt       DateTime?
+  /// The account WE sent the money FROM (our own KBZPay/bank/etc.), recorded
+  /// manually by an admin after approval — entirely separate from
+  /// accountType/accountName/accountNumber above, which describe the user's
+  /// own destination account and are never touched by this.
+  transferAccountType   String?
+  transferAccountName   String?
+  transferAccountNumber String?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  user       User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  approvedBy User? @relation("WithdrawalApprovals", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("withdrawals")
+}
+
+/// Single global row holding admin-configurable transaction limits, lazily
+/// created with defaults on first read. Amounts use the app's one currency
+/// (Kyat) — no separate currency field, matching every other money field.
+model FinanceSettings {
+  id                  String   @id @default(uuid())
+  minDepositAmount    Decimal  @db.Decimal(12, 2)
+  maxDepositAmount    Decimal  @db.Decimal(12, 2)
+  minWithdrawalAmount Decimal  @db.Decimal(12, 2)
+  maxWithdrawalAmount Decimal  @db.Decimal(12, 2)
+  updatedByUserId     String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  updatedBy User? @relation("FinanceSettingsUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: SetNull)
+
+  @@map("finance_settings")
+}
+
+/// An admin-managed destination (KBZPay, bank account, etc.) shown to users
+/// when depositing — replaces what used to be a payment-method list
+/// hardcoded separately in each client app. `type` is a free string, not an
+/// enum or a foreign key, matching the same convention as
+/// Deposit.paymentMethod — it always equals some PaymentMethodType.label.
+/// Renaming a PaymentMethodType cascades and rewrites every matching `type`
+/// value here so the two never drift apart (see
+/// PaymentAccountsService.updateType).
+model PaymentAccount {
+  id            String  @id @default(uuid())
+  type          String
+  accountName   String
+  /// Account number or phone number, depending on type.
+  accountNumber String
+  /// Only meaningful for bank-transfer types; null otherwise.
+  bankName      String?
+  note          String?
+  isActive      Boolean @default(true)
+
+  createdByUserId String?
+  updatedByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  createdBy User? @relation("PaymentAccountCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  updatedBy User? @relation("PaymentAccountUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([isActive])
+  @@index([type])
+  @@map("payment_accounts")
+}
+
+/// The catalog of payment methods (KBZPay, Bank Account, and any Super
+/// Admin has added since) offered when creating a PaymentAccount or making
+/// a deposit. `label` is the single source of truth for the method's
+/// display name and is what gets stored verbatim in PaymentAccount.type —
+/// there is no separate internal code, so renaming here is a real rename
+/// everywhere. Deleting is blocked while any PaymentAccount still uses it.
+model PaymentMethodType {
+  id               String   @id @default(uuid())
+  label            String   @unique
+  requiresBankName Boolean  @default(false)
+  /// Logo shown next to this method wherever it's listed (admin, deposit
+  /// pickers). Stored the same way as Movie poster/cover URLs — an absolute
+  /// MinIO-served URL, not a relative object key.
+  logoUrl          String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@map("payment_method_types")
 }
 
 /// A monthly subscription tier admins can offer. Plans differ only in

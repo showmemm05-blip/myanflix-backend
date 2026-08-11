@@ -452,10 +452,13 @@ async function seedCommerceAndHistory(
   plans: { id: string; price: Prisma.Decimal }[],
 ) {
   const subscriptionPublished = movies.filter(
-    (m) => m.accessType === AccessType.SUBSCRIPTION && m.status === MovieStatus.PUBLISHED,
+    (m) =>
+      m.accessType === AccessType.SUBSCRIPTION &&
+      m.status === MovieStatus.PUBLISHED,
   );
   const freePublished = movies.filter(
-    (m) => m.accessType === AccessType.FREE && m.status === MovieStatus.PUBLISHED,
+    (m) =>
+      m.accessType === AccessType.FREE && m.status === MovieStatus.PUBLISHED,
   );
 
   for (const [index, user] of users.entries()) {
@@ -470,7 +473,10 @@ async function seedCommerceAndHistory(
       ? subscriptionPublished
           .slice(index % subscriptionPublished.length)
           .concat(
-            subscriptionPublished.slice(0, index % subscriptionPublished.length),
+            subscriptionPublished.slice(
+              0,
+              index % subscriptionPublished.length,
+            ),
           )
           .slice(0, purchaseCount)
       : [];
@@ -567,7 +573,9 @@ async function seedCommerceAndHistory(
             userId: user.id,
             movieId: movie.id,
             progress: wIndex === 0 ? 80 : 25,
-            lastPosition: Math.round((movie.duration * 60 * 0.5) / (wIndex + 1)),
+            lastPosition: Math.round(
+              (movie.duration * 60 * 0.5) / (wIndex + 1),
+            ),
           },
           update: {},
         });

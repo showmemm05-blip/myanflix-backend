@@ -132,9 +132,11 @@ export class VideosService {
         : movie.accessType;
 
       if (accessType === AccessType.SUBSCRIPTION) {
-        const activeSubscription = await this.prisma.userSubscription.findFirst({
-          where: { userId, expiresAt: { gt: new Date() } },
-        });
+        const activeSubscription = await this.prisma.userSubscription.findFirst(
+          {
+            where: { userId, expiresAt: { gt: new Date() } },
+          },
+        );
         if (!activeSubscription) {
           throw new ForbiddenException(
             'An active subscription is required to start streaming',

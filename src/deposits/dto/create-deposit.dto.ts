@@ -1,5 +1,13 @@
 import { Type } from 'class-transformer';
-import { IsNotEmpty, IsNumber, IsString, Matches, Min } from 'class-validator';
+import {
+  IsNotEmpty,
+  IsNumber,
+  IsOptional,
+  IsString,
+  Matches,
+  MaxLength,
+  Min,
+} from 'class-validator';
 
 export class CreateDepositDto {
   @Type(() => Number)
@@ -10,6 +18,12 @@ export class CreateDepositDto {
   @IsString()
   @IsNotEmpty()
   paymentMethod!: string;
+
+  /** The PaymentAccount.accountName the client's account picker selected — optional so older clients that haven't been updated still work. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  accountName?: string;
 
   /**
    * Deliberately @IsString() with no @Type(() => Number) — the reference

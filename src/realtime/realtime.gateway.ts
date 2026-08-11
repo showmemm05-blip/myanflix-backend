@@ -26,6 +26,7 @@ export interface DepositCreatedPayload {
   username: string;
   amount: number;
   paymentMethod: string;
+  accountName: string | null;
   reference: string;
   status: string;
   createdAt: Date;
@@ -39,6 +40,32 @@ export interface DepositUpdatedPayload {
   reference: string;
   rejectionReason?: string | null;
   approvedAt?: Date | null;
+}
+
+export interface WithdrawalCreatedPayload {
+  id: string;
+  userId: string;
+  username: string;
+  amount: number;
+  accountType: string;
+  accountName: string;
+  accountNumber: string;
+  status: string;
+  createdAt: Date;
+}
+
+export interface WithdrawalUpdatedPayload {
+  id: string;
+  status: string;
+  amount: number;
+  accountType: string;
+  accountName: string;
+  accountNumber: string;
+  rejectionReason?: string | null;
+  approvedAt?: Date | null;
+  transferAccountType?: string | null;
+  transferAccountName?: string | null;
+  transferAccountNumber?: string | null;
 }
 
 export interface NotificationCreatedPayload {
@@ -135,5 +162,16 @@ export class RealtimeGateway
 
   notifyUserBalanceUpdated(userId: string, balance: number): void {
     this.server.to(userRoom(userId)).emit('wallet.balanceUpdated', { balance });
+  }
+
+  notifyAdminsWithdrawalCreated(payload: WithdrawalCreatedPayload): void {
+    this.server.to(adminRoom()).emit('withdrawal.created', payload);
+  }
+
+  notifyUserWithdrawalUpdated(
+    userId: string,
+    payload: WithdrawalUpdatedPayload,
+  ): void {
+    this.server.to(userRoom(userId)).emit('withdrawal.updated', payload);
   }
 }

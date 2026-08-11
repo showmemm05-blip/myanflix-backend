@@ -1,4 +1,11 @@
-import { IsIn, IsOptional, IsString, Matches, MaxLength, MinLength } from 'class-validator';
+import {
+  IsIn,
+  IsOptional,
+  IsString,
+  Matches,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 import { STAFF_ROLES } from './create-staff.dto';
 
 export class UpdateStaffDto {

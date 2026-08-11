@@ -3,13 +3,13 @@ import { RolesModule } from '../roles/roles.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { FinanceSettingsModule } from '../finance-settings/finance-settings.module';
-import { DepositsController } from './deposits.controller';
-import { DepositsService } from './deposits.service';
+import { WithdrawalsController } from './withdrawals.controller';
+import { WithdrawalsService } from './withdrawals.service';
 
 @Module({
   imports: [RolesModule, WalletModule, RealtimeModule, FinanceSettingsModule],
-  controllers: [DepositsController],
-  providers: [DepositsService],
-  exports: [DepositsService],
+  controllers: [WithdrawalsController],
+  providers: [WithdrawalsService],
+  exports: [WithdrawalsService],
 })
-export class DepositsModule {}
+export class WithdrawalsModule {}

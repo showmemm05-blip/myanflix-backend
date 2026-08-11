@@ -101,7 +101,8 @@ export class WalletService {
 
     if (result.count === 0) {
       const wallet = await tx.wallet.findUnique({ where: { userId } });
-      if (!wallet) throw new NotFoundException('Wallet not found for this user');
+      if (!wallet)
+        throw new NotFoundException('Wallet not found for this user');
       throw new BadRequestException('Insufficient wallet balance');
     }
 

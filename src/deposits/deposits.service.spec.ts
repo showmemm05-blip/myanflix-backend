@@ -1,10 +1,11 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import { Prisma } from '../generated/prisma/client';
 import { DepositStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { FinanceSettingsService } from '../finance-settings/finance-settings.service';
 import { DepositsService } from './deposits.service';
 
 function makeDeposit(overrides: Partial<Record<string, unknown>> = {}) {
@@ -49,6 +50,7 @@ describe('DepositsService', () => {
     notifyUserNotificationCreated: jest.Mock;
     notifyUserBalanceUpdated: jest.Mock;
   };
+  let financeSettingsService: { getLimits: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
@@ -78,6 +80,14 @@ describe('DepositsService', () => {
       notifyUserNotificationCreated: jest.fn(),
       notifyUserBalanceUpdated: jest.fn(),
     };
+    financeSettingsService = {
+      getLimits: jest.fn().mockResolvedValue({
+        minDepositAmount: 0,
+        maxDepositAmount: Number.MAX_SAFE_INTEGER,
+        minWithdrawalAmount: 0,
+        maxWithdrawalAmount: Number.MAX_SAFE_INTEGER,
+      }),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -85,6 +95,7 @@ describe('DepositsService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: WalletService, useValue: walletService },
         { provide: RealtimeGateway, useValue: gateway },
+        { provide: FinanceSettingsService, useValue: financeSettingsService },
       ],
     }).compile();
 
@@ -109,6 +120,26 @@ describe('DepositsService', () => {
       expect(prisma.deposit.create).toHaveBeenCalledWith({
         data: { userId: 'user-1', amount: 5000, paymentMethod: 'KBZ Pay', reference: '000123' },
       });
+    });
+
+    it('persists the selected payment account name and forwards it to the admin realtime notification', async () => {
+      prisma.deposit.findFirst.mockResolvedValue(null);
+      prisma.deposit.create.mockResolvedValue(makeDeposit({ accountName: 'MyanFlix Co., Ltd.' }));
+      prisma.user.findUniqueOrThrow.mockResolvedValue({ username: 'john' });
+
+      await service.create('user-1', {
+        amount: 5000,
+        paymentMethod: 'KBZPay',
+        accountName: 'MyanFlix Co., Ltd.',
+        reference: '000123',
+      });
+
+      expect(prisma.deposit.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ accountName: 'MyanFlix Co., Ltd.' }),
+      });
+      expect(gateway.notifyAdminsDepositCreated).toHaveBeenCalledWith(
+        expect.objectContaining({ accountName: 'MyanFlix Co., Ltd.' }),
+      );
     });
 
     it('stores the reference as the exact string passed in, leading zeros intact', async () => {
@@ -160,6 +191,52 @@ describe('DepositsService', () => {
         expect.objectContaining({ id: 'deposit-1', username: 'john', amount: 5000, status: DepositStatus.PENDING }),
       );
     });
+
+    it('rejects an amount below the configured minimum deposit', async () => {
+      financeSettingsService.getLimits.mockResolvedValue({
+        minDepositAmount: 10000,
+        maxDepositAmount: 5000000,
+        minWithdrawalAmount: 0,
+        maxWithdrawalAmount: Number.MAX_SAFE_INTEGER,
+      });
+
+      await expect(
+        service.create('user-1', { amount: 5000, paymentMethod: 'KBZ Pay', reference: '000123' }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.deposit.findFirst).not.toHaveBeenCalled();
+      expect(prisma.deposit.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects an amount above the configured maximum deposit', async () => {
+      financeSettingsService.getLimits.mockResolvedValue({
+        minDepositAmount: 1000,
+        maxDepositAmount: 100000,
+        minWithdrawalAmount: 0,
+        maxWithdrawalAmount: Number.MAX_SAFE_INTEGER,
+      });
+
+      await expect(
+        service.create('user-1', { amount: 200000, paymentMethod: 'KBZ Pay', reference: '000123' }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.deposit.create).not.toHaveBeenCalled();
+    });
+
+    it('accepts an amount within the configured deposit range', async () => {
+      financeSettingsService.getLimits.mockResolvedValue({
+        minDepositAmount: 1000,
+        maxDepositAmount: 100000,
+        minWithdrawalAmount: 0,
+        maxWithdrawalAmount: Number.MAX_SAFE_INTEGER,
+      });
+      prisma.deposit.findFirst.mockResolvedValue(null);
+      prisma.deposit.create.mockResolvedValue(makeDeposit({ amount: new Prisma.Decimal(5000) }));
+      prisma.user.findUniqueOrThrow.mockResolvedValue({ username: 'john' });
+
+      await expect(
+        service.create('user-1', { amount: 5000, paymentMethod: 'KBZ Pay', reference: '000123' }),
+      ).resolves.toBeDefined();
+      expect(prisma.deposit.create).toHaveBeenCalled();
+    });
   });
 
   describe('approve', () => {
@@ -200,7 +277,7 @@ describe('DepositsService', () => {
       prisma.deposit.findUniqueOrThrow.mockResolvedValue(
         makeDeposit({
           status: DepositStatus.APPROVED,
-          user: { id: 'user-1', username: 'john', email: 'john@example.com' },
+          user: { id: 'user-1', username: 'john', email: 'john@example.com', phone: '+959123456' },
         }),
       );
       prisma.wallet.findUniqueOrThrow.mockResolvedValue({ balance: new Prisma.Decimal(10000) });
@@ -217,9 +294,11 @@ describe('DepositsService', () => {
       const result = await service.approve('deposit-1', admin);
 
       expect(prisma.deposit.findUniqueOrThrow).toHaveBeenCalledWith(
-        expect.objectContaining({ include: { user: { select: { id: true, username: true, email: true } } } }),
+        expect.objectContaining({
+          include: { user: { select: { id: true, username: true, email: true, phone: true } } },
+        }),
       );
-      expect(result.user).toEqual({ id: 'user-1', username: 'john', email: 'john@example.com' });
+      expect(result.user).toEqual({ id: 'user-1', username: 'john', email: 'john@example.com', phone: '+959123456' });
     });
 
     it('throws ConflictException and never credits the wallet when the deposit is no longer PENDING', async () => {
@@ -283,7 +362,7 @@ describe('DepositsService', () => {
       prisma.deposit.findUniqueOrThrow.mockResolvedValue(
         makeDeposit({
           status: DepositStatus.REJECTED,
-          user: { id: 'user-1', username: 'john', email: 'john@example.com' },
+          user: { id: 'user-1', username: 'john', email: 'john@example.com', phone: '+959123456' },
         }),
       );
       prisma.notification.create.mockResolvedValue({
@@ -299,9 +378,11 @@ describe('DepositsService', () => {
       const result = await service.reject('deposit-1', admin, { reason: 'x' });
 
       expect(prisma.deposit.findUniqueOrThrow).toHaveBeenCalledWith(
-        expect.objectContaining({ include: { user: { select: { id: true, username: true, email: true } } } }),
+        expect.objectContaining({
+          include: { user: { select: { id: true, username: true, email: true, phone: true } } },
+        }),
       );
-      expect(result.user).toEqual({ id: 'user-1', username: 'john', email: 'john@example.com' });
+      expect(result.user).toEqual({ id: 'user-1', username: 'john', email: 'john@example.com', phone: '+959123456' });
     });
   });
 });

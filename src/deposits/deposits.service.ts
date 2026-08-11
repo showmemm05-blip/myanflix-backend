@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
@@ -6,6 +7,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { FinanceSettingsService } from '../finance-settings/finance-settings.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import {
   DepositStatus,
@@ -23,6 +25,7 @@ export class DepositsService {
     private readonly prisma: PrismaService,
     private readonly walletService: WalletService,
     private readonly realtimeGateway: RealtimeGateway,
+    private readonly financeSettingsService: FinanceSettingsService,
   ) {}
 
   /**
@@ -31,6 +34,14 @@ export class DepositsService {
    * reference after a mistaken rejection. Balance never moves here.
    */
   async create(userId: string, dto: CreateDepositDto) {
+    const { minDepositAmount, maxDepositAmount } =
+      await this.financeSettingsService.getLimits();
+    if (dto.amount < minDepositAmount || dto.amount > maxDepositAmount) {
+      throw new BadRequestException(
+        `Deposit amount must be between ${minDepositAmount.toLocaleString('en-US')} and ${maxDepositAmount.toLocaleString('en-US')} Ks`,
+      );
+    }
+
     const duplicate = await this.prisma.deposit.findFirst({
       where: {
         reference: dto.reference,
@@ -48,6 +59,7 @@ export class DepositsService {
         userId,
         amount: dto.amount,
         paymentMethod: dto.paymentMethod,
+        accountName: dto.accountName,
         reference: dto.reference,
       },
     });
@@ -63,6 +75,7 @@ export class DepositsService {
       username: user.username,
       amount: decimalToNumber(deposit.amount),
       paymentMethod: deposit.paymentMethod,
+      accountName: deposit.accountName,
       reference: deposit.reference,
       status: deposit.status,
       createdAt: deposit.createdAt,
@@ -87,7 +100,9 @@ export class DepositsService {
         skip: (page - 1) * limit,
         take: limit,
         include: {
-          user: { select: { id: true, username: true, email: true } },
+          user: {
+            select: { id: true, username: true, email: true, phone: true },
+          },
         },
       }),
       this.prisma.deposit.count({ where }),
@@ -173,7 +188,9 @@ export class DepositsService {
       const updated = await tx.deposit.findUniqueOrThrow({
         where: { id: depositId },
         include: {
-          user: { select: { id: true, username: true, email: true } },
+          user: {
+            select: { id: true, username: true, email: true, phone: true },
+          },
         },
       });
       const wallet = await tx.wallet.findUniqueOrThrow({
@@ -246,7 +263,9 @@ export class DepositsService {
       const updated = await tx.deposit.findUniqueOrThrow({
         where: { id: depositId },
         include: {
-          user: { select: { id: true, username: true, email: true } },
+          user: {
+            select: { id: true, username: true, email: true, phone: true },
+          },
         },
       });
       return { deposit: updated, notification };

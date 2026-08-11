@@ -107,7 +107,10 @@ export class StaffService {
 
     const target = await this.usersService.findByIdOrThrow(id);
 
-    if (dto.status === UserStatus.SUSPENDED && target.role === Role.SUPER_ADMIN) {
+    if (
+      dto.status === UserStatus.SUSPENDED &&
+      target.role === Role.SUPER_ADMIN
+    ) {
       await this.assertNotLastActiveSuperAdmin(id);
     }
 
@@ -132,7 +135,9 @@ export class StaffService {
   }
 
   /** Guards against removing/demoting/deactivating the only remaining active Super Admin. */
-  private async assertNotLastActiveSuperAdmin(excludeId: string): Promise<void> {
+  private async assertNotLastActiveSuperAdmin(
+    excludeId: string,
+  ): Promise<void> {
     const otherActiveSuperAdmins = await this.prisma.user.count({
       where: {
         role: Role.SUPER_ADMIN,

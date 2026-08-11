@@ -97,32 +97,33 @@ export class UsersService {
   ): Promise<Map<string, WalletSummary>> {
     if (userIds.length === 0) return new Map();
 
-    const [wallets, spent, deposited, activeSubscriptions] =
-      await Promise.all([
-        this.prisma.wallet.findMany({ where: { userId: { in: userIds } } }),
-        this.prisma.transaction.groupBy({
-          by: ['userId'],
-          where: {
-            userId: { in: userIds },
-            type: { in: [TransactionType.PURCHASE, TransactionType.SUBSCRIPTION] },
-            status: 'COMPLETED',
+    const [wallets, spent, deposited, activeSubscriptions] = await Promise.all([
+      this.prisma.wallet.findMany({ where: { userId: { in: userIds } } }),
+      this.prisma.transaction.groupBy({
+        by: ['userId'],
+        where: {
+          userId: { in: userIds },
+          type: {
+            in: [TransactionType.PURCHASE, TransactionType.SUBSCRIPTION],
           },
-          _sum: { amount: true },
-        }),
-        this.prisma.transaction.groupBy({
-          by: ['userId'],
-          where: {
-            userId: { in: userIds },
-            type: TransactionType.DEPOSIT,
-            status: 'COMPLETED',
-          },
-          _sum: { amount: true },
-        }),
-        this.prisma.userSubscription.findMany({
-          where: { userId: { in: userIds }, expiresAt: { gt: new Date() } },
-          orderBy: { expiresAt: 'desc' },
-        }),
-      ]);
+          status: 'COMPLETED',
+        },
+        _sum: { amount: true },
+      }),
+      this.prisma.transaction.groupBy({
+        by: ['userId'],
+        where: {
+          userId: { in: userIds },
+          type: TransactionType.DEPOSIT,
+          status: 'COMPLETED',
+        },
+        _sum: { amount: true },
+      }),
+      this.prisma.userSubscription.findMany({
+        where: { userId: { in: userIds }, expiresAt: { gt: new Date() } },
+        orderBy: { expiresAt: 'desc' },
+      }),
+    ]);
 
     const balanceById = new Map(
       wallets.map((w) => [w.userId, decimalToNumber(w.balance)]),
@@ -181,7 +182,9 @@ export class UsersService {
         this.prisma.transaction.aggregate({
           where: {
             userId,
-            type: { in: [TransactionType.PURCHASE, TransactionType.SUBSCRIPTION] },
+            type: {
+              in: [TransactionType.PURCHASE, TransactionType.SUBSCRIPTION],
+            },
             status: 'COMPLETED',
           },
           _sum: { amount: true },

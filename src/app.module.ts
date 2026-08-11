@@ -21,11 +21,14 @@ import { TransactionsModule } from './transactions/transactions.module';
 import { FinanceModule } from './finance/finance.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { DepositsModule } from './deposits/deposits.module';
+import { WithdrawalsModule } from './withdrawals/withdrawals.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { SubtitlesModule } from './subtitles/subtitles.module';
 import { SeriesModule } from './series/series.module';
 import { SubscriptionsModule } from './subscriptions/subscriptions.module';
+import { PaymentAccountsModule } from './payment-accounts/payment-accounts.module';
+import { FinanceSettingsModule } from './finance-settings/finance-settings.module';
 
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
@@ -55,11 +58,14 @@ import { AppService } from './app.service';
     FinanceModule,
     AnalyticsModule,
     DepositsModule,
+    WithdrawalsModule,
     NotificationsModule,
     RealtimeModule,
     SubtitlesModule,
     SeriesModule,
     SubscriptionsModule,
+    PaymentAccountsModule,
+    FinanceSettingsModule,
   ],
   controllers: [AppController],
   providers: [

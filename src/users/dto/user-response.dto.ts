@@ -5,6 +5,7 @@ export class UserResponseDto {
   id: string;
   username: string;
   email: string;
+  phone: string | null;
   avatar: string | null;
   role: Role;
   status: UserStatus;
@@ -21,6 +22,7 @@ export class UserResponseDto {
     dto.id = user.id;
     dto.username = user.username;
     dto.email = user.email;
+    dto.phone = user.phone;
     dto.avatar = user.avatar;
     dto.role = user.role;
     dto.status = user.status;
