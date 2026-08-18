@@ -41,24 +41,19 @@ export class AuthService {
   async register(
     dto: RegisterDto,
   ): Promise<{ user: AuthenticatedUser } & AuthTokens> {
-    const existing = await this.usersService.findByEmailOrUsername(
-      dto.email,
-      dto.username,
-    );
+    const existing = await this.usersService.findByUsername(dto.username);
     if (existing) {
-      throw new ConflictException('Email or username is already registered');
+      throw new ConflictException('Username is already registered');
     }
 
     const passwordHash = await bcrypt.hash(dto.password, PASSWORD_SALT_ROUNDS);
     const user = await this.usersService.create({
       username: dto.username,
-      email: dto.email,
       password: passwordHash,
     });
 
     const authenticatedUser: AuthenticatedUser = {
       id: user.id,
-      email: user.email,
       username: user.username,
       role: user.role,
     };
@@ -85,7 +80,6 @@ export class AuthService {
 
     const authenticatedUser: AuthenticatedUser = {
       id: user.id,
-      email: user.email,
       username: user.username,
       role: user.role,
     };
@@ -105,7 +99,7 @@ export class AuthService {
   /**
    * Step 2 for a returning phone: checks the password before an OTP is even
    * sent. Deliberately the same generic message on both "no such phone" and
-   * "wrong password" — same reasoning as the email/password login() below.
+   * "wrong password" — same reasoning as the username/password login() above.
    */
   async verifyPhonePassword(
     phone: string,
@@ -149,13 +143,12 @@ export class AuthService {
           'A password is required to create a new account',
         );
       }
-      // Username/email have no independent meaning for a phone account —
-      // synthesize unique placeholders (the digits make them unique per
-      // phone) so the existing required columns stay satisfied.
+      // A username has no independent meaning for a phone account —
+      // synthesize a unique placeholder (the digits make it unique per
+      // phone) so the required unique column stays satisfied.
       const digits = phone.replace(/\D/g, '');
       user = await this.usersService.create({
         username: `user_${digits}`,
-        email: `${digits}@phone.myanflix.local`,
         password: await bcrypt.hash(password, PASSWORD_SALT_ROUNDS),
         phone,
       });
@@ -167,7 +160,6 @@ export class AuthService {
 
     const authenticatedUser: AuthenticatedUser = {
       id: user.id,
-      email: user.email,
       username: user.username,
       role: user.role,
     };
@@ -209,7 +201,6 @@ export class AuthService {
     const user = await this.usersService.findByIdOrThrow(stored.userId);
     const authenticatedUser: AuthenticatedUser = {
       id: user.id,
-      email: user.email,
       username: user.username,
       role: user.role,
     };
@@ -237,7 +228,7 @@ export class AuthService {
   }
 
   private async issueTokens(user: AuthenticatedUser): Promise<AuthTokens> {
-    const accessPayload: JwtPayload = { sub: user.id, email: user.email };
+    const accessPayload: JwtPayload = { sub: user.id };
     const accessToken = await this.jwtService.signAsync(accessPayload, {
       secret: this.configService.get<string>('JWT_SECRET'),
       expiresIn: this.configService.get<string>(

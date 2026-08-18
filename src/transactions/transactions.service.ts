@@ -19,7 +19,7 @@ export class TransactionsService {
         skip: (page - 1) * limit,
         take: limit,
         include: {
-          user: { select: { id: true, username: true, email: true } },
+          user: { select: { id: true, username: true } },
         },
       }),
       this.prisma.transaction.count({ where }),

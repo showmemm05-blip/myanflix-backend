@@ -92,11 +92,34 @@ export class MoviesService {
     return movie;
   }
 
+  /**
+   * Image URLs as they should be STORED — see MinioService.canonicalImageUrl.
+   * Responses re-host these per request, and the admin's edit dialog sends a
+   * fetched movie's URLs straight back when the artwork was not changed, so
+   * without this a row would inherit whichever host that one save arrived on.
+   */
+  private withCanonicalImageUrls<
+    T extends {
+      posterUrl?: string | null;
+      coverUrl?: string | null;
+      thumbnailUrl?: string | null;
+    },
+  >(data: T): T {
+    const canon = (value: string | null | undefined) =>
+      this.minioService.canonicalImageUrl(value);
+    return {
+      ...data,
+      ...(data.posterUrl !== undefined ? { posterUrl: canon(data.posterUrl) } : {}),
+      ...(data.coverUrl !== undefined ? { coverUrl: canon(data.coverUrl) } : {}),
+      ...(data.thumbnailUrl !== undefined ? { thumbnailUrl: canon(data.thumbnailUrl) } : {}),
+    };
+  }
+
   async create(dto: CreateMovieDto): Promise<Movie> {
     const { categoryIds, ...data } = dto;
     return this.prisma.movie.create({
       data: {
-        ...data,
+        ...this.withCanonicalImageUrls(data),
         categories: categoryIds
           ? { connect: categoryIds.map((id) => ({ id })) }
           : undefined,
@@ -161,7 +184,7 @@ export class MoviesService {
     return this.prisma.movie.update({
       where: { id },
       data: {
-        ...data,
+        ...this.withCanonicalImageUrls(data),
         categories: categoryIds
           ? { set: categoryIds.map((cid) => ({ id: cid })) }
           : undefined,
@@ -263,7 +286,7 @@ export class MoviesService {
         id: p.id,
         movieId: p.movieId,
         movieTitle: p.movie.title,
-        posterUrl: p.movie.posterUrl,
+        posterUrl: this.minioService.imageUrl(p.movie.posterUrl),
         amount: decimalToNumber(p.amount),
         createdAt: p.createdAt,
       })),

@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { requestHostContext } from './request-host.context';
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
@@ -82,6 +83,13 @@ const CONTENT_TYPES: Record<string, string> = {
   '.vtt': 'text/vtt',
   '.ass': 'text/x-ssa',
 };
+
+/**
+ * The key namespaces this service writes (see StorageService.imageObjectKey /
+ * videoObjectKey). A URL only counts as "ours" if its key starts with one of
+ * them — see MinioService.ownImageKey.
+ */
+const OWN_KEY_PREFIXES = ['images/', 'videos/', 'subtitles/'] as const;
 
 /**
  * Talks to the storage server (MinIO, or any S3-compatible endpoint) —
@@ -167,6 +175,93 @@ export class MinioService {
   publicUrl(objectKey: string): string {
     const base = this.configService.get<string>('STREAM_PUBLIC_BASE_URL') ?? '';
     return `${base.replace(/\/$/, '')}/${this.bucket}/${objectKey}`;
+  }
+
+  /**
+   * Playback URL built from the hostname the CURRENT request used to reach
+   * the API, keeping only the cache server's protocol/port from
+   * STREAM_PUBLIC_BASE_URL. The host machine hops between networks, so a
+   * hard-coded LAN IP goes stale on every hop — while the host the client
+   * is already talking to is correct by construction (localhost stays
+   * localhost, a phone's LAN IP stays that LAN IP). Falls back to
+   * publicUrl() outside a request context. Only for per-response playback
+   * fields — PERSISTED urls (saveImage) must keep using publicUrl(), or a
+   * request-specific host would be baked into the database.
+   */
+  playbackUrl(objectKey: string): string {
+    const ctx = requestHostContext.getStore();
+    if (!ctx?.hostname) return this.publicUrl(objectKey);
+
+    const base = this.configService.get<string>('STREAM_PUBLIC_BASE_URL') ?? '';
+    let protocol = 'http';
+    let port = '8080';
+    try {
+      const parsed = new URL(base);
+      protocol = parsed.protocol.replace(/:$/, '') || protocol;
+      if (parsed.port) port = parsed.port;
+    } catch {
+      // Malformed/absent env base — keep the defaults above.
+    }
+    return `${protocol}://${ctx.hostname}:${port}/${this.bucket}/${objectKey}`;
+  }
+
+  /**
+   * Read-time repair for a PERSISTED image URL (poster/cover/thumbnail/
+   * logo). Unlike playback URLs — which are derived per request from an
+   * object key and never stored — image URLs were baked into the database
+   * as absolute URLs by saveImage(), carrying whatever host the machine
+   * happened to have at upload time. Every network hop silently broke every
+   * one of them: the bytes are fine, only the hostname went stale.
+   *
+   * So the host is discarded and re-derived here, at read time, exactly the
+   * way streams already do it: recover the object key from the stored URL
+   * (keyFromPublicUrl only looks at the bucket path segment, so a
+   * stale-host URL resolves just as well as a fresh one) and rebuild it via
+   * playbackUrl(). A URL that isn't one of ours — tmdb, picsum, anything
+   * external — has no key to recover and is passed through untouched.
+   *
+   * Strictly a derivation: nothing is written back, saveImage() keeps
+   * persisting publicUrl(), and the stored value stays exactly as it was.
+   */
+  imageUrl(url: string | null | undefined): string | null {
+    // `?? null` normalizes undefined; an empty string is left as-is rather
+    // than turned into null, so a response field's shape never changes.
+    if (!url) return url ?? null;
+    const key = this.ownImageKey(url);
+    if (!key) return url;
+    return this.playbackUrl(key);
+  }
+
+  /**
+   * The canonical form to PERSIST — the same object addressed by the
+   * configured public base rather than by whichever host happened to ask.
+   *
+   * Reads re-host image URLs per request, and a client that echoes a fetched
+   * record straight back on save (the admin does exactly this when you edit a
+   * series without touching its artwork) would otherwise write that one
+   * request's host into the database. Normalising on the way in makes writes
+   * idempotent: the row keeps a stable address no matter who saved it.
+   */
+  canonicalImageUrl<T extends string | null | undefined>(url: T): T {
+    if (!url) return url;
+    const key = this.ownImageKey(url);
+    return (key ? this.publicUrl(key) : url) as T;
+  }
+
+  /**
+   * The key IF this URL addresses an object of ours, else null.
+   *
+   * keyFromPublicUrl() ignores the host on purpose — that host-blindness is
+   * what lets a URL baked with a long-dead LAN IP still be repaired. The cost
+   * is that it would also claim `https://some-cdn.com/movies/poster.jpg`
+   * purely because its first path segment matches the bucket name, and rewrite
+   * it to a MinIO object that does not exist. Requiring one of our own key
+   * prefixes closes that hole while keeping stale hosts repairable.
+   */
+  private ownImageKey(url: string): string | null {
+    const key = this.keyFromPublicUrl(url);
+    if (!key) return null;
+    return OWN_KEY_PREFIXES.some((prefix) => key.startsWith(prefix)) ? key : null;
   }
 
   /**

@@ -20,9 +20,9 @@ describe('Deposits (e2e)', () => {
   let userToken: string;
   let adminToken: string;
 
-  async function signToken(id: string, email: string): Promise<string> {
+  async function signToken(id: string): Promise<string> {
     return jwtService.signAsync(
-      { sub: id, email },
+      { sub: id },
       { secret: configService.get<string>('JWT_SECRET'), expiresIn: '15m' },
     );
   }
@@ -45,12 +45,11 @@ describe('Deposits (e2e)', () => {
     configService = app.get(ConfigService);
 
     // Isolated per-suite-run data so re-running the suite never collides on
-    // unique username/email constraints.
+    // unique username constraints.
     const suffix = randomUUID().slice(0, 8);
     const user = await prisma.user.create({
       data: {
         username: `depositor_${suffix}`,
-        email: `depositor_${suffix}@test.local`,
         password: 'unused-in-these-tests',
         role: Role.USER,
         status: UserStatus.ACTIVE,
@@ -61,7 +60,6 @@ describe('Deposits (e2e)', () => {
     const admin = await prisma.user.create({
       data: {
         username: `admin_${suffix}`,
-        email: `admin_${suffix}@test.local`,
         password: 'unused-in-these-tests',
         role: Role.ADMIN,
         status: UserStatus.ACTIVE,
@@ -71,8 +69,8 @@ describe('Deposits (e2e)', () => {
 
     userId = user.id;
     adminId = admin.id;
-    userToken = await signToken(user.id, user.email);
-    adminToken = await signToken(admin.id, admin.email);
+    userToken = await signToken(user.id);
+    adminToken = await signToken(admin.id);
   });
 
   afterAll(async () => {
@@ -262,14 +260,13 @@ describe('Deposits (e2e)', () => {
     const otherUser = await prisma.user.create({
       data: {
         username: `other_${suffix}`,
-        email: `other_${suffix}@test.local`,
         password: 'unused',
         role: Role.USER,
         status: UserStatus.ACTIVE,
       },
     });
     await prisma.wallet.create({ data: { userId: otherUser.id, balance: 0 } });
-    const otherToken = await signToken(otherUser.id, otherUser.email);
+    const otherToken = await signToken(otherUser.id);
 
     await request(app.getHttpServer())
       .post('/api/deposits')

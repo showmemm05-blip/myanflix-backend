@@ -80,7 +80,8 @@ export class WithdrawalsController {
   updateTransferAccount(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateTransferAccountDto,
+    @CurrentUser() admin: AuthenticatedUser,
   ) {
-    return this.withdrawalsService.updateTransferAccount(id, dto);
+    return this.withdrawalsService.updateTransferAccount(id, dto, admin);
   }
 }

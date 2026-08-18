@@ -8,6 +8,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { FinanceSettingsService } from '../finance-settings/finance-settings.service';
+import { PaymentAccountLedgerService } from '../payment-accounts/payment-account-ledger.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import {
   NotificationType,
@@ -27,6 +28,7 @@ export class WithdrawalsService {
     private readonly walletService: WalletService,
     private readonly realtimeGateway: RealtimeGateway,
     private readonly financeSettingsService: FinanceSettingsService,
+    private readonly paymentAccountLedgerService: PaymentAccountLedgerService,
   ) {}
 
   /**
@@ -61,6 +63,10 @@ export class WithdrawalsService {
         accountType: dto.accountType,
         accountName: dto.accountName,
         accountNumber: dto.accountNumber,
+        // Snapshot of what the user asked for on THIS request — deliberately
+        // taken straight from the DTO with no profile lookup anywhere in this
+        // method, so a payout always reflects the details submitted with it.
+        bankName: dto.bankName ?? null,
       },
     });
 
@@ -77,6 +83,7 @@ export class WithdrawalsService {
       accountType: withdrawal.accountType,
       accountName: withdrawal.accountName,
       accountNumber: withdrawal.accountNumber,
+      bankName: withdrawal.bankName,
       status: withdrawal.status,
       createdAt: withdrawal.createdAt,
     });
@@ -92,7 +99,17 @@ export class WithdrawalsService {
   async findAllAdmin(query: WithdrawalQueryDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
-    const where = { status: query.status, userId: query.userId };
+    const where = {
+      status: query.status,
+      userId: query.userId,
+      createdAt:
+        query.dateFrom || query.dateTo
+          ? {
+              gte: query.dateFrom ? new Date(query.dateFrom) : undefined,
+              lte: query.dateTo ? new Date(query.dateTo) : undefined,
+            }
+          : undefined,
+    };
 
     const [items, total] = await this.prisma.$transaction([
       this.prisma.withdrawal.findMany({
@@ -102,7 +119,7 @@ export class WithdrawalsService {
         take: limit,
         include: {
           user: {
-            select: { id: true, username: true, email: true, phone: true },
+            select: { id: true, username: true, phone: true },
           },
         },
       }),
@@ -120,7 +137,17 @@ export class WithdrawalsService {
   private async findAll(query: WithdrawalQueryDto & { userId: string }) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
-    const where = { userId: query.userId, status: query.status };
+    const where = {
+      userId: query.userId,
+      status: query.status,
+      createdAt:
+        query.dateFrom || query.dateTo
+          ? {
+              gte: query.dateFrom ? new Date(query.dateFrom) : undefined,
+              lte: query.dateTo ? new Date(query.dateTo) : undefined,
+            }
+          : undefined,
+    };
 
     const [items, total] = await this.prisma.$transaction([
       this.prisma.withdrawal.findMany({
@@ -199,7 +226,7 @@ export class WithdrawalsService {
         where: { id: withdrawalId },
         include: {
           user: {
-            select: { id: true, username: true, email: true, phone: true },
+            select: { id: true, username: true, phone: true },
           },
         },
       });
@@ -283,7 +310,7 @@ export class WithdrawalsService {
         where: { id: withdrawalId },
         include: {
           user: {
-            select: { id: true, username: true, email: true, phone: true },
+            select: { id: true, username: true, phone: true },
           },
         },
       });
@@ -322,36 +349,74 @@ export class WithdrawalsService {
    * Records OUR account — the one we sent the money FROM — after approval.
    * Entirely separate from accountType/accountName/accountNumber (the
    * user's own destination account), which this never touches, along with
-   * status/approvedAt/wallet/ledger. Plain update, not the atomic-claim
-   * transaction approve()/reject() use (no PENDING race to guard against).
+   * status/approvedAt/wallet ledger.
+   *
+   * Wrapped in its own $transaction (unlike the plain update() this used to
+   * be) so the payment-account ledger sync (which may post a reversal + a
+   * fresh WITHDRAWAL_OUT when re-linking to a different account) and the
+   * Withdrawal row update commit atomically.
    */
   async updateTransferAccount(
     withdrawalId: string,
     dto: UpdateTransferAccountDto,
+    admin: AuthenticatedUser,
   ) {
-    const withdrawal = await this.prisma.withdrawal.findUnique({
-      where: { id: withdrawalId },
-    });
-    if (!withdrawal) throw new NotFoundException('Withdrawal not found');
-    if (withdrawal.status !== WithdrawalStatus.APPROVED) {
-      throw new BadRequestException(
-        'The transfer account can only be edited for an approved withdrawal',
-      );
-    }
+    const result = await this.prisma.$transaction(async (tx) => {
+      const withdrawal = await tx.withdrawal.findUnique({
+        where: { id: withdrawalId },
+      });
+      if (!withdrawal) throw new NotFoundException('Withdrawal not found');
+      if (withdrawal.status !== WithdrawalStatus.APPROVED) {
+        throw new BadRequestException(
+          'The transfer account can only be edited for an approved withdrawal',
+        );
+      }
 
-    const updated = await this.prisma.withdrawal.update({
-      where: { id: withdrawalId },
-      data: {
-        transferAccountType: dto.transferAccountType,
-        transferAccountName: dto.transferAccountName,
-        transferAccountNumber: dto.transferAccountNumber,
-      },
-      include: {
-        user: {
-          select: { id: true, username: true, email: true, phone: true },
+      const oldPaymentAccountId = withdrawal.transferPaymentAccountId;
+      const newPaymentAccountId = dto.paymentAccountId ?? null;
+
+      await this.paymentAccountLedgerService.syncWithdrawalLink(
+        tx,
+        withdrawal,
+        newPaymentAccountId,
+        dto.transferTransactionCode,
+        admin.id,
+      );
+
+      const updatedWithdrawal = await tx.withdrawal.update({
+        where: { id: withdrawalId },
+        data: {
+          transferAccountType: dto.transferAccountType,
+          // Explicitly nulled (not left undefined) when absent, so a manual
+          // edit that no longer matches the originally-picked catalog entry
+          // can't leave a stale subname behind from a previous save.
+          transferAccountSubname: dto.transferAccountSubname ?? null,
+          transferAccountName: dto.transferAccountName,
+          transferAccountNumber: dto.transferAccountNumber,
+          transferTransactionCode: dto.transferTransactionCode,
+          transferTransactionTime: dto.transferTransactionTime,
         },
-      },
+        include: {
+          user: {
+            select: { id: true, username: true, phone: true },
+          },
+        },
+      });
+
+      return { withdrawal: updatedWithdrawal, oldPaymentAccountId, newPaymentAccountId };
     });
+    const updated = result.withdrawal;
+
+    // Both sides of a re-link can have their balance changed by
+    // syncWithdrawalLink's reversal-then-forward — notify each distinct
+    // account actually involved.
+    for (const paymentAccountId of new Set(
+      [result.oldPaymentAccountId, result.newPaymentAccountId].filter(
+        (id): id is string => id !== null,
+      ),
+    )) {
+      this.realtimeGateway.notifyAdminsPaymentAccountUpdated({ paymentAccountId });
+    }
 
     this.realtimeGateway.notifyUserWithdrawalUpdated(updated.userId, {
       id: updated.id,
@@ -360,10 +425,14 @@ export class WithdrawalsService {
       accountType: updated.accountType,
       accountName: updated.accountName,
       accountNumber: updated.accountNumber,
+      bankName: updated.bankName,
       approvedAt: updated.approvedAt,
       transferAccountType: updated.transferAccountType,
+      transferAccountSubname: updated.transferAccountSubname,
       transferAccountName: updated.transferAccountName,
       transferAccountNumber: updated.transferAccountNumber,
+      transferTransactionCode: updated.transferTransactionCode,
+      transferTransactionTime: updated.transferTransactionTime,
     });
 
     return { ...this.toResponse(updated), user: updated.user };
@@ -376,13 +445,18 @@ export class WithdrawalsService {
     accountType: string;
     accountName: string;
     accountNumber: string;
+    bankName?: string | null;
     status: WithdrawalStatus;
     rejectionReason: string | null;
     approvedByUserId: string | null;
     approvedAt: Date | null;
     transferAccountType?: string | null;
+    transferAccountSubname?: string | null;
     transferAccountName?: string | null;
     transferAccountNumber?: string | null;
+    transferTransactionCode?: string | null;
+    transferTransactionTime?: string | null;
+    transferPaymentAccountId?: string | null;
     createdAt: Date;
     updatedAt: Date;
   }) {

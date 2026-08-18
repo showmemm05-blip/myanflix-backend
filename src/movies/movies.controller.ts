@@ -13,6 +13,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { MinioService } from '../common/storage/minio.service';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { Permission } from '../roles/permission.enum';
@@ -22,12 +23,25 @@ import { CreateMovieDto } from './dto/create-movie.dto';
 import { CreateUploadPlaceholderDto } from './dto/create-upload-placeholder.dto';
 import { MovieQueryDto } from './dto/movie-query.dto';
 import { MovieResponseDto } from './dto/movie-response.dto';
+import type { ImageUrlResolver } from './dto/movie-response.dto';
 import { UpdateMovieDto } from './dto/update-movie.dto';
 import { MoviesService } from './movies.service';
 
 @Controller('movies')
 export class MoviesController {
-  constructor(private readonly moviesService: MoviesService) {}
+  constructor(
+    private readonly moviesService: MoviesService,
+    private readonly minioService: MinioService,
+  ) {}
+
+  /**
+   * Poster/cover/thumbnail URLs are persisted absolute (baked with whatever
+   * host uploaded them), so every one of them is re-hosted against the
+   * current request before going out — see MinioService.imageUrl. An arrow
+   * property so it stays bound when handed to MovieResponseDto.fromEntity.
+   */
+  private readonly resolveImageUrl: ImageUrlResolver = (url) =>
+    this.minioService.imageUrl(url);
 
   @Get()
   async findAll(
@@ -39,7 +53,9 @@ export class MoviesController {
       user.role,
     );
     return {
-      items: items.map((m) => MovieResponseDto.fromEntity(m)),
+      items: items.map((m) =>
+        MovieResponseDto.fromEntity(m, this.resolveImageUrl),
+      ),
       total,
       page,
       limit,
@@ -59,7 +75,9 @@ export class MoviesController {
   @Get('most-purchased')
   async getMostPurchased() {
     const movies = await this.moviesService.getMostPurchased();
-    return movies.map((m) => MovieResponseDto.fromEntity(m));
+    return movies.map((m) =>
+      MovieResponseDto.fromEntity(m, this.resolveImageUrl),
+    );
   }
 
   @Get(':id')
@@ -68,7 +86,7 @@ export class MoviesController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     const movie = await this.moviesService.findByIdOrThrow(id, user.role);
-    return MovieResponseDto.fromEntity(movie);
+    return MovieResponseDto.fromEntity(movie, this.resolveImageUrl);
   }
 
   @Post()
@@ -76,7 +94,7 @@ export class MoviesController {
   @RequirePermissions(Permission.MOVIE_CREATE)
   async create(@Body() dto: CreateMovieDto) {
     const movie = await this.moviesService.create(dto);
-    return MovieResponseDto.fromEntity(movie);
+    return MovieResponseDto.fromEntity(movie, this.resolveImageUrl);
   }
 
   /**
@@ -98,7 +116,7 @@ export class MoviesController {
           }
         : undefined,
     );
-    return MovieResponseDto.fromEntity(movie);
+    return MovieResponseDto.fromEntity(movie, this.resolveImageUrl);
   }
 
   @Put(':id')
@@ -109,7 +127,7 @@ export class MoviesController {
     @Body() dto: UpdateMovieDto,
   ) {
     const movie = await this.moviesService.update(id, dto);
-    return MovieResponseDto.fromEntity(movie);
+    return MovieResponseDto.fromEntity(movie, this.resolveImageUrl);
   }
 
   @Delete(':id')

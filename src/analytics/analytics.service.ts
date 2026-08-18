@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { MinioService } from '../common/storage/minio.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import { TransactionType } from '../generated/prisma/client';
 
@@ -28,7 +29,10 @@ const MONTH_LABELS = [
 
 @Injectable()
 export class AnalyticsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly minioService: MinioService,
+  ) {}
 
   async getOverview() {
     const now = new Date();
@@ -135,7 +139,14 @@ export class AnalyticsService {
       where: { id: { in: grouped.map((g) => g.movieId) } },
       select: { id: true, title: true, posterUrl: true },
     });
-    const movieById = new Map(movies.map((m) => [m.id, m]));
+    const movieById = new Map(
+      movies.map((m) => [
+        m.id,
+        // Persisted poster URLs carry whatever host uploaded them; re-hosted
+        // per request here, same as everywhere else (MinioService.imageUrl).
+        { ...m, posterUrl: this.minioService.imageUrl(m.posterUrl) },
+      ]),
+    );
 
     return grouped.map((g) => ({
       movie: movieById.get(g.movieId) ?? null,

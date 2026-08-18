@@ -64,6 +64,25 @@ enum TransactionType {
   REFUND
   SUBSCRIPTION
   WITHDRAWAL
+  /// Admin-initiated wallet correction (see WalletAdjustment) — credit adds
+  /// to the balance, debit removes from it.
+  ADJUSTMENT_CREDIT
+  ADJUSTMENT_DEBIT
+}
+
+/// Ledger entry type for a single PaymentAccount's own audit trail — distinct
+/// from TransactionType (the user-wallet ledger) to avoid an import name
+/// collision. `amount` on PaymentAccountTransaction is always a positive
+/// magnitude; credit vs debit is derived from this type via a fixed map in
+/// PaymentAccountLedgerService, never a separately stored sign/direction.
+enum PaymentAccountTransactionType {
+  OPENING_BALANCE
+  MANUAL_CREDIT
+  MANUAL_DEBIT
+  DEPOSIT_IN
+  WITHDRAWAL_OUT
+  ADJUSTMENT_CREDIT
+  ADJUSTMENT_DEBIT
 }
 
 /// FREE content is streamable by anyone; SUBSCRIPTION content requires an
@@ -100,6 +119,12 @@ enum NotificationType {
   DEPOSIT_REJECTED
   WITHDRAWAL_APPROVED
   WITHDRAWAL_REJECTED
+  BALANCE_ADJUSTED
+}
+
+enum WalletAdjustmentDirection {
+  CREDIT
+  DEBIT
 }
 
 // ---------------------------------------------------------------------------
@@ -107,34 +132,37 @@ enum NotificationType {
 // ---------------------------------------------------------------------------
 
 model User {
-  id        String     @id @default(uuid())
-  username  String     @unique
-  email     String     @unique
-  password  String
-  /// Set for phone+OTP accounts. Nullable so existing email/password users are unaffected.
-  phone     String?    @unique
-  avatar    String?
+  id          String     @id @default(uuid())
+  username    String     @unique
+  password    String
+  /// Set for phone+OTP accounts. Nullable so username/password accounts are unaffected.
+  phone       String?    @unique
+  /// MinIO object KEY for the profile picture (e.g. images/avatars/<userId>-<epochMs>.png) — never an absolute URL.
+  avatar      String?
   role        Role       @default(USER)
   status      UserStatus @default(ACTIVE)
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
   lastLoginAt DateTime?
 
-  wallet           Wallet?
-  purchases        Purchase[]
-  seriesPurchases  SeriesPurchase[]
-  subscriptions    UserSubscription[]
-  transactions     Transaction[]
-  watchHistory     WatchHistory[]
-  refreshTokens    RefreshToken[]
-  deposits         Deposit[]
-  depositApprovals Deposit[]      @relation("DepositApprovals")
-  notifications    Notification[]
-  paymentAccountsCreated PaymentAccount[] @relation("PaymentAccountCreatedBy")
-  paymentAccountsUpdated PaymentAccount[] @relation("PaymentAccountUpdatedBy")
-  withdrawals         Withdrawal[]
-  withdrawalApprovals Withdrawal[] @relation("WithdrawalApprovals")
-  financeSettingsUpdates FinanceSettings[] @relation("FinanceSettingsUpdatedBy")
+  wallet                              Wallet?
+  purchases                           Purchase[]
+  seriesPurchases                     SeriesPurchase[]
+  subscriptions                       UserSubscription[]
+  transactions                        Transaction[]
+  watchHistory                        WatchHistory[]
+  refreshTokens                       RefreshToken[]
+  deposits                            Deposit[]
+  depositApprovals                    Deposit[]                   @relation("DepositApprovals")
+  notifications                       Notification[]
+  paymentAccountsCreated              PaymentAccount[]            @relation("PaymentAccountCreatedBy")
+  paymentAccountsUpdated              PaymentAccount[]            @relation("PaymentAccountUpdatedBy")
+  withdrawals                         Withdrawal[]
+  withdrawalApprovals                 Withdrawal[]                @relation("WithdrawalApprovals")
+  financeSettingsUpdates              FinanceSettings[]           @relation("FinanceSettingsUpdatedBy")
+  paymentAccountTransactionsPerformed PaymentAccountTransaction[] @relation("PaymentAccountTransactionPerformedBy")
+  walletAdjustments                   WalletAdjustment[]          @relation("WalletAdjustmentUser")
+  walletAdjustmentsPerformed          WalletAdjustment[]          @relation("WalletAdjustmentPerformedBy")
 
   @@map("users")
 }
@@ -187,28 +215,28 @@ model OtpCode {
 /// streaming) is keyed on movieId, and an episode needs every bit of it
 /// unchanged. Series-ness is purely additive metadata on top.
 model Movie {
-  id           String      @id @default(uuid())
-  title        String
-  description  String
-  posterUrl    String?
-  coverUrl     String?
-  thumbnailUrl String?
-  genre        String
-  language     String
-  releaseYear  Int
-  duration     Int // minutes
-  rating       Float       @default(0)
+  id            String      @id @default(uuid())
+  title         String
+  description   String
+  posterUrl     String?
+  coverUrl      String?
+  thumbnailUrl  String?
+  genre         String
+  language      String
+  releaseYear   Int
+  duration      Int // minutes
+  rating        Float       @default(0)
   /// For an episode (seriesId set), this is vestigial and never consulted —
   /// access is always inherited from the parent series' own accessType, the
   /// same way isPremium used to be inherited before this field existed.
-  accessType   AccessType  @default(SUBSCRIPTION)
-  status       MovieStatus @default(DRAFT)
+  accessType    AccessType  @default(SUBSCRIPTION)
+  status        MovieStatus @default(DRAFT)
   /// Set only for episodes — null means a standalone movie.
   seriesId      String?
   seasonNumber  Int?
   episodeNumber Int?
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
 
   categories     Category[]
   videos         Video[]
@@ -227,7 +255,7 @@ model Movie {
 /// than cascading, so uploaded content is never destroyed by a metadata
 /// cleanup; orphaned episodes stay manageable from the movies table.
 model Series {
-  id          String   @id @default(uuid())
+  id          String     @id @default(uuid())
   title       String
   description String
   posterUrl   String?
@@ -239,8 +267,8 @@ model Series {
   /// this accessType governs every season and episode, including ones added
   /// later. An episode's own Movie.accessType is never consulted.
   accessType  AccessType @default(SUBSCRIPTION)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
 
   episodes   Movie[]
   categories Category[]
@@ -329,14 +357,14 @@ model Subtitle {
 /// Tracks an in-progress chunked upload so it can be resumed after a client
 /// disconnect. Rows are cleaned up once the upload completes.
 model UploadSession {
-  id             String       @id @default(uuid())
-  movieId        String
-  filename       String
-  fileSize       BigInt
-  chunkSize      Int
-  totalChunks    Int
-  tempDir        String
-  status         UploadStatus @default(IN_PROGRESS)
+  id           String       @id @default(uuid())
+  movieId      String
+  filename     String
+  fileSize     BigInt
+  chunkSize    Int
+  totalChunks  Int
+  tempDir      String
+  status       UploadStatus @default(IN_PROGRESS)
   /// Set only for the externally-pre-transcoded upload flow — e.g.
   /// "original.mp4", "hls/720p/index.m3u8", "hls/720p/segment_000.ts".
   /// Null means the classic single-video-file flow (unchanged behavior):
@@ -344,9 +372,9 @@ model UploadSession {
   /// transcoding. When set, completeUpload() instead uploads the merged
   /// file straight to `videos/<movieId>/<relativePath>` and does nothing
   /// else — no Video row, no processVideo() call.
-  relativePath   String?
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
+  relativePath String?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
 
   movie Movie @relation(fields: [movieId], references: [id], onDelete: Cascade)
 
@@ -431,11 +459,40 @@ model Transaction {
   movieId   String?
   createdAt DateTime          @default(now())
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  walletAdjustment WalletAdjustment?
 
   @@index([userId])
   @@index([createdAt])
   @@map("transactions")
+}
+
+/// Audit record of one admin-initiated wallet balance correction — always
+/// paired with a Transaction row (ADJUSTMENT_CREDIT/ADJUSTMENT_DEBIT) created
+/// in the same $transaction. Append-only, mirroring the
+/// PaymentAccountTransaction convention.
+model WalletAdjustment {
+  id                String                    @id @default(uuid())
+  userId            String
+  direction         WalletAdjustmentDirection
+  /// Always a positive magnitude; direction carries the sign.
+  amount            Decimal                   @db.Decimal(12, 2)
+  balanceBefore     Decimal                   @db.Decimal(12, 2)
+  balanceAfter      Decimal                   @db.Decimal(12, 2)
+  reason            String
+  /// Client-generated per dialog-open; unique = server-side duplicate guard.
+  idempotencyKey    String                    @unique
+  performedByUserId String?
+  transactionId     String?                   @unique
+  createdAt         DateTime                  @default(now())
+
+  user        User         @relation("WalletAdjustmentUser", fields: [userId], references: [id], onDelete: Cascade)
+  performedBy User?        @relation("WalletAdjustmentPerformedBy", fields: [performedByUserId], references: [id], onDelete: SetNull)
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([createdAt])
+  @@map("wallet_adjustments")
 }
 
 /// A user-submitted balance top-up request awaiting admin review. Approving
@@ -443,33 +500,78 @@ model Transaction {
 /// itself never touches the ledger directly, so a rejected request leaves no
 /// trace on the Wallet/Transaction tables at all.
 model Deposit {
-  id               String        @id @default(uuid())
-  userId           String
-  amount           Decimal       @db.Decimal(12, 2)
-  paymentMethod    String
+  id                        String        @id @default(uuid())
+  userId                    String
+  amount                    Decimal       @db.Decimal(12, 2)
+  paymentMethod             String
   /// The PaymentAccount.accountName the depositor says they sent to, as a
   /// plain snapshot string (same free-text convention as paymentMethod) —
   /// not a foreign key, so it survives that PaymentAccount later being
   /// renamed or deleted. Null for deposits submitted before this field
   /// existed, or from a client that hasn't been updated to send it.
-  accountName      String?
+  accountName               String?
   /// 6-digit payment reference, e.g. "000123" — stored as a string so
   /// leading zeros survive; validated at the DTO layer, not the DB.
-  reference        String
-  status           DepositStatus @default(PENDING)
-  rejectionReason  String?
-  approvedByUserId String?
-  approvedAt       DateTime?
-  createdAt        DateTime      @default(now())
-  updatedAt        DateTime      @updatedAt
+  reference                 String
+  /// The catalog PaymentAccount the depositor picked as their destination at
+  /// submission time (captured from the deposit dialog's account picker) —
+  /// what they CLAIM they sent to, not yet confirmed. Deliberately distinct
+  /// from receivingPaymentAccountId (the confirmed/ledgered account): if they
+  /// were the same field, approve() crediting this account wouldn't be
+  /// distinguishable from "nothing changed" once it's already set. Null for
+  /// deposits from a client that hasn't been updated to send it.
+  declaredPaymentAccountId  String?
+  status                    DepositStatus @default(PENDING)
+  rejectionReason           String?
+  approvedByUserId          String?
+  approvedAt                DateTime?
+  /// The account WE received the money INTO (our own KPay/bank/etc.),
+  /// recorded manually by an admin after approval — entirely separate from
+  /// paymentMethod/accountName above, which describe what the user says they
+  /// sent FROM and are never touched by this. Mirrors Withdrawal's
+  /// transferAccount* fields (see that model's doc comments).
+  receivingAccountType      String?
+  /// Copied from PaymentAccount.subname at save time when the admin picks a
+  /// configured account (see ReceivingAccountCell) — a short internal label
+  /// (e.g. "K1") that reads better than the account holder's real name in
+  /// the compact table view. Null when the admin typed the account in
+  /// manually instead of picking one from the catalog.
+  receivingAccountSubname   String?
+  receivingAccountName      String?
+  receivingAccountNumber    String?
+  /// Last 6 characters (alphanumeric) of the transaction code, keyed in by
+  /// the admin from the payment provider's confirmation — not the full code.
+  receivingTransactionCode  String?
+  /// Time of day only (no date), e.g. "06:56:28" — see
+  /// UpdateReceivingAccountDto for the normalization/validation rules.
+  receivingTransactionTime  String?
+  /// Set when the admin picks a catalog PaymentAccount (rather than typing
+  /// the receiving account in free text) via updateReceivingAccount — this
+  /// is what lets PaymentAccountLedgerService.syncDepositLink post a
+  /// DEPOSIT_IN ledger entry against that specific account. Null if never
+  /// picked from the catalog, in which case no ledger entry is ever created
+  /// for this deposit.
+  receivingPaymentAccountId String?
+  /// Customer wallet balance immediately before/after this deposit's credit —
+  /// captured at approve/manual-create time; null for deposits credited
+  /// before these columns existed and for PENDING/REJECTED deposits.
+  walletBalanceBefore       Decimal?      @db.Decimal(12, 2)
+  walletBalanceAfter        Decimal?      @db.Decimal(12, 2)
+  createdAt                 DateTime      @default(now())
+  updatedAt                 DateTime      @updatedAt
 
-  user       User  @relation(fields: [userId], references: [id], onDelete: Cascade)
-  approvedBy User? @relation("DepositApprovals", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  user                    User                        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  approvedBy              User?                       @relation("DepositApprovals", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  declaredPaymentAccount  PaymentAccount?             @relation("DepositDeclaredAccount", fields: [declaredPaymentAccountId], references: [id], onDelete: SetNull)
+  receivingPaymentAccount PaymentAccount?             @relation("DepositReceivingAccount", fields: [receivingPaymentAccountId], references: [id], onDelete: SetNull)
+  ledgerEntries           PaymentAccountTransaction[] @relation("DepositLedgerEntries")
 
   @@index([userId])
   @@index([status])
   @@index([reference])
   @@index([createdAt])
+  @@index([declaredPaymentAccountId])
+  @@index([receivingPaymentAccountId])
   @@map("deposits")
 }
 
@@ -480,36 +582,67 @@ model Deposit {
 /// Transaction. Unlike Deposit's `accountName` (who the user says they sent
 /// FROM), these three fields describe where the admin should send money TO.
 model Withdrawal {
-  id               String           @id @default(uuid())
-  userId           String
-  amount           Decimal          @db.Decimal(12, 2)
+  id                       String           @id @default(uuid())
+  userId                   String
+  amount                   Decimal          @db.Decimal(12, 2)
   /// Free string, same convention as PaymentAccount.type / PaymentMethodType
   /// — not a foreign key. Typically one of the known payment method labels
   /// (KBZPay, Bank Account, ...) but not enforced against that catalog,
   /// since it describes the user's own external account, not a platform one.
-  accountType      String
-  accountName      String
-  accountNumber    String
-  status           WithdrawalStatus @default(PENDING)
-  rejectionReason  String?
-  approvedByUserId String?
-  approvedAt       DateTime?
+  accountType              String
+  accountName              String
+  accountNumber            String
+  /// The bank the user named on THIS request, captured only when the chosen
+  /// accountType requires one (see PaymentMethodType.requiresBankName). Part
+  /// of the same user-provided snapshot as the three fields above: it records
+  /// what they asked us to pay out to on this occasion, which may differ from
+  /// any bank on their profile or on a previous request, and is never
+  /// back-filled or overwritten from either. Null for non-bank methods, and
+  /// for requests submitted before this field existed.
+  bankName                 String?
+  status                   WithdrawalStatus @default(PENDING)
+  rejectionReason          String?
+  approvedByUserId         String?
+  approvedAt               DateTime?
   /// The account WE sent the money FROM (our own KBZPay/bank/etc.), recorded
   /// manually by an admin after approval — entirely separate from
   /// accountType/accountName/accountNumber above, which describe the user's
   /// own destination account and are never touched by this.
-  transferAccountType   String?
-  transferAccountName   String?
-  transferAccountNumber String?
-  createdAt        DateTime         @default(now())
-  updatedAt        DateTime         @updatedAt
+  transferAccountType      String?
+  /// Copied from PaymentAccount.subname at save time when the admin picks a
+  /// configured account (see TransferAccountCell) — a short internal label
+  /// (e.g. "K1") that reads better than the account holder's real name in
+  /// the compact table view. Null when the admin typed the account in
+  /// manually instead of picking one from the catalog.
+  transferAccountSubname   String?
+  transferAccountName      String?
+  transferAccountNumber    String?
+  /// Last 6 characters (alphanumeric) of the transaction code, keyed in by
+  /// the admin from the payment provider's confirmation — not the full code.
+  transferTransactionCode  String?
+  /// The actual time the transfer happened (per the provider's receipt), as
+  /// free text — a plain record of what the admin typed, not a parsed/
+  /// validated timestamp, since the provider's receipt format varies.
+  transferTransactionTime  String?
+  /// Set when the admin picks a catalog PaymentAccount (rather than typing
+  /// the transferring account in free text) via updateTransferAccount — this
+  /// is what lets PaymentAccountLedgerService.syncWithdrawalLink post a
+  /// WITHDRAWAL_OUT ledger entry against that specific account. Null if
+  /// never picked from the catalog, in which case no ledger entry is ever
+  /// created for this withdrawal.
+  transferPaymentAccountId String?
+  createdAt                DateTime         @default(now())
+  updatedAt                DateTime         @updatedAt
 
-  user       User  @relation(fields: [userId], references: [id], onDelete: Cascade)
-  approvedBy User? @relation("WithdrawalApprovals", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  user                   User                        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  approvedBy             User?                       @relation("WithdrawalApprovals", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  transferPaymentAccount PaymentAccount?             @relation("WithdrawalTransferAccount", fields: [transferPaymentAccountId], references: [id], onDelete: SetNull)
+  ledgerEntries          PaymentAccountTransaction[] @relation("WithdrawalLedgerEntries")
 
   @@index([userId])
   @@index([status])
   @@index([createdAt])
+  @@index([transferPaymentAccountId])
   @@map("withdrawals")
 }
 
@@ -542,6 +675,11 @@ model FinanceSettings {
 model PaymentAccount {
   id            String  @id @default(uuid())
   type          String
+  /// Admin-facing label distinguishing multiple accounts under the same
+  /// `type` (e.g. "Main Account" vs "Backup Account" for KBZPay) — never
+  /// shown to users during deposit, and never used as the actual account
+  /// name that gets sent anywhere.
+  subname       String?
   accountName   String
   /// Account number or phone number, depending on type.
   accountNumber String
@@ -549,6 +687,19 @@ model PaymentAccount {
   bankName      String?
   note          String?
   isActive      Boolean @default(true)
+
+  /// Running balance — a cache, not the source of truth. The real audit
+  /// trail is PaymentAccountTransaction; this column (and totalIn/totalOut
+  /// below) is only ever updated by PaymentAccountLedgerService inside the
+  /// same $transaction as the ledger row that explains the change. Never
+  /// part of Create/UpdatePaymentAccountDto — that omission is what keeps
+  /// this non-editable directly by an admin.
+  balance  Decimal @default(0) @db.Decimal(12, 2)
+  /// Sum of every credit ever posted to this account (opening balance,
+  /// manual credits, deposit inflow, positive adjustments).
+  totalIn  Decimal @default(0) @db.Decimal(12, 2)
+  /// Sum of every debit ever posted to this account.
+  totalOut Decimal @default(0) @db.Decimal(12, 2)
 
   createdByUserId String?
   updatedByUserId String?
@@ -558,9 +709,54 @@ model PaymentAccount {
   createdBy User? @relation("PaymentAccountCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
   updatedBy User? @relation("PaymentAccountUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: SetNull)
 
+  transactions     PaymentAccountTransaction[]
+  depositsDeclared Deposit[]                   @relation("DepositDeclaredAccount")
+  depositsReceived Deposit[]                   @relation("DepositReceivingAccount")
+  withdrawalsSent  Withdrawal[]                @relation("WithdrawalTransferAccount")
+
   @@index([isActive])
   @@index([type])
   @@map("payment_accounts")
+}
+
+/// Full audit ledger for a single PaymentAccount — the append-only source of
+/// truth backing PaymentAccount.balance/totalIn/totalOut. Rows are never
+/// updated or deleted once created; corrections are posted as new rows
+/// (ADJUSTMENT_CREDIT/ADJUSTMENT_DEBIT), same convention as
+/// Transaction/Wallet.
+model PaymentAccountTransaction {
+  id                  String                        @id @default(uuid())
+  paymentAccountId    String
+  type                PaymentAccountTransactionType
+  /// Always a positive magnitude — direction is derived from `type`.
+  amount              Decimal                       @db.Decimal(12, 2)
+  balanceBefore       Decimal                       @db.Decimal(12, 2)
+  balanceAfter        Decimal                       @db.Decimal(12, 2)
+  /// Free-text transaction/reference code. For DEPOSIT_IN/WITHDRAWAL_OUT
+  /// rows this is copied from the deposit/withdrawal's own
+  /// receiving/transferTransactionCode at the moment the entry is created;
+  /// for manual entries it's whatever the admin types.
+  referenceCode       String?
+  note                String?
+  relatedDepositId    String?
+  relatedWithdrawalId String?
+  /// Who performed/triggered this movement — the admin for manual entries
+  /// and for the approve/link action that generated an automatic
+  /// DEPOSIT_IN/WITHDRAWAL_OUT/reversal row.
+  performedByUserId   String?
+  createdAt           DateTime                      @default(now())
+
+  paymentAccount    PaymentAccount @relation(fields: [paymentAccountId], references: [id], onDelete: Restrict)
+  relatedDeposit    Deposit?       @relation("DepositLedgerEntries", fields: [relatedDepositId], references: [id], onDelete: SetNull)
+  relatedWithdrawal Withdrawal?    @relation("WithdrawalLedgerEntries", fields: [relatedWithdrawalId], references: [id], onDelete: SetNull)
+  performedBy       User?          @relation("PaymentAccountTransactionPerformedBy", fields: [performedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([paymentAccountId])
+  @@index([type])
+  @@index([createdAt])
+  @@index([relatedDepositId])
+  @@index([relatedWithdrawalId])
+  @@map("payment_account_transactions")
 }
 
 /// The catalog of payment methods (KBZPay, Bank Account, and any Super

@@ -2,8 +2,10 @@ import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { IoAdapter } from '@nestjs/platform-socket.io';
 import { json, urlencoded } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import type { Server } from 'node:http';
 import { AppModule } from './app.module';
+import { requestHostContext } from './common/storage/request-host.context';
 
 // Express's default JSON body limit is 100kb — too small for
 // POST /uploads/:movieId/finalize, whose body lists every file in a
@@ -23,6 +25,22 @@ async function bootstrap() {
 
   app.use(json({ limit: JSON_BODY_LIMIT }));
   app.use(urlencoded({ extended: true, limit: JSON_BODY_LIMIT }));
+
+  // Capture the Host each request came in on so playback URLs can be built
+  // from it (MinioService.playbackUrl) — the machine hosting this stack
+  // changes networks regularly, and any hard-coded IP breaks on every hop.
+  app.use((req: Request, _res: Response, next: NextFunction) => {
+    const rawHost = req.headers.host ?? '';
+    // Strip the API port; keep IPv6 brackets intact.
+    const hostname = rawHost.startsWith('[')
+      ? rawHost.slice(0, rawHost.indexOf(']') + 1)
+      : rawHost.split(':')[0];
+    if (!hostname) {
+      next();
+      return;
+    }
+    requestHostContext.run({ hostname }, next);
+  });
 
   // maxAge (seconds) lets the browser cache a preflight instead of repeating
   // it on every request to the same URL — without it, browsers default to a

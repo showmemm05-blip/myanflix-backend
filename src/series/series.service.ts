@@ -7,6 +7,7 @@ import {
   type Series,
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { MinioService } from '../common/storage/minio.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import type { CreateSeriesDto } from './dto/create-series.dto';
 import type { EpisodeQueryDto } from './dto/episode-query.dto';
@@ -24,7 +25,27 @@ type SeriesWithCategories = Series & { categories?: Category[] };
  */
 @Injectable()
 export class SeriesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly minioService: MinioService,
+  ) {}
+
+  /**
+   * A show's poster/cover URLs are persisted absolute, baked with whatever
+   * host uploaded them, so they go stale the moment this machine changes
+   * networks. Every read path re-hosts them against the current request —
+   * see MinioService.imageUrl. Purely a read-time derivation; the stored
+   * values are never touched.
+   */
+  private withImageUrls<
+    T extends { posterUrl: string | null; coverUrl: string | null },
+  >(series: T): T {
+    return {
+      ...series,
+      posterUrl: this.minioService.imageUrl(series.posterUrl),
+      coverUrl: this.minioService.imageUrl(series.coverUrl),
+    };
+  }
 
   async findAll(query: SeriesQueryDto) {
     const page = query.page ?? 1;
@@ -46,7 +67,7 @@ export class SeriesService {
 
     return {
       items: items.map(({ _count, ...series }) => ({
-        ...series,
+        ...this.withImageUrls(series),
         episodeCount: _count.episodes,
       })),
       total,
@@ -61,7 +82,7 @@ export class SeriesService {
       include: { categories: true },
     });
     if (!series) throw new NotFoundException('Series not found');
-    return series;
+    return this.withImageUrls(series);
   }
 
   /** Detail shape for a viewer — access is a global per-user subscription flag, not per-item, so it isn't computed here. */
@@ -69,18 +90,38 @@ export class SeriesService {
     return this.findByIdOrThrow(id);
   }
 
+  /**
+   * Image URLs as they should be STORED — see MinioService.canonicalImageUrl.
+   * The admin echoes a fetched record back on save when the artwork was not
+   * touched, so without this a row would inherit whichever host that one save
+   * request happened to arrive on.
+   */
+  private withCanonicalImageUrls<T extends { posterUrl?: string | null; coverUrl?: string | null }>(
+    data: T,
+  ): T {
+    return {
+      ...data,
+      ...(data.posterUrl !== undefined
+        ? { posterUrl: this.minioService.canonicalImageUrl(data.posterUrl) }
+        : {}),
+      ...(data.coverUrl !== undefined
+        ? { coverUrl: this.minioService.canonicalImageUrl(data.coverUrl) }
+        : {}),
+    };
+  }
+
   async create(dto: CreateSeriesDto) {
     const { categoryIds, ...data } = dto;
     const created = await this.prisma.series.create({
       data: {
-        ...data,
+        ...this.withCanonicalImageUrls(data),
         categories: categoryIds
           ? { connect: categoryIds.map((id) => ({ id })) }
           : undefined,
       },
       include: { categories: true },
     });
-    return created;
+    return this.withImageUrls(created);
   }
 
   async update(id: string, dto: UpdateSeriesDto) {
@@ -89,14 +130,14 @@ export class SeriesService {
     const updated = await this.prisma.series.update({
       where: { id },
       data: {
-        ...data,
+        ...this.withCanonicalImageUrls(data),
         categories: categoryIds
           ? { set: categoryIds.map((cid) => ({ id: cid })) }
           : undefined,
       },
       include: { categories: true },
     });
-    return updated;
+    return this.withImageUrls(updated);
   }
 
   /**
@@ -218,8 +259,8 @@ export class SeriesService {
             title: e.title,
             episodeNumber: e.episodeNumber,
             duration: e.duration,
-            thumbnailUrl: e.thumbnailUrl,
-            posterUrl: e.posterUrl,
+            thumbnailUrl: this.minioService.imageUrl(e.thumbnailUrl),
+            posterUrl: this.minioService.imageUrl(e.posterUrl),
             watchProgress: progressByMovieId.get(e.id) ?? null,
           })),
         })),
@@ -287,7 +328,7 @@ export class SeriesService {
       id: p.id,
       seriesId: p.seriesId,
       seriesTitle: p.series.title,
-      posterUrl: p.series.posterUrl,
+      posterUrl: this.minioService.imageUrl(p.series.posterUrl),
       amount: decimalToNumber(p.amount),
       createdAt: p.createdAt,
     }));

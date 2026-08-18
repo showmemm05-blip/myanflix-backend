@@ -21,12 +21,15 @@ describe('Realtime WebSocket (e2e)', () => {
 
   let userId: string;
   let adminId: string;
+  let superAdminId: string;
   let userToken: string;
   let adminToken: string;
+  let superAdminToken: string;
+  let paymentAccountId: string;
 
-  async function signToken(id: string, email: string): Promise<string> {
+  async function signToken(id: string): Promise<string> {
     return jwtService.signAsync(
-      { sub: id, email },
+      { sub: id },
       { secret: configService.get<string>('JWT_SECRET'), expiresIn: '15m' },
     );
   }
@@ -71,7 +74,6 @@ describe('Realtime WebSocket (e2e)', () => {
     const user = await prisma.user.create({
       data: {
         username: `rtuser_${suffix}`,
-        email: `rtuser_${suffix}@test.local`,
         password: 'unused-in-these-tests',
         role: Role.USER,
         status: UserStatus.ACTIVE,
@@ -82,7 +84,6 @@ describe('Realtime WebSocket (e2e)', () => {
     const admin = await prisma.user.create({
       data: {
         username: `rtadmin_${suffix}`,
-        email: `rtadmin_${suffix}@test.local`,
         password: 'unused-in-these-tests',
         role: Role.ADMIN,
         status: UserStatus.ACTIVE,
@@ -90,18 +91,44 @@ describe('Realtime WebSocket (e2e)', () => {
     });
     await prisma.wallet.create({ data: { userId: admin.id, balance: 0 } });
 
+    const superAdmin = await prisma.user.create({
+      data: {
+        username: `rtsuper_${suffix}`,
+        password: 'unused-in-these-tests',
+        role: Role.SUPER_ADMIN,
+        status: UserStatus.ACTIVE,
+      },
+    });
+    await prisma.wallet.create({ data: { userId: superAdmin.id, balance: 0 } });
+
+    const paymentAccount = await prisma.paymentAccount.create({
+      data: {
+        type: 'KBZPay',
+        accountName: `RT Test Account ${suffix}`,
+        accountNumber: '09000000000',
+        createdByUserId: superAdmin.id,
+        updatedByUserId: superAdmin.id,
+      },
+    });
+
     userId = user.id;
     adminId = admin.id;
-    userToken = await signToken(user.id, user.email);
-    adminToken = await signToken(admin.id, admin.email);
+    superAdminId = superAdmin.id;
+    paymentAccountId = paymentAccount.id;
+    userToken = await signToken(user.id);
+    adminToken = await signToken(admin.id);
+    superAdminToken = await signToken(superAdmin.id);
   });
 
   afterAll(async () => {
-    await prisma.notification.deleteMany({ where: { userId: { in: [userId, adminId] } } });
-    await prisma.transaction.deleteMany({ where: { userId: { in: [userId, adminId] } } });
-    await prisma.deposit.deleteMany({ where: { userId: { in: [userId, adminId] } } });
-    await prisma.wallet.deleteMany({ where: { userId: { in: [userId, adminId] } } });
-    await prisma.user.deleteMany({ where: { id: { in: [userId, adminId] } } });
+    const allIds = [userId, adminId, superAdminId];
+    await prisma.paymentAccountTransaction.deleteMany({ where: { paymentAccountId } });
+    await prisma.paymentAccount.deleteMany({ where: { id: paymentAccountId } });
+    await prisma.notification.deleteMany({ where: { userId: { in: allIds } } });
+    await prisma.transaction.deleteMany({ where: { userId: { in: allIds } } });
+    await prisma.deposit.deleteMany({ where: { userId: { in: allIds } } });
+    await prisma.wallet.deleteMany({ where: { userId: { in: allIds } } });
+    await prisma.user.deleteMany({ where: { id: { in: allIds } } });
     await app.close();
   });
 
@@ -207,6 +234,62 @@ describe('Realtime WebSocket (e2e)', () => {
       expect(balance.balance).toBe(4500);
     } finally {
       userSocket.disconnect();
+    }
+  });
+
+  it('emits payment-account.updated to the admins room when a manual ledger entry is recorded', async () => {
+    const adminSocket = await connect(adminToken);
+
+    try {
+      const eventPromise = waitForEvent<{ paymentAccountId: string }>(
+        adminSocket,
+        'payment-account.updated',
+      );
+
+      await request(app.getHttpServer())
+        .post(`/api/payment-accounts/${paymentAccountId}/transactions`)
+        .set('Authorization', `Bearer ${superAdminToken}`)
+        .send({ type: 'MANUAL_CREDIT', amount: 2500 })
+        .expect(201);
+
+      const event = await eventPromise;
+      expect(event.paymentAccountId).toBe(paymentAccountId);
+    } finally {
+      adminSocket.disconnect();
+    }
+  });
+
+  it('emits payment-account.updated to admins when a deposit is approved with an auto-credited receiving account', async () => {
+    const adminSocket = await connect(adminToken);
+
+    try {
+      const createRes = await request(app.getHttpServer())
+        .post('/api/deposits')
+        .set('Authorization', `Bearer ${userToken}`)
+        .send({
+          amount: 3000,
+          paymentMethod: 'KBZ Pay',
+          reference: '900444',
+          paymentAccountId,
+        })
+        .expect(201);
+      const depositId = createRes.body.data.id;
+
+      const eventPromise = waitForEvent<{ paymentAccountId: string }>(
+        adminSocket,
+        'payment-account.updated',
+      );
+
+      await request(app.getHttpServer())
+        .patch(`/api/deposits/${depositId}/approve`)
+        .set('Authorization', `Bearer ${superAdminToken}`)
+        .send({})
+        .expect(200);
+
+      const event = await eventPromise;
+      expect(event.paymentAccountId).toBe(paymentAccountId);
+    } finally {
+      adminSocket.disconnect();
     }
   });
 });

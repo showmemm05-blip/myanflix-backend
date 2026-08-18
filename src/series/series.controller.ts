@@ -14,11 +14,13 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { MinioService } from '../common/storage/minio.service';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { MovieResponseDto } from '../movies/dto/movie-response.dto';
+import type { ImageUrlResolver } from '../movies/dto/movie-response.dto';
 import { CreateSeriesDto } from './dto/create-series.dto';
 import { EpisodeQueryDto } from './dto/episode-query.dto';
 import { SeriesQueryDto } from './dto/series-query.dto';
@@ -27,7 +29,19 @@ import { SeriesService } from './series.service';
 
 @Controller('series')
 export class SeriesController {
-  constructor(private readonly seriesService: SeriesService) {}
+  constructor(
+    private readonly seriesService: SeriesService,
+    private readonly minioService: MinioService,
+  ) {}
+
+  /**
+   * Episode poster/thumbnail URLs are persisted absolute (baked with
+   * whatever host uploaded them), so they're re-hosted against the current
+   * request on the way out — see MinioService.imageUrl. An arrow property so
+   * it stays bound when handed to MovieResponseDto.fromEntity.
+   */
+  private readonly resolveImageUrl: ImageUrlResolver = (url) =>
+    this.minioService.imageUrl(url);
 
   @Get()
   findAll(@Query() query: SeriesQueryDto) {
@@ -53,7 +67,7 @@ export class SeriesController {
       await this.seriesService.findEpisodesForAdmin(query);
     return {
       items: items.map((episode) => ({
-        ...MovieResponseDto.fromEntity(episode),
+        ...MovieResponseDto.fromEntity(episode, this.resolveImageUrl),
         seriesTitle: episode.series?.title ?? null,
       })),
       total,
@@ -96,7 +110,9 @@ export class SeriesController {
       user.role,
       seasonNumber,
     );
-    return episodes.map((e) => MovieResponseDto.fromEntity(e));
+    return episodes.map((e) =>
+      MovieResponseDto.fromEntity(e, this.resolveImageUrl),
+    );
   }
 
   /** Grouped-by-season episode list + the caller's own watch progress, for the player page's "Episodes" section. */

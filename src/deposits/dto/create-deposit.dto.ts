@@ -4,6 +4,7 @@ import {
   IsNumber,
   IsOptional,
   IsString,
+  IsUUID,
   Matches,
   MaxLength,
   Min,
@@ -24,6 +25,17 @@ export class CreateDepositDto {
   @IsString()
   @MaxLength(120)
   accountName?: string;
+
+  /**
+   * The catalog PaymentAccount the client's picker selected as the
+   * destination — optional so older clients that haven't been updated still
+   * work. Stored as Deposit.declaredPaymentAccountId and auto-credited to
+   * that account's ledger the moment an admin approves this deposit (see
+   * DepositsService.approve).
+   */
+  @IsOptional()
+  @IsUUID('4')
+  paymentAccountId?: string;
 
   /**
    * Deliberately @IsString() with no @Type(() => Number) — the reference

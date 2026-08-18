@@ -60,6 +60,24 @@ describe('ROLE_PERMISSIONS — STAFF_MANAGE', () => {
   });
 });
 
+describe('ROLE_PERMISSIONS — WALLET_ADJUST', () => {
+  it('is granted to SUPER_ADMIN (via ALL_PERMISSIONS)', () => {
+    expect(roleHasPermission(Role.SUPER_ADMIN, Permission.WALLET_ADJUST)).toBe(true);
+  });
+
+  it('is not granted to ADMIN — balance corrections are stricter than USER_MANAGE', () => {
+    expect(roleHasPermission(Role.ADMIN, Permission.WALLET_ADJUST)).toBe(false);
+  });
+
+  it('is not granted to CONTENT_UPLOADER', () => {
+    expect(roleHasPermission(Role.CONTENT_UPLOADER, Permission.WALLET_ADJUST)).toBe(false);
+  });
+
+  it('is not granted to USER', () => {
+    expect(roleHasPermission(Role.USER, Permission.WALLET_ADJUST)).toBe(false);
+  });
+});
+
 describe('ROLE_PERMISSIONS — FINANCE_SETTINGS_MANAGE', () => {
   it('is granted to SUPER_ADMIN', () => {
     expect(roleHasPermission(Role.SUPER_ADMIN, Permission.FINANCE_SETTINGS_MANAGE)).toBe(true);

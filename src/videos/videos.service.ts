@@ -155,14 +155,16 @@ export class VideosService {
     });
 
     return {
-      playlistUrl: this.minioService.publicUrl(video.hlsMasterPath),
+      // playbackUrl (not publicUrl): follows the host the client called the
+      // API on, so streaming survives the machine changing networks.
+      playlistUrl: this.minioService.playbackUrl(video.hlsMasterPath),
       subtitles: subtitles.map((s) => ({
         id: s.id,
         language: s.language,
         label: s.label,
         format: s.format,
         isDefault: s.isDefault,
-        url: this.minioService.publicUrl(s.objectKey),
+        url: this.minioService.playbackUrl(s.objectKey),
       })),
     };
   }
@@ -212,7 +214,7 @@ export class VideosService {
         id: h.id,
         movieId: h.movieId,
         movieTitle: h.movie.title,
-        posterUrl: h.movie.posterUrl,
+        posterUrl: this.minioService.imageUrl(h.movie.posterUrl),
         durationMinutes: h.movie.duration,
         progress: h.progress,
         lastPosition: h.lastPosition,
@@ -237,7 +239,7 @@ export class VideosService {
       duration: video.duration,
       resolution: video.resolution,
       hlsMasterPath: video.hlsMasterPath
-        ? this.minioService.publicUrl(video.hlsMasterPath)
+        ? this.minioService.playbackUrl(video.hlsMasterPath)
         : null,
       renditions: video.renditions,
       createdAt: video.createdAt,

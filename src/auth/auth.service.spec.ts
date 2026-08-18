@@ -15,7 +15,6 @@ function makeUser(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     id: 'user-1',
     username: 'user_959123456789',
-    email: '959123456789@phone.myanflix.local',
     password: bcrypt.hashSync(CORRECT_PASSWORD, 10),
     phone: '+959123456789',
     avatar: null,
@@ -124,14 +123,11 @@ describe('AuthService — phone OTP', () => {
 
       const result = await service.verifyPhoneOtp('+959123456789', '123456', 'a-new-password');
 
-      expect(usersService.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          phone: '+959123456789',
-          username: expect.stringContaining('959123456789'),
-          email: expect.stringContaining('@phone.myanflix.local'),
-          password: expect.any(String),
-        }),
-      );
+      expect(usersService.create).toHaveBeenCalledWith({
+        phone: '+959123456789',
+        username: expect.stringContaining('959123456789'),
+        password: expect.any(String),
+      });
       // The stored password must actually be the chosen one, hashed — not a random placeholder.
       const storedHash = usersService.create.mock.calls[0][0].password;
       await expect(bcrypt.compare('a-new-password', storedHash)).resolves.toBe(true);

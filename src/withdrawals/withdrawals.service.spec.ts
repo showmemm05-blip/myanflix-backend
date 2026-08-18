@@ -10,6 +10,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { FinanceSettingsService } from '../finance-settings/finance-settings.service';
+import { PaymentAccountLedgerService } from '../payment-accounts/payment-account-ledger.service';
 import { WithdrawalsService } from './withdrawals.service';
 
 function makeWithdrawal(overrides: Partial<Record<string, unknown>> = {}) {
@@ -60,8 +61,10 @@ describe('WithdrawalsService', () => {
     notifyUserWithdrawalUpdated: jest.Mock;
     notifyUserNotificationCreated: jest.Mock;
     notifyUserBalanceUpdated: jest.Mock;
+    notifyAdminsPaymentAccountUpdated: jest.Mock;
   };
   let financeSettingsService: { getLimits: jest.Mock };
+  let paymentAccountLedgerService: { syncWithdrawalLink: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
@@ -78,10 +81,15 @@ describe('WithdrawalsService', () => {
       transaction: { create: jest.fn() },
       notification: { create: jest.fn() },
       user: { findUniqueOrThrow: jest.fn() },
-      // The real prisma.$transaction(callback) runs the callback with a tx
-      // client — here `tx` is just `prisma` itself, since every mocked
-      // method lives directly on this object (mirrors deposits.service.spec.ts).
-      $transaction: jest.fn(async (callback: (tx: unknown) => unknown) => callback(prisma)),
+      // Both call styles are in use: the callback form for the write paths —
+      // where `tx` is just `prisma` itself, since every mocked method lives
+      // directly on this object (mirrors deposits.service.spec.ts) — and the
+      // array form for the list queries' findMany+count pair.
+      $transaction: jest.fn((arg: unknown) =>
+        typeof arg === 'function'
+          ? (arg as (tx: unknown) => unknown)(prisma)
+          : Promise.all(arg as Promise<unknown>[]),
+      ),
     };
     walletService = { getByUserId: jest.fn(), debitWithinTransaction: jest.fn() };
     gateway = {
@@ -89,6 +97,7 @@ describe('WithdrawalsService', () => {
       notifyUserWithdrawalUpdated: jest.fn(),
       notifyUserNotificationCreated: jest.fn(),
       notifyUserBalanceUpdated: jest.fn(),
+      notifyAdminsPaymentAccountUpdated: jest.fn(),
     };
     financeSettingsService = {
       getLimits: jest.fn().mockResolvedValue({
@@ -98,6 +107,10 @@ describe('WithdrawalsService', () => {
         maxWithdrawalAmount: Number.MAX_SAFE_INTEGER,
       }),
     };
+    // Real linking/reversal behavior is covered by
+    // payment-account-ledger.service.spec.ts — here it's a no-op so these
+    // tests stay focused on WithdrawalsService's own orchestration.
+    paymentAccountLedgerService = { syncWithdrawalLink: jest.fn().mockResolvedValue(undefined) };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -106,6 +119,7 @@ describe('WithdrawalsService', () => {
         { provide: WalletService, useValue: walletService },
         { provide: RealtimeGateway, useValue: gateway },
         { provide: FinanceSettingsService, useValue: financeSettingsService },
+        { provide: PaymentAccountLedgerService, useValue: paymentAccountLedgerService },
       ],
     }).compile();
 
@@ -135,7 +149,43 @@ describe('WithdrawalsService', () => {
           accountType: 'KBZPay',
           accountName: 'Ko Ko',
           accountNumber: '09123456789',
+          bankName: null,
         },
+      });
+    });
+
+    it('stores the payout details from the request itself, never from the requester\'s profile', async () => {
+      walletService.getByUserId.mockResolvedValue({ balance: new Prisma.Decimal(100000) });
+      prisma.withdrawal.create.mockResolvedValue(makeWithdrawal());
+      prisma.user.findUniqueOrThrow.mockResolvedValue({ username: 'john' });
+
+      await service.create('user-1', {
+        amount: 5000,
+        accountType: 'Bank Account',
+        accountName: 'Daw Mya',
+        accountNumber: '09999999999',
+        bankName: 'AYA Bank',
+      });
+
+      // Every payout field comes straight off the DTO. A withdrawal is a
+      // snapshot of what was asked for on the day, so a later profile edit —
+      // or a profile that never matched in the first place — must not change
+      // where this payout goes.
+      expect(prisma.withdrawal.create).toHaveBeenCalledWith({
+        data: {
+          userId: 'user-1',
+          amount: 5000,
+          accountType: 'Bank Account',
+          accountName: 'Daw Mya',
+          accountNumber: '09999999999',
+          bankName: 'AYA Bank',
+        },
+      });
+      // The only profile read in create() is for the username on the realtime
+      // notification — it must never be selecting payout details.
+      expect(prisma.user.findUniqueOrThrow).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        select: { username: true },
       });
     });
 
@@ -215,6 +265,101 @@ describe('WithdrawalsService', () => {
     });
   });
 
+  describe('findAllAdmin', () => {
+    beforeEach(() => {
+      prisma.withdrawal.findMany.mockResolvedValue([]);
+      prisma.withdrawal.count.mockResolvedValue(0);
+    });
+
+    it('filters findMany and count by the createdAt range (as real Dates) when dateFrom/dateTo are set', async () => {
+      await service.findAllAdmin({
+        dateFrom: '2026-08-13T17:30:00.000Z',
+        dateTo: '2026-08-14T17:29:59.999Z',
+      });
+
+      const expectedWhere = {
+        status: undefined,
+        userId: undefined,
+        createdAt: {
+          gte: new Date('2026-08-13T17:30:00.000Z'),
+          lte: new Date('2026-08-14T17:29:59.999Z'),
+        },
+      };
+      expect(prisma.withdrawal.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expectedWhere }),
+      );
+      expect(prisma.withdrawal.count).toHaveBeenCalledWith({ where: expectedWhere });
+    });
+
+    it('leaves createdAt undefined when no date range is given, so existing queries are untouched', async () => {
+      await service.findAllAdmin({});
+
+      expect(prisma.withdrawal.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { status: undefined, userId: undefined, createdAt: undefined },
+        }),
+      );
+    });
+
+    it('composes the status filter with the date range', async () => {
+      await service.findAllAdmin({
+        status: WithdrawalStatus.PENDING,
+        dateFrom: '2026-08-13T17:30:00.000Z',
+        dateTo: '2026-08-14T17:29:59.999Z',
+      });
+
+      expect(prisma.withdrawal.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            status: WithdrawalStatus.PENDING,
+            userId: undefined,
+            createdAt: {
+              gte: new Date('2026-08-13T17:30:00.000Z'),
+              lte: new Date('2026-08-14T17:29:59.999Z'),
+            },
+          },
+        }),
+      );
+    });
+  });
+
+  describe('findAllForUser', () => {
+    beforeEach(() => {
+      prisma.withdrawal.findMany.mockResolvedValue([]);
+      prisma.withdrawal.count.mockResolvedValue(0);
+    });
+
+    it("applies the createdAt range on top of the caller's own userId scope", async () => {
+      await service.findAllForUser('user-1', {
+        dateFrom: '2026-08-13T17:30:00.000Z',
+        dateTo: '2026-08-14T17:29:59.999Z',
+      });
+
+      expect(prisma.withdrawal.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            userId: 'user-1',
+            status: undefined,
+            createdAt: {
+              gte: new Date('2026-08-13T17:30:00.000Z'),
+              lte: new Date('2026-08-14T17:29:59.999Z'),
+            },
+          },
+        }),
+      );
+    });
+
+    it('leaves createdAt undefined when no date range is given', async () => {
+      await service.findAllForUser('user-1', {});
+
+      expect(prisma.withdrawal.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { userId: 'user-1', status: undefined, createdAt: undefined },
+        }),
+      );
+    });
+  });
+
   describe('approve', () => {
     it('throws NotFoundException for an unknown withdrawal, without writing anything', async () => {
       prisma.withdrawal.findUnique.mockResolvedValue(null);
@@ -251,7 +396,7 @@ describe('WithdrawalsService', () => {
       });
       prisma.withdrawal.findUniqueOrThrow.mockResolvedValue({
         ...makeWithdrawal({ status: WithdrawalStatus.APPROVED }),
-        user: { id: 'user-1', username: 'john', email: 'j@x.com' },
+        user: { id: 'user-1', username: 'john' },
       });
       prisma.wallet.findUniqueOrThrow.mockResolvedValue({ balance: new Prisma.Decimal(5000) });
 
@@ -317,7 +462,7 @@ describe('WithdrawalsService', () => {
       });
       prisma.withdrawal.findUniqueOrThrow.mockResolvedValue({
         ...makeWithdrawal({ status: WithdrawalStatus.REJECTED, rejectionReason: 'bad' }),
-        user: { id: 'user-1', username: 'john', email: 'j@x.com' },
+        user: { id: 'user-1', username: 'john' },
       });
 
       const result = await service.reject('withdrawal-1', { id: 'admin-1' } as never, {
@@ -332,15 +477,23 @@ describe('WithdrawalsService', () => {
   });
 
   describe('updateTransferAccount', () => {
+    const admin = { id: 'admin-1', username: 'admin', role: 'ADMIN' } as never;
+
     it('throws NotFoundException for an unknown withdrawal, without writing anything', async () => {
       prisma.withdrawal.findUnique.mockResolvedValue(null);
 
       await expect(
-        service.updateTransferAccount('nope', {
-          transferAccountType: 'KBZPay',
-          transferAccountName: 'MyanFlix',
-          transferAccountNumber: '09999999999',
-        }),
+        service.updateTransferAccount(
+          'nope',
+          {
+            transferAccountType: 'KBZPay',
+            transferAccountName: 'MyanFlix',
+            transferAccountNumber: '09999999999',
+            transferTransactionCode: '123456',
+            transferTransactionTime: 'Jan 1, 2026 10:00 AM',
+          },
+          admin,
+        ),
       ).rejects.toThrow(NotFoundException);
       expect(prisma.withdrawal.update).not.toHaveBeenCalled();
     });
@@ -351,16 +504,22 @@ describe('WithdrawalsService', () => {
       );
 
       await expect(
-        service.updateTransferAccount('withdrawal-1', {
-          transferAccountType: 'KBZPay',
-          transferAccountName: 'MyanFlix',
-          transferAccountNumber: '09999999999',
-        }),
+        service.updateTransferAccount(
+          'withdrawal-1',
+          {
+            transferAccountType: 'KBZPay',
+            transferAccountName: 'MyanFlix',
+            transferAccountNumber: '09999999999',
+            transferTransactionCode: '123456',
+            transferTransactionTime: 'Jan 1, 2026 10:00 AM',
+          },
+          admin,
+        ),
       ).rejects.toThrow(BadRequestException);
       expect(prisma.withdrawal.update).not.toHaveBeenCalled();
     });
 
-    it('records our transfer account without touching the user\'s own withdrawal account fields, status, wallet, or ledger', async () => {
+    it('records our transfer account (incl. subname), transaction code, and transaction time without touching the user\'s own withdrawal account fields, status, wallet, or ledger', async () => {
       prisma.withdrawal.findUnique.mockResolvedValue(
         makeWithdrawal({ status: WithdrawalStatus.APPROVED }),
       );
@@ -368,27 +527,40 @@ describe('WithdrawalsService', () => {
         ...makeWithdrawal({
           status: WithdrawalStatus.APPROVED,
           transferAccountType: 'KBZPay',
+          transferAccountSubname: 'K1',
           transferAccountName: 'MyanFlix',
           transferAccountNumber: '09999999999',
+          transferTransactionCode: '123456',
+          transferTransactionTime: 'Jan 1, 2026 10:00 AM',
         }),
-        user: { id: 'user-1', username: 'john', email: 'j@x.com', phone: null },
+        user: { id: 'user-1', username: 'john', phone: null },
       });
 
-      const result = await service.updateTransferAccount('withdrawal-1', {
-        transferAccountType: 'KBZPay',
-        transferAccountName: 'MyanFlix',
-        transferAccountNumber: '09999999999',
-      });
+      const result = await service.updateTransferAccount(
+        'withdrawal-1',
+        {
+          transferAccountType: 'KBZPay',
+          transferAccountSubname: 'K1',
+          transferAccountName: 'MyanFlix',
+          transferAccountNumber: '09999999999',
+          transferTransactionCode: '123456',
+          transferTransactionTime: 'Jan 1, 2026 10:00 AM',
+        },
+        admin,
+      );
 
       expect(prisma.withdrawal.update).toHaveBeenCalledWith({
         where: { id: 'withdrawal-1' },
         data: {
           transferAccountType: 'KBZPay',
+          transferAccountSubname: 'K1',
           transferAccountName: 'MyanFlix',
           transferAccountNumber: '09999999999',
+          transferTransactionCode: '123456',
+          transferTransactionTime: 'Jan 1, 2026 10:00 AM',
         },
         include: {
-          user: { select: { id: true, username: true, email: true, phone: true } },
+          user: { select: { id: true, username: true, phone: true } },
         },
       });
       expect(walletService.debitWithinTransaction).not.toHaveBeenCalled();
@@ -403,13 +575,45 @@ describe('WithdrawalsService', () => {
         accountNumber: '09123456789',
         approvedAt: null,
         transferAccountType: 'KBZPay',
+        transferAccountSubname: 'K1',
         transferAccountName: 'MyanFlix',
         transferAccountNumber: '09999999999',
+        transferTransactionCode: '123456',
+        transferTransactionTime: 'Jan 1, 2026 10:00 AM',
       });
       // The user's own withdrawal account (what they submitted) is untouched.
       expect(result.accountName).toBe('Ko Ko');
       expect(result.transferAccountName).toBe('MyanFlix');
+      expect(result.transferAccountSubname).toBe('K1');
+      expect(result.transferTransactionCode).toBe('123456');
       expect(result.status).toBe(WithdrawalStatus.APPROVED);
+    });
+
+    it('nulls out subname (not leaving it undefined) when the admin types the account in manually instead of picking from the catalog', async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue(
+        makeWithdrawal({ status: WithdrawalStatus.APPROVED }),
+      );
+      prisma.withdrawal.update.mockResolvedValue(
+        makeWithdrawal({ status: WithdrawalStatus.APPROVED }),
+      );
+
+      await service.updateTransferAccount(
+        'withdrawal-1',
+        {
+          transferAccountType: 'KBZPay',
+          transferAccountName: 'MyanFlix',
+          transferAccountNumber: '09999999999',
+          transferTransactionCode: '123456',
+          transferTransactionTime: 'Jan 1, 2026 10:00 AM',
+        },
+        admin,
+      );
+
+      expect(prisma.withdrawal.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ transferAccountSubname: null }),
+        }),
+      );
     });
   });
 });

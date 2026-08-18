@@ -1,4 +1,4 @@
-import { IsEnum, IsOptional, IsUUID } from 'class-validator';
+import { IsDateString, IsEnum, IsOptional, IsUUID } from 'class-validator';
 import { WithdrawalStatus } from '../../generated/prisma/client';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 
@@ -11,4 +11,12 @@ export class WithdrawalQueryDto extends PaginationQueryDto {
   @IsOptional()
   @IsUUID('4')
   userId?: string;
+
+  @IsOptional()
+  @IsDateString()
+  dateFrom?: string;
+
+  @IsOptional()
+  @IsDateString()
+  dateTo?: string;
 }

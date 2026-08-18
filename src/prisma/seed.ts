@@ -79,7 +79,6 @@ async function seedUsers() {
     prisma.user.create({
       data: {
         username: 'superadmin',
-        email: 'superadmin@myanflix.com',
         password: passwordHash,
         role: Role.SUPER_ADMIN,
         status: UserStatus.ACTIVE,
@@ -88,7 +87,6 @@ async function seedUsers() {
     prisma.user.create({
       data: {
         username: 'admin.thiha',
-        email: 'thiha.aung@myanflix.com',
         password: passwordHash,
         role: Role.ADMIN,
         status: UserStatus.ACTIVE,
@@ -97,7 +95,6 @@ async function seedUsers() {
     prisma.user.create({
       data: {
         username: 'admin.sarah',
-        email: 'sarah.johnson@myanflix.com',
         password: passwordHash,
         role: Role.ADMIN,
         status: UserStatus.ACTIVE,
@@ -107,27 +104,18 @@ async function seedUsers() {
 
   const regularUserSeed: {
     username: string;
-    email: string;
     status?: UserStatus;
   }[] = [
-    { username: 'john.smith', email: 'john.smith@gmail.com' },
-    { username: 'sarah.williams', email: 'sarah.williams@outlook.com' },
-    { username: 'michael.chen', email: 'michael.chen@yahoo.com' },
-    { username: 'susu.hlaing', email: 'susu.hlaing@gmail.com' },
-    {
-      username: 'emily.davis',
-      email: 'emily.davis@icloud.com',
-      status: UserStatus.SUSPENDED,
-    },
-    { username: 'kaungmyat.soe', email: 'kaungmyat.soe@gmail.com' },
-    { username: 'david.kim', email: 'david.kim@naver.com' },
-    { username: 'zawlin.htut', email: 'zawlin.htut@gmail.com' },
-    { username: 'amara.okafor', email: 'amara.okafor@gmail.com' },
-    {
-      username: 'rachel.green',
-      email: 'rachel.green@gmail.com',
-      status: UserStatus.BANNED,
-    },
+    { username: 'john.smith' },
+    { username: 'sarah.williams' },
+    { username: 'michael.chen' },
+    { username: 'susu.hlaing' },
+    { username: 'emily.davis', status: UserStatus.SUSPENDED },
+    { username: 'kaungmyat.soe' },
+    { username: 'david.kim' },
+    { username: 'zawlin.htut' },
+    { username: 'amara.okafor' },
+    { username: 'rachel.green', status: UserStatus.BANNED },
   ];
 
   const users = await Promise.all(
@@ -135,7 +123,6 @@ async function seedUsers() {
       prisma.user.create({
         data: {
           username: u.username,
-          email: u.email,
           password: passwordHash,
           role: Role.USER,
           status: u.status ?? UserStatus.ACTIVE,

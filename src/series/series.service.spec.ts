@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { NotFoundException } from '@nestjs/common';
 import { SeriesService } from './series.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { MinioService } from '../common/storage/minio.service';
 import { AccessType, MovieStatus, Role } from '../generated/prisma/client';
 
 describe('SeriesService', () => {
@@ -14,8 +15,20 @@ describe('SeriesService', () => {
     $transaction: jest.Mock;
   };
 
+  let minioService: { imageUrl: jest.Mock };
+
   beforeEach(async () => {
     jest.clearAllMocks();
+
+    // Mirrors the real MinioService.imageUrl(): a URL under our bucket is
+    // re-hosted against the current request, anything else passes through.
+    minioService = {
+      imageUrl: jest.fn((url: string | null | undefined) => {
+        if (!url) return url ?? null;
+        const match = /\/movies\/(.+)$/.exec(url);
+        return match ? `http://current-host:8080/movies/${match[1]}` : url;
+      }),
+    };
 
     prisma = {
       series: {
@@ -38,6 +51,7 @@ describe('SeriesService', () => {
       providers: [
         SeriesService,
         { provide: PrismaService, useValue: prisma },
+        { provide: MinioService, useValue: minioService },
       ],
     }).compile();
 
@@ -205,8 +219,99 @@ describe('SeriesService', () => {
     });
   });
 
+  /**
+   * Poster/cover/thumbnail URLs are persisted absolute, baked with whatever
+   * host uploaded them, so every read path has to re-derive the host from
+   * the current request (MinioService.imageUrl) or the images 404 the
+   * moment this machine changes networks.
+   */
+  describe('persisted image URLs are re-hosted per request', () => {
+    const stale = (name: string) =>
+      `http://192.168.10.122:8080/movies/images/${name}.jpeg`;
+    const fresh = (name: string) =>
+      `http://current-host:8080/movies/images/${name}.jpeg`;
+
+    it('re-hosts poster and cover on the series list', async () => {
+      prisma.series.findMany.mockResolvedValue([
+        {
+          id: 'series-1',
+          title: 'A Show',
+          posterUrl: stale('poster'),
+          coverUrl: stale('cover'),
+          _count: { episodes: 4 },
+        },
+      ]);
+      prisma.series.count.mockResolvedValue(1);
+
+      const result = await service.findAll({});
+
+      expect(result.items[0]).toMatchObject({
+        id: 'series-1',
+        title: 'A Show',
+        posterUrl: fresh('poster'),
+        coverUrl: fresh('cover'),
+        episodeCount: 4,
+      });
+    });
+
+    it('re-hosts poster and cover on series detail, leaving an external one alone', async () => {
+      prisma.series.findUnique.mockResolvedValue({
+        id: 'series-1',
+        posterUrl: stale('poster'),
+        coverUrl: 'https://picsum.photos/seed/A%20Show-cover/1280/720',
+        categories: [],
+      });
+
+      const result = await service.getForViewer('series-1', 'user-1', Role.USER);
+
+      expect(result.posterUrl).toBe(fresh('poster'));
+      expect(result.coverUrl).toBe(
+        'https://picsum.photos/seed/A%20Show-cover/1280/720',
+      );
+    });
+
+    it('re-hosts episode thumbnails and posters on the player episode list', async () => {
+      prisma.series.findUnique.mockResolvedValue({ id: 'series-1' });
+      prisma.movie.findMany.mockResolvedValue([
+        {
+          id: 'ep-1',
+          title: 'Pilot',
+          seasonNumber: 1,
+          episodeNumber: 1,
+          duration: 42,
+          thumbnailUrl: stale('thumb'),
+          posterUrl: null,
+        },
+      ]);
+      prisma.watchHistory.findMany.mockResolvedValue([]);
+
+      const result = await service.getPlayerEpisodes('series-1', 'user-1', Role.ADMIN);
+
+      expect(result.seasons[0].episodes[0]).toMatchObject({
+        thumbnailUrl: fresh('thumb'),
+        posterUrl: null,
+      });
+    });
+
+    it('re-hosts the poster on owned-series purchase history', async () => {
+      prisma.seriesPurchase.findMany.mockResolvedValue([
+        {
+          id: 'sp-1',
+          seriesId: 'series-1',
+          amount: 5000,
+          createdAt: new Date('2026-01-01T00:00:00.000Z'),
+          series: { id: 'series-1', title: 'A Show', posterUrl: stale('poster') },
+        },
+      ]);
+
+      const result = await service.getPurchasesForUser('user-1');
+
+      expect(result[0].posterUrl).toBe(fresh('poster'));
+    });
+  });
+
   describe('getForViewer', () => {
-    const series = { id: 'series-1', accessType: AccessType.SUBSCRIPTION, categories: [] };
+    const series = { id: 'series-1', accessType: AccessType.SUBSCRIPTION, categories: [], posterUrl: null, coverUrl: null };
 
     it('throws NotFoundException for an unknown series', async () => {
       prisma.series.findUnique.mockResolvedValue(null);

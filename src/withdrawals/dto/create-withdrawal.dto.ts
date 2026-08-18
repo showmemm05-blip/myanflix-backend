@@ -2,6 +2,7 @@ import { Type } from 'class-transformer';
 import {
   IsNotEmpty,
   IsNumber,
+  IsOptional,
   IsString,
   MaxLength,
   Min,
@@ -28,4 +29,14 @@ export class CreateWithdrawalDto {
   @IsNotEmpty()
   @MaxLength(60)
   accountNumber!: string;
+
+  /**
+   * Only meaningful for bank-transfer account types, so optional rather than
+   * required — a KBZPay withdrawal has no bank to name. Stored verbatim as
+   * part of this request's snapshot; never defaulted from the user's profile.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  bankName?: string;
 }

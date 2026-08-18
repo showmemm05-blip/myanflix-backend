@@ -20,6 +20,14 @@ export class CreatePaymentAccountDto {
   @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
   type!: string;
 
+  /** Internal label distinguishing multiple accounts under the same
+   * `type` — never shown to users during deposit, never the actual
+   * account name. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  subname?: string;
+
   @IsString()
   @IsNotEmpty()
   accountName!: string;

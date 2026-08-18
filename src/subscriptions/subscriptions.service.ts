@@ -2,6 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { Role, TransactionType } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import type { CreatePlanDto } from './dto/create-plan.dto';
 import type { UpdatePlanDto } from './dto/update-plan.dto';
@@ -13,6 +14,7 @@ export class SubscriptionsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly walletService: WalletService,
+    private readonly realtimeGateway: RealtimeGateway,
   ) {}
 
   /**
@@ -71,7 +73,7 @@ export class SubscriptionsService {
       throw new NotFoundException('Subscription plan not found');
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       await this.walletService.debitWithinTransaction(
         tx,
         userId,
@@ -99,8 +101,20 @@ export class SubscriptionsService {
           status: 'COMPLETED',
         },
       });
-      return subscription;
+      const wallet = await tx.wallet.findUniqueOrThrow({ where: { userId } });
+      return { subscription, balance: wallet.balance };
     });
+
+    // Emitted only after commit, same as every other balance-changing flow —
+    // without this the wallet pill/balance in the UI goes stale until the
+    // user manually reloads, since a subscription purchase previously fired
+    // no real-time signal of any kind.
+    this.realtimeGateway.notifyUserBalanceUpdated(
+      userId,
+      decimalToNumber(result.balance),
+    );
+
+    return result.subscription;
   }
 
   private async assertPlanExists(id: string): Promise<void> {

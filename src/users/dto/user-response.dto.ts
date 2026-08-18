@@ -4,9 +4,13 @@ import type { WalletSummary } from '../users.service';
 export class UserResponseDto {
   id: string;
   username: string;
-  email: string;
   phone: string | null;
-  avatar: string | null;
+  /**
+   * Per-request playback URL for the user's profile picture (or null). The
+   * raw `avatar` object key is never exposed — callers pass the computed URL
+   * in (see UsersService.avatarUrlFor).
+   */
+  avatarUrl: string | null;
   role: Role;
   status: UserStatus;
   createdAt: Date;
@@ -17,13 +21,16 @@ export class UserResponseDto {
   isSubscribed?: boolean;
   subscriptionExpiresAt?: Date | null;
 
-  static fromEntity(user: User, wallet?: WalletSummary): UserResponseDto {
+  static fromEntity(
+    user: User,
+    avatarUrl: string | null,
+    wallet?: WalletSummary,
+  ): UserResponseDto {
     const dto = new UserResponseDto();
     dto.id = user.id;
     dto.username = user.username;
-    dto.email = user.email;
     dto.phone = user.phone;
-    dto.avatar = user.avatar;
+    dto.avatarUrl = avatarUrl;
     dto.role = user.role;
     dto.status = user.status;
     dto.createdAt = user.createdAt;

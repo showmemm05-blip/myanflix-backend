@@ -38,7 +38,6 @@ export class StaffService {
     const passwordHash = await bcrypt.hash(dto.password, PASSWORD_SALT_ROUNDS);
     return this.usersService.create({
       username: dto.username,
-      email: `${dto.username}@staff.myanflix.local`,
       password: passwordHash,
       role: dto.role,
     });
@@ -75,10 +74,7 @@ export class StaffService {
     return this.prisma.user.update({
       where: { id },
       data: {
-        ...(dto.username !== undefined && {
-          username: dto.username,
-          email: `${dto.username}@staff.myanflix.local`,
-        }),
+        ...(dto.username !== undefined && { username: dto.username }),
         ...(dto.role !== undefined && { role: dto.role }),
       },
     });

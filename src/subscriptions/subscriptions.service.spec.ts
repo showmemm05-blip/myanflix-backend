@@ -3,6 +3,7 @@ import { NotFoundException } from '@nestjs/common';
 import { SubscriptionsService } from './subscriptions.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { Prisma, Role } from '../generated/prisma/client';
 
 describe('SubscriptionsService', () => {
@@ -13,9 +14,11 @@ describe('SubscriptionsService', () => {
     $transaction: jest.Mock;
   };
   let walletService: { debitWithinTransaction: jest.Mock };
+  let realtimeGateway: { notifyUserBalanceUpdated: jest.Mock };
   let tx: {
     userSubscription: { findFirst: jest.Mock; create: jest.Mock };
     transaction: { create: jest.Mock };
+    wallet: { findUniqueOrThrow: jest.Mock };
   };
 
   beforeEach(async () => {
@@ -27,6 +30,9 @@ describe('SubscriptionsService', () => {
         create: jest.fn().mockResolvedValue({ id: 'sub-1' }),
       },
       transaction: { create: jest.fn().mockResolvedValue({ id: 'tx-1' }) },
+      wallet: {
+        findUniqueOrThrow: jest.fn().mockResolvedValue({ balance: new Prisma.Decimal(0) }),
+      },
     };
     prisma = {
       subscriptionPlan: {
@@ -41,12 +47,14 @@ describe('SubscriptionsService', () => {
       ),
     };
     walletService = { debitWithinTransaction: jest.fn().mockResolvedValue(undefined) };
+    realtimeGateway = { notifyUserBalanceUpdated: jest.fn() };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         SubscriptionsService,
         { provide: PrismaService, useValue: prisma },
         { provide: WalletService, useValue: walletService },
+        { provide: RealtimeGateway, useValue: realtimeGateway },
       ],
     }).compile();
 
@@ -160,6 +168,7 @@ describe('SubscriptionsService', () => {
         isActive: true,
       });
       tx.userSubscription.findFirst.mockResolvedValue(null);
+      tx.wallet.findUniqueOrThrow.mockResolvedValue({ balance: new Prisma.Decimal(4000) });
 
       await service.subscribe('user-1', 'plan-1');
 
@@ -170,6 +179,10 @@ describe('SubscriptionsService', () => {
       expect(tx.transaction.create).toHaveBeenCalledWith({
         data: expect.objectContaining({ userId: 'user-1', type: 'SUBSCRIPTION' }),
       });
+      // Real-time audit: a subscription purchase must push the caller's new
+      // balance the same way every other debit/credit flow does, or the
+      // wallet pill goes stale until a manual reload.
+      expect(realtimeGateway.notifyUserBalanceUpdated).toHaveBeenCalledWith('user-1', 4000);
     });
 
     it('extends from the current expiry rather than from now, when already subscribed', async () => {

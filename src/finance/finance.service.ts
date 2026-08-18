@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { MinioService } from '../common/storage/minio.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import { TransactionType, type Prisma } from '../generated/prisma/client';
 
@@ -80,7 +81,10 @@ const MONTHLY_GRANULARITY: RevenueBucketGranularity = {
 
 @Injectable()
 export class FinanceService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly minioService: MinioService,
+  ) {}
 
   async getDashboard() {
     const [
@@ -194,7 +198,14 @@ export class FinanceService {
       where: { id: { in: grouped.map((g) => g.movieId) } },
       select: { id: true, title: true, posterUrl: true },
     });
-    const movieById = new Map(movies.map((m) => [m.id, m]));
+    const movieById = new Map(
+      movies.map((m) => [
+        m.id,
+        // Persisted poster URLs carry whatever host uploaded them; re-hosted
+        // per request here, same as everywhere else (MinioService.imageUrl).
+        { ...m, posterUrl: this.minioService.imageUrl(m.posterUrl) },
+      ]),
+    );
 
     return grouped.map((g) => ({
       movie: movieById.get(g.movieId) ?? null,
@@ -214,9 +225,18 @@ export class FinanceService {
 
     const users = await this.prisma.user.findMany({
       where: { id: { in: grouped.map((g) => g.userId) } },
-      select: { id: true, username: true, email: true, avatar: true },
+      select: { id: true, username: true, avatar: true },
     });
-    const userById = new Map(users.map((u) => [u.id, u]));
+    const userById = new Map(
+      users.map((u) => [
+        u.id,
+        {
+          id: u.id,
+          username: u.username,
+          avatarUrl: u.avatar ? this.minioService.playbackUrl(u.avatar) : null,
+        },
+      ]),
+    );
 
     return grouped.map((g) => ({
       user: userById.get(g.userId) ?? null,

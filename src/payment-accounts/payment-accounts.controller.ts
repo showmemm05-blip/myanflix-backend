@@ -7,6 +7,7 @@ import {
   ParseUUIDPipe,
   Patch,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -18,6 +19,9 @@ import { CreatePaymentAccountDto } from './dto/create-payment-account.dto';
 import { UpdatePaymentAccountDto } from './dto/update-payment-account.dto';
 import { CreatePaymentMethodTypeDto } from './dto/create-payment-method-type.dto';
 import { UpdatePaymentMethodTypeDto } from './dto/update-payment-method-type.dto';
+import { CreateManualPaymentAccountTransactionDto } from './dto/create-manual-payment-account-transaction.dto';
+import { PaymentAccountTransactionQueryDto } from './dto/payment-account-transaction-query.dto';
+import { AllPaymentAccountTransactionsQueryDto } from './dto/all-payment-account-transactions-query.dto';
 import { PaymentAccountsService } from './payment-accounts.service';
 
 /**
@@ -68,11 +72,42 @@ export class PaymentAccountsController {
     return this.paymentAccountsService.removeType(id);
   }
 
+  /** Central cross-account transaction view — must be registered before `:id` so "transactions" isn't captured as an id. */
+  @Get('transactions')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  findAllTransactions(@Query() query: AllPaymentAccountTransactionsQueryDto) {
+    return this.paymentAccountsService.getAllTransactions(query);
+  }
+
   @Get(':id')
   @UseGuards(PermissionsGuard)
   @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
   findOne(@Param('id', ParseUUIDPipe) id: string) {
     return this.paymentAccountsService.findOne(id);
+  }
+
+  /** Per-account transaction history. */
+  @Get(':id/transactions')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  findTransactions(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: PaymentAccountTransactionQueryDto,
+  ) {
+    return this.paymentAccountsService.getTransactions(id, query);
+  }
+
+  /** Manual Add/Remove Money. */
+  @Post(':id/transactions')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  recordTransaction(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: CreateManualPaymentAccountTransactionDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.paymentAccountsService.recordTransaction(id, dto, user.id);
   }
 
   @Post()
