@@ -1,6 +1,9 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException } from '@nestjs/common';
-import { MultipartUploadService, MULTIPART_PART_SIZE } from './multipart-upload.service';
+import {
+  MultipartUploadService,
+  MULTIPART_PART_SIZE,
+} from './multipart-upload.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { ResourceUploadTypeRegistry } from './resource-upload-type.registry';
@@ -43,16 +46,23 @@ describe('MultipartUploadService', () => {
       },
     };
     minioService = {
-      getPresignedPutUrl: jest.fn().mockResolvedValue('https://minio.example/presigned-put'),
+      getPresignedPutUrl: jest
+        .fn()
+        .mockResolvedValue('https://minio.example/presigned-put'),
       createMultipartUpload: jest.fn().mockResolvedValue('minio-upload-1'),
-      getPresignedUploadPartUrl: jest.fn().mockResolvedValue('https://minio.example/presigned-part'),
+      getPresignedUploadPartUrl: jest
+        .fn()
+        .mockResolvedValue('https://minio.example/presigned-part'),
       listUploadedParts: jest.fn().mockResolvedValue([]),
       completeMultipartUpload: jest.fn().mockResolvedValue(undefined),
       abortMultipartUpload: jest.fn().mockResolvedValue(undefined),
     };
     movieType = {
       assertExists: jest.fn().mockResolvedValue(undefined),
-      buildKey: jest.fn((resourceId: string, relativePath: string) => `videos/${resourceId}/${relativePath}`),
+      buildKey: jest.fn(
+        (resourceId: string, relativePath: string) =>
+          `videos/${resourceId}/${relativePath}`,
+      ),
     };
     resourceTypes = {
       assertPermission: jest.fn(),
@@ -84,18 +94,33 @@ describe('MultipartUploadService', () => {
     it('checks permission and resource existence before issuing any URL', async () => {
       await service.presignBatch(role, dto);
 
-      expect(resourceTypes.assertPermission).toHaveBeenCalledWith('movie', role);
+      expect(resourceTypes.assertPermission).toHaveBeenCalledWith(
+        'movie',
+        role,
+      );
       expect(movieType.assertExists).toHaveBeenCalledWith('movie-1');
     });
 
-    it('returns one presigned PUT URL per file, keyed via the resource type\'s buildKey', async () => {
+    it("returns one presigned PUT URL per file, keyed via the resource type's buildKey", async () => {
       const result = await service.presignBatch(role, dto);
 
-      expect(minioService.getPresignedPutUrl).toHaveBeenCalledWith('videos/movie-1/hls/master.m3u8');
-      expect(minioService.getPresignedPutUrl).toHaveBeenCalledWith('videos/movie-1/subtitles/english.vtt');
+      expect(minioService.getPresignedPutUrl).toHaveBeenCalledWith(
+        'videos/movie-1/hls/master.m3u8',
+      );
+      expect(minioService.getPresignedPutUrl).toHaveBeenCalledWith(
+        'videos/movie-1/subtitles/english.vtt',
+      );
       expect(result.files).toEqual([
-        { relativePath: 'hls/master.m3u8', key: 'videos/movie-1/hls/master.m3u8', url: 'https://minio.example/presigned-put' },
-        { relativePath: 'subtitles/english.vtt', key: 'videos/movie-1/subtitles/english.vtt', url: 'https://minio.example/presigned-put' },
+        {
+          relativePath: 'hls/master.m3u8',
+          key: 'videos/movie-1/hls/master.m3u8',
+          url: 'https://minio.example/presigned-put',
+        },
+        {
+          relativePath: 'subtitles/english.vtt',
+          key: 'videos/movie-1/subtitles/english.vtt',
+          url: 'https://minio.example/presigned-put',
+        },
       ]);
     });
 
@@ -107,15 +132,25 @@ describe('MultipartUploadService', () => {
   });
 
   describe('initMultipart', () => {
-    const dto = { resourceType: 'movie', resourceId: 'movie-1', filename: 'original.mp4', filesize: 100_000_000, relativePath: 'original.mp4' };
+    const dto = {
+      resourceType: 'movie',
+      resourceId: 'movie-1',
+      filename: 'original.mp4',
+      filesize: 100_000_000,
+      relativePath: 'original.mp4',
+    };
 
     it('creates a fresh session and starts a MinIO multipart upload when none exists', async () => {
       prisma.multipartUploadSession.findFirst.mockResolvedValue(null);
-      prisma.multipartUploadSession.create.mockResolvedValue({ id: 'session-1' });
+      prisma.multipartUploadSession.create.mockResolvedValue({
+        id: 'session-1',
+      });
 
       const result = await service.initMultipart(role, dto);
 
-      expect(minioService.createMultipartUpload).toHaveBeenCalledWith('videos/movie-1/original.mp4');
+      expect(minioService.createMultipartUpload).toHaveBeenCalledWith(
+        'videos/movie-1/original.mp4',
+      );
       expect(prisma.multipartUploadSession.create).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
@@ -140,7 +175,7 @@ describe('MultipartUploadService', () => {
     });
 
     it(
-      'resumes an existing in-progress session, returning MinIO\'s own ListPartsCommand result ' +
+      "resumes an existing in-progress session, returning MinIO's own ListPartsCommand result " +
         'rather than anything stored in Postgres',
       async () => {
         prisma.multipartUploadSession.findFirst.mockResolvedValue({
@@ -158,7 +193,10 @@ describe('MultipartUploadService', () => {
         const result = await service.initMultipart(role, dto);
 
         expect(minioService.createMultipartUpload).not.toHaveBeenCalled();
-        expect(minioService.listUploadedParts).toHaveBeenCalledWith('videos/movie-1/original.mp4', 'minio-upload-existing');
+        expect(minioService.listUploadedParts).toHaveBeenCalledWith(
+          'videos/movie-1/original.mp4',
+          'minio-upload-existing',
+        );
         expect(result).toEqual({
           sessionId: 'session-existing',
           key: 'videos/movie-1/original.mp4',
@@ -183,8 +221,12 @@ describe('MultipartUploadService', () => {
           partSize: MULTIPART_PART_SIZE,
           totalParts: 4,
         });
-        minioService.listUploadedParts.mockRejectedValue(Object.assign(new Error('gone'), { name: 'NoSuchUpload' }));
-        prisma.multipartUploadSession.create.mockResolvedValue({ id: 'session-fresh' });
+        minioService.listUploadedParts.mockRejectedValue(
+          Object.assign(new Error('gone'), { name: 'NoSuchUpload' }),
+        );
+        prisma.multipartUploadSession.create.mockResolvedValue({
+          id: 'session-fresh',
+        });
 
         const result = await service.initMultipart(role, dto);
 
@@ -199,7 +241,7 @@ describe('MultipartUploadService', () => {
   });
 
   describe('getPartUrls', () => {
-    it('rejects a partNumber outside the session\'s known range', async () => {
+    it("rejects a partNumber outside the session's known range", async () => {
       prisma.multipartUploadSession.findUnique.mockResolvedValue({
         id: 'session-1',
         status: UploadStatus.IN_PROGRESS,
@@ -209,7 +251,9 @@ describe('MultipartUploadService', () => {
         totalParts: 3,
       });
 
-      await expect(service.getPartUrls(role, 'session-1', [4])).rejects.toThrow(BadRequestException);
+      await expect(service.getPartUrls(role, 'session-1', [4])).rejects.toThrow(
+        BadRequestException,
+      );
     });
 
     it('returns one presigned URL per requested part number', async () => {
@@ -245,7 +289,9 @@ describe('MultipartUploadService', () => {
       prisma.multipartUploadSession.findUnique.mockResolvedValue(session);
 
       await expect(
-        service.completeMultipart(role, 'session-1', [{ partNumber: 1, etag: 'etag-1' }]),
+        service.completeMultipart(role, 'session-1', [
+          { partNumber: 1, etag: 'etag-1' },
+        ]),
       ).rejects.toThrow(BadRequestException);
       expect(minioService.completeMultipartUpload).not.toHaveBeenCalled();
     });
@@ -268,7 +314,10 @@ describe('MultipartUploadService', () => {
         where: { id: 'session-1' },
         data: { status: UploadStatus.COMPLETED },
       });
-      expect(result).toEqual({ relativePath: 'videos/movie-1/original.mp4', status: UploadStatus.COMPLETED });
+      expect(result).toEqual({
+        relativePath: 'videos/movie-1/original.mp4',
+        status: UploadStatus.COMPLETED,
+      });
     });
   });
 
@@ -283,7 +332,10 @@ describe('MultipartUploadService', () => {
 
       await service.abortMultipart(role, 'session-1');
 
-      expect(minioService.abortMultipartUpload).toHaveBeenCalledWith('videos/movie-1/original.mp4', 'minio-upload-1');
+      expect(minioService.abortMultipartUpload).toHaveBeenCalledWith(
+        'videos/movie-1/original.mp4',
+        'minio-upload-1',
+      );
       expect(prisma.multipartUploadSession.update).toHaveBeenCalledWith({
         where: { id: 'session-1' },
         data: { status: UploadStatus.FAILED },

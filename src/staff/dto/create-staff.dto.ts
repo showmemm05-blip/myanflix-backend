@@ -1,4 +1,12 @@
-import { IsIn, IsString, Matches, MaxLength, MinLength } from 'class-validator';
+import {
+  IsIn,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Matches,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 import { Role } from '../../generated/prisma/client';
 
 export const STAFF_ROLES = [
@@ -23,4 +31,12 @@ export class CreateStaffDto {
 
   @IsIn(STAFF_ROLES)
   role!: (typeof STAFF_ROLES)[number];
+
+  /**
+   * Granular RBAC role (AppRole.id). Omitted means "the system role matching
+   * `role`", which is what every pre-RBAC caller effectively asked for.
+   */
+  @IsOptional()
+  @IsUUID()
+  appRoleId?: string;
 }

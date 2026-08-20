@@ -72,13 +72,14 @@ export class DepositsService {
 
     const user = await this.prisma.user.findUniqueOrThrow({
       where: { id: userId },
-      select: { username: true },
+      select: { username: true, displayName: true },
     });
 
     this.realtimeGateway.notifyAdminsDepositCreated({
       id: deposit.id,
       userId: deposit.userId,
       username: user.username,
+      displayName: user.displayName,
       amount: decimalToNumber(deposit.amount),
       paymentMethod: deposit.paymentMethod,
       accountName: deposit.accountName,
@@ -117,7 +118,12 @@ export class DepositsService {
         take: limit,
         include: {
           user: {
-            select: { id: true, username: true, phone: true },
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+              phone: true,
+            },
           },
         },
       }),
@@ -247,7 +253,12 @@ export class DepositsService {
         where: { id: depositId },
         include: {
           user: {
-            select: { id: true, username: true, phone: true },
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+              phone: true,
+            },
           },
         },
       });
@@ -396,7 +407,12 @@ export class DepositsService {
         where: { id: deposit.id },
         include: {
           user: {
-            select: { id: true, username: true, phone: true },
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+              phone: true,
+            },
           },
         },
       });
@@ -475,7 +491,12 @@ export class DepositsService {
         where: { id: depositId },
         include: {
           user: {
-            select: { id: true, username: true, phone: true },
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+              phone: true,
+            },
           },
         },
       });
@@ -575,7 +596,12 @@ export class DepositsService {
         },
         include: {
           user: {
-            select: { id: true, username: true, phone: true },
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+              phone: true,
+            },
           },
         },
       });

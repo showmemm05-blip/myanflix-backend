@@ -1,6 +1,7 @@
 import {
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import {
@@ -12,6 +13,7 @@ import {
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
+import { TrackingService } from '../tracking/tracking.service';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 
 export interface CreateVideoInput {
@@ -36,9 +38,12 @@ export interface SubtitleInfo {
 
 @Injectable()
 export class VideosService {
+  private readonly logger = new Logger(VideosService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
+    private readonly trackingService: TrackingService,
   ) {}
 
   create(input: CreateVideoInput): Promise<Video> {
@@ -169,7 +174,16 @@ export class VideosService {
     };
   }
 
-  /** Upserts the caller's watch progress for a movie — feeds analytics (views, completion rate). */
+  /**
+   * Upserts the caller's watch progress for a movie — feeds analytics
+   * (views, completion rate) and, since this is the only heartbeat either
+   * client sends, the hour-bucketed WatchActivity log behind "when do people
+   * watch".
+   *
+   * The seconds credited to that log are derived from the position ALREADY
+   * STORED versus the one being written, both server-side facts — the client
+   * never gets to say how long it watched. Its own response is unchanged.
+   */
   async recordWatchProgress(
     userId: string,
     movieId: string,
@@ -182,11 +196,36 @@ export class VideosService {
     });
     if (!movie) throw new NotFoundException('Movie not found');
 
-    return this.prisma.watchHistory.upsert({
+    // Read before the upsert overwrites it — this is the "previous" end of
+    // the delta. No row yet means the user is starting from 0.
+    const existing = await this.prisma.watchHistory.findUnique({
+      where: { userId_movieId: { userId, movieId } },
+      select: { lastPosition: true },
+    });
+
+    const updated = await this.prisma.watchHistory.upsert({
       where: { userId_movieId: { userId, movieId } },
       create: { userId, movieId, progress, lastPosition },
       update: { progress, lastPosition },
     });
+
+    // Awaited (so the bucket is durable by the time the heartbeat is
+    // acknowledged) but never allowed to fail the heartbeat — playback
+    // progress is the user's data, watch activity is only ours.
+    await this.trackingService
+      .recordWatchActivity({
+        userId,
+        movieId,
+        previousPosition: existing?.lastPosition ?? 0,
+        nextPosition: lastPosition,
+      })
+      .catch((error: unknown) =>
+        this.logger.warn(
+          `Failed to record watch activity: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+
+    return updated;
   }
 
   /** Watch history for a user (own profile, or an admin viewing any user). */

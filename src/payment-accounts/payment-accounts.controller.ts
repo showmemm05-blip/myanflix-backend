@@ -11,7 +11,6 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
@@ -26,9 +25,10 @@ import { PaymentAccountsService } from './payment-accounts.service';
 
 /**
  * No class-level guard — `findAll`/`findTypes` are readable by any
- * authenticated user (the deposit flow needs to show active accounts to
- * pick from), while the mutating routes need PAYMENT_ACCOUNT_MANAGE (Super
- * Admin only, per role-permissions.map.ts). Same per-route pattern as
+ * authenticated user (the deposit flow needs to show active accounts to pick
+ * from; findAll shapes its rows by the caller's permissions instead), while
+ * the mutating routes carry the specific PAYMENT_ACCOUNTS.* /
+ * PAYMENT_METHODS.* permission they need. Same per-route pattern as
  * DepositsController/SubscriptionPlansController.
  */
 @Controller('payment-accounts')
@@ -39,7 +39,7 @@ export class PaymentAccountsController {
 
   @Get()
   findAll(@CurrentUser() user: AuthenticatedUser) {
-    return this.paymentAccountsService.findAll(user.role);
+    return this.paymentAccountsService.findAll(user);
   }
 
   /** Must be registered before `:id` so "types" isn't captured as an id. */
@@ -50,14 +50,14 @@ export class PaymentAccountsController {
 
   @Post('types')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  @RequirePermissions('PAYMENT_METHODS.CREATE')
   createType(@Body() dto: CreatePaymentMethodTypeDto) {
     return this.paymentAccountsService.createType(dto);
   }
 
   @Patch('types/:id')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  @RequirePermissions('PAYMENT_METHODS.EDIT')
   updateType(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdatePaymentMethodTypeDto,
@@ -67,7 +67,7 @@ export class PaymentAccountsController {
 
   @Delete('types/:id')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  @RequirePermissions('PAYMENT_METHODS.DELETE')
   removeType(@Param('id', ParseUUIDPipe) id: string) {
     return this.paymentAccountsService.removeType(id);
   }
@@ -75,14 +75,14 @@ export class PaymentAccountsController {
   /** Central cross-account transaction view — must be registered before `:id` so "transactions" isn't captured as an id. */
   @Get('transactions')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  @RequirePermissions('PAYMENT_ACCOUNTS.LEDGER_MANAGE')
   findAllTransactions(@Query() query: AllPaymentAccountTransactionsQueryDto) {
     return this.paymentAccountsService.getAllTransactions(query);
   }
 
   @Get(':id')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  @RequirePermissions('PAYMENT_ACCOUNTS.VIEW')
   findOne(@Param('id', ParseUUIDPipe) id: string) {
     return this.paymentAccountsService.findOne(id);
   }
@@ -90,7 +90,7 @@ export class PaymentAccountsController {
   /** Per-account transaction history. */
   @Get(':id/transactions')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  @RequirePermissions('PAYMENT_ACCOUNTS.LEDGER_MANAGE')
   findTransactions(
     @Param('id', ParseUUIDPipe) id: string,
     @Query() query: PaymentAccountTransactionQueryDto,
@@ -101,7 +101,7 @@ export class PaymentAccountsController {
   /** Manual Add/Remove Money. */
   @Post(':id/transactions')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  @RequirePermissions('PAYMENT_ACCOUNTS.LEDGER_MANAGE')
   recordTransaction(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateManualPaymentAccountTransactionDto,
@@ -112,7 +112,7 @@ export class PaymentAccountsController {
 
   @Post()
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  @RequirePermissions('PAYMENT_ACCOUNTS.CREATE')
   create(
     @Body() dto: CreatePaymentAccountDto,
     @CurrentUser() user: AuthenticatedUser,
@@ -122,7 +122,7 @@ export class PaymentAccountsController {
 
   @Patch(':id')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  @RequirePermissions('PAYMENT_ACCOUNTS.EDIT')
   update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdatePaymentAccountDto,
@@ -133,7 +133,7 @@ export class PaymentAccountsController {
 
   @Delete(':id')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.PAYMENT_ACCOUNT_MANAGE)
+  @RequirePermissions('PAYMENT_ACCOUNTS.DELETE')
   remove(@Param('id', ParseUUIDPipe) id: string) {
     return this.paymentAccountsService.remove(id);
   }

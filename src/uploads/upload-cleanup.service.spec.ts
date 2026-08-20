@@ -18,7 +18,10 @@ describe('UploadCleanupService', () => {
     jest.clearAllMocks();
 
     prisma = {
-      multipartUploadSession: { findMany: jest.fn().mockResolvedValue([]), update: jest.fn() },
+      multipartUploadSession: {
+        findMany: jest.fn().mockResolvedValue([]),
+        update: jest.fn(),
+      },
     };
     minioService = {
       abortMultipartUpload: jest.fn().mockResolvedValue(undefined),
@@ -38,14 +41,28 @@ describe('UploadCleanupService', () => {
 
   it('aborts and fails every stale IN_PROGRESS session row it finds', async () => {
     prisma.multipartUploadSession.findMany.mockResolvedValueOnce([
-      { id: 'session-1', objectKey: 'videos/movie-1/original.mp4', minioUploadId: 'minio-1' },
-      { id: 'session-2', objectKey: 'videos/movie-2/original.mp4', minioUploadId: 'minio-2' },
+      {
+        id: 'session-1',
+        objectKey: 'videos/movie-1/original.mp4',
+        minioUploadId: 'minio-1',
+      },
+      {
+        id: 'session-2',
+        objectKey: 'videos/movie-2/original.mp4',
+        minioUploadId: 'minio-2',
+      },
     ]);
 
     await service.sweepAbandonedMultipartUploads();
 
-    expect(minioService.abortMultipartUpload).toHaveBeenCalledWith('videos/movie-1/original.mp4', 'minio-1');
-    expect(minioService.abortMultipartUpload).toHaveBeenCalledWith('videos/movie-2/original.mp4', 'minio-2');
+    expect(minioService.abortMultipartUpload).toHaveBeenCalledWith(
+      'videos/movie-1/original.mp4',
+      'minio-1',
+    );
+    expect(minioService.abortMultipartUpload).toHaveBeenCalledWith(
+      'videos/movie-2/original.mp4',
+      'minio-2',
+    );
     expect(prisma.multipartUploadSession.update).toHaveBeenCalledWith({
       where: { id: 'session-1' },
       data: { status: UploadStatus.FAILED },
@@ -76,7 +93,11 @@ describe('UploadCleanupService', () => {
   it('aborts a MinIO-side upload with no matching session row at all (the crash-before-insert case)', async () => {
     const staleInitiated = new Date(Date.now() - 72 * 60 * 60 * 1000); // 72h ago
     minioService.listInProgressMultipartUploads.mockResolvedValue([
-      { key: 'videos/movie-3/original.mp4', uploadId: 'orphan-1', initiated: staleInitiated },
+      {
+        key: 'videos/movie-3/original.mp4',
+        uploadId: 'orphan-1',
+        initiated: staleInitiated,
+      },
     ]);
     prisma.multipartUploadSession.findMany
       .mockResolvedValueOnce([]) // sweepStaleSessionRows: no stale rows
@@ -84,13 +105,20 @@ describe('UploadCleanupService', () => {
 
     await service.sweepAbandonedMultipartUploads();
 
-    expect(minioService.abortMultipartUpload).toHaveBeenCalledWith('videos/movie-3/original.mp4', 'orphan-1');
+    expect(minioService.abortMultipartUpload).toHaveBeenCalledWith(
+      'videos/movie-3/original.mp4',
+      'orphan-1',
+    );
   });
 
   it('leaves a MinIO-side upload alone when a live session row already accounts for it', async () => {
     const staleInitiated = new Date(Date.now() - 72 * 60 * 60 * 1000);
     minioService.listInProgressMultipartUploads.mockResolvedValue([
-      { key: 'videos/movie-4/original.mp4', uploadId: 'known-1', initiated: staleInitiated },
+      {
+        key: 'videos/movie-4/original.mp4',
+        uploadId: 'known-1',
+        initiated: staleInitiated,
+      },
     ]);
     prisma.multipartUploadSession.findMany
       .mockResolvedValueOnce([]) // no stale rows to sweep
@@ -103,9 +131,15 @@ describe('UploadCleanupService', () => {
 
   it('leaves a recently-initiated orphan alone — it may just be mid-flight, not abandoned yet', async () => {
     minioService.listInProgressMultipartUploads.mockResolvedValue([
-      { key: 'videos/movie-5/original.mp4', uploadId: 'fresh-orphan', initiated: new Date() },
+      {
+        key: 'videos/movie-5/original.mp4',
+        uploadId: 'fresh-orphan',
+        initiated: new Date(),
+      },
     ]);
-    prisma.multipartUploadSession.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    prisma.multipartUploadSession.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
 
     await service.sweepAbandonedMultipartUploads();
 

@@ -3,6 +3,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 import { UsersModule } from '../users/users.module';
 import { OtpModule } from '../otp/otp.module';
+import { TrackingModule } from '../tracking/tracking.module';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { JwtStrategy } from './strategies/jwt.strategy';
@@ -12,6 +13,9 @@ import { JwtAuthGuard } from './guards/jwt-auth.guard';
   imports: [
     UsersModule,
     OtpModule,
+    // Sessions on sign-in, and the throttled last-seen touch JwtStrategy
+    // fires on every authenticated request.
+    TrackingModule,
     PassportModule,
     // Every sign/verify call below passes its own secret and expiry
     // explicitly (access vs. refresh use different secrets), so this

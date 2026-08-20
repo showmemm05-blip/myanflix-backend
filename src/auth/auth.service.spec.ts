@@ -7,6 +7,7 @@ import { AuthService } from './auth.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import { OtpService } from '../otp/otp.service';
+import { TrackingService } from '../tracking/tracking.service';
 import { Role, UserStatus } from '../generated/prisma/client';
 
 const CORRECT_PASSWORD = 'correct-horse-battery';
@@ -31,6 +32,7 @@ describe('AuthService — phone OTP', () => {
   let usersService: { findByPhone: jest.Mock; create: jest.Mock };
   let otpService: { requestOtp: jest.Mock; verifyOtp: jest.Mock };
   let prisma: { refreshToken: { create: jest.Mock } };
+  let trackingService: { startSession: jest.Mock; fireAndForget: jest.Mock };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -38,6 +40,13 @@ describe('AuthService — phone OTP', () => {
     usersService = { findByPhone: jest.fn(), create: jest.fn() };
     otpService = { requestOtp: jest.fn().mockResolvedValue(undefined), verifyOtp: jest.fn().mockResolvedValue(undefined) };
     prisma = { refreshToken: { create: jest.fn().mockResolvedValue({}) } };
+    trackingService = {
+      startSession: jest.fn().mockResolvedValue(undefined),
+      // Matches the real helper: run it, swallow failures into a log.
+      fireAndForget: jest.fn((_what: string, run: Promise<void>) => {
+        void run.catch(() => undefined);
+      }),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -50,6 +59,7 @@ describe('AuthService — phone OTP', () => {
           useValue: { get: jest.fn((key: string) => (key === 'JWT_REFRESH_EXPIRES_IN' ? '7d' : 'secret')) },
         },
         { provide: OtpService, useValue: otpService },
+        { provide: TrackingService, useValue: trackingService },
       ],
     }).compile();
 
@@ -153,5 +163,98 @@ describe('AuthService — phone OTP', () => {
       await expect(service.verifyPhoneOtp('+959123456789', '000000')).rejects.toThrow(UnauthorizedException);
       expect(usersService.findByPhone).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('AuthService — session tracking on sign-in', () => {
+  let service: AuthService;
+  let usersService: {
+    findByPhone: jest.Mock;
+    findByUsername: jest.Mock;
+    create: jest.Mock;
+    updateLastLogin: jest.Mock;
+  };
+  let otpService: { verifyOtp: jest.Mock };
+  let trackingService: { startSession: jest.Mock; fireAndForget: jest.Mock };
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+
+    usersService = {
+      findByPhone: jest.fn(),
+      findByUsername: jest.fn(),
+      create: jest.fn(),
+      updateLastLogin: jest.fn().mockResolvedValue(undefined),
+    };
+    otpService = { verifyOtp: jest.fn().mockResolvedValue(undefined) };
+    trackingService = {
+      startSession: jest.fn().mockResolvedValue(undefined),
+      fireAndForget: jest.fn((_what: string, run: Promise<void>) => {
+        void run.catch(() => undefined);
+      }),
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        AuthService,
+        { provide: UsersService, useValue: usersService },
+        {
+          provide: PrismaService,
+          useValue: { refreshToken: { create: jest.fn().mockResolvedValue({}) } },
+        },
+        {
+          provide: JwtService,
+          useValue: { signAsync: jest.fn().mockResolvedValue('token') },
+        },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) =>
+              key === 'JWT_REFRESH_EXPIRES_IN' ? '7d' : 'secret',
+            ),
+          },
+        },
+        { provide: OtpService, useValue: otpService },
+        { provide: TrackingService, useValue: trackingService },
+      ],
+    }).compile();
+
+    service = module.get(AuthService);
+  });
+
+  it('opens a session on password login', async () => {
+    usersService.findByUsername.mockResolvedValue(makeUser());
+
+    await service.login({ username: 'blake', password: CORRECT_PASSWORD });
+
+    expect(trackingService.startSession).toHaveBeenCalledWith('user-1');
+  });
+
+  it('opens a session on OTP verify — the sign-in path both clients actually use', async () => {
+    usersService.findByPhone.mockResolvedValue(makeUser());
+
+    await service.verifyPhoneOtp('+959123456789', '123456');
+
+    expect(trackingService.startSession).toHaveBeenCalledWith('user-1');
+  });
+
+  it('opens no session when the credentials are wrong', async () => {
+    usersService.findByUsername.mockResolvedValue(makeUser());
+
+    await expect(
+      service.login({ username: 'blake', password: 'wrong-password' }),
+    ).rejects.toThrow(UnauthorizedException);
+    expect(trackingService.startSession).not.toHaveBeenCalled();
+  });
+
+  it('still signs the user in when session tracking fails', async () => {
+    usersService.findByUsername.mockResolvedValue(makeUser());
+    trackingService.startSession.mockRejectedValue(new Error('db down'));
+
+    await expect(
+      service.login({ username: 'blake', password: CORRECT_PASSWORD }),
+    ).resolves.toEqual(expect.objectContaining({ accessToken: 'token' }));
+    // Let the rejected promise's .catch handler run.
+    await new Promise(process.nextTick);
   });
 });

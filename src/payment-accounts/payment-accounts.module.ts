@@ -9,7 +9,11 @@ import { PaymentAccountLedgerService } from './payment-account-ledger.service';
 @Module({
   imports: [RolesModule, RealtimeModule],
   controllers: [PaymentAccountsController],
-  providers: [PaymentAccountsService, PaymentAccountLedgerService, MinioService],
+  providers: [
+    PaymentAccountsService,
+    PaymentAccountLedgerService,
+    MinioService,
+  ],
   exports: [PaymentAccountsService, PaymentAccountLedgerService],
 })
 export class PaymentAccountsModule {}

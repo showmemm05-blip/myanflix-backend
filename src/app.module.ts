@@ -29,6 +29,11 @@ import { SeriesModule } from './series/series.module';
 import { SubscriptionsModule } from './subscriptions/subscriptions.module';
 import { PaymentAccountsModule } from './payment-accounts/payment-accounts.module';
 import { FinanceSettingsModule } from './finance-settings/finance-settings.module';
+import { PeakUsersModule } from './peak-users/peak-users.module';
+import { TrackingModule } from './tracking/tracking.module';
+import { TrackingReadModule } from './tracking/tracking-read.module';
+import { CommentsModule } from './comments/comments.module';
+import { FeedbackModule } from './feedback/feedback.module';
 
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
@@ -66,6 +71,11 @@ import { AppService } from './app.service';
     SubscriptionsModule,
     PaymentAccountsModule,
     FinanceSettingsModule,
+    PeakUsersModule,
+    TrackingModule,
+    TrackingReadModule,
+    CommentsModule,
+    FeedbackModule,
   ],
   controllers: [AppController],
   providers: [

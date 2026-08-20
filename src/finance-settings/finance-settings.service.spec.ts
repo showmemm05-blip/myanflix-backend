@@ -138,9 +138,43 @@ describe('FinanceSettingsService', () => {
       expect(prisma.financeSettings.update).toHaveBeenCalledWith({
         where: { id: 'settings-1' },
         data: { ...dto, updatedByUserId: 'admin-1' },
-        include: { updatedBy: { select: { id: true, username: true } } },
+        include: {
+          updatedBy: {
+            select: { id: true, username: true, displayName: true },
+          },
+        },
       });
       expect(result.updatedByUserId).toBe('admin-1');
+    });
+
+    it('joins the updating staff member with their display name, so "Last updated by" can name them', async () => {
+      prisma.financeSettings.findFirst.mockResolvedValue(makeSettings());
+      prisma.financeSettings.update.mockResolvedValue(
+        makeSettings({
+          updatedByUserId: 'admin-1',
+          updatedBy: {
+            id: 'admin-1',
+            username: 'admin.blake',
+            displayName: 'Blake',
+          },
+        }),
+      );
+
+      const result = await service.update(
+        {
+          minDepositAmount: 2000,
+          maxDepositAmount: 200000,
+          minWithdrawalAmount: 2000,
+          maxWithdrawalAmount: 200000,
+        },
+        'admin-1',
+      );
+
+      expect(result.updatedBy).toEqual({
+        id: 'admin-1',
+        username: 'admin.blake',
+        displayName: 'Blake',
+      });
     });
   });
 });

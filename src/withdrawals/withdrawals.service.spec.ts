@@ -185,8 +185,53 @@ describe('WithdrawalsService', () => {
       // notification — it must never be selecting payout details.
       expect(prisma.user.findUniqueOrThrow).toHaveBeenCalledWith({
         where: { id: 'user-1' },
-        select: { username: true },
+        select: { username: true, displayName: true },
       });
+    });
+
+    it('announces the withdrawal to admins with the display name next to the raw username', async () => {
+      walletService.getByUserId.mockResolvedValue({ balance: new Prisma.Decimal(100000) });
+      prisma.withdrawal.create.mockResolvedValue(makeWithdrawal());
+      prisma.user.findUniqueOrThrow.mockResolvedValue({
+        username: 'user_95950495369',
+        displayName: 'Blake',
+      });
+
+      await service.create('user-1', {
+        amount: 5000,
+        accountType: 'KBZPay',
+        accountName: 'Ko Ko',
+        accountNumber: '09123456789',
+      });
+
+      // The raw username is the login identity and must survive alongside the
+      // label — the admin still has to be able to tell which account this is.
+      expect(gateway.notifyAdminsWithdrawalCreated).toHaveBeenCalledWith(
+        expect.objectContaining({
+          username: 'user_95950495369',
+          displayName: 'Blake',
+        }),
+      );
+    });
+
+    it('emits displayName as null on the realtime event when the user never set a name', async () => {
+      walletService.getByUserId.mockResolvedValue({ balance: new Prisma.Decimal(100000) });
+      prisma.withdrawal.create.mockResolvedValue(makeWithdrawal());
+      prisma.user.findUniqueOrThrow.mockResolvedValue({
+        username: 'john',
+        displayName: null,
+      });
+
+      await service.create('user-1', {
+        amount: 5000,
+        accountType: 'KBZPay',
+        accountName: 'Ko Ko',
+        accountNumber: '09123456789',
+      });
+
+      expect(gateway.notifyAdminsWithdrawalCreated).toHaveBeenCalledWith(
+        expect.objectContaining({ username: 'john', displayName: null }),
+      );
     });
 
     it('rejects a request for more than the available wallet balance, without creating anything', async () => {
@@ -289,6 +334,43 @@ describe('WithdrawalsService', () => {
         expect.objectContaining({ where: expectedWhere }),
       );
       expect(prisma.withdrawal.count).toHaveBeenCalledWith({ where: expectedWhere });
+    });
+
+    it('projects the requesting user with their display name next to the raw username', async () => {
+      prisma.withdrawal.findMany.mockResolvedValue([
+        makeWithdrawal({
+          user: {
+            id: 'user-1',
+            username: 'user_95950495369',
+            displayName: 'Blake',
+            phone: '+959123456',
+          },
+        }),
+      ]);
+      prisma.withdrawal.count.mockResolvedValue(1);
+
+      const result = await service.findAllAdmin({});
+
+      expect(prisma.withdrawal.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          include: {
+            user: {
+              select: {
+                id: true,
+                username: true,
+                displayName: true,
+                phone: true,
+              },
+            },
+          },
+        }),
+      );
+      expect(result.items[0].user).toEqual({
+        id: 'user-1',
+        username: 'user_95950495369',
+        displayName: 'Blake',
+        phone: '+959123456',
+      });
     });
 
     it('leaves createdAt undefined when no date range is given, so existing queries are untouched', async () => {
@@ -560,7 +642,14 @@ describe('WithdrawalsService', () => {
           transferTransactionTime: 'Jan 1, 2026 10:00 AM',
         },
         include: {
-          user: { select: { id: true, username: true, phone: true } },
+          user: {
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+              phone: true,
+            },
+          },
         },
       });
       expect(walletService.debitWithinTransaction).not.toHaveBeenCalled();

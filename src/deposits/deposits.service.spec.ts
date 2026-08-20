@@ -217,6 +217,43 @@ describe('DepositsService', () => {
       );
     });
 
+    it('carries the display name next to the raw username on the admin realtime event, so a phone signup is announced by the name they chose', async () => {
+      prisma.deposit.findFirst.mockResolvedValue(null);
+      prisma.deposit.create.mockResolvedValue(makeDeposit());
+      prisma.user.findUniqueOrThrow.mockResolvedValue({
+        username: 'user_95950495369',
+        displayName: 'Blake',
+      });
+
+      await service.create('user-1', { amount: 5000, paymentMethod: 'KBZ Pay', reference: '000123' });
+
+      expect(prisma.user.findUniqueOrThrow).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        select: { username: true, displayName: true },
+      });
+      expect(gateway.notifyAdminsDepositCreated).toHaveBeenCalledWith(
+        expect.objectContaining({
+          username: 'user_95950495369',
+          displayName: 'Blake',
+        }),
+      );
+    });
+
+    it('still emits the raw username with displayName null when the user never set a name', async () => {
+      prisma.deposit.findFirst.mockResolvedValue(null);
+      prisma.deposit.create.mockResolvedValue(makeDeposit());
+      prisma.user.findUniqueOrThrow.mockResolvedValue({
+        username: 'john',
+        displayName: null,
+      });
+
+      await service.create('user-1', { amount: 5000, paymentMethod: 'KBZ Pay', reference: '000123' });
+
+      expect(gateway.notifyAdminsDepositCreated).toHaveBeenCalledWith(
+        expect.objectContaining({ username: 'john', displayName: null }),
+      );
+    });
+
     it('rejects an amount below the configured minimum deposit', async () => {
       financeSettingsService.getLimits.mockResolvedValue({
         minDepositAmount: 10000,
@@ -298,6 +335,43 @@ describe('DepositsService', () => {
           where: { status: undefined, userId: undefined, createdAt: undefined },
         }),
       );
+    });
+
+    it('projects the depositing user with their display name next to the raw username, so the admin list can label the row by name', async () => {
+      prisma.deposit.findMany.mockResolvedValue([
+        makeDeposit({
+          user: {
+            id: 'user-1',
+            username: 'user_95950495369',
+            displayName: 'Blake',
+            phone: '+959123456',
+          },
+        }),
+      ]);
+      prisma.deposit.count.mockResolvedValue(1);
+
+      const result = await service.findAllAdmin({});
+
+      expect(prisma.deposit.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          include: {
+            user: {
+              select: {
+                id: true,
+                username: true,
+                displayName: true,
+                phone: true,
+              },
+            },
+          },
+        }),
+      );
+      expect(result.items[0].user).toEqual({
+        id: 'user-1',
+        username: 'user_95950495369',
+        displayName: 'Blake',
+        phone: '+959123456',
+      });
     });
 
     it('composes the status filter with the date range', async () => {
@@ -447,7 +521,16 @@ describe('DepositsService', () => {
 
       expect(prisma.deposit.findUniqueOrThrow).toHaveBeenCalledWith(
         expect.objectContaining({
-          include: { user: { select: { id: true, username: true, phone: true } } },
+          include: {
+            user: {
+              select: {
+                id: true,
+                username: true,
+                displayName: true,
+                phone: true,
+              },
+            },
+          },
         }),
       );
       expect(result.user).toEqual({ id: 'user-1', username: 'john', phone: '+959123456' });
@@ -647,7 +730,16 @@ describe('DepositsService', () => {
 
       expect(prisma.deposit.findUniqueOrThrow).toHaveBeenCalledWith(
         expect.objectContaining({
-          include: { user: { select: { id: true, username: true, phone: true } } },
+          include: {
+            user: {
+              select: {
+                id: true,
+                username: true,
+                displayName: true,
+                phone: true,
+              },
+            },
+          },
         }),
       );
       expect(result.user).toEqual({ id: 'user-1', username: 'john', phone: '+959123456' });
@@ -734,7 +826,14 @@ describe('DepositsService', () => {
           receivingTransactionTime: '06:56:28',
         },
         include: {
-          user: { select: { id: true, username: true, phone: true } },
+          user: {
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+              phone: true,
+            },
+          },
         },
       });
       expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();

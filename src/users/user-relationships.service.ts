@@ -1,7 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
-import { DepositStatus, WithdrawalStatus } from '../generated/prisma/client';
+import {
+  DepositStatus,
+  UserStatus,
+  WithdrawalStatus,
+} from '../generated/prisma/client';
 
 /**
  * Hard ceilings on the BFS closure. A phone shared by a payment shop can pull
@@ -33,13 +37,18 @@ export type RelationshipEdgeKind = 'PROFILE' | 'WITHDRAWAL';
 export interface RelationshipUserNode {
   id: string;
   /**
-   * The schema has no separate display-name column (see prisma User), so this
-   * mirrors `username`. It exists because the graph/tree UI wants one label
-   * field it can render without deciding which column is the "name".
+   * The label the graph/tree UI renders: `displayName?.trim() || username`.
+   * It exists because the UI wants one name field it can print without
+   * deciding which column is the "name".
    */
   name: string;
+  /** Cosmetic name the user set for themselves; null when unset. */
+  displayName: string | null;
+  /** The raw login identity — never replaced by `displayName`. */
   username: string;
   profilePhone: string | null;
+  /** Account status, so the admin graph can show and act on suspensions inline. */
+  status: UserStatus;
   depositCount: number;
   withdrawalCount: number;
   totalDepositedAmount: number;
@@ -209,10 +218,23 @@ interface PhoneAccumulator {
   linkedUserIds: Set<string>;
 }
 
+/**
+ * The one label rule for this graph: the name the user set for themselves,
+ * falling back to the login identity when they never set one. Returns '' for
+ * a user that isn't in the wave (activity rows tolerate a missing name).
+ */
+function labelFor(
+  user: { displayName: string | null; username: string } | undefined,
+): string {
+  return user ? user.displayName?.trim() || user.username : '';
+}
+
 interface UserAccumulator {
   id: string;
   username: string;
+  displayName: string | null;
   phone: string | null;
+  status: UserStatus;
   createdAt: Date;
   depth: number;
   withdrawalCount: number;
@@ -376,13 +398,22 @@ export class UserRelationshipsService {
 
       const userRows = await this.prisma.user.findMany({
         where: { id: { in: accepted } },
-        select: { id: true, username: true, phone: true, createdAt: true },
+        select: {
+          id: true,
+          username: true,
+          displayName: true,
+          phone: true,
+          status: true,
+          createdAt: true,
+        },
       });
       for (const row of userRows) {
         users.set(row.id, {
           id: row.id,
           username: row.username,
+          displayName: row.displayName,
           phone: row.phone,
+          status: row.status,
           createdAt: row.createdAt,
           depth: phoneDepth + 1,
           withdrawalCount: 0,
@@ -531,9 +562,11 @@ export class UserRelationshipsService {
     const userNodes: RelationshipUserNode[] = [...users.values()]
       .map((user) => ({
         id: user.id,
-        name: user.username,
+        name: labelFor(user),
+        displayName: user.displayName,
         username: user.username,
         profilePhone: user.phone,
+        status: user.status,
         depositCount: depositCountByUser.get(user.id) ?? 0,
         withdrawalCount: user.withdrawalCount,
         totalDepositedAmount: depositSumByUser.get(user.id) ?? 0,
@@ -541,7 +574,16 @@ export class UserRelationshipsService {
         depth: user.depth,
         createdAt: user.createdAt,
       }))
-      .sort((a, b) => a.depth - b.depth || (a.username < b.username ? -1 : 1));
+      // Ordered by the caption the graph and tree actually print, so the node
+      // list reads alphabetically to an admin scanning it. `username` is the
+      // final tiebreak only — it is unique, so the order stays deterministic
+      // when two accounts chose the same display name.
+      .sort(
+        (a, b) =>
+          a.depth - b.depth ||
+          a.name.localeCompare(b.name) ||
+          a.username.localeCompare(b.username),
+      );
 
     const phoneNodes: RelationshipPhoneNode[] = [...phones.values()]
       .map((phone) => {
@@ -580,7 +622,7 @@ export class UserRelationshipsService {
         id: deposit.id,
         type: 'DEPOSIT' as const,
         userId: deposit.userId,
-        userName: users.get(deposit.userId)?.username ?? '',
+        userName: labelFor(users.get(deposit.userId)),
         amount: decimalToNumber(deposit.amount as never),
         status: deposit.status,
         createdAt: deposit.createdAt,
@@ -595,7 +637,7 @@ export class UserRelationshipsService {
         id: withdrawal.id,
         type: 'WITHDRAWAL' as const,
         userId: withdrawal.userId,
-        userName: users.get(withdrawal.userId)?.username ?? '',
+        userName: labelFor(users.get(withdrawal.userId)),
         amount: decimalToNumber(withdrawal.amount as never),
         status: withdrawal.status,
         createdAt: withdrawal.createdAt,

@@ -1,5 +1,9 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  NotFoundException,
+} from '@nestjs/common';
 import { access, readdir } from 'node:fs/promises';
 import { UploadsService } from './uploads.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -23,7 +27,11 @@ describe('UploadsService', () => {
   let service: UploadsService;
   let prisma: {
     movie: { findUnique: jest.Mock; update: jest.Mock };
-    uploadSession: { findFirst: jest.Mock; create: jest.Mock; update: jest.Mock };
+    uploadSession: {
+      findFirst: jest.Mock;
+      create: jest.Mock;
+      update: jest.Mock;
+    };
   };
   let storageService: {
     uploadSessionDir: jest.Mock;
@@ -34,9 +42,20 @@ describe('UploadsService', () => {
     hlsMasterKey: jest.Mock;
     hlsRenditionKeyPrefix: jest.Mock;
   };
-  let minioService: { downloadFile: jest.Mock; objectExists: jest.Mock; uploadFile: jest.Mock };
-  let videosService: { findLatestForMovie: jest.Mock; create: jest.Mock; markReady: jest.Mock };
-  let processingService: { processVideo: jest.Mock; isActivelyProcessing: jest.Mock };
+  let minioService: {
+    downloadFile: jest.Mock;
+    objectExists: jest.Mock;
+    uploadFile: jest.Mock;
+  };
+  let videosService: {
+    findLatestForMovie: jest.Mock;
+    create: jest.Mock;
+    markReady: jest.Mock;
+  };
+  let processingService: {
+    processVideo: jest.Mock;
+    isActivelyProcessing: jest.Mock;
+  };
   let subtitlesService: { createFromExistingKey: jest.Mock };
 
   beforeEach(async () => {
@@ -44,16 +63,29 @@ describe('UploadsService', () => {
 
     prisma = {
       movie: { findUnique: jest.fn(), update: jest.fn() },
-      uploadSession: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn() },
+      uploadSession: {
+        findFirst: jest.fn(),
+        create: jest.fn(),
+        update: jest.fn(),
+      },
     };
     storageService = {
       uploadSessionDir: jest.fn((id: string) => `/storage/uploads/${id}`),
       ensureDir: jest.fn().mockResolvedValue(undefined),
       videoDir: jest.fn((movieId: string) => `/storage/videos/${movieId}`),
-      originalVideoPath: jest.fn((movieId: string, ext: string) => `/storage/videos/${movieId}/original${ext}`),
-      originalObjectKey: jest.fn((movieId: string, ext: string) => `videos/${movieId}/original${ext}`),
-      hlsMasterKey: jest.fn((movieId: string) => `videos/${movieId}/hls/master.m3u8`),
-      hlsRenditionKeyPrefix: jest.fn((movieId: string, name: string) => `videos/${movieId}/hls/${name}`),
+      originalVideoPath: jest.fn(
+        (movieId: string, ext: string) =>
+          `/storage/videos/${movieId}/original${ext}`,
+      ),
+      originalObjectKey: jest.fn(
+        (movieId: string, ext: string) => `videos/${movieId}/original${ext}`,
+      ),
+      hlsMasterKey: jest.fn(
+        (movieId: string) => `videos/${movieId}/hls/master.m3u8`,
+      ),
+      hlsRenditionKeyPrefix: jest.fn(
+        (movieId: string, name: string) => `videos/${movieId}/hls/${name}`,
+      ),
     };
     minioService = {
       downloadFile: jest.fn().mockResolvedValue(undefined),
@@ -65,8 +97,13 @@ describe('UploadsService', () => {
       create: jest.fn().mockResolvedValue({ id: 'video-1' }),
       markReady: jest.fn().mockResolvedValue(undefined),
     };
-    processingService = { processVideo: jest.fn(), isActivelyProcessing: jest.fn().mockReturnValue(false) };
-    subtitlesService = { createFromExistingKey: jest.fn().mockResolvedValue({ id: 'subtitle-1' }) };
+    processingService = {
+      processVideo: jest.fn(),
+      isActivelyProcessing: jest.fn().mockReturnValue(false),
+    };
+    subtitlesService = {
+      createFromExistingKey: jest.fn().mockResolvedValue({ id: 'subtitle-1' }),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -84,7 +121,11 @@ describe('UploadsService', () => {
   });
 
   describe('initUpload', () => {
-    const dto = { movieId: 'movie-1', filename: 'movie.mp4', filesize: 10_000_000 };
+    const dto = {
+      movieId: 'movie-1',
+      filename: 'movie.mp4',
+      filesize: 10_000_000,
+    };
 
     it('throws NotFoundException when the movie does not exist', async () => {
       prisma.movie.findUnique.mockResolvedValue(null);
@@ -136,7 +177,9 @@ describe('UploadsService', () => {
         chunkSize: 5 * 1024 * 1024,
         totalChunks: 3,
       });
-      readdirMock.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+      readdirMock.mockRejectedValue(
+        Object.assign(new Error('ENOENT'), { code: 'ENOENT' }),
+      );
 
       const result = await service.initUpload(dto);
 
@@ -172,16 +215,24 @@ describe('UploadsService', () => {
         prisma.uploadSession.create.mockResolvedValue({ id: 'session-3' });
         prisma.uploadSession.update.mockResolvedValue({});
 
-        await service.initUpload({ ...dto, filename: 'index.m3u8', relativePath: 'hls/720p/index.m3u8' });
+        await service.initUpload({
+          ...dto,
+          filename: 'index.m3u8',
+          relativePath: 'hls/720p/index.m3u8',
+        });
 
         expect(prisma.uploadSession.findFirst).toHaveBeenCalledWith(
           expect.objectContaining({
-            where: expect.objectContaining({ relativePath: 'hls/720p/index.m3u8' }),
+            where: expect.objectContaining({
+              relativePath: 'hls/720p/index.m3u8',
+            }),
           }),
         );
         expect(prisma.uploadSession.create).toHaveBeenCalledWith(
           expect.objectContaining({
-            data: expect.objectContaining({ relativePath: 'hls/720p/index.m3u8' }),
+            data: expect.objectContaining({
+              relativePath: 'hls/720p/index.m3u8',
+            }),
           }),
         );
       },
@@ -196,7 +247,9 @@ describe('UploadsService', () => {
       await service.initUpload(dto); // no relativePath
 
       expect(prisma.uploadSession.findFirst).toHaveBeenCalledWith(
-        expect.objectContaining({ where: expect.objectContaining({ relativePath: null }) }),
+        expect.objectContaining({
+          where: expect.objectContaining({ relativePath: null }),
+        }),
       );
     });
   });
@@ -206,19 +259,31 @@ describe('UploadsService', () => {
       prisma.movie.findUnique.mockResolvedValue(null);
 
       await expect(
-        service.validateExternalBundle('movie-1', { relativePaths: ['original.mp4'] }),
+        service.validateExternalBundle('movie-1', {
+          relativePaths: ['original.mp4'],
+        }),
       ).rejects.toThrow(NotFoundException);
     });
 
     it('reports every relativePath that is not actually present in MinIO', async () => {
       prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
-      minioService.objectExists.mockImplementation(async (key: string) => key !== 'videos/movie-1/hls/master.m3u8');
+      minioService.objectExists.mockImplementation(
+        async (key: string) => key !== 'videos/movie-1/hls/master.m3u8',
+      );
 
       const result = await service.validateExternalBundle('movie-1', {
-        relativePaths: ['original.mp4', 'hls/master.m3u8', 'hls/720p/index.m3u8'],
+        relativePaths: [
+          'original.mp4',
+          'hls/master.m3u8',
+          'hls/720p/index.m3u8',
+        ],
       });
 
-      expect(result).toEqual({ missing: ['hls/master.m3u8'], structureErrors: [], valid: false });
+      expect(result).toEqual({
+        missing: ['hls/master.m3u8'],
+        structureErrors: [],
+        valid: false,
+      });
     });
 
     it('reports valid:true and an empty missing list when every file is present and the structure is complete', async () => {
@@ -226,7 +291,11 @@ describe('UploadsService', () => {
       minioService.objectExists.mockResolvedValue(true);
 
       const result = await service.validateExternalBundle('movie-1', {
-        relativePaths: ['original.mp4', 'hls/master.m3u8', 'hls/720p/index.m3u8'],
+        relativePaths: [
+          'original.mp4',
+          'hls/master.m3u8',
+          'hls/720p/index.m3u8',
+        ],
       });
 
       expect(result).toEqual({ missing: [], structureErrors: [], valid: true });
@@ -262,7 +331,9 @@ describe('UploadsService', () => {
     it('throws NotFoundException when the movie does not exist', async () => {
       prisma.movie.findUnique.mockResolvedValue(null);
 
-      await expect(service.finalizeExternalUpload('movie-1', dto)).rejects.toThrow(NotFoundException);
+      await expect(
+        service.finalizeExternalUpload('movie-1', dto),
+      ).rejects.toThrow(NotFoundException);
     });
 
     it(
@@ -272,7 +343,9 @@ describe('UploadsService', () => {
         prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
 
         await expect(
-          service.finalizeExternalUpload('movie-1', { relativePaths: ['hls/master.m3u8'] }), // no original.mp4, no rendition
+          service.finalizeExternalUpload('movie-1', {
+            relativePaths: ['hls/master.m3u8'],
+          }), // no original.mp4, no rendition
         ).rejects.toThrow(BadRequestException);
         expect(minioService.objectExists).not.toHaveBeenCalled();
         expect(videosService.create).not.toHaveBeenCalled();
@@ -293,7 +366,9 @@ describe('UploadsService', () => {
           async (key: string) => key !== 'videos/movie-1/hls/480p/index.m3u8',
         );
 
-        await expect(service.finalizeExternalUpload('movie-1', dto)).rejects.toThrow(BadRequestException);
+        await expect(
+          service.finalizeExternalUpload('movie-1', dto),
+        ).rejects.toThrow(BadRequestException);
         expect(videosService.create).not.toHaveBeenCalled();
         expect(videosService.markReady).not.toHaveBeenCalled();
         expect(prisma.movie.update).toHaveBeenCalledWith({
@@ -322,11 +397,20 @@ describe('UploadsService', () => {
           resolution: null,
           hlsMasterPath: 'videos/movie-1/hls/master.m3u8',
           renditions: [
-            { resolution: '480p', playlistPath: 'videos/movie-1/hls/480p/index.m3u8' },
-            { resolution: '720p', playlistPath: 'videos/movie-1/hls/720p/index.m3u8' },
+            {
+              resolution: '480p',
+              playlistPath: 'videos/movie-1/hls/480p/index.m3u8',
+            },
+            {
+              resolution: '720p',
+              playlistPath: 'videos/movie-1/hls/720p/index.m3u8',
+            },
           ],
         });
-        expect(result).toEqual({ videoId: 'video-1', status: VideoStatus.READY });
+        expect(result).toEqual({
+          videoId: 'video-1',
+          status: VideoStatus.READY,
+        });
       },
     );
 
@@ -356,13 +440,23 @@ describe('UploadsService', () => {
       minioService.objectExists.mockResolvedValue(true);
 
       await service.finalizeExternalUpload('movie-1', {
-        relativePaths: ['original.mp4', 'hls/master.m3u8', 'hls/720p/index.m3u8', 'hls/weird-name/index.m3u8'],
+        relativePaths: [
+          'original.mp4',
+          'hls/master.m3u8',
+          'hls/720p/index.m3u8',
+          'hls/weird-name/index.m3u8',
+        ],
       });
 
       expect(videosService.markReady).toHaveBeenCalledWith(
         'video-1',
         expect.objectContaining({
-          renditions: [{ resolution: '720p', playlistPath: 'videos/movie-1/hls/720p/index.m3u8' }],
+          renditions: [
+            {
+              resolution: '720p',
+              playlistPath: 'videos/movie-1/hls/720p/index.m3u8',
+            },
+          ],
         }),
       );
     });
@@ -394,7 +488,11 @@ describe('UploadsService', () => {
       minioService.objectExists.mockResolvedValue(true);
 
       await service.finalizeExternalUpload('movie-1', {
-        relativePaths: ['original.mp4', 'hls/master.m3u8', 'hls/720p/index.m3u8'],
+        relativePaths: [
+          'original.mp4',
+          'hls/master.m3u8',
+          'hls/720p/index.m3u8',
+        ],
       });
 
       expect(subtitlesService.createFromExistingKey).not.toHaveBeenCalled();
@@ -414,7 +512,9 @@ describe('UploadsService', () => {
     it('throws NotFoundException when no video exists for the movie', async () => {
       videosService.findLatestForMovie.mockResolvedValue(null);
 
-      await expect(service.reprocessVideo('movie-1')).rejects.toThrow(NotFoundException);
+      await expect(service.reprocessVideo('movie-1')).rejects.toThrow(
+        NotFoundException,
+      );
     });
 
     it('throws BadRequestException when the video is not FAILED', async () => {
@@ -425,7 +525,9 @@ describe('UploadsService', () => {
         originalFilename: 'movie.mp4',
       });
 
-      await expect(service.reprocessVideo('movie-1')).rejects.toThrow(BadRequestException);
+      await expect(service.reprocessVideo('movie-1')).rejects.toThrow(
+        BadRequestException,
+      );
       expect(processingService.processVideo).not.toHaveBeenCalled();
     });
 
@@ -437,7 +539,9 @@ describe('UploadsService', () => {
         originalFilename: 'movie.mp4',
       });
 
-      await expect(service.reprocessVideo('movie-1')).rejects.toThrow(BadRequestException);
+      await expect(service.reprocessVideo('movie-1')).rejects.toThrow(
+        BadRequestException,
+      );
     });
 
     it('reprocesses directly from the local scratch file when the archive-to-MinIO step never ran', async () => {
@@ -457,7 +561,10 @@ describe('UploadsService', () => {
         'movie-1',
         '/storage/videos/movie-1/original.mp4',
       );
-      expect(result).toEqual({ videoId: 'video-1', status: VideoStatus.PROCESSING });
+      expect(result).toEqual({
+        videoId: 'video-1',
+        status: VideoStatus.PROCESSING,
+      });
     });
 
     it(
@@ -518,13 +625,18 @@ describe('UploadsService', () => {
 
           const result = await service.reprocessVideo('movie-1');
 
-          expect(processingService.isActivelyProcessing).toHaveBeenCalledWith('video-1');
+          expect(processingService.isActivelyProcessing).toHaveBeenCalledWith(
+            'video-1',
+          );
           expect(processingService.processVideo).toHaveBeenCalledWith(
             'video-1',
             'movie-1',
             '/storage/videos/movie-1/original.mp4',
           );
-          expect(result).toEqual({ videoId: 'video-1', status: VideoStatus.PROCESSING });
+          expect(result).toEqual({
+            videoId: 'video-1',
+            status: VideoStatus.PROCESSING,
+          });
         },
       );
 
@@ -535,7 +647,9 @@ describe('UploadsService', () => {
           videosService.findLatestForMovie.mockResolvedValue(processingVideo);
           processingService.isActivelyProcessing.mockReturnValue(true);
 
-          await expect(service.reprocessVideo('movie-1')).rejects.toThrow(ConflictException);
+          await expect(service.reprocessVideo('movie-1')).rejects.toThrow(
+            ConflictException,
+          );
           expect(processingService.processVideo).not.toHaveBeenCalled();
         },
       );

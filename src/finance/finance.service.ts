@@ -225,7 +225,7 @@ export class FinanceService {
 
     const users = await this.prisma.user.findMany({
       where: { id: { in: grouped.map((g) => g.userId) } },
-      select: { id: true, username: true, avatar: true },
+      select: { id: true, username: true, displayName: true, avatar: true },
     });
     const userById = new Map(
       users.map((u) => [
@@ -233,6 +233,7 @@ export class FinanceService {
         {
           id: u.id,
           username: u.username,
+          displayName: u.displayName,
           avatarUrl: u.avatar ? this.minioService.playbackUrl(u.avatar) : null,
         },
       ]),

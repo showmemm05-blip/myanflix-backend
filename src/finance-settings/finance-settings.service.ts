@@ -55,7 +55,7 @@ export class FinanceSettingsService {
         updatedByUserId: adminId,
       },
       include: {
-        updatedBy: { select: { id: true, username: true } },
+        updatedBy: { select: { id: true, username: true, displayName: true } },
       },
     });
   }

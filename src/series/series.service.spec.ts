@@ -3,19 +3,29 @@ import { NotFoundException } from '@nestjs/common';
 import { SeriesService } from './series.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
-import { AccessType, MovieStatus, Role } from '../generated/prisma/client';
+import {
+  AccessType,
+  MovieStatus,
+  Role,
+  SeriesStatus,
+} from '../generated/prisma/client';
 
 describe('SeriesService', () => {
   let service: SeriesService;
   let prisma: {
     series: { findUnique: jest.Mock; create: jest.Mock; update: jest.Mock; delete: jest.Mock; findMany: jest.Mock; count: jest.Mock };
-    movie: { groupBy: jest.Mock; findMany: jest.Mock };
+    movie: { groupBy: jest.Mock; findMany: jest.Mock; count: jest.Mock };
     seriesPurchase: { findMany: jest.Mock };
     watchHistory: { findMany: jest.Mock };
     $transaction: jest.Mock;
   };
 
-  let minioService: { imageUrl: jest.Mock };
+  let minioService: {
+    imageUrl: jest.Mock;
+    keyFromPublicUrl: jest.Mock;
+    deleteByPrefix: jest.Mock;
+    deleteObject: jest.Mock;
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -28,6 +38,14 @@ describe('SeriesService', () => {
         const match = /\/movies\/(.+)$/.exec(url);
         return match ? `http://current-host:8080/movies/${match[1]}` : url;
       }),
+      // Mirrors the real keyFromPublicUrl(): recovers the object key from a
+      // URL under our bucket, null for anything external.
+      keyFromPublicUrl: jest.fn((url: string) => {
+        const match = /\/movies\/(.+)$/.exec(url);
+        return match ? match[1] : null;
+      }),
+      deleteByPrefix: jest.fn().mockResolvedValue(undefined),
+      deleteObject: jest.fn().mockResolvedValue(undefined),
     };
 
     prisma = {
@@ -39,7 +57,7 @@ describe('SeriesService', () => {
         findMany: jest.fn(),
         count: jest.fn(),
       },
-      movie: { groupBy: jest.fn(), findMany: jest.fn() },
+      movie: { groupBy: jest.fn(), findMany: jest.fn(), count: jest.fn() },
       seriesPurchase: { findMany: jest.fn() },
       watchHistory: { findMany: jest.fn() },
       $transaction: jest.fn(async (arg: unknown) =>
@@ -61,7 +79,7 @@ describe('SeriesService', () => {
   describe('getSeasons', () => {
     it('throws NotFoundException for an unknown series', async () => {
       prisma.series.findUnique.mockResolvedValue(null);
-      await expect(service.getSeasons('nope')).rejects.toThrow(NotFoundException);
+      await expect(service.getSeasons('nope', Role.ADMIN)).rejects.toThrow(NotFoundException);
     });
 
     it('reports distinct season numbers with per-season episode counts, in order', async () => {
@@ -71,7 +89,7 @@ describe('SeriesService', () => {
         { seasonNumber: 2, _count: { seasonNumber: 3 } },
       ]);
 
-      const result = await service.getSeasons('series-1');
+      const result = await service.getSeasons('series-1', Role.ADMIN);
 
       expect(result).toEqual([
         { seasonNumber: 1, episodeCount: 8 },
@@ -82,7 +100,7 @@ describe('SeriesService', () => {
 
   describe('getEpisodes', () => {
     it('regular users only ever see PUBLISHED episodes — same rule as the movies catalog', async () => {
-      prisma.series.findUnique.mockResolvedValue({ id: 'series-1' });
+      prisma.series.findUnique.mockResolvedValue({ id: 'series-1', status: SeriesStatus.PUBLISHED });
       prisma.movie.findMany.mockResolvedValue([]);
 
       await service.getEpisodes('series-1', Role.USER);
@@ -133,7 +151,7 @@ describe('SeriesService', () => {
     });
 
     it('regular users only ever see PUBLISHED episodes — same rule as getEpisodes', async () => {
-      prisma.series.findUnique.mockResolvedValue({ id: 'series-1' });
+      prisma.series.findUnique.mockResolvedValue({ id: 'series-1', status: SeriesStatus.PUBLISHED });
       prisma.movie.findMany.mockResolvedValue([]);
       prisma.watchHistory.findMany.mockResolvedValue([]);
 
@@ -171,7 +189,7 @@ describe('SeriesService', () => {
     });
 
     it("attaches the caller's own watch progress per episode via one batched query, not one per episode", async () => {
-      prisma.series.findUnique.mockResolvedValue({ id: 'series-1' });
+      prisma.series.findUnique.mockResolvedValue({ id: 'series-1', status: SeriesStatus.PUBLISHED });
       prisma.movie.findMany.mockResolvedValue(episodes);
       prisma.watchHistory.findMany.mockResolvedValue([
         { movieId: 'ep-1', progress: 100, lastPosition: 2520 },
@@ -194,7 +212,7 @@ describe('SeriesService', () => {
     });
 
     it('skips the watch-history query entirely when the series has no episodes', async () => {
-      prisma.series.findUnique.mockResolvedValue({ id: 'series-1' });
+      prisma.series.findUnique.mockResolvedValue({ id: 'series-1', status: SeriesStatus.PUBLISHED });
       prisma.movie.findMany.mockResolvedValue([]);
 
       const result = await service.getPlayerEpisodes('series-1', 'user-1', Role.USER);
@@ -243,7 +261,7 @@ describe('SeriesService', () => {
       ]);
       prisma.series.count.mockResolvedValue(1);
 
-      const result = await service.findAll({});
+      const result = await service.findAll({}, Role.ADMIN);
 
       expect(result.items[0]).toMatchObject({
         id: 'series-1',
@@ -257,6 +275,7 @@ describe('SeriesService', () => {
     it('re-hosts poster and cover on series detail, leaving an external one alone', async () => {
       prisma.series.findUnique.mockResolvedValue({
         id: 'series-1',
+        status: SeriesStatus.PUBLISHED,
         posterUrl: stale('poster'),
         coverUrl: 'https://picsum.photos/seed/A%20Show-cover/1280/720',
         categories: [],
@@ -311,7 +330,7 @@ describe('SeriesService', () => {
   });
 
   describe('getForViewer', () => {
-    const series = { id: 'series-1', accessType: AccessType.SUBSCRIPTION, categories: [], posterUrl: null, coverUrl: null };
+    const series = { id: 'series-1', accessType: AccessType.SUBSCRIPTION, status: SeriesStatus.PUBLISHED, categories: [], posterUrl: null, coverUrl: null };
 
     it('throws NotFoundException for an unknown series', async () => {
       prisma.series.findUnique.mockResolvedValue(null);
@@ -325,6 +344,278 @@ describe('SeriesService', () => {
 
       expect(result).toEqual(series);
       expect(prisma.seriesPurchase.findMany).not.toHaveBeenCalled();
+    });
+
+    it.each([SeriesStatus.DRAFT, SeriesStatus.UNPUBLISHED])(
+      'a %s series does not exist for regular users — same NotFoundException as a bogus id, no leak',
+      async (status) => {
+        prisma.series.findUnique.mockResolvedValue({ ...series, status });
+
+        await expect(
+          service.getForViewer('series-1', 'user-1', Role.USER),
+        ).rejects.toThrow(NotFoundException);
+      },
+    );
+
+    it('staff see a DRAFT series normally', async () => {
+      const draft = { ...series, status: SeriesStatus.DRAFT };
+      prisma.series.findUnique.mockResolvedValue(draft);
+
+      const result = await service.getForViewer('series-1', 'admin-1', Role.SUPER_ADMIN);
+
+      expect(result).toEqual(draft);
+    });
+  });
+
+  describe('findAll — series-level visibility', () => {
+    beforeEach(() => {
+      prisma.series.findMany.mockResolvedValue([]);
+      prisma.series.count.mockResolvedValue(0);
+    });
+
+    const whereUsed = () =>
+      prisma.series.findMany.mock.calls[0][0].where as Record<string, unknown>;
+
+    it('forces status=PUBLISHED for regular users', async () => {
+      await service.findAll({}, Role.USER);
+      expect(whereUsed().status).toBe(SeriesStatus.PUBLISHED);
+    });
+
+    it('ignores (does not honor) a status filter passed by a regular user', async () => {
+      await service.findAll({ status: SeriesStatus.DRAFT }, Role.USER);
+      expect(whereUsed().status).toBe(SeriesStatus.PUBLISHED);
+    });
+
+    it('staff see every status by default', async () => {
+      await service.findAll({}, Role.ADMIN);
+      expect(whereUsed().status).toBeUndefined();
+    });
+
+    it('staff can narrow to one status', async () => {
+      await service.findAll({ status: SeriesStatus.UNPUBLISHED }, Role.SUPER_ADMIN);
+      expect(whereUsed().status).toBe(SeriesStatus.UNPUBLISHED);
+    });
+  });
+
+  describe('updateStatus', () => {
+    it('throws NotFoundException for an unknown series', async () => {
+      prisma.series.findUnique.mockResolvedValue(null);
+      await expect(
+        service.updateStatus('nope', SeriesStatus.PUBLISHED),
+      ).rejects.toThrow(NotFoundException);
+      expect(prisma.series.update).not.toHaveBeenCalled();
+    });
+
+    it('updates only the status and returns the admin shape (categories included)', async () => {
+      prisma.series.findUnique.mockResolvedValue({ id: 'series-1', status: SeriesStatus.DRAFT, posterUrl: null, coverUrl: null, categories: [] });
+      prisma.series.update.mockResolvedValue({ id: 'series-1', title: 'A Show', status: SeriesStatus.PUBLISHED, posterUrl: null, coverUrl: null, categories: [] });
+
+      const result = await service.updateStatus('series-1', SeriesStatus.PUBLISHED);
+
+      expect(prisma.series.update).toHaveBeenCalledWith({
+        where: { id: 'series-1' },
+        data: { status: SeriesStatus.PUBLISHED },
+        include: { categories: true },
+      });
+      expect(result.status).toBe(SeriesStatus.PUBLISHED);
+    });
+  });
+
+  describe('remove', () => {
+    const img = (name: string) =>
+      `http://192.168.10.122:8080/movies/images/${name}.jpeg`;
+
+    const makeSeries = (episodes: unknown[]) => ({
+      id: 'series-1',
+      title: 'A Show',
+      posterUrl: img('series-poster'),
+      coverUrl: img('series-cover'),
+      episodes,
+    });
+
+    const episode = (id: string, overrides: Record<string, unknown> = {}) => ({
+      id,
+      posterUrl: null,
+      coverUrl: null,
+      thumbnailUrl: null,
+      videos: [],
+      ...overrides,
+    });
+
+    beforeEach(() => {
+      prisma.series.delete.mockResolvedValue({});
+      // Shared-asset guard default: nothing else references any image key.
+      prisma.movie.count.mockResolvedValue(0);
+      prisma.series.count.mockResolvedValue(0);
+    });
+
+    it('throws NotFoundException for an unknown series and deletes nothing', async () => {
+      prisma.series.findUnique.mockResolvedValue(null);
+
+      await expect(service.remove('nope')).rejects.toThrow(NotFoundException);
+      expect(prisma.series.delete).not.toHaveBeenCalled();
+      expect(minioService.deleteByPrefix).not.toHaveBeenCalled();
+      expect(minioService.deleteObject).not.toHaveBeenCalled();
+    });
+
+    it('deletes the series row (Cascade takes the episodes) and reports the episode count', async () => {
+      prisma.series.findUnique.mockResolvedValue(
+        makeSeries([episode('ep-1'), episode('ep-2')]),
+      );
+
+      const result = await service.remove('series-1');
+
+      expect(prisma.series.delete).toHaveBeenCalledWith({ where: { id: 'series-1' } });
+      expect(result).toEqual({
+        deletedEpisodes: 2,
+        storageCleanup: 'complete',
+        failedObjects: [],
+      });
+    });
+
+    it('cleans MinIO per episode video prefix plus every episode and series image key', async () => {
+      prisma.series.findUnique.mockResolvedValue(
+        makeSeries([
+          episode('ep-1', { posterUrl: img('ep1-poster'), thumbnailUrl: img('ep1-thumb') }),
+          episode('ep-2'),
+        ]),
+      );
+
+      await service.remove('series-1');
+
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith('videos/ep-1/');
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith('videos/ep-2/');
+      const deletedKeys = minioService.deleteObject.mock.calls.map((c) => c[0]);
+      expect(deletedKeys).toEqual(
+        expect.arrayContaining([
+          'images/ep1-poster.jpeg',
+          'images/ep1-thumb.jpeg',
+          'images/series-poster.jpeg',
+          'images/series-cover.jpeg',
+        ]),
+      );
+    });
+
+    it('deletes a manually-uploaded subtitle individually, but not one already under the video prefix', async () => {
+      prisma.series.findUnique.mockResolvedValue(
+        makeSeries([
+          episode('ep-1', {
+            videos: [
+              {
+                subtitles: [
+                  { objectKey: 'subtitles/sub-1/my.vtt' },
+                  { objectKey: 'videos/ep-1/bundle/en.vtt' },
+                ],
+              },
+            ],
+          }),
+        ]),
+      );
+
+      await service.remove('series-1');
+
+      const deletedKeys = minioService.deleteObject.mock.calls.map((c) => c[0]);
+      expect(deletedKeys).toContain('subtitles/sub-1/my.vtt');
+      expect(deletedKeys).not.toContain('videos/ep-1/bundle/en.vtt');
+    });
+
+    it('skips an image key another surviving row still references — the shared-asset guard', async () => {
+      prisma.series.findUnique.mockResolvedValue(makeSeries([episode('ep-1')]));
+      // Another movie still references the series poster key.
+      prisma.movie.count.mockImplementation(
+        ({ where }: { where: { OR: { posterUrl?: { contains: string } }[] } }) =>
+          Promise.resolve(
+            where.OR[0].posterUrl?.contains === 'images/series-poster.jpeg' ? 1 : 0,
+          ),
+      );
+
+      const result = await service.remove('series-1');
+
+      const deletedKeys = minioService.deleteObject.mock.calls.map((c) => c[0]);
+      expect(deletedKeys).not.toContain('images/series-poster.jpeg');
+      expect(deletedKeys).toContain('images/series-cover.jpeg');
+      // A skipped shared key is not a failure.
+      expect(result.storageCleanup).toBe('complete');
+    });
+
+    it('a MinIO failure yields storageCleanup partial with the failed keys, is logged, and never rolls back the DB delete', async () => {
+      prisma.series.findUnique.mockResolvedValue(
+        makeSeries([episode('ep-1'), episode('ep-2')]),
+      );
+      minioService.deleteByPrefix.mockImplementation((prefix: string) =>
+        prefix === 'videos/ep-1/'
+          ? Promise.reject(new Error('minio down'))
+          : Promise.resolve(),
+      );
+      minioService.deleteObject.mockImplementation((key: string) =>
+        key === 'images/series-cover.jpeg'
+          ? Promise.reject(new Error('minio down'))
+          : Promise.resolve(),
+      );
+      const errorSpy = jest
+        .spyOn(service['logger'], 'error')
+        .mockImplementation(() => undefined);
+
+      const result = await service.remove('series-1');
+
+      expect(prisma.series.delete).toHaveBeenCalledWith({ where: { id: 'series-1' } });
+      expect(result.deletedEpisodes).toBe(2);
+      expect(result.storageCleanup).toBe('partial');
+      expect(result.failedObjects).toEqual(
+        expect.arrayContaining(['videos/ep-1/', 'images/series-cover.jpeg']),
+      );
+      expect(result.failedObjects).toHaveLength(2);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('videos/ep-1/'),
+      );
+    });
+  });
+
+  /**
+   * The series-level gate: seasons, episodes and player-episodes of a
+   * non-PUBLISHED series are 404 for regular users (indistinguishable from
+   * a nonexistent series) while staff keep full access for management.
+   */
+  describe('series-level gating of seasons/episodes', () => {
+    const draft = { id: 'series-1', status: SeriesStatus.DRAFT, posterUrl: null, coverUrl: null, categories: [] };
+
+    it('getSeasons: 404 for USER on a non-PUBLISHED series', async () => {
+      prisma.series.findUnique.mockResolvedValue(draft);
+      await expect(service.getSeasons('series-1', Role.USER)).rejects.toThrow(NotFoundException);
+      expect(prisma.movie.groupBy).not.toHaveBeenCalled();
+    });
+
+    it('getSeasons: staff still list seasons of a DRAFT series', async () => {
+      prisma.series.findUnique.mockResolvedValue(draft);
+      prisma.movie.groupBy.mockResolvedValue([]);
+      await expect(service.getSeasons('series-1', Role.ADMIN)).resolves.toEqual([]);
+    });
+
+    it('getEpisodes: 404 for USER on a non-PUBLISHED series', async () => {
+      prisma.series.findUnique.mockResolvedValue({ ...draft, status: SeriesStatus.UNPUBLISHED });
+      await expect(service.getEpisodes('series-1', Role.USER)).rejects.toThrow(NotFoundException);
+      expect(prisma.movie.findMany).not.toHaveBeenCalled();
+    });
+
+    it('getEpisodes: staff still list episodes of an UNPUBLISHED series', async () => {
+      prisma.series.findUnique.mockResolvedValue({ ...draft, status: SeriesStatus.UNPUBLISHED });
+      prisma.movie.findMany.mockResolvedValue([]);
+      await expect(service.getEpisodes('series-1', Role.ADMIN)).resolves.toEqual([]);
+    });
+
+    it('getPlayerEpisodes: 404 for USER on a non-PUBLISHED series', async () => {
+      prisma.series.findUnique.mockResolvedValue(draft);
+      await expect(
+        service.getPlayerEpisodes('series-1', 'user-1', Role.USER),
+      ).rejects.toThrow(NotFoundException);
+      expect(prisma.movie.findMany).not.toHaveBeenCalled();
+    });
+
+    it('getPlayerEpisodes: staff still get the grouped list for a DRAFT series', async () => {
+      prisma.series.findUnique.mockResolvedValue(draft);
+      prisma.movie.findMany.mockResolvedValue([]);
+      const result = await service.getPlayerEpisodes('series-1', 'admin-1', Role.SUPER_ADMIN);
+      expect(result.seasons).toEqual([]);
     });
   });
 });

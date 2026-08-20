@@ -72,13 +72,14 @@ export class WithdrawalsService {
 
     const user = await this.prisma.user.findUniqueOrThrow({
       where: { id: userId },
-      select: { username: true },
+      select: { username: true, displayName: true },
     });
 
     this.realtimeGateway.notifyAdminsWithdrawalCreated({
       id: withdrawal.id,
       userId: withdrawal.userId,
       username: user.username,
+      displayName: user.displayName,
       amount: decimalToNumber(withdrawal.amount),
       accountType: withdrawal.accountType,
       accountName: withdrawal.accountName,
@@ -119,7 +120,12 @@ export class WithdrawalsService {
         take: limit,
         include: {
           user: {
-            select: { id: true, username: true, phone: true },
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+              phone: true,
+            },
           },
         },
       }),
@@ -226,7 +232,12 @@ export class WithdrawalsService {
         where: { id: withdrawalId },
         include: {
           user: {
-            select: { id: true, username: true, phone: true },
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+              phone: true,
+            },
           },
         },
       });
@@ -310,7 +321,12 @@ export class WithdrawalsService {
         where: { id: withdrawalId },
         include: {
           user: {
-            select: { id: true, username: true, phone: true },
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+              phone: true,
+            },
           },
         },
       });
@@ -398,7 +414,12 @@ export class WithdrawalsService {
         },
         include: {
           user: {
-            select: { id: true, username: true, phone: true },
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+              phone: true,
+            },
           },
         },
       });

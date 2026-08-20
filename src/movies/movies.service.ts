@@ -9,6 +9,7 @@ import {
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
+import { TrackingService } from '../tracking/tracking.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { CreateMovieDto } from './dto/create-movie.dto';
@@ -26,9 +27,15 @@ export class MoviesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
+    private readonly trackingService: TrackingService,
   ) {}
 
-  async findAll(query: MovieQueryDto, viewerRole: Role) {
+  /**
+   * `viewerId` is optional only so the many call sites that predate search
+   * logging keep compiling; the catalog route always passes it, and it only
+   * ever ends up as SearchQuery.userId.
+   */
+  async findAll(query: MovieQueryDto, viewerRole: Role, viewerId?: string) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
@@ -69,6 +76,23 @@ export class MoviesService {
       }),
       this.prisma.movie.count({ where }),
     ]);
+
+    // Logged AFTER the query so `resultCount` is the real total this search
+    // returned, not the size of the page being read. Fire-and-forget by
+    // design: a search must never get slower, or fail, because of tracking.
+    // Staff searches are dropped inside recordSearch — an admin browsing the
+    // catalog through this same endpoint is not user demand.
+    if (query.search?.trim()) {
+      this.trackingService.fireAndForget(
+        'search',
+        this.trackingService.recordSearch({
+          term: query.search,
+          resultCount: total,
+          userId: viewerId ?? null,
+          viewerRole,
+        }),
+      );
+    }
 
     return { items, total, page, limit };
   }
@@ -294,6 +318,20 @@ export class MoviesService {
       page,
       limit,
     };
+  }
+
+  /**
+   * Current lifecycle status only. Movies publish through the edit route's
+   * `status` field, so the PUT /movies/:id gate has to know which direction
+   * the edit is moving before it can pick MOVIES.PUBLISH vs MOVIES.UNPUBLISH.
+   */
+  async getStatusOrThrow(id: string): Promise<MovieStatus> {
+    const movie = await this.prisma.movie.findUnique({
+      where: { id },
+      select: { status: true },
+    });
+    if (!movie) throw new NotFoundException('Movie not found');
+    return movie.status;
   }
 
   private async assertExists(id: string): Promise<void> {

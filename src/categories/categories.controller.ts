@@ -11,7 +11,6 @@ import {
   Put,
   UseGuards,
 } from '@nestjs/common';
-import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { CategoriesService } from './categories.service';
@@ -34,14 +33,14 @@ export class CategoriesController {
 
   @Post()
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.MOVIE_CREATE)
+  @RequirePermissions('CATEGORIES.CREATE')
   create(@Body() dto: CreateCategoryDto) {
     return this.categoriesService.create(dto);
   }
 
   @Put(':id')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.MOVIE_UPDATE)
+  @RequirePermissions('CATEGORIES.EDIT')
   update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateCategoryDto,
@@ -52,7 +51,7 @@ export class CategoriesController {
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.MOVIE_DELETE)
+  @RequirePermissions('CATEGORIES.DELETE')
   async remove(@Param('id', ParseUUIDPipe) id: string) {
     await this.categoriesService.remove(id);
   }

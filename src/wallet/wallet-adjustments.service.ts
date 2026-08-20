@@ -18,7 +18,11 @@ import type { CreateWalletAdjustmentDto } from './dto/create-wallet-adjustment.d
 import { WalletService } from './wallet.service';
 
 type AdjustmentWithPerformer = WalletAdjustment & {
-  performedBy: { id: string; username: string } | null;
+  performedBy: {
+    id: string;
+    username: string;
+    displayName: string | null;
+  } | null;
 };
 
 /** Discriminated on `replayed` — a replay carries nothing to emit post-commit. */
@@ -70,7 +74,11 @@ export class WalletAdjustmentsService {
         async (tx): Promise<AdjustTransactionResult> => {
           const existing = await tx.walletAdjustment.findUnique({
             where: { idempotencyKey: dto.idempotencyKey },
-            include: { performedBy: { select: { id: true, username: true } } },
+            include: {
+              performedBy: {
+                select: { id: true, username: true, displayName: true },
+              },
+            },
           });
           if (existing) {
             this.assertReplayMatches(existing, userId, dto);
@@ -133,7 +141,11 @@ export class WalletAdjustmentsService {
               performedByUserId: admin.id,
               transactionId: transaction.id,
             },
-            include: { performedBy: { select: { id: true, username: true } } },
+            include: {
+              performedBy: {
+                select: { id: true, username: true, displayName: true },
+              },
+            },
           });
 
           // `reason` deliberately stays out of the user-facing message — it can
@@ -174,7 +186,11 @@ export class WalletAdjustmentsService {
       ) {
         const existing = await this.prisma.walletAdjustment.findUnique({
           where: { idempotencyKey: dto.idempotencyKey },
-          include: { performedBy: { select: { id: true, username: true } } },
+          include: {
+            performedBy: {
+              select: { id: true, username: true, displayName: true },
+            },
+          },
         });
         if (existing) {
           this.assertReplayMatches(existing, userId, dto);
@@ -213,7 +229,11 @@ export class WalletAdjustmentsService {
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
-        include: { performedBy: { select: { id: true, username: true } } },
+        include: {
+          performedBy: {
+            select: { id: true, username: true, displayName: true },
+          },
+        },
       }),
       this.prisma.walletAdjustment.count({ where: { userId } }),
     ]);
@@ -266,7 +286,11 @@ export class WalletAdjustmentsService {
     idempotencyKey: string;
     transactionId: string | null;
     createdAt: Date;
-    performedBy: { id: string; username: string } | null;
+    performedBy: {
+      id: string;
+      username: string;
+      displayName: string | null;
+    } | null;
   }) {
     return {
       id: adjustment.id,

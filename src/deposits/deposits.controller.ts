@@ -10,7 +10,6 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
@@ -51,14 +50,14 @@ export class DepositsController {
 
   @Get()
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.DEPOSIT_MANAGE)
+  @RequirePermissions('DEPOSITS.VIEW')
   findAll(@Query() query: DepositQueryDto) {
     return this.depositsService.findAllAdmin(query);
   }
 
   @Post('manual')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.DEPOSIT_MANAGE)
+  @RequirePermissions('DEPOSITS.CREATE')
   createManual(
     @Body() dto: CreateManualDepositDto,
     @CurrentUser() admin: AuthenticatedUser,
@@ -68,7 +67,7 @@ export class DepositsController {
 
   @Patch(':id/approve')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.DEPOSIT_MANAGE)
+  @RequirePermissions('DEPOSITS.APPROVE')
   approve(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: ApproveDepositDto,
@@ -79,7 +78,7 @@ export class DepositsController {
 
   @Patch(':id/reject')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.DEPOSIT_MANAGE)
+  @RequirePermissions('DEPOSITS.REJECT')
   reject(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() admin: AuthenticatedUser,
@@ -90,7 +89,7 @@ export class DepositsController {
 
   @Patch(':id/receiving-account')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.DEPOSIT_MANAGE)
+  @RequirePermissions('DEPOSITS.EDIT')
   updateReceivingAccount(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateReceivingAccountDto,

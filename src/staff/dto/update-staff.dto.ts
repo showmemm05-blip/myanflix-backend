@@ -2,6 +2,7 @@ import {
   IsIn,
   IsOptional,
   IsString,
+  IsUUID,
   Matches,
   MaxLength,
   MinLength,
@@ -21,4 +22,13 @@ export class UpdateStaffDto {
   @IsOptional()
   @IsIn(STAFF_ROLES)
   role?: (typeof STAFF_ROLES)[number];
+
+  /**
+   * Granular RBAC role (AppRole.id). Assigning a built-in role also moves the
+   * legacy `role` enum to match; assigning a custom role leaves it alone
+   * (custom roles are staff-tier by definition).
+   */
+  @IsOptional()
+  @IsUUID()
+  appRoleId?: string;
 }

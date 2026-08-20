@@ -3,7 +3,8 @@ import { NotFoundException } from '@nestjs/common';
 import { MoviesService } from './movies.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
-import { AccessType, MovieStatus } from '../generated/prisma/client';
+import { TrackingService } from '../tracking/tracking.service';
+import { AccessType, MovieStatus, Role } from '../generated/prisma/client';
 
 describe('MoviesService', () => {
   let service: MoviesService;
@@ -35,6 +36,15 @@ describe('MoviesService', () => {
         MoviesService,
         { provide: PrismaService, useValue: prisma },
         { provide: MinioService, useValue: minioService },
+        // findAll fire-and-forgets a search row; nothing else in this suite
+        // touches tracking.
+        {
+          provide: TrackingService,
+          useValue: {
+            recordSearch: jest.fn().mockResolvedValue(undefined),
+            fireAndForget: jest.fn(),
+          },
+        },
       ],
     }).compile();
 
@@ -196,5 +206,119 @@ describe('MoviesService', () => {
       await expect(service.remove('movie-1')).resolves.toBeUndefined();
       expect(prisma.movie.delete).toHaveBeenCalledWith({ where: { id: 'movie-1' } });
     });
+  });
+});
+
+describe('MoviesService — search logging', () => {
+  let service: MoviesService;
+  let prisma: {
+    movie: { findMany: jest.Mock; count: jest.Mock };
+    $transaction: jest.Mock;
+  };
+  let trackingService: { recordSearch: jest.Mock; fireAndForget: jest.Mock };
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+
+    prisma = {
+      movie: {
+        findMany: jest.fn().mockResolvedValue([]),
+        count: jest.fn().mockResolvedValue(0),
+      },
+      $transaction: jest.fn((operations: Promise<unknown>[]) =>
+        Promise.all(operations),
+      ),
+    };
+    trackingService = {
+      recordSearch: jest.fn().mockResolvedValue(undefined),
+      // Matches the real helper: run it, swallow failures into a log.
+      fireAndForget: jest.fn((_what: string, run: Promise<void>) => {
+        void run.catch(() => undefined);
+      }),
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        MoviesService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: MinioService, useValue: {} },
+        { provide: TrackingService, useValue: trackingService },
+      ],
+    }).compile();
+
+    service = module.get(MoviesService);
+  });
+
+  it('logs a search with the real total the query returned, not the page size', async () => {
+    prisma.movie.findMany.mockResolvedValue([{ id: 'movie-1' }]);
+    prisma.movie.count.mockResolvedValue(42);
+
+    await service.findAll({ search: 'avengers', limit: 1 }, Role.USER, 'user-1');
+
+    expect(trackingService.recordSearch).toHaveBeenCalledWith({
+      term: 'avengers',
+      resultCount: 42,
+      userId: 'user-1',
+      viewerRole: Role.USER,
+    });
+  });
+
+  it('logs a search that found nothing — that is the most interesting kind', async () => {
+    prisma.movie.count.mockResolvedValue(0);
+
+    await service.findAll({ search: 'kdrama 2035' }, Role.USER, 'user-1');
+
+    expect(trackingService.recordSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ resultCount: 0 }),
+    );
+  });
+
+  it('logs nothing when the request carries no search term', async () => {
+    await service.findAll({ genre: 'Action' }, Role.USER, 'user-1');
+
+    expect(trackingService.recordSearch).not.toHaveBeenCalled();
+  });
+
+  it('logs nothing for a whitespace-only search term', async () => {
+    await service.findAll({ search: '   ' }, Role.USER, 'user-1');
+
+    expect(trackingService.recordSearch).not.toHaveBeenCalled();
+  });
+
+  it("hands the caller's role through, so staff searches can be dropped", async () => {
+    await service.findAll({ search: 'avengers' }, Role.ADMIN, 'admin-1');
+
+    expect(trackingService.recordSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ viewerRole: Role.ADMIN }),
+    );
+  });
+
+  it('is fire-and-forget — the search still returns when logging rejects', async () => {
+    prisma.movie.count.mockResolvedValue(7);
+    trackingService.recordSearch.mockRejectedValue(new Error('db down'));
+
+    const result = await service.findAll(
+      { search: 'avengers' },
+      Role.USER,
+      'user-1',
+    );
+
+    expect(result.total).toBe(7);
+    expect(trackingService.fireAndForget).toHaveBeenCalled();
+    // Let the rejected promise's .catch handler run.
+    await new Promise(process.nextTick);
+  });
+
+  it('logs after the query, so a search is never slowed down by tracking', async () => {
+    const order: string[] = [];
+    prisma.movie.count.mockImplementation(() => {
+      order.push('count');
+      return Promise.resolve(1);
+    });
+    trackingService.fireAndForget.mockImplementation(() => order.push('log'));
+
+    await service.findAll({ search: 'avengers' }, Role.USER, 'user-1');
+
+    expect(order).toEqual(['count', 'log']);
   });
 });

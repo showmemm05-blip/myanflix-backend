@@ -10,7 +10,6 @@ import {
 } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
-import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { CreatePlanDto } from './dto/create-plan.dto';
@@ -28,14 +27,14 @@ export class SubscriptionPlansController {
 
   @Post()
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.SUBSCRIPTION_MANAGE)
+  @RequirePermissions('SUBSCRIPTIONS.CREATE')
   create(@Body() dto: CreatePlanDto) {
     return this.subscriptionsService.createPlan(dto);
   }
 
   @Put(':id')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.SUBSCRIPTION_MANAGE)
+  @RequirePermissions('SUBSCRIPTIONS.EDIT')
   update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdatePlanDto) {
     return this.subscriptionsService.updatePlan(id, dto);
   }

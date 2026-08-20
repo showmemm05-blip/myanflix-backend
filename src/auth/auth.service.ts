@@ -12,12 +12,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import { OtpService } from '../otp/otp.service';
+import { TrackingService } from '../tracking/tracking.service';
 import type { RegisterDto } from './dto/register.dto';
 import type { LoginDto } from './dto/login.dto';
 import type { AuthenticatedUser } from './types/authenticated-user.type';
 import type { JwtPayload, RefreshPayload } from './types/jwt-payload.type';
-
-const PASSWORD_SALT_ROUNDS = 10;
+import { PASSWORD_SALT_ROUNDS } from './password.constants';
 
 export interface AuthTokens {
   accessToken: string;
@@ -36,6 +36,7 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly otpService: OtpService,
+    private readonly trackingService: TrackingService,
   ) {}
 
   async register(
@@ -56,6 +57,7 @@ export class AuthService {
       id: user.id,
       username: user.username,
       role: user.role,
+      appRoleId: user.appRoleId,
     };
     const tokens = await this.issueTokens(authenticatedUser);
     return { user: authenticatedUser, ...tokens };
@@ -82,11 +84,19 @@ export class AuthService {
       id: user.id,
       username: user.username,
       role: user.role,
+      appRoleId: user.appRoleId,
     };
     const [tokens] = await Promise.all([
       this.issueTokens(authenticatedUser),
       this.usersService.updateLastLogin(user.id),
     ]);
+    // Opens the session row behind presence and the admin's Phone/IP view.
+    // Fire-and-forget: a tracking failure must never cost someone their
+    // login, and nothing in the response depends on it.
+    this.trackingService.fireAndForget(
+      'session start',
+      this.trackingService.startSession(user.id),
+    );
     return { user: authenticatedUser, ...tokens };
   }
 
@@ -162,8 +172,15 @@ export class AuthService {
       id: user.id,
       username: user.username,
       role: user.role,
+      appRoleId: user.appRoleId,
     };
     const tokens = await this.issueTokens(authenticatedUser);
+    // Same session bookkeeping as password login — this is the sign-in path
+    // both the website and the mobile app actually use.
+    this.trackingService.fireAndForget(
+      'session start',
+      this.trackingService.startSession(user.id),
+    );
     return { user: authenticatedUser, ...tokens };
   }
 
@@ -203,6 +220,7 @@ export class AuthService {
       id: user.id,
       username: user.username,
       role: user.role,
+      appRoleId: user.appRoleId,
     };
     return this.issueTokens(authenticatedUser);
   }

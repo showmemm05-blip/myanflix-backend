@@ -39,6 +39,16 @@ enum MovieStatus {
   READY_TO_PUBLISH
 }
 
+/// Show-level publish lifecycle — independent of the per-episode
+/// MovieStatus. A series is created DRAFT, made visible to users by an
+/// explicit publish (PUBLISHED), and can be hidden again (UNPUBLISHED)
+/// while staying fully manageable in the admin.
+enum SeriesStatus {
+  DRAFT
+  PUBLISHED
+  UNPUBLISHED
+}
+
 enum VideoStatus {
   UPLOADING
   PROCESSING
@@ -127,6 +137,42 @@ enum WalletAdjustmentDirection {
   DEBIT
 }
 
+/// Which client an action came from. Resolved server-side from the
+/// `X-Client-Platform` request header (or the socket handshake's `platform`),
+/// falling back to a user-agent sniff and then to UNKNOWN — never from a
+/// value a client can pass as ordinary payload. UNKNOWN is a real, expected
+/// value (curl, an older client build, a background job), not an error state.
+enum ClientPlatform {
+  WEB
+  MOBILE
+  UNKNOWN
+}
+
+/// Moderation state of a Comment. HIDDEN rows stay in the table (the audit
+/// trail and the tracking counts need them) but are never served to users.
+enum CommentStatus {
+  VISIBLE
+  HIDDEN
+}
+
+enum FeedbackCategory {
+  BUG
+  SUGGESTION
+  CONTENT
+  PAYMENT
+  OTHER
+}
+
+/// Declared in triage order deliberately — Postgres native enums sort by
+/// declaration order, so `ORDER BY status ASC` puts NEW rows first without
+/// any raw SQL or extra sort key (same trick as WithdrawalStatus).
+enum FeedbackStatus {
+  NEW
+  IN_REVIEW
+  RESOLVED
+  DISMISSED
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
@@ -137,13 +183,33 @@ model User {
   password    String
   /// Set for phone+OTP accounts. Nullable so username/password accounts are unaffected.
   phone       String?    @unique
+  /// Free-text name the user picks for themselves and can edit from their
+  /// profile. Purely cosmetic: `username` and `phone` remain the login
+  /// identities and are never edited through the profile screen. NULL means
+  /// "not set" — clients fall back to username/phone for display.
+  displayName String?
   /// MinIO object KEY for the profile picture (e.g. images/avatars/<userId>-<epochMs>.png) — never an absolute URL.
   avatar      String?
   role        Role       @default(USER)
+  /// Granular RBAC assignment (see AppRole). NULL falls back to the seeded
+  /// system AppRole whose `key` equals `role`, so pre-RBAC rows keep working.
+  appRoleId   String?
   status      UserStatus @default(ACTIVE)
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
   lastLoginAt DateTime?
+
+  /// Presence, refreshed (throttled) from any authenticated request on any
+  /// client — distinct from `lastLoginAt`, which only moves on a fresh
+  /// sign-in and so says nothing about whether the account is active now.
+  lastSeenAt    DateTime?
+  /// Last observed client IP, denormalised from UserSession so the admin's
+  /// Phone/IP table is one query. Always masked server-side unless the
+  /// caller holds TRACKING.PII_VIEW.
+  lastIpAddress String?
+  /// Last observed client platform, denormalised from UserSession for the
+  /// same reason as `lastIpAddress`.
+  lastPlatform  ClientPlatform?
 
   wallet                              Wallet?
   purchases                           Purchase[]
@@ -160,11 +226,66 @@ model User {
   withdrawals                         Withdrawal[]
   withdrawalApprovals                 Withdrawal[]                @relation("WithdrawalApprovals")
   financeSettingsUpdates              FinanceSettings[]           @relation("FinanceSettingsUpdatedBy")
+  peakUserStatsUpdates                PeakUserStats[]             @relation("PeakUserStatsUpdatedBy")
   paymentAccountTransactionsPerformed PaymentAccountTransaction[] @relation("PaymentAccountTransactionPerformedBy")
   walletAdjustments                   WalletAdjustment[]          @relation("WalletAdjustmentUser")
   walletAdjustmentsPerformed          WalletAdjustment[]          @relation("WalletAdjustmentPerformedBy")
+  appRole                             AppRole?                    @relation("UserAppRole", fields: [appRoleId], references: [id], onDelete: SetNull)
+  comments                            Comment[]
+  feedbacks                           Feedback[]                  @relation("FeedbackAuthor")
+  handledFeedbacks                    Feedback[]                  @relation("FeedbackHandledBy")
+  searchQueries                       SearchQuery[]
+  watchActivities                     WatchActivity[]
+  sessions                            UserSession[]
 
+  @@index([appRoleId])
   @@map("users")
+}
+
+/// A database-driven RBAC role: a named bundle of `MODULE.ACTION` permissions
+/// (see src/roles/permission-catalogue.ts) that staff accounts are assigned to.
+///
+/// The `Role` enum is NOT replaced by this — it stays the coarse "account
+/// kind" axis (USER vs staff) that auth, the website and the mobile app read.
+/// AppRole is the fine-grained authorization axis, editable at runtime from
+/// the admin roles screen with no redeploy and no re-login.
+model AppRole {
+  id          String   @id @default(uuid())
+  /// Stable identifier. The four seeded roles use the `Role` enum members
+  /// verbatim so a user with a NULL appRoleId resolves through this column.
+  key         String   @unique
+  name        String
+  description String?
+  /// The four built-ins: never deletable, `key` immutable.
+  isSystem    Boolean  @default(false)
+  /// SUPER_ADMIN only: permissions are not editable either, and the resolver
+  /// short-circuits it to every permission so it can never lock itself out.
+  isProtected Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  permissions AppRolePermission[]
+  users       User[]              @relation("UserAppRole")
+
+  @@map("app_roles")
+}
+
+/// One granted permission string on one role. Stored as rows rather than a
+/// string[] column so the unique constraint does the de-duplication and a
+/// permission grant/revoke is a single row insert/delete.
+model AppRolePermission {
+  id         String   @id @default(uuid())
+  roleId     String
+  /// A `MODULE.ACTION` value from the catalogue. Kept as a plain String (not
+  /// a Postgres enum) so adding a permission is a code change, not a migration.
+  permission String
+  createdAt  DateTime @default(now())
+
+  role AppRole @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permission])
+  @@index([roleId])
+  @@map("app_role_permissions")
 }
 
 /// Server-side record of issued refresh tokens so /auth/logout can revoke a
@@ -242,8 +363,10 @@ model Movie {
   videos         Video[]
   purchases      Purchase[]
   watchHistory   WatchHistory[]
+  watchActivity  WatchActivity[]
+  comments       Comment[]
   uploadSessions UploadSession[]
-  series         Series?         @relation(fields: [seriesId], references: [id], onDelete: SetNull)
+  series         Series?         @relation(fields: [seriesId], references: [id], onDelete: Cascade)
 
   @@index([status])
   @@index([seriesId, seasonNumber, episodeNumber])
@@ -251,11 +374,12 @@ model Movie {
 }
 
 /// Show-level metadata for a series. Episodes are Movie rows pointing here
-/// via seriesId — deleting a series detaches its episodes (SetNull) rather
-/// than cascading, so uploaded content is never destroyed by a metadata
-/// cleanup; orphaned episodes stay manageable from the movies table.
+/// via seriesId — deleting a series CASCADES to its episodes (and, through
+/// the Movie cascades, to their videos/subtitles/watch history), so no code
+/// path can ever orphan an episode into the standalone movies list. Storage
+/// cleanup for those episodes lives in SeriesService.remove().
 model Series {
-  id          String     @id @default(uuid())
+  id          String       @id @default(uuid())
   title       String
   description String
   posterUrl   String?
@@ -266,14 +390,19 @@ model Series {
   /// The whole show is one product — episodes are never gated individually;
   /// this accessType governs every season and episode, including ones added
   /// later. An episode's own Movie.accessType is never consulted.
-  accessType  AccessType @default(SUBSCRIPTION)
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @updatedAt
+  accessType  AccessType   @default(SUBSCRIPTION)
+  /// Show-level visibility: regular users only ever see PUBLISHED series.
+  /// New series start DRAFT and go live only via an explicit admin publish.
+  status      SeriesStatus @default(DRAFT)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
 
   episodes   Movie[]
   categories Category[]
   purchases  SeriesPurchase[]
+  comments   Comment[]
 
+  @@index([status])
   @@map("series")
 }
 
@@ -664,6 +793,24 @@ model FinanceSettings {
   @@map("finance_settings")
 }
 
+/// Single global row tracking the concurrent-user peak. `actualPeak` is the
+/// real tracked high-water mark (never edited by hand); `additionalPeak` is
+/// an admin-set marketing adjustment (>= 0, resettable to 0). Public callers
+/// only ever see the combined total — the split stays admin-only.
+model PeakUserStats {
+  id              String    @id @default(uuid())
+  actualPeak      Int       @default(0)
+  actualPeakAt    DateTime?
+  additionalPeak  Int       @default(0)
+  updatedByUserId String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  updatedBy User? @relation("PeakUserStatsUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: SetNull)
+
+  @@map("peak_user_stats")
+}
+
 /// An admin-managed destination (KBZPay, bank account, etc.) shown to users
 /// when depositing — replaces what used to be a payment-method list
 /// hardcoded separately in each client app. `type` is a free string, not an
@@ -855,4 +1002,191 @@ model Notification {
   @@index([userId])
   @@index([userId, isRead])
   @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Tracking
+//
+// Everything below is append-only observation of what users actually do —
+// what they say (Comment, Feedback), what they look for (SearchQuery), when
+// they watch (WatchActivity) and where they connect from (UserSession).
+// No existing model changed shape for it; WatchHistory in particular keeps
+// its exact "resume where you left off" job and is untouched.
+//
+// Two rules hold for every model here:
+//   - every timestamp is server-side (`new Date()` in the service), never a
+//     value the client sent;
+//   - `platform` and `ipAddress` come from the per-request context captured
+//     in main.ts (see common/storage/request-host.context.ts), never from a
+//     body field a caller could forge.
+// ---------------------------------------------------------------------------
+
+/// A user's comment on a movie or a series, with at most one level of
+/// replies (a reply's own `parentId` is always null — enforced in the
+/// service, since the schema cannot express depth).
+///
+/// EXACTLY ONE of `movieId` / `seriesId` is non-null. Postgres cannot express
+/// that as a column constraint through Prisma, so CommentsService validates
+/// it on write and every read filters on the one that is set. A reply
+/// inherits its parent's target and carries the same one.
+model Comment {
+  id       String        @id @default(uuid())
+  userId   String
+  movieId  String?
+  seriesId String?
+  /// Null for a top-level comment; the comment being replied to otherwise.
+  parentId String?
+  body     String
+  status   CommentStatus @default(VISIBLE)
+
+  platform  ClientPlatform @default(UNKNOWN)
+  ipAddress String?
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  user    User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  movie   Movie?    @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  series  Series?   @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  parent  Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies Comment[] @relation("CommentReplies")
+
+  @@index([movieId])
+  @@index([seriesId])
+  @@index([userId])
+  @@index([parentId])
+  @@index([createdAt])
+  @@map("comments")
+}
+
+/// Free-text feedback submitted from the website or the app. Kept forever
+/// (an operator's triage history is the point) and never edited by its
+/// author — staff only ever move `status` and add an `adminNote`.
+model Feedback {
+  id       String           @id @default(uuid())
+  userId   String
+  category FeedbackCategory
+  message  String
+  status   FeedbackStatus   @default(NEW)
+
+  platform  ClientPlatform @default(UNKNOWN)
+  ipAddress String?
+
+  /// Staff member who last moved this out of NEW, and when. Nullable
+  /// forever: an untriaged row has neither.
+  handledByUserId String?
+  handledAt       DateTime?
+  /// Internal only — never returned to the feedback's author.
+  adminNote       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user      User  @relation("FeedbackAuthor", fields: [userId], references: [id], onDelete: Cascade)
+  /// SetNull, not Cascade: deleting the staff account that triaged a row
+  /// must not delete the user's feedback along with it.
+  handledBy User? @relation("FeedbackHandledBy", fields: [handledByUserId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([userId])
+  @@index([handledByUserId])
+  @@map("feedback")
+}
+
+/// One row per settled search — the log `MoviesService.findAll` never kept.
+/// Both clients already debounce (web 300ms, mobile 400ms), so this is one
+/// row per keystroke burst, not per keystroke.
+///
+/// `normalizedTerm` is `term` trimmed, lowercased and with runs of
+/// whitespace collapsed to a single space; it is what "top searches" groups
+/// by, while `term` keeps the raw spelling so the admin can show the wording
+/// users actually typed. `userId` is nullable so an anonymous search is
+/// still counted, and survives (SetNull) if the account is later deleted.
+model SearchQuery {
+  id             String  @id @default(uuid())
+  userId         String?
+  term           String
+  normalizedTerm String
+  /// How many results that search actually returned — the signal that
+  /// separates "people search for this and find nothing" from "people
+  /// search for this a lot".
+  resultCount    Int
+
+  platform  ClientPlatform @default(UNKNOWN)
+  ipAddress String?
+  createdAt DateTime       @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([normalizedTerm])
+  @@index([createdAt])
+  @@index([userId])
+  @@map("search_queries")
+}
+
+/// Hour-bucketed watch activity — the append-safe log WatchHistory can't be.
+///
+/// WatchHistory holds exactly one upserted row per (user, movie) carrying a
+/// position and an `updatedAt`, so it can answer "where did I stop" and
+/// nothing else: a re-watch overwrites the previous one and no history of
+/// WHEN anybody watched survives. This model keeps that question answerable
+/// without touching it — one row per (user, movie, platform, hour), with
+/// seconds accumulated by a clamped delta between heartbeats, so a heatmap
+/// of when people watch is exact, a backwards seek adds zero rather than a
+/// negative, and re-watching adds instead of overwriting.
+///
+/// `hourStart` is truncated server-side to the top of the hour in UTC;
+/// bucketing into local hour-of-day/weekday happens at read time in the
+/// tracking service, so the stored value never depends on the server's TZ.
+model WatchActivity {
+  id         String         @id @default(uuid())
+  userId     String
+  movieId    String
+  platform   ClientPlatform @default(UNKNOWN)
+  /// Top of the UTC hour this activity fell in.
+  hourStart  DateTime
+  /// Accumulated watched seconds in this bucket (clamped per heartbeat).
+  seconds    Int            @default(0)
+  /// How many heartbeats landed in this bucket — lets a mean-per-heartbeat
+  /// sanity check separate real watching from a stuck client.
+  heartbeats Int            @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  movie Movie @relation(fields: [movieId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, movieId, platform, hourStart])
+  @@index([hourStart])
+  @@index([movieId])
+  @@map("watch_activity")
+}
+
+/// One sign-in from one client — created on login and on OTP verify, then
+/// touched (at most once per 60s per user) by any authenticated request, so
+/// "who is active right now" is answerable without a socket connection.
+///
+/// `endedAt` is set on an explicit logout; a session that simply goes quiet
+/// keeps a null `endedAt` and ages out of the "active" window via
+/// `lastSeenAt` instead — there is no reliable client-side end-of-session
+/// signal to trust.
+model UserSession {
+  id        String         @id @default(uuid())
+  userId    String
+  platform  ClientPlatform @default(UNKNOWN)
+  /// Masked server-side unless the caller holds TRACKING.PII_VIEW.
+  ipAddress String?
+  userAgent String?
+
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime
+  endedAt    DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([lastSeenAt])
+  @@index([ipAddress])
+  @@map("user_sessions")
 }

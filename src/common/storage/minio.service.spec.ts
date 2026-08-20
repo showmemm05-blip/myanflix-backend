@@ -97,6 +97,20 @@ describe('MinioService.imageUrl', () => {
     ).toBe('http://192.168.100.27:8080/movies/images/abc-123.jpeg');
   });
 
+  it('falls back the same way inside a request that carried no Host header', () => {
+    // The context middleware used to skip the ALS entirely when Host was
+    // empty; it now always runs (so IP/platform are never silently dropped)
+    // and stores hostname ''. That must be indistinguishable here from not
+    // being in a request at all — an empty host is not an address.
+    expect(
+      asRequestFrom('', () =>
+        service.imageUrl(
+          'http://192.168.10.122:8080/movies/images/abc-123.jpeg',
+        ),
+      ),
+    ).toBe('http://192.168.100.27:8080/movies/images/abc-123.jpeg');
+  });
+
   it('does not mutate anything — the stored value is only ever read', () => {
     const persisted = 'http://192.168.10.122:8080/movies/images/abc-123.jpeg';
     asRequestFrom('localhost', () => service.imageUrl(persisted));

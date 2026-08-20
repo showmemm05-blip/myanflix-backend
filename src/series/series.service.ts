@@ -1,8 +1,9 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
   MovieStatus,
   Prisma,
   Role,
+  SeriesStatus,
   type Category,
   type Series,
 } from '../generated/prisma/client';
@@ -16,6 +17,12 @@ import type { UpdateSeriesDto } from './dto/update-series.dto';
 
 type SeriesWithCategories = Series & { categories?: Category[] };
 
+export interface SeriesRemovalResult {
+  deletedEpisodes: number;
+  storageCleanup: 'complete' | 'partial';
+  failedObjects: string[];
+}
+
 /**
  * Show-level metadata CRUD plus series-level access. Seasons are
  * deliberately NOT rows anywhere — a "season" is just the distinct
@@ -25,6 +32,8 @@ type SeriesWithCategories = Series & { categories?: Category[] };
  */
 @Injectable()
 export class SeriesService {
+  private readonly logger = new Logger(SeriesService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
@@ -47,12 +56,21 @@ export class SeriesService {
     };
   }
 
-  async findAll(query: SeriesQueryDto) {
+  async findAll(query: SeriesQueryDto, viewerRole: Role) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
     const where: Prisma.SeriesWhereInput = {};
     if (query.accessType) where.accessType = query.accessType;
+
+    // Regular users can only ever browse PUBLISHED series — any status
+    // filter they pass is ignored, not honored. Staff see everything by
+    // default and may narrow to one status.
+    if (viewerRole === Role.USER) {
+      where.status = SeriesStatus.PUBLISHED;
+    } else if (query.status) {
+      where.status = query.status;
+    }
 
     const [items, total] = await this.prisma.$transaction([
       this.prisma.series.findMany({
@@ -85,9 +103,29 @@ export class SeriesService {
     return this.withImageUrls(series);
   }
 
+  /**
+   * findByIdOrThrow plus the show-level visibility rule: a series that is
+   * not PUBLISHED simply does not exist for regular users — the same
+   * NotFoundException as a bogus id, so an unpublished show's presence
+   * never leaks. Staff pass through untouched.
+   */
+  private async findViewableOrThrow(
+    id: string,
+    viewerRole: Role,
+  ): Promise<SeriesWithCategories> {
+    const series = await this.findByIdOrThrow(id);
+    if (
+      viewerRole === Role.USER &&
+      series.status !== SeriesStatus.PUBLISHED
+    ) {
+      throw new NotFoundException('Series not found');
+    }
+    return series;
+  }
+
   /** Detail shape for a viewer — access is a global per-user subscription flag, not per-item, so it isn't computed here. */
-  async getForViewer(id: string, _userId: string, _role: Role) {
-    return this.findByIdOrThrow(id);
+  async getForViewer(id: string, _userId: string, role: Role) {
+    return this.findViewableOrThrow(id, role);
   }
 
   /**
@@ -141,20 +179,146 @@ export class SeriesService {
   }
 
   /**
-   * Deleting a series only removes the show-level metadata — its episodes
-   * survive with seriesId nulled (the schema's SetNull), so hours of
-   * uploaded, transcoded content never rides along with a metadata delete.
-   * Removing actual episodes stays an explicit per-movie action with its
-   * own storage cleanup (MoviesService.remove).
+   * Publish / unpublish — the one status transition endpoint. Deliberately
+   * separate from update() so SERIES_MANAGE metadata edits can never flip
+   * visibility as a side effect of echoing a stale form back.
    */
-  async remove(id: string): Promise<void> {
+  async updateStatus(id: string, status: SeriesStatus) {
     await this.findByIdOrThrow(id);
+    const updated = await this.prisma.series.update({
+      where: { id },
+      data: { status },
+      include: { categories: true },
+    });
+    return this.withImageUrls(updated);
+  }
+
+  /**
+   * Deletes the whole show: the series row, every episode (Movie rows —
+   * the schema's onDelete: Cascade removes them and their Video/Subtitle/
+   * WatchHistory/UploadSession children with the one series delete), and
+   * then best-effort cleans their bytes out of MinIO, mirroring
+   * MoviesService.remove's per-movie cleanup.
+   *
+   * Order matters: DB first, storage second — a failed storage call must
+   * never leave broken DB rows behind. Storage failures are therefore
+   * COLLECTED, not thrown: the caller gets storageCleanup 'partial' plus
+   * the exact keys that survived, and the same list is logged at error
+   * level, so a MinIO hiccup is visible to the admin but never rolls back
+   * the catalog delete.
+   */
+  async remove(id: string): Promise<SeriesRemovalResult> {
+    const series = await this.prisma.series.findUnique({
+      where: { id },
+      include: {
+        episodes: { include: { videos: { include: { subtitles: true } } } },
+      },
+    });
+    if (!series) throw new NotFoundException('Series not found');
+
     await this.prisma.series.delete({ where: { id } });
+
+    const failedObjects: string[] = [];
+
+    for (const episode of series.episodes) {
+      // The whole HLS tree (original + renditions + bundle subtitles) lives
+      // under this id-keyed prefix — unshareable by construction, no guard.
+      const prefix = `videos/${episode.id}/`;
+      try {
+        await this.minioService.deleteByPrefix(prefix);
+      } catch {
+        failedObjects.push(prefix);
+      }
+
+      // Manually-uploaded subtitles live under the separate global
+      // subtitles/<id>/ prefix and need deleting individually; bundle ones
+      // were already caught by the prefix delete above. Same rule as
+      // MoviesService.remove.
+      for (const video of episode.videos) {
+        for (const subtitle of video.subtitles) {
+          if (subtitle.objectKey.startsWith(prefix)) continue;
+          try {
+            await this.minioService.deleteObject(subtitle.objectKey);
+          } catch {
+            failedObjects.push(subtitle.objectKey);
+          }
+        }
+      }
+    }
+
+    // Image keys (episode poster/cover/thumbnail + series poster/cover) are
+    // uuid-named under images/ and CAN be referenced by several rows, so
+    // each key is deleted only after confirming no surviving movie or
+    // series row still points at it (the rows being deleted are already
+    // gone from the DB at this point and can't count as references).
+    const imageKeys = new Set<string>();
+    const collectImageKey = (url: string | null) => {
+      if (!url) return;
+      const key = this.minioService.keyFromPublicUrl(url);
+      if (key) imageKeys.add(key);
+    };
+    for (const episode of series.episodes) {
+      collectImageKey(episode.posterUrl);
+      collectImageKey(episode.coverUrl);
+      collectImageKey(episode.thumbnailUrl);
+    }
+    collectImageKey(series.posterUrl);
+    collectImageKey(series.coverUrl);
+
+    for (const key of imageKeys) {
+      try {
+        if (await this.isImageKeyStillReferenced(key)) continue;
+        await this.minioService.deleteObject(key);
+      } catch {
+        failedObjects.push(key);
+      }
+    }
+
+    if (failedObjects.length > 0) {
+      this.logger.error(
+        `Storage cleanup incomplete for deleted series ${id} — ${failedObjects.length} object(s)/prefix(es) not removed: ${failedObjects.join(', ')}`,
+      );
+    }
+
+    return {
+      deletedEpisodes: series.episodes.length,
+      storageCleanup: failedObjects.length === 0 ? 'complete' : 'partial',
+      failedObjects,
+    };
+  }
+
+  /**
+   * Shared-asset guard for image deletes: true when any OTHER movie or
+   * series row (the deleted ones no longer exist in the DB) references a
+   * URL containing this object key — deleting it would break that row's
+   * artwork.
+   */
+  private async isImageKeyStillReferenced(key: string): Promise<boolean> {
+    const [movieRefs, seriesRefs] = await Promise.all([
+      this.prisma.movie.count({
+        where: {
+          OR: [
+            { posterUrl: { contains: key } },
+            { coverUrl: { contains: key } },
+            { thumbnailUrl: { contains: key } },
+          ],
+        },
+      }),
+      this.prisma.series.count({
+        where: {
+          OR: [
+            { posterUrl: { contains: key } },
+            { coverUrl: { contains: key } },
+          ],
+        },
+      }),
+    ]);
+    return movieRefs + seriesRefs > 0;
   }
 
   /** Distinct season numbers + per-season episode counts, e.g. [{seasonNumber: 1, episodeCount: 8}]. */
-  async getSeasons(seriesId: string) {
-    await this.findByIdOrThrow(seriesId);
+  async getSeasons(seriesId: string, viewerRole: Role) {
+    await this.findViewableOrThrow(seriesId, viewerRole);
     const grouped = await this.prisma.movie.groupBy({
       by: ['seasonNumber'],
       where: { seriesId, seasonNumber: { not: null } },
@@ -173,7 +337,7 @@ export class SeriesService {
    * the movies catalog enforces.
    */
   async getEpisodes(seriesId: string, viewerRole: Role, seasonNumber?: number) {
-    await this.findByIdOrThrow(seriesId);
+    await this.findViewableOrThrow(seriesId, viewerRole);
 
     const where: Prisma.MovieWhereInput = { seriesId };
     if (seasonNumber !== undefined) where.seasonNumber = seasonNumber;
@@ -199,7 +363,7 @@ export class SeriesService {
    * + a Map for O(1) lookup while assembling the response).
    */
   async getPlayerEpisodes(seriesId: string, userId: string, viewerRole: Role) {
-    await this.findByIdOrThrow(seriesId);
+    await this.findViewableOrThrow(seriesId, viewerRole);
 
     const where: Prisma.MovieWhereInput = { seriesId };
     if (viewerRole === Role.USER) where.status = MovieStatus.PUBLISHED;

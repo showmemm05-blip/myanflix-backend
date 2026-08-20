@@ -1,12 +1,17 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import * as bcrypt from 'bcrypt';
 import type { User, UserStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { PASSWORD_SALT_ROUNDS } from '../auth/password.constants';
 import { MinioService } from '../common/storage/minio.service';
+import { AuthorityService } from '../roles/authority.service';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { Role, TransactionType } from '../generated/prisma/client';
@@ -16,6 +21,8 @@ export interface CreateUserInput {
   password: string;
   phone?: string;
   role?: Role;
+  /** Granular RBAC assignment; omitted means "fall back to the system role matching `role`". */
+  appRoleId?: string;
 }
 
 /**
@@ -78,6 +85,7 @@ export class UsersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
+    private readonly authority: AuthorityService,
   ) {}
 
   async create(input: CreateUserInput): Promise<User> {
@@ -126,6 +134,9 @@ export class UsersService {
         ? {
             OR: [
               { username: { contains: search, mode: 'insensitive' as const } },
+              {
+                displayName: { contains: search, mode: 'insensitive' as const },
+              },
               { phone: { contains: search } },
             ],
           }
@@ -213,14 +224,115 @@ export class UsersService {
     );
   }
 
-  async updateRole(id: string, role: Role): Promise<User> {
-    await this.findByIdOrThrow(id);
-    return this.prisma.user.update({ where: { id }, data: { role } });
+  /**
+   * Changes the coarse account kind AND re-points the RBAC assignment at the
+   * matching system role. Before AppRoles existed the enum alone decided
+   * permissions, so a role change had to move them too — keeping both in step
+   * preserves that exactly.
+   *
+   * This is the most powerful endpoint in the platform (it can mint a Super
+   * Admin), and it used to be reachable with nothing but USERS.EDIT and no
+   * checks at all — F2/F7. It now runs every guard the staff routes run:
+   * no promoting yourself, P2 on the role being handed out AND on the account
+   * being changed, plus both lockout guards.
+   */
+  async updateRole(
+    id: string,
+    role: Role,
+    actor: AuthenticatedUser,
+  ): Promise<User> {
+    if (id === actor.id) {
+      throw new ForbiddenException(
+        'You cannot change your own role. Ask another Super Admin to do this.',
+      );
+    }
+
+    const target = await this.findByIdOrThrow(id);
+    const systemRole = await this.prisma.appRole.findUnique({
+      where: { key: role },
+      select: { id: true },
+    });
+    const assignment = { role, appRoleId: systemRole?.id ?? null };
+
+    // (c) you may not demote a tier you do not belong to...
+    if (await this.authority.isSuperAdminTier(target)) {
+      await this.authority.assertActorIsSuperAdmin(actor);
+    }
+    // ...(b) nor promote anyone into it, nor grant a set you lack (P1).
+    await this.authority.assertCanAssignRole(actor, assignment);
+
+    // (d)/F7: the staff guards, on the endpoint that used to bypass them.
+    if (
+      (await this.authority.isEffectiveSuperAdmin(target)) &&
+      !(await this.authority.isEffectiveSuperAdmin(assignment))
+    ) {
+      await this.authority.assertNotLastActiveSuperAdmin(id);
+    }
+    await this.authority.assertNotLastRoleManagerAccount(
+      { id, role: target.role, appRoleId: target.appRoleId },
+      assignment,
+    );
+
+    return this.prisma.user.update({
+      where: { id },
+      data: { role, ...(systemRole && { appRoleId: systemRole.id }) },
+    });
   }
 
   async updateStatus(id: string, status: UserStatus): Promise<User> {
     await this.findByIdOrThrow(id);
     return this.prisma.user.update({ where: { id }, data: { status } });
+  }
+
+  /**
+   * Self-service profile edit. Deliberately narrow: only the cosmetic
+   * `displayName` is writable here — `username` and `phone` are login
+   * identities and must never be editable from the profile screen.
+   *
+   * `undefined` means "field not sent, leave it alone"; an explicit `null`
+   * clears the name back to unset. The DTO has already trimmed and
+   * length-checked any string.
+   */
+  async updateProfile(
+    id: string,
+    input: { displayName?: string | null },
+  ): Promise<User> {
+    await this.findByIdOrThrow(id);
+    if (input.displayName === undefined) {
+      // Nothing to write — re-read rather than issuing a no-op UPDATE that
+      // would still bump updatedAt.
+      return this.findByIdOrThrow(id);
+    }
+    return this.prisma.user.update({
+      where: { id },
+      data: { displayName: input.displayName },
+    });
+  }
+
+  /**
+   * Self-service password change: proves ownership with the current password
+   * before writing the new hash, using the same bcrypt cost as registration.
+   *
+   * Existing refresh tokens are deliberately NOT revoked — signing other
+   * devices out on a password change is a separate product decision and is
+   * out of scope here.
+   */
+  async changePassword(
+    id: string,
+    currentPassword: string,
+    newPassword: string,
+  ): Promise<void> {
+    const user = await this.findByIdOrThrow(id);
+    const matches = await bcrypt.compare(currentPassword, user.password);
+    if (!matches) {
+      throw new BadRequestException('Your current password is incorrect');
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, PASSWORD_SALT_ROUNDS);
+    await this.prisma.user.update({
+      where: { id },
+      data: { password: passwordHash },
+    });
   }
 
   /**

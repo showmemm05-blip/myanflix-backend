@@ -3,12 +3,14 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma, Role } from '../generated/prisma/client';
+import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
-import { Permission } from '../roles/permission.enum';
-import { roleHasPermission } from '../roles/role-permissions.map';
+import {
+  PermissionResolverService,
+  type PermissionSubject,
+} from '../roles/permission-resolver.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import type { CreatePaymentAccountDto } from './dto/create-payment-account.dto';
 import type { UpdatePaymentAccountDto } from './dto/update-payment-account.dto';
@@ -20,8 +22,8 @@ import type { CreateManualPaymentAccountTransactionDto } from './dto/create-manu
 import { PaymentAccountLedgerService } from './payment-account-ledger.service';
 
 const ADMIN_INCLUDE = {
-  createdBy: { select: { id: true, username: true } },
-  updatedBy: { select: { id: true, username: true } },
+  createdBy: { select: { id: true, username: true, displayName: true } },
+  updatedBy: { select: { id: true, username: true, displayName: true } },
 } satisfies Prisma.PaymentAccountInclude;
 
 type AdminRow = Prisma.PaymentAccountGetPayload<{
@@ -33,16 +35,19 @@ type PublicRow = Pick<
 >;
 
 /**
- * The customer on a deposit/withdrawal. Phone signups get a machine-generated
- * username (`user_959…`), so that alone reads as anonymous — the phone,
- * avatar, account status and wallet balance are what actually let an admin
- * tell *who* this is and whether the account is in good standing, without
- * leaving the transaction.
+ * The customer on a deposit/withdrawal. `displayName` is the primary label —
+ * the name the user set for themselves — while `username` is kept because it
+ * stays the login identity an admin may need to match an account by. Phone
+ * signups get a machine-generated username (`user_959…`), so when displayName
+ * is null the phone, avatar, account status and wallet balance are what let an
+ * admin tell *who* this is and whether the account is in good standing,
+ * without leaving the transaction.
  */
 const USER_REF = {
   select: {
     id: true,
     username: true,
+    displayName: true,
     phone: true,
     avatar: true,
     role: true,
@@ -52,7 +57,9 @@ const USER_REF = {
     wallet: { select: { balance: true } },
   },
 } as const;
-const STAFF_REF = { select: { id: true, username: true } } as const;
+const STAFF_REF = {
+  select: { id: true, username: true, displayName: true },
+} as const;
 const ACCOUNT_REF = {
   select: { id: true, type: true, subname: true, accountName: true },
 } as const;
@@ -78,7 +85,9 @@ const TRANSACTION_INCLUDE = {
       isActive: true,
     },
   },
-  performedBy: { select: { id: true, username: true, role: true } },
+  performedBy: {
+    select: { id: true, username: true, displayName: true, role: true },
+  },
   relatedDeposit: {
     include: {
       user: USER_REF,
@@ -99,7 +108,9 @@ const TRANSACTION_INCLUDE = {
 type TransactionRow = Prisma.PaymentAccountTransactionGetPayload<{
   include: typeof TRANSACTION_INCLUDE;
 }>;
-type TransactionCustomer = NonNullable<TransactionRow['relatedDeposit']>['user'];
+type TransactionCustomer = NonNullable<
+  TransactionRow['relatedDeposit']
+>['user'];
 
 @Injectable()
 export class PaymentAccountsService {
@@ -108,26 +119,31 @@ export class PaymentAccountsService {
     private readonly paymentAccountLedgerService: PaymentAccountLedgerService,
     private readonly realtimeGateway: RealtimeGateway,
     private readonly minioService: MinioService,
+    private readonly permissionResolver: PermissionResolverService,
   ) {}
 
   /**
-   * Same "one endpoint, row+field-shaped by viewer role" idiom already used
-   * by subscription plans / movies / series: a caller without
-   * PAYMENT_ACCOUNT_MANAGE, WITHDRAWAL_MANAGE, or DEPOSIT_MANAGE only ever
-   * sees active accounts, and only the fields they actually need to send a
+   * Same "one endpoint, row+field-shaped by viewer" idiom already used by
+   * subscription plans / movies / series: a caller without
+   * PAYMENT_ACCOUNTS.VIEW, WITHDRAWALS.VIEW or DEPOSITS.VIEW only ever sees
+   * active accounts, and only the fields they actually need to send a
    * deposit to — never audit metadata (who created/edited it, when, or its
    * active/inactive history) or `subname` (the internal label). Withdrawal
    * and deposit reviewers also get the admin shape — despite lacking
-   * PAYMENT_ACCOUNT_MANAGE itself — because recording which of our accounts
+   * PAYMENT_ACCOUNTS.VIEW itself — because recording which of our accounts
    * sent a payout or received a deposit (see TransferAccountCell /
    * ReceivingAccountCell in the admin app) needs to tell same-type accounts
    * apart by their subname.
+   *
+   * This is the one response-shaping check outside PermissionsGuard, so it
+   * goes through the same resolver the guard uses rather than any role name.
    */
-  async findAll(viewerRole: Role) {
-    const canManage =
-      roleHasPermission(viewerRole, Permission.PAYMENT_ACCOUNT_MANAGE) ||
-      roleHasPermission(viewerRole, Permission.WITHDRAWAL_MANAGE) ||
-      roleHasPermission(viewerRole, Permission.DEPOSIT_MANAGE);
+  async findAll(viewer: PermissionSubject) {
+    const canManage = await this.permissionResolver.canAny(viewer, [
+      'PAYMENT_ACCOUNTS.VIEW',
+      'WITHDRAWALS.VIEW',
+      'DEPOSITS.VIEW',
+    ]);
 
     if (!canManage) {
       const accounts = await this.prisma.paymentAccount.findMany({
@@ -287,14 +303,17 @@ export class PaymentAccountsService {
     dto: CreateManualPaymentAccountTransactionDto,
     actorUserId: string,
   ) {
-    const { account, entry } = await this.paymentAccountLedgerService.recordManualEntry(
-      accountId,
-      dto,
-      actorUserId,
-    );
+    const { account, entry } =
+      await this.paymentAccountLedgerService.recordManualEntry(
+        accountId,
+        dto,
+        actorUserId,
+      );
     // recordManualEntry owns and has already committed its own transaction
     // by the time we're back here, so it's safe to notify now.
-    this.realtimeGateway.notifyAdminsPaymentAccountUpdated({ paymentAccountId: accountId });
+    this.realtimeGateway.notifyAdminsPaymentAccountUpdated({
+      paymentAccountId: accountId,
+    });
     return {
       account: this.toAdminResponse({
         ...account,
@@ -319,7 +338,10 @@ export class PaymentAccountsService {
   }
 
   /** Per-account transaction history — backs the detail page's history table. */
-  async getTransactions(accountId: string, query: PaymentAccountTransactionQueryDto) {
+  async getTransactions(
+    accountId: string,
+    query: PaymentAccountTransactionQueryDto,
+  ) {
     await this.assertExists(accountId);
     return this.queryTransactions({ ...query, paymentAccountId: accountId });
   }

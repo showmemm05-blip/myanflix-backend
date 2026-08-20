@@ -14,7 +14,6 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { InitUploadDto } from './dto/init-upload.dto';
@@ -26,7 +25,7 @@ const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
 @Controller('uploads')
 @UseGuards(PermissionsGuard)
-@RequirePermissions(Permission.VIDEO_UPLOAD)
+@RequirePermissions('MEDIA.UPLOAD')
 export class UploadsController {
   constructor(private readonly uploadsService: UploadsService) {}
 
@@ -35,8 +34,10 @@ export class UploadsController {
     return this.uploadsService.initUpload(dto);
   }
 
+  // Serves poster/cover art for movies, series, episodes AND categories, so
+  // it rides the class-level MEDIA.UPLOAD rule rather than a movie-specific
+  // one (the old MOVIE_CREATE override resolved to the same three roles).
   @Post('image')
-  @RequirePermissions(Permission.MOVIE_CREATE)
   @UseInterceptors(
     FileInterceptor('file', { limits: { fileSize: MAX_IMAGE_BYTES } }),
   )

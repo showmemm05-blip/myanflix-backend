@@ -3,7 +3,9 @@ import {
   CanActivate,
   ExecutionContext,
   INestApplication,
+  ValidationPipe,
 } from '@nestjs/common';
+import * as bcrypt from 'bcrypt';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import { Role, UserStatus } from '../generated/prisma/client';
@@ -13,6 +15,9 @@ import { MoviesService } from '../movies/movies.service';
 import { VideosService } from '../videos/videos.service';
 import { WalletAdjustmentsService } from '../wallet/wallet-adjustments.service';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
+import { AuthorityService } from '../roles/authority.service';
+import { PermissionResolverService } from '../roles/permission-resolver.service';
+import { createSeededPermissionResolver } from '../../test/seeded-permission-resolver';
 import { UsersController } from './users.controller';
 import { UsersService } from './users.service';
 import { UserRelationshipsService } from './user-relationships.service';
@@ -25,6 +30,7 @@ function makeUserRow(overrides: Partial<Record<string, unknown>> = {}) {
     username: 'john',
     password: 'hashed',
     phone: null,
+    displayName: null,
     avatar: null,
     role: Role.USER,
     status: UserStatus.ACTIVE,
@@ -41,12 +47,21 @@ class FakeAuthGuard implements CanActivate {
     const req = context
       .switchToHttp()
       .getRequest<{ user?: Record<string, unknown> }>();
-    req.user = { id: USER_ID, username: 'john', role: Role.USER };
+    req.user = {
+      id: USER_ID,
+      username: 'john',
+      role: Role.USER,
+      appRoleId: null,
+    };
     return true;
   }
 }
 
-describe('UsersController — own avatar management', () => {
+/** Cheap stand-in for a real stored hash — 4 rounds keeps the suite fast. */
+const CURRENT_PASSWORD = 'current-password';
+const CURRENT_PASSWORD_HASH = bcrypt.hashSync(CURRENT_PASSWORD, 4);
+
+describe('UsersController — self-service "me" routes (profile, password, avatar)', () => {
   let app: INestApplication<App>;
   let prisma: {
     user: { findUnique: jest.Mock; update: jest.Mock };
@@ -63,15 +78,20 @@ describe('UsersController — own avatar management', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
 
+    // A one-row stand-in for the users table: `update` mutates it and
+    // `findUnique` reads it back, the way the real Prisma client behaves when
+    // a route writes and then re-reads the profile (PATCH /users/me does).
+    // Tests that need a different starting row still override findUnique.
+    let row = makeUserRow();
     prisma = {
       user: {
-        findUnique: jest.fn().mockResolvedValue(makeUserRow()),
+        findUnique: jest.fn(() => Promise.resolve(row)),
         update: jest
           .fn()
-          .mockImplementation(
-            ({ data }: { data: { avatar: string | null } }) =>
-              Promise.resolve(makeUserRow({ avatar: data.avatar })),
-          ),
+          .mockImplementation(({ data }: { data: Record<string, unknown> }) => {
+            row = makeUserRow({ ...row, ...data });
+            return Promise.resolve(row);
+          }),
       },
       wallet: { findUnique: jest.fn().mockResolvedValue(null) },
       transaction: {
@@ -91,6 +111,9 @@ describe('UsersController — own avatar management', () => {
       controllers: [UsersController],
       providers: [
         UsersService,
+        // UsersService's escalation guards for PATCH /users/:id/role; none of
+        // the avatar routes reach them (their own spec covers those).
+        AuthorityService,
         { provide: PrismaService, useValue: prisma },
         { provide: MinioService, useValue: minio },
         { provide: MoviesService, useValue: {} },
@@ -100,6 +123,10 @@ describe('UsersController — own avatar management', () => {
         // — the real class, since its only dependency is the mocked Prisma.
         // Its own behavior is covered by user-relationships.service.spec.ts.
         UserRelationshipsService,
+        {
+          provide: PermissionResolverService,
+          useValue: createSeededPermissionResolver(),
+        },
       ],
     })
       .overrideGuard(PermissionsGuard)
@@ -107,6 +134,17 @@ describe('UsersController — own avatar management', () => {
       .compile();
 
     app = moduleFixture.createNestApplication();
+    // Same configuration as the global APP_PIPE in app.module.ts — the
+    // profile DTOs (trimming, length limits, forbidNonWhitelisted) are only
+    // meaningful with it in place.
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        transform: true,
+        forbidNonWhitelisted: true,
+        transformOptions: { enableImplicitConversion: true },
+      }),
+    );
     await app.init();
   });
 
@@ -228,9 +266,7 @@ describe('UsersController — own avatar management', () => {
 
     it('best-effort deletes the previous avatar object when replacing', async () => {
       const oldKey = `images/avatars/${USER_ID}-1000.jpg`;
-      prisma.user.findUnique.mockResolvedValue(
-        makeUserRow({ avatar: oldKey }),
-      );
+      prisma.user.findUnique.mockResolvedValue(makeUserRow({ avatar: oldKey }));
 
       await request(app.getHttpServer())
         .post('/users/me/avatar')
@@ -280,9 +316,7 @@ describe('UsersController — own avatar management', () => {
   describe('DELETE /users/me/avatar', () => {
     it('clears the avatar, best-effort deletes the old object, and responds with avatarUrl null', async () => {
       const oldKey = `images/avatars/${USER_ID}-1000.png`;
-      prisma.user.findUnique.mockResolvedValue(
-        makeUserRow({ avatar: oldKey }),
-      );
+      prisma.user.findUnique.mockResolvedValue(makeUserRow({ avatar: oldKey }));
 
       const response = await request(app.getHttpServer())
         .delete('/users/me/avatar')
@@ -305,6 +339,173 @@ describe('UsersController — own avatar management', () => {
         data: { avatar: null },
       });
       expect(minio.deleteObject).not.toHaveBeenCalled();
+    });
+  });
+  describe('PATCH /users/me', () => {
+    it('trims the display name, persists it, and responds with the full GET /users/me shape', async () => {
+      const response = await request(app.getHttpServer())
+        .patch('/users/me')
+        .send({ displayName: '  Ada Lovelace  ' })
+        .expect(200);
+
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: USER_ID },
+        data: { displayName: 'Ada Lovelace' },
+      });
+      expect(response.body.displayName).toBe('Ada Lovelace');
+      // Wholesale-replaceable: the same fields GET /users/me returns.
+      expect(response.body.id).toBe(USER_ID);
+      expect(response.body.username).toBe('john');
+      expect(response.body.avatarUrl).toBeNull();
+      expect(response.body.balance).toBe(0);
+      expect(Array.isArray(response.body.permissions)).toBe(true);
+      expect(response.body.roleName).toBeTruthy();
+      expect(response.body).not.toHaveProperty('password');
+      expect(response.body).not.toHaveProperty('avatar');
+    });
+
+    it('clears the display name when an explicit null is sent', async () => {
+      await request(app.getHttpServer())
+        .patch('/users/me')
+        .send({ displayName: 'Ada' })
+        .expect(200);
+
+      const response = await request(app.getHttpServer())
+        .patch('/users/me')
+        .send({ displayName: null })
+        .expect(200);
+
+      expect(prisma.user.update).toHaveBeenLastCalledWith({
+        where: { id: USER_ID },
+        data: { displayName: null },
+      });
+      expect(response.body.displayName).toBeNull();
+    });
+
+    it('leaves the row untouched when displayName is omitted entirely', async () => {
+      await request(app.getHttpServer())
+        .patch('/users/me')
+        .send({})
+        .expect(200);
+
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects a whitespace-only display name with 400 and writes nothing', async () => {
+      const response = await request(app.getHttpServer())
+        .patch('/users/me')
+        .send({ displayName: '   ' })
+        .expect(400);
+
+      expect(String(response.body.message)).toContain('1 and 40 characters');
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects a display name longer than 40 characters with 400', async () => {
+      await request(app.getHttpServer())
+        .patch('/users/me')
+        .send({ displayName: 'a'.repeat(41) })
+        .expect(400);
+
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('accepts exactly 40 characters (the boundary is inclusive)', async () => {
+      const name = 'a'.repeat(40);
+      const response = await request(app.getHttpServer())
+        .patch('/users/me')
+        .send({ displayName: name })
+        .expect(200);
+
+      expect(response.body.displayName).toBe(name);
+    });
+
+    it('rejects a non-string display name with 400', async () => {
+      await request(app.getHttpServer())
+        .patch('/users/me')
+        .send({ displayName: 42 })
+        .expect(400);
+
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('refuses to edit the login identities — username and phone are not accepted here', async () => {
+      await request(app.getHttpServer())
+        .patch('/users/me')
+        .send({ displayName: 'Ada', username: 'someone-else' })
+        .expect(400);
+
+      await request(app.getHttpServer())
+        .patch('/users/me')
+        .send({ phone: '+959123456789' })
+        .expect(400);
+
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('PATCH /users/me/password', () => {
+    beforeEach(() => {
+      prisma.user.findUnique.mockResolvedValue(
+        makeUserRow({ password: CURRENT_PASSWORD_HASH }),
+      );
+    });
+
+    it('replaces the stored hash when the current password matches, and responds { changed: true }', async () => {
+      const response = await request(app.getHttpServer())
+        .patch('/users/me/password')
+        .send({
+          currentPassword: CURRENT_PASSWORD,
+          newPassword: 'brand-new-password',
+        })
+        .expect(200);
+
+      expect(response.body).toEqual({ changed: true });
+      expect(prisma.user.update).toHaveBeenCalledTimes(1);
+      const { where, data } = prisma.user.update.mock.calls[0][0] as {
+        where: { id: string };
+        data: { password: string };
+      };
+      expect(where).toEqual({ id: USER_ID });
+      // Hashed, never stored in the clear, and it verifies against the new password.
+      expect(data.password).not.toBe('brand-new-password');
+      expect(await bcrypt.compare('brand-new-password', data.password)).toBe(
+        true,
+      );
+    });
+
+    it('rejects a wrong current password with 400 and never writes', async () => {
+      const response = await request(app.getHttpServer())
+        .patch('/users/me/password')
+        .send({
+          currentPassword: 'not-my-password',
+          newPassword: 'brand-new-password',
+        })
+        .expect(400);
+
+      expect(String(response.body.message)).toBe(
+        'Your current password is incorrect',
+      );
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects a new password shorter than 8 characters with 400 and never writes', async () => {
+      const response = await request(app.getHttpServer())
+        .patch('/users/me/password')
+        .send({ currentPassword: CURRENT_PASSWORD, newPassword: 'short7c' })
+        .expect(400);
+
+      expect(String(response.body.message)).toContain('at least 8 characters');
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects a missing current password with 400', async () => {
+      await request(app.getHttpServer())
+        .patch('/users/me/password')
+        .send({ newPassword: 'brand-new-password' })
+        .expect(400);
+
+      expect(prisma.user.update).not.toHaveBeenCalled();
     });
   });
 });

@@ -3,8 +3,8 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import type { Role } from '../generated/prisma/client';
 import { UploadStatus } from '../generated/prisma/client';
+import type { PermissionSubject } from '../roles/permission-resolver.service';
 import { MinioService } from '../common/storage/minio.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ResourceUploadTypeRegistry } from './resource-upload-type.registry';
@@ -43,8 +43,8 @@ export class MultipartUploadService {
   ) {}
 
   /** Small files (playlists, subtitles, segments) — one presigned PUT each, no session row. */
-  async presignBatch(role: Role, dto: PresignBatchDto) {
-    this.resourceTypes.assertPermission(dto.resourceType, role);
+  async presignBatch(user: PermissionSubject, dto: PresignBatchDto) {
+    await this.resourceTypes.assertPermission(dto.resourceType, user);
     const type = this.resourceTypes.resolve(dto.resourceType);
     await type.assertExists(dto.resourceId);
 
@@ -64,8 +64,8 @@ export class MultipartUploadService {
    * client is re-attempting an upload that never finished, not starting a
    * new one — reuse it and hand back what MinIO already has.
    */
-  async initMultipart(role: Role, dto: MultipartInitDto) {
-    this.resourceTypes.assertPermission(dto.resourceType, role);
+  async initMultipart(user: PermissionSubject, dto: MultipartInitDto) {
+    await this.resourceTypes.assertPermission(dto.resourceType, user);
     const type = this.resourceTypes.resolve(dto.resourceType);
     await type.assertExists(dto.resourceId);
 
@@ -130,9 +130,13 @@ export class MultipartUploadService {
     };
   }
 
-  async getPartUrls(role: Role, sessionId: string, partNumbers: number[]) {
+  async getPartUrls(
+    user: PermissionSubject,
+    sessionId: string,
+    partNumbers: number[],
+  ) {
     const session = await this.getActiveSessionOrThrow(sessionId);
-    this.resourceTypes.assertPermission(session.resourceType, role);
+    await this.resourceTypes.assertPermission(session.resourceType, user);
 
     const parts = await Promise.all(
       partNumbers.map(async (partNumber) => {
@@ -153,12 +157,12 @@ export class MultipartUploadService {
   }
 
   async completeMultipart(
-    role: Role,
+    user: PermissionSubject,
     sessionId: string,
     parts: { partNumber: number; etag: string }[],
   ) {
     const session = await this.getActiveSessionOrThrow(sessionId);
-    this.resourceTypes.assertPermission(session.resourceType, role);
+    await this.resourceTypes.assertPermission(session.resourceType, user);
 
     if (parts.length !== session.totalParts) {
       throw new BadRequestException(
@@ -179,9 +183,9 @@ export class MultipartUploadService {
     return { relativePath: session.objectKey, status: UploadStatus.COMPLETED };
   }
 
-  async abortMultipart(role: Role, sessionId: string) {
+  async abortMultipart(user: PermissionSubject, sessionId: string) {
     const session = await this.getSessionOrThrow(sessionId);
-    this.resourceTypes.assertPermission(session.resourceType, role);
+    await this.resourceTypes.assertPermission(session.resourceType, user);
 
     await this.minioService.abortMultipartUpload(
       session.objectKey,

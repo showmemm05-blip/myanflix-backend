@@ -3,10 +3,12 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import type { Role } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { Permission } from '../roles/permission.enum';
-import { roleHasPermission } from '../roles/role-permissions.map';
+import type { Permission } from '../roles/permission-catalogue';
+import {
+  PermissionResolverService,
+  type PermissionSubject,
+} from '../roles/permission-resolver.service';
 
 export interface ResourceUploadType {
   permission: Permission;
@@ -31,10 +33,13 @@ export interface ResourceUploadType {
 export class ResourceUploadTypeRegistry {
   private readonly types: Record<string, ResourceUploadType>;
 
-  constructor(private readonly prisma: PrismaService) {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly permissionResolver: PermissionResolverService,
+  ) {
     this.types = {
       movie: {
-        permission: Permission.VIDEO_UPLOAD,
+        permission: 'MEDIA.UPLOAD',
         assertExists: async (resourceId) => {
           const movie = await this.prisma.movie.findUnique({
             where: { id: resourceId },
@@ -55,10 +60,22 @@ export class ResourceUploadTypeRegistry {
     return type;
   }
 
-  /** Confirms the caller's role is allowed to upload this resource type — throws rather than returning a boolean since every caller needs the same reaction (403) on failure. */
-  assertPermission(resourceType: string, role: Role): void {
+  /**
+   * Confirms the caller is allowed to upload this resource type — throws
+   * rather than returning a boolean since every caller needs the same
+   * reaction (403) on failure.
+   *
+   * This is the ONLY authorization gate on MultipartUploadController (its
+   * routes carry no @RequirePermissions because the permission depends on the
+   * request's resourceType), so it resolves the caller's live permission set
+   * through PermissionResolverService exactly like PermissionsGuard does.
+   */
+  async assertPermission(
+    resourceType: string,
+    user: PermissionSubject,
+  ): Promise<void> {
     const type = this.resolve(resourceType);
-    if (!roleHasPermission(role, type.permission)) {
+    if (!(await this.permissionResolver.can(user, type.permission))) {
       throw new ForbiddenException(
         'You do not have permission to upload this resource type',
       );

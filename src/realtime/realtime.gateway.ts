@@ -8,7 +8,12 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import type { Server, Socket } from 'socket.io';
-import { UserStatus } from '../generated/prisma/client';
+import { ClientPlatform, UserStatus } from '../generated/prisma/client';
+import {
+  resolveClientIp,
+  resolveClientPlatform,
+} from '../common/storage/request-host.context';
+import { PeakUsersService } from '../peak-users/peak-users.service';
 import { UsersService } from '../users/users.service';
 import type { JwtPayload } from '../auth/types/jwt-payload.type';
 
@@ -24,6 +29,8 @@ export interface DepositCreatedPayload {
   id: string;
   userId: string;
   username: string;
+  /** Cosmetic label the user set; `username` above stays the login identity. */
+  displayName: string | null;
   amount: number;
   paymentMethod: string;
   accountName: string | null;
@@ -52,6 +59,8 @@ export interface WithdrawalCreatedPayload {
   id: string;
   userId: string;
   username: string;
+  /** Cosmetic label the user set; `username` above stays the login identity. */
+  displayName: string | null;
   amount: number;
   accountType: string;
   accountName: string;
@@ -102,6 +111,32 @@ export interface PaymentAccountUpdatedPayload {
   paymentAccountId: string;
 }
 
+/** One live audience socket, as the presence map remembers it. */
+interface ConnectedUserSocket {
+  userId: string;
+  platform: ClientPlatform;
+  ip: string | null;
+  connectedAt: Date;
+}
+
+/**
+ * One currently-online user, however many sockets they hold.
+ *
+ * `platforms` is what makes the web/mobile split honest: someone reading on
+ * their phone while a laptop tab is still open is ONE active user who is
+ * present on both. `platform`/`ip` describe their most recent connection —
+ * the single value a one-row-per-user table shows — while `since` reaches
+ * back to their earliest still-open socket, i.e. when they actually came
+ * online.
+ */
+export interface ActiveSocketUser {
+  userId: string;
+  platform: ClientPlatform;
+  platforms: ClientPlatform[];
+  ip: string | null;
+  since: Date;
+}
+
 /**
  * Socket.IO gateway attached to the same HTTP server Nest already runs (no
  * separate port, no Docker/compose change needed). Auth happens here in
@@ -118,10 +153,26 @@ export class RealtimeGateway
   @WebSocketServer()
   server!: Server;
 
+  /**
+   * Sockets belonging to role USER, keyed by socket id — the concurrent
+   * -audience peak count and the admin's live "who is online" list. Admin/
+   * staff sockets (dashboards) are deliberately excluded from both: they are
+   * operators, not audience.
+   *
+   * It used to hold just the user id; it now holds where that socket came
+   * from as well. Peak counting is unchanged either way — it has always
+   * counted DISTINCT user ids, so two tabs were and still are one user.
+   */
+  private readonly connectedUserSockets = new Map<
+    string,
+    ConnectedUserSocket
+  >();
+
   constructor(
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly usersService: UsersService,
+    private readonly peakUsersService: PeakUsersService,
   ) {}
 
   async handleConnection(client: Socket): Promise<void> {
@@ -144,6 +195,25 @@ export class RealtimeGateway
       if (user.role === 'ADMIN' || user.role === 'SUPER_ADMIN') {
         await client.join(adminRoom());
       }
+
+      if (user.role === 'USER') {
+        this.connectedUserSockets.set(client.id, {
+          userId: user.id,
+          platform: this.platformOf(client),
+          ip: this.ipOf(client),
+          connectedAt: new Date(),
+        });
+        const distinctUsers = this.distinctUserIds().size;
+        // Fire-and-forget — peak tracking must never block or break the
+        // connection path.
+        this.peakUsersService
+          .recordConcurrent(distinctUsers)
+          .catch((error: Error) =>
+            this.logger.warn(
+              `Failed to record concurrent peak: ${error.message}`,
+            ),
+          );
+      }
     } catch (error) {
       this.logger.debug(
         `Rejecting socket connection: ${(error as Error).message}`,
@@ -152,8 +222,79 @@ export class RealtimeGateway
     }
   }
 
-  handleDisconnect(): void {
-    // Nothing to clean up — room membership is discarded with the socket.
+  handleDisconnect(client: Socket): void {
+    // Room membership is discarded with the socket; only the concurrent
+    // USER-count bookkeeping needs explicit cleanup.
+    this.connectedUserSockets.delete(client.id);
+  }
+
+  /**
+   * Everyone currently holding at least one audience socket, one entry per
+   * USER — never per socket. Feeds GET /tracking/active-users, which unions
+   * it with recently-active sessions.
+   *
+   * Returned newest-first by `since` so the list leads with who just
+   * arrived. A user is dropped from it the moment their last socket closes;
+   * "recently active but not connected" is the session table's job, not
+   * this map's.
+   */
+  getActiveUsers(): ActiveSocketUser[] {
+    const byUser = new Map<string, ConnectedUserSocket[]>();
+    for (const entry of this.connectedUserSockets.values()) {
+      const existing = byUser.get(entry.userId);
+      if (existing) existing.push(entry);
+      else byUser.set(entry.userId, [entry]);
+    }
+
+    return [...byUser.entries()]
+      .map(([userId, sockets]) => {
+        const ordered = [...sockets].sort(
+          (a, b) => a.connectedAt.getTime() - b.connectedAt.getTime(),
+        );
+        const newest = ordered[ordered.length - 1];
+        return {
+          userId,
+          platform: newest.platform,
+          platforms: [...new Set(ordered.map((s) => s.platform))],
+          ip: newest.ip,
+          since: ordered[0].connectedAt,
+        };
+      })
+      .sort((a, b) => b.since.getTime() - a.since.getTime());
+  }
+
+  /** The count PeakUsersService has always been given: distinct users, not sockets. */
+  private distinctUserIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const entry of this.connectedUserSockets.values())
+      ids.add(entry.userId);
+    return ids;
+  }
+
+  /**
+   * Which client opened this socket. Both apps declare it in the handshake
+   * (`auth: { token, platform }`); the user-agent fallback and UNKNOWN
+   * default are shared with the HTTP path so a socket and a request from the
+   * same app never disagree.
+   */
+  private platformOf(client: Socket): ClientPlatform {
+    const declared: unknown = client.handshake.auth?.['platform'];
+    return resolveClientPlatform(
+      typeof declared === 'string' ? declared : undefined,
+      client.handshake.headers['user-agent'] ?? null,
+    );
+  }
+
+  /**
+   * The socket's client IP. `handshake.address` is the peer address, which
+   * behind nginx/the cache server is the proxy — so the forwarded header
+   * wins, exactly as it does for HTTP requests.
+   */
+  private ipOf(client: Socket): string | null {
+    return resolveClientIp(
+      client.handshake.headers['x-forwarded-for'],
+      client.handshake.address,
+    );
   }
 
   private extractToken(client: Socket): string | undefined {

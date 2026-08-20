@@ -10,7 +10,6 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
@@ -48,14 +47,14 @@ export class WithdrawalsController {
 
   @Get()
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.WITHDRAWAL_MANAGE)
+  @RequirePermissions('WITHDRAWALS.VIEW')
   findAll(@Query() query: WithdrawalQueryDto) {
     return this.withdrawalsService.findAllAdmin(query);
   }
 
   @Patch(':id/approve')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.WITHDRAWAL_MANAGE)
+  @RequirePermissions('WITHDRAWALS.APPROVE')
   approve(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() admin: AuthenticatedUser,
@@ -65,7 +64,7 @@ export class WithdrawalsController {
 
   @Patch(':id/reject')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.WITHDRAWAL_MANAGE)
+  @RequirePermissions('WITHDRAWALS.REJECT')
   reject(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() admin: AuthenticatedUser,
@@ -76,7 +75,7 @@ export class WithdrawalsController {
 
   @Patch(':id/transfer-account')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.WITHDRAWAL_MANAGE)
+  @RequirePermissions('WITHDRAWALS.EDIT')
   updateTransferAccount(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateTransferAccountDto,

@@ -480,7 +480,11 @@ describe('WalletAdjustmentsService', () => {
         orderBy: { createdAt: 'desc' },
         skip: 10,
         take: 10,
-        include: { performedBy: { select: { id: true, username: true } } },
+        include: {
+          performedBy: {
+            select: { id: true, username: true, displayName: true },
+          },
+        },
       });
       expect(result.total).toBe(1);
       expect(result.page).toBe(2);
@@ -496,6 +500,29 @@ describe('WalletAdjustmentsService', () => {
       });
       // list items carry no `replayed` flag — that's a POST-response concern.
       expect(result.items[0]).not.toHaveProperty('replayed');
+    });
+
+    it("surfaces the performing staff member's display name next to their raw username", async () => {
+      prisma.walletAdjustment.findMany.mockResolvedValue([
+        makeAdjustment({
+          performedBy: {
+            id: 'admin-1',
+            username: 'admin.blake',
+            displayName: 'Blake',
+          },
+        }),
+      ]);
+      prisma.walletAdjustment.count.mockResolvedValue(1);
+
+      const result = await service.list('user-1', { page: 1, limit: 10 });
+
+      // The whole performedBy object is re-emitted, so the label reaches the
+      // admin's "Performed by" column without the username being replaced.
+      expect(result.items[0].performedBy).toEqual({
+        id: 'admin-1',
+        username: 'admin.blake',
+        displayName: 'Blake',
+      });
     });
   });
 });

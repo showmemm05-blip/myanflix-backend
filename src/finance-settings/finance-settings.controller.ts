@@ -1,6 +1,5 @@
 import { Body, Controller, Get, Patch, UseGuards } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
@@ -25,7 +24,7 @@ export class FinanceSettingsController {
 
   @Patch()
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.FINANCE_SETTINGS_MANAGE)
+  @RequirePermissions('FINANCE.SETTINGS_MANAGE')
   update(
     @Body() dto: UpdateFinanceSettingsDto,
     @CurrentUser() admin: AuthenticatedUser,

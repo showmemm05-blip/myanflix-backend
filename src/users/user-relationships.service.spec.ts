@@ -10,6 +10,7 @@ import {
 interface UserRow {
   id: string;
   username: string;
+  displayName: string | null;
   phone: string | null;
   createdAt: Date;
 }
@@ -39,8 +40,9 @@ function user(
   id: string,
   phone: string | null = null,
   createdAt = T0,
+  displayName: string | null = null,
 ): UserRow {
-  return { id, username: `user-${id}`, phone, createdAt };
+  return { id, username: `user-${id}`, displayName, phone, createdAt };
 }
 
 function withdrawal(
@@ -446,7 +448,9 @@ describe('UserRelationshipsService.getNetwork', () => {
     expect(byId.get('a')).toMatchObject({
       depositCount: 2,
       totalDepositedAmount: 5000,
+      // No displayName set, so the label falls back to the login identity.
       name: 'user-a',
+      displayName: null,
       username: 'user-a',
     });
     expect(byId.get('b')).toMatchObject({
@@ -489,6 +493,93 @@ describe('UserRelationshipsService.getNetwork', () => {
       'w1',
       'd1',
     ]);
+  });
+
+  it('labels a node by the name the user set, keeping the raw username alongside it, and uses that label on the activity rows', async () => {
+    // 'a' is a phone signup: a machine username plus a name they chose.
+    const users = [user('a', null, T0, 'Blake'), user('b')];
+    const withdrawals = [
+      withdrawal('w1', 'a', '09111111111', { createdAt: at(2) }),
+      withdrawal('w2', 'b', '09111111111', { createdAt: at(1) }),
+    ];
+    const deposits: DepositRow[] = [
+      {
+        id: 'd1',
+        userId: 'a',
+        amount: new Prisma.Decimal(5000),
+        status: DepositStatus.APPROVED,
+        createdAt: at(3),
+      },
+    ];
+    const service = await buildService(makeDb(users, withdrawals, deposits));
+
+    const result = await service.getNetwork('09111111111');
+
+    const byId = new Map(result.users.map((u) => [u.id, u]));
+    // `name` is the graph/tree caption; `username` stays the login identity so
+    // an admin can still tell which account the node actually is.
+    expect(byId.get('a')).toMatchObject({
+      name: 'Blake',
+      displayName: 'Blake',
+      username: 'user-a',
+    });
+    // The one who never set a name still falls back to their username.
+    expect(byId.get('b')).toMatchObject({
+      name: 'user-b',
+      displayName: null,
+      username: 'user-b',
+    });
+
+    // The activity feed names people with the same rule.
+    const activityFor = (id: string) =>
+      result.recentActivity.find((a) => a.id === id)!;
+    expect(activityFor('d1').userName).toBe('Blake');
+    expect(activityFor('w1').userName).toBe('Blake');
+    expect(activityFor('w2').userName).toBe('user-b');
+  });
+
+  it('ignores a whitespace-only display name and falls back to the username', async () => {
+    const users = [user('a', null, T0, '   ')];
+    const withdrawals = [withdrawal('w1', 'a', '09111111111')];
+    const service = await buildService(makeDb(users, withdrawals));
+
+    const result = await service.getNetwork('09111111111');
+
+    expect(result.users[0]).toMatchObject({
+      name: 'user-a',
+      displayName: '   ',
+      username: 'user-a',
+    });
+  });
+
+  it('orders nodes by the printed label, not the raw username', async () => {
+    // Usernames sort a-before-b, the chosen names sort the other way — the
+    // node list must follow the names the graph and tree actually print.
+    const users = [user('a', null, T0, 'Zaw'), user('b', null, T0, 'Aung')];
+    const withdrawals = [
+      withdrawal('w1', 'a', '09111111111'),
+      withdrawal('w2', 'b', '09111111111'),
+    ];
+    const service = await buildService(makeDb(users, withdrawals));
+
+    const result = await service.getNetwork('09111111111');
+
+    expect(result.users.map((u) => u.name)).toEqual(['Aung', 'Zaw']);
+    expect(result.users.map((u) => u.username)).toEqual(['user-b', 'user-a']);
+  });
+
+  it('keeps node ordering deterministic when two accounts share a display name', async () => {
+    const users = [user('b', null, T0, 'Blake'), user('a', null, T0, 'Blake')];
+    const withdrawals = [
+      withdrawal('w1', 'a', '09111111111'),
+      withdrawal('w2', 'b', '09111111111'),
+    ];
+    const service = await buildService(makeDb(users, withdrawals));
+
+    const result = await service.getNetwork('09111111111');
+
+    // Equal labels fall through to the unique login identity.
+    expect(result.users.map((u) => u.username)).toEqual(['user-a', 'user-b']);
   });
 
   it('counts a two-phone user’s deposits once per phone-user row, and never twice inside one phone total', async () => {

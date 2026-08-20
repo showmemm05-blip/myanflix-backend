@@ -6,6 +6,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { Prisma, Role } from '../generated/prisma/client';
+import { PermissionResolverService } from '../roles/permission-resolver.service';
+import { createSeededPermissionResolver } from '../../test/seeded-permission-resolver';
 import type { CreateManualPaymentAccountTransactionDto } from './dto/create-manual-payment-account-transaction.dto';
 
 describe('PaymentAccountsService', () => {
@@ -47,8 +49,8 @@ describe('PaymentAccountsService', () => {
     isActive: true,
     createdAt: new Date('2026-01-01'),
     updatedAt: new Date('2026-01-01'),
-    createdBy: { id: 'user-1', username: 'superadmin' },
-    updatedBy: { id: 'user-1', username: 'superadmin' },
+    createdBy: { id: 'user-1', username: 'admin.blake', displayName: 'Blake' },
+    updatedBy: { id: 'user-1', username: 'admin.blake', displayName: 'Blake' },
   };
 
   beforeEach(async () => {
@@ -90,12 +92,17 @@ describe('PaymentAccountsService', () => {
       providers: [
         PaymentAccountsService,
         { provide: PrismaService, useValue: prisma },
-        { provide: PaymentAccountLedgerService, useValue: paymentAccountLedgerService },
+        {
+          provide: PaymentAccountLedgerService,
+          useValue: paymentAccountLedgerService,
+        },
         { provide: RealtimeGateway, useValue: realtimeGateway },
         {
           provide: MinioService,
           useValue: {
-            playbackUrl: jest.fn((key: string) => `http://cache.test:8080/movies/${key}`),
+            playbackUrl: jest.fn(
+              (key: string) => `http://cache.test:8080/movies/${key}`,
+            ),
             // Mirrors the real imageUrl(): re-hosts a URL under our bucket,
             // passes anything external through untouched.
             imageUrl: jest.fn((url: string | null | undefined) => {
@@ -105,38 +112,85 @@ describe('PaymentAccountsService', () => {
             }),
           },
         },
+        {
+          provide: PermissionResolverService,
+          useValue: createSeededPermissionResolver(),
+        },
       ],
     }).compile();
 
     service = module.get(PaymentAccountsService);
   });
 
+  /** GET /payment-accounts shapes rows by the CALLER'S PERMISSIONS now, not their role name. */
+  const viewer = (role: Role) => ({ role, appRoleId: null });
+
   describe('findAll', () => {
     it('SUPER_ADMIN sees every account (active or not) with full admin fields', async () => {
       prisma.paymentAccount.findMany.mockResolvedValue([adminRow]);
 
-      const result = await service.findAll(Role.SUPER_ADMIN);
+      const result = await service.findAll(viewer(Role.SUPER_ADMIN));
 
       expect(prisma.paymentAccount.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           include: {
-            createdBy: { select: { id: true, username: true } },
-            updatedBy: { select: { id: true, username: true } },
+            createdBy: {
+              select: { id: true, username: true, displayName: true },
+            },
+            updatedBy: {
+              select: { id: true, username: true, displayName: true },
+            },
           },
         }),
       );
-      expect(prisma.paymentAccount.findMany.mock.calls[0][0].where).toBeUndefined();
+      expect(
+        prisma.paymentAccount.findMany.mock.calls[0][0].where,
+      ).toBeUndefined();
       expect(result[0]).toEqual(
-        expect.objectContaining({ isActive: true, createdBy: adminRow.createdBy, subname: 'Main Account' }),
+        expect.objectContaining({
+          isActive: true,
+          createdBy: adminRow.createdBy,
+          subname: 'Main Account',
+        }),
+      );
+    });
+
+    it("exposes the auditing staff member's display name next to their raw username on createdBy/updatedBy", async () => {
+      prisma.paymentAccount.findMany.mockResolvedValue([adminRow]);
+
+      const result = await service.findAll(viewer(Role.SUPER_ADMIN));
+
+      // "Last updated by <name>" on the accounts table reads this.
+      expect(result[0]).toEqual(
+        expect.objectContaining({
+          createdBy: {
+            id: 'user-1',
+            username: 'admin.blake',
+            displayName: 'Blake',
+          },
+          updatedBy: {
+            id: 'user-1',
+            username: 'admin.blake',
+            displayName: 'Blake',
+          },
+        }),
       );
     });
 
     it('regular users only see active accounts, and never audit metadata or the internal subname label', async () => {
       prisma.paymentAccount.findMany.mockResolvedValue([
-        { id: 'acct-1', type: 'KBZPay', subname: 'Main Account', accountName: 'MyanFlix', accountNumber: '09123456789', bankName: null, note: null },
+        {
+          id: 'acct-1',
+          type: 'KBZPay',
+          subname: 'Main Account',
+          accountName: 'MyanFlix',
+          accountNumber: '09123456789',
+          bankName: null,
+          note: null,
+        },
       ]);
 
-      const result = await service.findAll(Role.USER);
+      const result = await service.findAll(viewer(Role.USER));
 
       expect(prisma.paymentAccount.findMany).toHaveBeenCalledWith(
         expect.objectContaining({ where: { isActive: true } }),
@@ -154,19 +208,23 @@ describe('PaymentAccountsService', () => {
       expect(result[0]).not.toHaveProperty('subname');
     });
 
-    it('ADMIN gets the admin shape (incl. subname) via WITHDRAWAL_MANAGE, despite lacking PAYMENT_ACCOUNT_MANAGE — needed to record which of our accounts sent a payout', async () => {
+    it('ADMIN gets the admin shape (incl. subname) via WITHDRAWALS.VIEW, despite lacking PAYMENT_ACCOUNTS.VIEW — needed to record which of our accounts sent a payout', async () => {
       prisma.paymentAccount.findMany.mockResolvedValue([adminRow]);
 
-      const result = await service.findAll(Role.ADMIN);
+      const result = await service.findAll(viewer(Role.ADMIN));
 
-      expect(prisma.paymentAccount.findMany.mock.calls[0][0].where).toBeUndefined();
-      expect(result[0]).toEqual(expect.objectContaining({ subname: 'Main Account' }));
+      expect(
+        prisma.paymentAccount.findMany.mock.calls[0][0].where,
+      ).toBeUndefined();
+      expect(result[0]).toEqual(
+        expect.objectContaining({ subname: 'Main Account' }),
+      );
     });
 
-    it('CONTENT_UPLOADER (neither PAYMENT_ACCOUNT_MANAGE nor WITHDRAWAL_MANAGE) is treated as a regular viewer', async () => {
+    it('CONTENT_UPLOADER (neither PAYMENT_ACCOUNTS.VIEW nor WITHDRAWALS.VIEW) is treated as a regular viewer', async () => {
       prisma.paymentAccount.findMany.mockResolvedValue([]);
 
-      await service.findAll(Role.CONTENT_UPLOADER);
+      await service.findAll(viewer(Role.CONTENT_UPLOADER));
 
       expect(prisma.paymentAccount.findMany).toHaveBeenCalledWith(
         expect.objectContaining({ where: { isActive: true } }),
@@ -178,14 +236,31 @@ describe('PaymentAccountsService', () => {
     it('returns the catalog with value mirroring label', async () => {
       prisma.paymentMethodType.findMany.mockResolvedValue([
         { id: 't1', label: 'KBZPay', requiresBankName: false, logoUrl: null },
-        { id: 't2', label: 'Bank Account', requiresBankName: true, logoUrl: null },
+        {
+          id: 't2',
+          label: 'Bank Account',
+          requiresBankName: true,
+          logoUrl: null,
+        },
       ]);
 
       const types = await service.getTypes();
 
       expect(types).toEqual([
-        { id: 't1', value: 'KBZPay', label: 'KBZPay', requiresBankName: false, logoUrl: null },
-        { id: 't2', value: 'Bank Account', label: 'Bank Account', requiresBankName: true, logoUrl: null },
+        {
+          id: 't1',
+          value: 'KBZPay',
+          label: 'KBZPay',
+          requiresBankName: false,
+          logoUrl: null,
+        },
+        {
+          id: 't2',
+          value: 'Bank Account',
+          label: 'Bank Account',
+          requiresBankName: true,
+          logoUrl: null,
+        },
       ]);
     });
   });
@@ -193,9 +268,17 @@ describe('PaymentAccountsService', () => {
   describe('createType', () => {
     it('creates a new method and returns it with a `value` field the client Select relies on', async () => {
       prisma.paymentMethodType.findUnique.mockResolvedValue(null);
-      prisma.paymentMethodType.create.mockResolvedValue({ id: 't3', label: 'Wave Pay', requiresBankName: false, logoUrl: null });
+      prisma.paymentMethodType.create.mockResolvedValue({
+        id: 't3',
+        label: 'Wave Pay',
+        requiresBankName: false,
+        logoUrl: null,
+      });
 
-      const result = await service.createType({ label: 'Wave Pay', requiresBankName: false });
+      const result = await service.createType({
+        label: 'Wave Pay',
+        requiresBankName: false,
+      });
 
       expect(prisma.paymentMethodType.create).toHaveBeenCalledWith({
         data: { label: 'Wave Pay', requiresBankName: false },
@@ -203,11 +286,20 @@ describe('PaymentAccountsService', () => {
       // Regression guard: a raw Prisma row has no `value` field, which
       // silently made the freshly created method unselectable in the
       // admin UI until the next page refresh.
-      expect(result).toEqual({ id: 't3', value: 'Wave Pay', label: 'Wave Pay', requiresBankName: false, logoUrl: null });
+      expect(result).toEqual({
+        id: 't3',
+        value: 'Wave Pay',
+        label: 'Wave Pay',
+        requiresBankName: false,
+        logoUrl: null,
+      });
     });
 
     it('rejects a duplicate label', async () => {
-      prisma.paymentMethodType.findUnique.mockResolvedValue({ id: 't1', label: 'Wave Pay' });
+      prisma.paymentMethodType.findUnique.mockResolvedValue({
+        id: 't1',
+        label: 'Wave Pay',
+      });
 
       await expect(
         service.createType({ label: 'Wave Pay', requiresBankName: false }),
@@ -231,7 +323,11 @@ describe('PaymentAccountsService', () => {
       });
 
       expect(prisma.paymentMethodType.create).toHaveBeenCalledWith({
-        data: { label: 'Wave Pay', requiresBankName: false, logoUrl: 'https://cdn.example.com/wave-pay.png' },
+        data: {
+          label: 'Wave Pay',
+          requiresBankName: false,
+          logoUrl: 'https://cdn.example.com/wave-pay.png',
+        },
       });
       expect(result.logoUrl).toBe('https://cdn.example.com/wave-pay.png');
     });
@@ -247,8 +343,17 @@ describe('PaymentAccountsService', () => {
     });
 
     it('updates requiresBankName without touching existing accounts when the label is unchanged', async () => {
-      prisma.paymentMethodType.findUnique.mockResolvedValue({ id: 't1', label: 'Wave Pay', requiresBankName: false });
-      prisma.paymentMethodType.update.mockResolvedValue({ id: 't1', label: 'Wave Pay', requiresBankName: true, logoUrl: null });
+      prisma.paymentMethodType.findUnique.mockResolvedValue({
+        id: 't1',
+        label: 'Wave Pay',
+        requiresBankName: false,
+      });
+      prisma.paymentMethodType.update.mockResolvedValue({
+        id: 't1',
+        label: 'Wave Pay',
+        requiresBankName: true,
+        logoUrl: null,
+      });
 
       const result = await service.updateType('t1', { requiresBankName: true });
 
@@ -257,7 +362,13 @@ describe('PaymentAccountsService', () => {
         where: { id: 't1' },
         data: { requiresBankName: true },
       });
-      expect(result).toEqual({ id: 't1', value: 'Wave Pay', label: 'Wave Pay', requiresBankName: true, logoUrl: null });
+      expect(result).toEqual({
+        id: 't1',
+        value: 'Wave Pay',
+        label: 'Wave Pay',
+        requiresBankName: true,
+        logoUrl: null,
+      });
     });
 
     it('updates the logo URL without touching the label', async () => {
@@ -274,20 +385,33 @@ describe('PaymentAccountsService', () => {
         logoUrl: 'https://cdn.example.com/wave-pay.png',
       });
 
-      const result = await service.updateType('t1', { logoUrl: 'https://cdn.example.com/wave-pay.png' });
+      const result = await service.updateType('t1', {
+        logoUrl: 'https://cdn.example.com/wave-pay.png',
+      });
 
       expect(prisma.paymentMethodType.update).toHaveBeenCalledWith({
         where: { id: 't1' },
-        data: { requiresBankName: undefined, logoUrl: 'https://cdn.example.com/wave-pay.png' },
+        data: {
+          requiresBankName: undefined,
+          logoUrl: 'https://cdn.example.com/wave-pay.png',
+        },
       });
       expect(result.logoUrl).toBe('https://cdn.example.com/wave-pay.png');
     });
 
     it('renaming cascades to every account currently on that method', async () => {
       prisma.paymentMethodType.findUnique
-        .mockResolvedValueOnce({ id: 't1', label: 'Wave Pay', requiresBankName: false }) // existing lookup
+        .mockResolvedValueOnce({
+          id: 't1',
+          label: 'Wave Pay',
+          requiresBankName: false,
+        }) // existing lookup
         .mockResolvedValueOnce(null); // clash check for the new label
-      prisma.paymentMethodType.update.mockResolvedValue({ id: 't1', label: 'Wave Money', requiresBankName: false });
+      prisma.paymentMethodType.update.mockResolvedValue({
+        id: 't1',
+        label: 'Wave Money',
+        requiresBankName: false,
+      });
 
       const result = await service.updateType('t1', { label: 'Wave Money' });
 
@@ -300,15 +424,27 @@ describe('PaymentAccountsService', () => {
         where: { id: 't1' },
         data: { label: 'Wave Money', requiresBankName: undefined },
       });
-      expect(result).toEqual({ id: 't1', value: 'Wave Money', label: 'Wave Money', requiresBankName: false, logoUrl: null });
+      expect(result).toEqual({
+        id: 't1',
+        value: 'Wave Money',
+        label: 'Wave Money',
+        requiresBankName: false,
+        logoUrl: null,
+      });
     });
 
     it('rejects renaming into a label another method already uses', async () => {
       prisma.paymentMethodType.findUnique
-        .mockResolvedValueOnce({ id: 't1', label: 'Wave Pay', requiresBankName: false })
+        .mockResolvedValueOnce({
+          id: 't1',
+          label: 'Wave Pay',
+          requiresBankName: false,
+        })
         .mockResolvedValueOnce({ id: 't2', label: 'AYA Pay' });
 
-      await expect(service.updateType('t1', { label: 'AYA Pay' })).rejects.toThrow(ConflictException);
+      await expect(
+        service.updateType('t1', { label: 'AYA Pay' }),
+      ).rejects.toThrow(ConflictException);
       expect(prisma.paymentAccount.updateMany).not.toHaveBeenCalled();
     });
   });
@@ -317,11 +453,16 @@ describe('PaymentAccountsService', () => {
     it('throws NotFoundException for an unknown method', async () => {
       prisma.paymentMethodType.findUnique.mockResolvedValue(null);
 
-      await expect(service.removeType('nope')).rejects.toThrow(NotFoundException);
+      await expect(service.removeType('nope')).rejects.toThrow(
+        NotFoundException,
+      );
     });
 
     it('blocks deletion while accounts still use the method', async () => {
-      prisma.paymentMethodType.findUnique.mockResolvedValue({ id: 't1', label: 'Wave Pay' });
+      prisma.paymentMethodType.findUnique.mockResolvedValue({
+        id: 't1',
+        label: 'Wave Pay',
+      });
       prisma.paymentAccount.count.mockResolvedValue(2);
 
       await expect(service.removeType('t1')).rejects.toThrow(ConflictException);
@@ -329,12 +470,17 @@ describe('PaymentAccountsService', () => {
     });
 
     it('deletes a method with no accounts using it', async () => {
-      prisma.paymentMethodType.findUnique.mockResolvedValue({ id: 't1', label: 'Wave Pay' });
+      prisma.paymentMethodType.findUnique.mockResolvedValue({
+        id: 't1',
+        label: 'Wave Pay',
+      });
       prisma.paymentAccount.count.mockResolvedValue(0);
 
       const result = await service.removeType('t1');
 
-      expect(prisma.paymentMethodType.delete).toHaveBeenCalledWith({ where: { id: 't1' } });
+      expect(prisma.paymentMethodType.delete).toHaveBeenCalledWith({
+        where: { id: 't1' },
+      });
       expect(result).toEqual({ deleted: true });
     });
   });
@@ -344,7 +490,11 @@ describe('PaymentAccountsService', () => {
       prisma.paymentAccount.create.mockResolvedValue(adminRow);
 
       await service.create(
-        { type: 'KBZPay', accountName: 'MyanFlix', accountNumber: '09123456789' },
+        {
+          type: 'KBZPay',
+          accountName: 'MyanFlix',
+          accountNumber: '09123456789',
+        },
         'user-1',
       );
 
@@ -362,7 +512,12 @@ describe('PaymentAccountsService', () => {
       prisma.paymentAccount.create.mockResolvedValue(adminRow);
 
       const result = await service.create(
-        { type: 'KBZPay', subname: 'Backup Account', accountName: 'MyanFlix', accountNumber: '09123456789' },
+        {
+          type: 'KBZPay',
+          subname: 'Backup Account',
+          accountName: 'MyanFlix',
+          accountNumber: '09123456789',
+        },
         'user-1',
       );
 
@@ -387,14 +542,24 @@ describe('PaymentAccountsService', () => {
 
     it('stamps updatedByUserId on every edit, including a plain activate/deactivate toggle', async () => {
       prisma.paymentAccount.findUnique.mockResolvedValue({ id: 'acct-1' });
-      prisma.paymentAccount.update.mockResolvedValue({ ...adminRow, isActive: false });
+      prisma.paymentAccount.update.mockResolvedValue({
+        ...adminRow,
+        isActive: false,
+      });
 
-      const result = await service.update('acct-1', { isActive: false }, 'user-2');
+      const result = await service.update(
+        'acct-1',
+        { isActive: false },
+        'user-2',
+      );
 
       expect(prisma.paymentAccount.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 'acct-1' },
-          data: expect.objectContaining({ isActive: false, updatedByUserId: 'user-2' }),
+          data: expect.objectContaining({
+            isActive: false,
+            updatedByUserId: 'user-2',
+          }),
         }),
       );
       expect(result.isActive).toBe(false);
@@ -419,11 +584,13 @@ describe('PaymentAccountsService', () => {
       expect(prisma.paymentAccountTransaction.count).toHaveBeenCalledWith({
         where: { paymentAccountId: 'acct-1' },
       });
-      expect(prisma.paymentAccount.delete).toHaveBeenCalledWith({ where: { id: 'acct-1' } });
+      expect(prisma.paymentAccount.delete).toHaveBeenCalledWith({
+        where: { id: 'acct-1' },
+      });
       expect(result).toEqual({ deleted: true });
     });
 
-    it('blocks deletion (and never deletes) when the account has ledger history, mirroring removeType()\'s in-use guard', async () => {
+    it("blocks deletion (and never deletes) when the account has ledger history, mirroring removeType()'s in-use guard", async () => {
       prisma.paymentAccount.findUnique.mockResolvedValue({ id: 'acct-1' });
       prisma.paymentAccountTransaction.count.mockResolvedValue(3);
 
@@ -449,8 +616,17 @@ describe('PaymentAccountsService', () => {
           relatedWithdrawalId: null,
           performedByUserId: 'admin-1',
           createdAt: new Date('2026-08-01T12:00:00Z'),
-          paymentAccount: { id: 'acct-1', type: 'KBZPay', subname: 'K1', accountName: 'MyanFlix' },
-          performedBy: { id: 'admin-1', username: 'superadmin' },
+          paymentAccount: {
+            id: 'acct-1',
+            type: 'KBZPay',
+            subname: 'K1',
+            accountName: 'MyanFlix',
+          },
+          performedBy: {
+            id: 'admin-1',
+            username: 'admin.blake',
+            displayName: 'Blake',
+          },
           relatedDeposit: {
             id: 'dep-1',
             userId: 'user-1',
@@ -459,8 +635,18 @@ describe('PaymentAccountsService', () => {
             reference: '000123',
             status: 'APPROVED',
             createdAt: depositCreatedAt,
-            user: { id: 'user-1', username: 'john', phone: '0912345678', avatar: null },
-            approvedBy: { id: 'admin-1', username: 'superadmin' },
+            user: {
+              id: 'user-1',
+              username: 'user_95950495369',
+              displayName: 'Blake',
+              phone: '0912345678',
+              avatar: null,
+            },
+            approvedBy: {
+              id: 'admin-1',
+              username: 'admin.blake',
+              displayName: 'Blake',
+            },
           },
           relatedWithdrawal: null,
         },
@@ -487,10 +673,83 @@ describe('PaymentAccountsService', () => {
       // Nested Decimals serialize as strings unless converted — a money field
       // arriving as "5000" would quietly break every downstream format call.
       expect(entry.relatedDeposit?.amount).toBe(5000);
-      expect(entry.relatedDeposit?.user.username).toBe('john');
+      expect(entry.relatedDeposit?.user.username).toBe('user_95950495369');
       expect(entry.relatedDeposit?.reference).toBe('000123');
       expect(entry.relatedWithdrawal).toBeNull();
       expect(result.total).toBe(1);
+    });
+
+    it('carries displayName next to username on the customer, the approver and the performer', async () => {
+      prisma.paymentAccountTransaction.findMany.mockResolvedValue([
+        {
+          id: 'entry-3',
+          paymentAccountId: 'acct-1',
+          type: 'DEPOSIT_IN',
+          amount: new Prisma.Decimal(5000),
+          balanceBefore: new Prisma.Decimal(1000),
+          balanceAfter: new Prisma.Decimal(6000),
+          referenceCode: 'AB12CD',
+          note: null,
+          relatedDepositId: 'dep-1',
+          relatedWithdrawalId: null,
+          performedByUserId: 'admin-1',
+          createdAt: new Date('2026-08-01T12:00:00Z'),
+          paymentAccount: {
+            id: 'acct-1',
+            type: 'KBZPay',
+            subname: 'K1',
+            accountName: 'MyanFlix',
+          },
+          performedBy: {
+            id: 'admin-1',
+            username: 'admin.blake',
+            displayName: 'Blake',
+          },
+          relatedDeposit: {
+            id: 'dep-1',
+            userId: 'user-1',
+            amount: new Prisma.Decimal(5000),
+            paymentMethod: 'KBZ Pay',
+            reference: '000123',
+            status: 'APPROVED',
+            createdAt: new Date('2026-08-01T11:00:00Z'),
+            user: {
+              id: 'user-1',
+              username: 'user_95950495369',
+              displayName: 'Blake',
+              phone: '0912345678',
+              avatar: null,
+            },
+            approvedBy: {
+              id: 'admin-1',
+              username: 'admin.blake',
+              displayName: 'Blake',
+            },
+          },
+          relatedWithdrawal: null,
+        },
+      ]);
+      prisma.paymentAccountTransaction.count.mockResolvedValue(1);
+
+      const result = await service.getAllTransactions({});
+      const entry = result.items[0];
+
+      // The ledger row names three different people; all three go through the
+      // same rule, and none of them loses its raw login identity.
+      expect(entry.relatedDeposit?.user).toMatchObject({
+        username: 'user_95950495369',
+        displayName: 'Blake',
+      });
+      expect(entry.relatedDeposit?.approvedBy).toEqual({
+        id: 'admin-1',
+        username: 'admin.blake',
+        displayName: 'Blake',
+      });
+      expect(entry.performedBy).toEqual({
+        id: 'admin-1',
+        username: 'admin.blake',
+        displayName: 'Blake',
+      });
     });
 
     it('leaves both related records null for a manual entry, which has neither', async () => {
@@ -508,7 +767,12 @@ describe('PaymentAccountsService', () => {
           relatedWithdrawalId: null,
           performedByUserId: 'admin-1',
           createdAt: new Date('2026-08-02T09:00:00Z'),
-          paymentAccount: { id: 'acct-1', type: 'KBZPay', subname: 'K1', accountName: 'MyanFlix' },
+          paymentAccount: {
+            id: 'acct-1',
+            type: 'KBZPay',
+            subname: 'K1',
+            accountName: 'MyanFlix',
+          },
           performedBy: { id: 'admin-1', username: 'superadmin' },
           relatedDeposit: null,
           relatedWithdrawal: null,
@@ -551,12 +815,17 @@ describe('PaymentAccountsService', () => {
 
       await service.recordTransaction(
         'acct-1',
-        { type: 'MANUAL_CREDIT', amount: 1000 } as CreateManualPaymentAccountTransactionDto,
+        {
+          type: 'MANUAL_CREDIT',
+          amount: 1000,
+        } as CreateManualPaymentAccountTransactionDto,
         'user-1',
       );
 
       expect(paymentAccountLedgerService.recordManualEntry).toHaveBeenCalled();
-      expect(realtimeGateway.notifyAdminsPaymentAccountUpdated).toHaveBeenCalledWith({
+      expect(
+        realtimeGateway.notifyAdminsPaymentAccountUpdated,
+      ).toHaveBeenCalledWith({
         paymentAccountId: 'acct-1',
       });
     });

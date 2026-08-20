@@ -11,11 +11,14 @@ import { MultipartUploadService } from './multipart-upload.service';
  * Direct browser->MinIO upload surface — purely additive alongside
  * UploadsController's backend-relayed chunked-upload endpoints, which stay
  * completely unmodified (see the classic ffmpeg flow it still serves).
- * Permission checks happen inside MultipartUploadService, keyed off each
+ * Permission checks happen inside MultipartUploadService (via
+ * ResourceUploadTypeRegistry.assertPermission, which resolves the caller's
+ * live permission set the same way PermissionsGuard does), keyed off each
  * request's `resourceType` (or, for session-scoped routes, the session's
  * own stored resourceType) rather than a single class-level
  * @RequirePermissions — the permission a caller needs depends on which
  * resource type they're uploading, which isn't known at decoration time.
+ * "movie" resolves to MEDIA.UPLOAD.
  */
 @Controller('uploads')
 export class MultipartUploadController {
@@ -29,7 +32,7 @@ export class MultipartUploadController {
     @CurrentUser() user: AuthenticatedUser,
     @Body() dto: PresignBatchDto,
   ) {
-    return this.multipartUploadService.presignBatch(user.role, dto);
+    return this.multipartUploadService.presignBatch(user, dto);
   }
 
   @Post('multipart/init')
@@ -37,7 +40,7 @@ export class MultipartUploadController {
     @CurrentUser() user: AuthenticatedUser,
     @Body() dto: MultipartInitDto,
   ) {
-    return this.multipartUploadService.initMultipart(user.role, dto);
+    return this.multipartUploadService.initMultipart(user, dto);
   }
 
   @Post('multipart/:sessionId/parts')
@@ -47,7 +50,7 @@ export class MultipartUploadController {
     @Body() dto: MultipartGetPartUrlsDto,
   ) {
     return this.multipartUploadService.getPartUrls(
-      user.role,
+      user,
       sessionId,
       dto.partNumbers,
     );
@@ -60,7 +63,7 @@ export class MultipartUploadController {
     @Body() dto: MultipartCompleteDto,
   ) {
     return this.multipartUploadService.completeMultipart(
-      user.role,
+      user,
       sessionId,
       dto.parts,
     );
@@ -71,6 +74,6 @@ export class MultipartUploadController {
     @CurrentUser() user: AuthenticatedUser,
     @Param('sessionId', ParseUUIDPipe) sessionId: string,
   ) {
-    return this.multipartUploadService.abortMultipart(user.role, sessionId);
+    return this.multipartUploadService.abortMultipart(user, sessionId);
   }
 }

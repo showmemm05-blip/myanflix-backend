@@ -13,7 +13,6 @@ import {
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
-import { Permission } from '../roles/permission.enum';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { UpdateWatchProgressDto } from './dto/update-watch-progress.dto';
@@ -34,7 +33,7 @@ export class VideosController {
 
   @Get('status/:movieId')
   @UseGuards(PermissionsGuard)
-  @RequirePermissions(Permission.VIDEO_UPLOAD)
+  @RequirePermissions('MEDIA.VIEW')
   getStatus(@Param('movieId', ParseUUIDPipe) movieId: string) {
     return this.videosService.getLatestStatusForMovie(movieId);
   }
