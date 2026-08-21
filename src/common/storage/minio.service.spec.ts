@@ -142,3 +142,85 @@ describe('MinioService.imageUrl', () => {
     });
   });
 });
+
+/**
+ * The split-deployment case: API, cache server and storage each on their own
+ * host. Deriving the stream host from the request points every viewer at the
+ * API's address, which is the one machine that does NOT run the cache server —
+ * so a correctly-migrated library returns connection-refused on every segment
+ * while the objects sit there, perfectly readable, on the storage host.
+ */
+describe('MinioService.playbackUrl with a public cache address', () => {
+  const buildService = async (
+    overrides: Record<string, string>,
+  ): Promise<MinioService> => {
+    const env: Record<string, string> = {
+      MINIO_BUCKET: 'movies',
+      STREAM_PUBLIC_BASE_URL: 'http://213.111.155.181:8080',
+      MINIO_ENDPOINT: 'http://minio:9000',
+      MINIO_ACCESS_KEY: 'key',
+      MINIO_SECRET_KEY: 'secret',
+      ...overrides,
+    };
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        MinioService,
+        {
+          provide: ConfigService,
+          useValue: { get: jest.fn((key: string) => env[key]) },
+        },
+      ],
+    }).compile();
+    return module.get(MinioService);
+  };
+
+  const key = 'videos/33e6e224/hls/master.m3u8';
+
+  it('uses the configured cache host when the base is marked public', async () => {
+    const service = await buildService({
+      STREAM_PUBLIC_BASE_URL_IS_PUBLIC: 'true',
+    });
+
+    const url = requestHostContext.run({ hostname: '185.165.169.16' }, () =>
+      service.playbackUrl(key),
+    );
+
+    // The API's own host (185.165.169.16) must NOT appear — that box runs no
+    // cache server.
+    expect(url).toBe(`http://213.111.155.181:8080/movies/${key}`);
+  });
+
+  it('still derives the host from the request when the flag is absent', async () => {
+    const service = await buildService({});
+
+    const url = requestHostContext.run({ hostname: '192.168.1.50' }, () =>
+      service.playbackUrl(key),
+    );
+
+    expect(url).toBe(`http://192.168.1.50:8080/movies/${key}`);
+  });
+
+  it('ignores a non-"true" value rather than guessing', async () => {
+    const service = await buildService({
+      STREAM_PUBLIC_BASE_URL_IS_PUBLIC: 'yes',
+    });
+
+    const url = requestHostContext.run({ hostname: '192.168.1.50' }, () =>
+      service.playbackUrl(key),
+    );
+
+    expect(url).toBe(`http://192.168.1.50:8080/movies/${key}`);
+  });
+
+  it('re-hosts persisted image URLs onto the cache host too', async () => {
+    const service = await buildService({
+      STREAM_PUBLIC_BASE_URL_IS_PUBLIC: 'true',
+    });
+
+    const url = requestHostContext.run({ hostname: '185.165.169.16' }, () =>
+      service.imageUrl('http://192.168.10.122:8080/movies/images/abc-123.jpeg'),
+    );
+
+    expect(url).toBe('http://213.111.155.181:8080/movies/images/abc-123.jpeg');
+  });
+});

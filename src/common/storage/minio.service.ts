@@ -113,10 +113,26 @@ export class MinioService {
    */
   private readonly presignClient: S3Client;
   private readonly bucket: string;
+  /**
+   * Whether STREAM_PUBLIC_BASE_URL names a real, reachable cache address.
+   *
+   * Off (the default), playbackUrl() derives the host from the request — the
+   * right call on a dev machine that hops networks, where any configured host
+   * goes stale on the next hop. On a split deployment that assumption breaks:
+   * the API and the cache server live on different hosts, so the host a client
+   * used to reach the API is precisely the one place the streams are NOT.
+   * Setting this to true makes the configured base authoritative.
+   */
+  private readonly streamBaseIsPublic: boolean;
   private bucketReady: Promise<void> | null = null;
 
   constructor(private readonly configService: ConfigService) {
     this.bucket = this.configService.get<string>('MINIO_BUCKET') ?? 'movies';
+    this.streamBaseIsPublic =
+      String(
+        this.configService.get<string>('STREAM_PUBLIC_BASE_URL_IS_PUBLIC') ??
+          '',
+      ).toLowerCase() === 'true';
     const credentials = {
       accessKeyId: this.configService.get<string>('MINIO_ACCESS_KEY') ?? '',
       secretAccessKey: this.configService.get<string>('MINIO_SECRET_KEY') ?? '',
@@ -189,6 +205,13 @@ export class MinioService {
    * request-specific host would be baked into the database.
    */
   playbackUrl(objectKey: string): string {
+    // A deployment whose cache server has an address of its own — a separate
+    // VPS, a CDN hostname — sets STREAM_PUBLIC_BASE_URL_IS_PUBLIC=true, and
+    // the configured base is then used verbatim. Deriving the host would
+    // point every stream at whichever host serves the API, which on a split
+    // deployment is the one machine with no cache server on it.
+    if (this.streamBaseIsPublic) return this.publicUrl(objectKey);
+
     const ctx = requestHostContext.getStore();
     if (!ctx?.hostname) return this.publicUrl(objectKey);
 
