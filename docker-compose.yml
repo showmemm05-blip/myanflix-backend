@@ -45,6 +45,13 @@ services:
       # domain — end users' browsers fetch video bytes from here, not from
       # this backend.
       STREAM_PUBLIC_BASE_URL: ${STREAM_PUBLIC_BASE_URL:-http://localhost:8080}
+      # Set to "true" once the cache server has an address of its own (a
+      # separate VPS, a CDN hostname): the base above is then used verbatim.
+      # Left unset, playback URLs keep deriving their host from the request,
+      # which is right for a dev machine that hops networks and wrong for a
+      # split deployment — there, the host serving the API is the one machine
+      # with no cache server on it.
+      STREAM_PUBLIC_BASE_URL_IS_PUBLIC: ${STREAM_PUBLIC_BASE_URL_IS_PUBLIC:-}
     extra_hosts:
       # host.docker.internal is automatic on Docker Desktop (macOS/Windows);
       # this makes it also resolve on Linux Docker engines.
