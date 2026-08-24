@@ -69,6 +69,27 @@ export class StorageService {
     return `videos/${movieId}/hls/${renditionName}`;
   }
 
+  /**
+   * MinIO key prefix for the published subtitle renditions — a sibling of
+   * the video renditions so the URIs inside master.m3u8 stay relative
+   * (`subs/<subtitleId>.m3u8`) and keep working through the cache server
+   * whatever host it is reached on. Distinct from `subtitles/<id>/original.*`,
+   * which is the uploaded SOURCE file and is never served to a player.
+   */
+  hlsSubtitleKeyPrefix(movieId: string): string {
+    return `videos/${movieId}/hls/subs`;
+  }
+
+  /** MinIO key for one published WebVTT track. */
+  hlsSubtitleVttKey(movieId: string, subtitleId: string): string {
+    return `${this.hlsSubtitleKeyPrefix(movieId)}/${subtitleId}.vtt`;
+  }
+
+  /** MinIO key for the single-segment media playlist wrapping that WebVTT. */
+  hlsSubtitlePlaylistKey(movieId: string, subtitleId: string): string {
+    return `${this.hlsSubtitleKeyPrefix(movieId)}/${subtitleId}.m3u8`;
+  }
+
   /** MinIO object key for a poster/cover image. */
   imageObjectKey(imageId: string, extension: string): string {
     return `images/${imageId}${extension}`;

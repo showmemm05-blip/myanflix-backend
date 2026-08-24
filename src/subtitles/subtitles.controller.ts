@@ -67,6 +67,28 @@ export class SubtitlesController {
     return this.subtitlesService.update(id, dto);
   }
 
+  /**
+   * Backfill / repair: re-derives this subtitle's movie's whole HLS subtitle
+   * group from the current rows. Exists because tracks uploaded before
+   * manifest publishing existed are in the database but not in any
+   * master.m3u8 — and because it is idempotent, it doubles as the "fix it"
+   * button if a publish ever failed while a create succeeded.
+   */
+  @Post(':id/publish')
+  @RequirePermissions('MEDIA.UPLOAD')
+  @HttpCode(HttpStatus.OK)
+  publish(@Param('id', ParseUUIDPipe) id: string) {
+    return this.subtitlesService.republish(id);
+  }
+
+  /** The same backfill addressed by movie, for when no subtitle id is at hand. */
+  @Post('publish')
+  @RequirePermissions('MEDIA.UPLOAD')
+  @HttpCode(HttpStatus.OK)
+  publishForMovie(@Query('movieId', ParseUUIDPipe) movieId: string) {
+    return this.subtitlesService.republishForMovie(movieId);
+  }
+
   @Patch(':id/set-default')
   @RequirePermissions('MEDIA.UPLOAD')
   setDefault(@Param('id', ParseUUIDPipe) id: string) {

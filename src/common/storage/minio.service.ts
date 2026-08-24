@@ -284,7 +284,9 @@ export class MinioService {
   private ownImageKey(url: string): string | null {
     const key = this.keyFromPublicUrl(url);
     if (!key) return null;
-    return OWN_KEY_PREFIXES.some((prefix) => key.startsWith(prefix)) ? key : null;
+    return OWN_KEY_PREFIXES.some((prefix) => key.startsWith(prefix))
+      ? key
+      : null;
   }
 
   /**
@@ -322,6 +324,39 @@ export class MinioService {
         ContentType: this.contentTypeFor(extname(key)),
       }),
     );
+  }
+
+  /**
+   * Reads a small text object fully into memory — playlists and subtitle
+   * files only. downloadFile() streams to disk because it exists for
+   * multi-GB originals; a master.m3u8 that has to be read, rewritten and
+   * written back is a few hundred bytes, and a local temp file for it would
+   * be pure ceremony.
+   */
+  async readText(key: string): Promise<string> {
+    const response = await this.client.send(
+      new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+    );
+    if (!response.Body) throw new Error(`Object "${key}" has no body`);
+    return response.Body.transformToString('utf-8');
+  }
+
+  /**
+   * The first `length` bytes of an object. Ranged deliberately: the callers
+   * that need this are probing the head of a multi-megabyte media segment for
+   * a few bytes of header, and pulling the whole object to read them would
+   * cost megabytes per call. A shorter object simply returns in full.
+   */
+  async readBytes(key: string, length: number): Promise<Buffer> {
+    const response = await this.client.send(
+      new GetObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+        Range: `bytes=0-${Math.max(0, length - 1)}`,
+      }),
+    );
+    if (!response.Body) throw new Error(`Object "${key}" has no body`);
+    return Buffer.from(await response.Body.transformToByteArray());
   }
 
   private contentTypeFor(extension: string): string {

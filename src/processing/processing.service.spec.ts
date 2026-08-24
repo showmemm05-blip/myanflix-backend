@@ -5,6 +5,7 @@ import { VideosService } from '../videos/videos.service';
 import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { HlsSubtitlesService } from '../subtitles/hls-subtitles.service';
 import { probeVideo, transcodeToHls } from './ffmpeg.util';
 import { rm, writeFile } from 'node:fs/promises';
 
@@ -28,6 +29,7 @@ describe('ProcessingService', () => {
   let videosService: { markProcessing: jest.Mock; markFailed: jest.Mock; updateOriginalPath: jest.Mock; markReady: jest.Mock };
   let prisma: { movie: { update: jest.Mock } };
   let minioService: { objectExists: jest.Mock; uploadFile: jest.Mock; uploadDirectory: jest.Mock };
+  let hlsSubtitlesService: { publishForVideo: jest.Mock };
   let storageService: {
     hlsDir: jest.Mock;
     ensureDir: jest.Mock;
@@ -55,6 +57,9 @@ describe('ProcessingService', () => {
       uploadFile: jest.fn().mockResolvedValue(undefined),
       uploadDirectory: jest.fn().mockResolvedValue(undefined),
     };
+    hlsSubtitlesService = {
+      publishForVideo: jest.fn().mockResolvedValue({ published: [] }),
+    };
     storageService = {
       hlsDir: jest.fn((movieId: string) => `/storage/videos/${movieId}/hls`),
       ensureDir: jest.fn().mockResolvedValue(undefined),
@@ -70,6 +75,7 @@ describe('ProcessingService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: StorageService, useValue: storageService },
         { provide: MinioService, useValue: minioService },
+        { provide: HlsSubtitlesService, useValue: hlsSubtitlesService },
       ],
     }).compile();
 
@@ -132,6 +138,37 @@ describe('ProcessingService', () => {
         expect.any(String),
       );
       expect(videosService.markReady).toHaveBeenCalled();
+      expect(prisma.movie.update).toHaveBeenCalledWith({
+        where: { id: 'movie-1' },
+        data: { status: 'PUBLISHED' },
+      });
+    });
+  });
+
+  /**
+   * buildMasterPlaylist() writes master.m3u8 from scratch, so a re-transcode
+   * of a movie that already has subtitle tracks would otherwise silently
+   * drop their #EXT-X-MEDIA block and leave both players with no subtitles
+   * again.
+   */
+  describe('republishing subtitles after a transcode', () => {
+    beforeEach(() => {
+      probeVideoMock.mockResolvedValue({ durationSeconds: 120, width: 426, height: 240 });
+      transcodeToHlsMock.mockResolvedValue(undefined);
+    });
+
+    it('republishes the subtitle renditions once the new master is uploaded', async () => {
+      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+
+      expect(hlsSubtitlesService.publishForVideo).toHaveBeenCalledWith('video-1');
+    });
+
+    it('does not fail the transcode when publishing them fails', async () => {
+      hlsSubtitlesService.publishForVideo.mockRejectedValue(new Error('MinIO unreachable'));
+
+      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+
+      expect(videosService.markFailed).not.toHaveBeenCalled();
       expect(prisma.movie.update).toHaveBeenCalledWith({
         where: { id: 'movie-1' },
         data: { status: 'PUBLISHED' },

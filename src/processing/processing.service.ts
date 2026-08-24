@@ -6,6 +6,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
 import { VideosService } from '../videos/videos.service';
+import { HlsSubtitlesService } from '../subtitles/hls-subtitles.service';
 import { probeVideo, transcodeToHls } from './ffmpeg.util';
 import { approximateWidth, pickRenditions } from './rendition-tiers';
 
@@ -27,6 +28,7 @@ export class ProcessingService {
     private readonly storageService: StorageService,
     private readonly minioService: MinioService,
     private readonly prisma: PrismaService,
+    private readonly hlsSubtitlesService: HlsSubtitlesService,
   ) {}
 
   isActivelyProcessing(videoId: string): boolean {
@@ -161,6 +163,20 @@ export class ProcessingService {
           playlistPath: `${this.storageService.hlsRenditionKeyPrefix(movieId, v.name)}/index.m3u8`,
         })),
       });
+
+      // buildMasterPlaylist() above wrote a master from scratch, so any
+      // subtitle group a previous publish had put there is gone. Re-derive
+      // it from the rows that still exist. Never allowed to fail the
+      // pipeline: the transcode itself succeeded, and the catch below would
+      // otherwise mark a perfectly good video FAILED.
+      try {
+        await this.hlsSubtitlesService.publishForVideo(videoId);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.logger.warn(
+          `Could not publish subtitle renditions for video ${videoId}: ${reason}`,
+        );
+      }
 
       await this.prisma.movie.update({
         where: { id: movieId },
