@@ -21,6 +21,8 @@
     "db:migrate": "prisma migrate dev",
     "db:seed": "prisma db seed",
     "db:seed:users": "npm run build && node dist/prisma/seed-users.js",
+    "db:backup": "bash scripts/db-backup.sh",
+    "db:restore": "bash scripts/db-restore.sh",
     "db:studio": "prisma studio"
   },
   "dependencies": {
