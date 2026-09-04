@@ -25,9 +25,11 @@ export interface ResourceUploadType {
  * (e.g. "book") is one new entry here; nothing in MultipartUploadService,
  * MinioService, or the frontend upload primitives needs to change.
  *
- * "movie" is the only entry today — it also serves series episodes, which
- * are just Movie rows with seriesId set (see schema.prisma's Movie doc
- * comment), so no separate "episode" type is needed.
+ * "movie" also serves series episodes, which are just Movie rows with
+ * seriesId set (see schema.prisma's Movie doc comment), so no separate
+ * "episode" type is needed. "book" is the PDF-book original: the admin
+ * uploads it straight to books/<bookId>/original.pdf and then asks the
+ * backend to convert it (POST /books/:id/process).
  */
 @Injectable()
 export class ResourceUploadTypeRegistry {
@@ -49,6 +51,21 @@ export class ResourceUploadTypeRegistry {
         },
         buildKey: (resourceId, relativePath) =>
           `videos/${resourceId}/${relativePath}`,
+      },
+      book: {
+        // BOOKS.EDIT rather than MEDIA.UPLOAD: whoever may edit a book may
+        // attach its PDF, and the books module has no other reason to grant
+        // the movie-pipeline's upload permission.
+        permission: 'BOOKS.EDIT',
+        assertExists: async (resourceId) => {
+          const book = await this.prisma.book.findUnique({
+            where: { id: resourceId },
+            select: { id: true },
+          });
+          if (!book) throw new NotFoundException('Book not found');
+        },
+        buildKey: (resourceId, relativePath) =>
+          `books/${resourceId}/${relativePath}`,
       },
     };
   }

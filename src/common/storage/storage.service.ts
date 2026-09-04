@@ -95,6 +95,55 @@ export class StorageService {
     return `images/${imageId}${extension}`;
   }
 
+  /** Local scratch dir for one chapter's PDF->WebP conversion (deleted after the run). */
+  bookScratchDir(chapterId: string): string {
+    return join(this.root, 'books', chapterId);
+  }
+
+  /**
+   * MinIO key prefix for one language edition. Nested under the BOOK, not
+   * beside it, so deleting a book still reaches every language with a single
+   * deleteByPrefix(`books/<bookId>/`).
+   */
+  bookEditionPrefix(bookId: string, editionId: string): string {
+    return `books/${bookId}/${editionId}`;
+  }
+
+  /**
+   * MinIO key prefix for one chapter, nested inside its edition for the same
+   * reason the edition nests inside the book: deleting any level above still
+   * reaches everything below it with a single prefix delete.
+   */
+  bookChapterPrefix(
+    bookId: string,
+    editionId: string,
+    chapterId: string,
+  ): string {
+    return `${this.bookEditionPrefix(bookId, editionId)}/${chapterId}`;
+  }
+
+  /** MinIO object key of one chapter's uploaded PDF — a chapter is a release. */
+  bookPdfKey(bookId: string, editionId: string, chapterId: string): string {
+    return `${this.bookChapterPrefix(bookId, editionId, chapterId)}/original.pdf`;
+  }
+
+  /**
+   * MinIO object key of one converted page, numbered WITHIN ITS CHAPTER. The
+   * page number is zero-padded to at least three digits (widening for very
+   * long chapters) so both key listings and filenames sort in reading order.
+   */
+  bookPageKey(
+    bookId: string,
+    editionId: string,
+    chapterId: string,
+    pageNumber: number,
+    totalPages: number,
+  ): string {
+    const width = Math.max(3, String(totalPages).length);
+    const padded = String(pageNumber).padStart(width, '0');
+    return `${this.bookChapterPrefix(bookId, editionId, chapterId)}/pages/page-${padded}.webp`;
+  }
+
   async ensureDir(path: string): Promise<void> {
     await mkdir(path, { recursive: true });
   }

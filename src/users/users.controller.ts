@@ -34,6 +34,7 @@ import { UserRelationshipsQueryDto } from './dto/user-relationships-query.dto';
 import { UserRelationshipsService } from './user-relationships.service';
 import { PermissionResolverService } from '../roles/permission-resolver.service';
 import { UsersService, type WalletSummary } from './users.service';
+import { LevelsService } from '../levels/levels.service';
 
 const MAX_AVATAR_BYTES = 5 * 1024 * 1024;
 
@@ -55,6 +56,7 @@ export class UsersController {
     private readonly walletAdjustmentsService: WalletAdjustmentsService,
     private readonly userRelationshipsService: UserRelationshipsService,
     private readonly permissionResolver: PermissionResolverService,
+    private readonly levelsService: LevelsService,
   ) {}
 
   /**
@@ -142,15 +144,34 @@ export class UsersController {
     return this.toResponse(updated, wallet);
   }
 
+  /**
+   * The caller's own membership-level status — same empty-permission
+   * override as the other "me" routes, and registered before ':id' for the
+   * same reason. The math lives in ONE place: LevelsService.
+   */
+  @Get('me/level')
+  @RequirePermissions()
+  getMyLevel(@CurrentUser() user: AuthenticatedUser) {
+    return this.levelsService.getUserLevelStatus(user.id);
+  }
+
   @Get()
   @RequirePermissions('USERS.VIEW')
   async findAll(@Query() pagination: UsersQueryDto) {
     const { items, total, walletByUserId } =
       await this.usersService.findAll(pagination);
+    // Batched like the wallet summaries — one groupBy for the whole page,
+    // never a per-row query. ADDITIVE field: each item gains `level` (the
+    // resolved level row or null) alongside the wallet fields.
+    const levelByUserId = await this.levelsService.getLevelsForUsers(
+      items.map((u) => u.id),
+    );
     return {
-      items: items.map((user) =>
-        this.toResponse(user, walletByUserId.get(user.id)),
-      ),
+      items: items.map((user) => {
+        const response = this.toResponse(user, walletByUserId.get(user.id));
+        response.level = levelByUserId.get(user.id) ?? null;
+        return response;
+      }),
       total,
       page: pagination.page ?? 1,
       limit: pagination.limit ?? 20,
@@ -195,6 +216,14 @@ export class UsersController {
     @Query() pagination: PaginationQueryDto,
   ) {
     return this.videosService.getWatchHistoryForUser(id, pagination);
+  }
+
+  /** Class-level USERS.VIEW already covers this; stated for clarity. */
+  @Get(':id/level')
+  @RequirePermissions('USERS.VIEW')
+  async getUserLevel(@Param('id', ParseUUIDPipe) id: string) {
+    await this.usersService.findByIdOrThrow(id);
+    return this.levelsService.getUserLevelStatus(id);
   }
 
   /**

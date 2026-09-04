@@ -23,10 +23,20 @@ export const PERMISSION_CATALOGUE = [
     label: 'Series',
     actions: ['VIEW', 'CREATE', 'EDIT', 'DELETE', 'PUBLISH', 'UNPUBLISH'],
   },
+  {
+    key: 'BOOKS',
+    label: 'Books',
+    actions: ['VIEW', 'CREATE', 'EDIT', 'DELETE', 'PUBLISH', 'UNPUBLISH'],
+  },
   { key: 'MEDIA', label: 'Media', actions: ['VIEW', 'UPLOAD', 'DELETE'] },
   {
     key: 'CATEGORIES',
     label: 'Categories',
+    actions: ['VIEW', 'CREATE', 'EDIT', 'DELETE'],
+  },
+  {
+    key: 'ACTORS',
+    label: 'Actors',
     actions: ['VIEW', 'CREATE', 'EDIT', 'DELETE'],
   },
   {

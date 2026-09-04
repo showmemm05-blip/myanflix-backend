@@ -48,6 +48,25 @@ class EnvironmentVariables {
   @IsString()
   JWT_REFRESH_EXPIRES_IN: string = '7d';
 
+  /**
+   * OAuth 2.0 *Web* client ID from Google Cloud Console — the `aud` every
+   * Google ID token must carry. Empty/unset disables "Continue with Google"
+   * (POST /auth/google answers 503); nothing else in the app changes.
+   */
+  @IsOptional()
+  @IsString()
+  GOOGLE_CLIENT_ID?: string;
+
+  /**
+   * Client secret of that same OAuth Web client. Only the popup auth-code
+   * flow (POST /auth/google with `code`) needs it — the backend exchanges
+   * the code with Google server-side. Empty/unset leaves the ID-token
+   * (`credential`) path working and makes the code path answer 503.
+   */
+  @IsOptional()
+  @IsString()
+  GOOGLE_CLIENT_SECRET?: string;
+
   @IsOptional()
   @IsString()
   STORAGE_PATH: string = './storage';

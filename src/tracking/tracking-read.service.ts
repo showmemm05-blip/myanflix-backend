@@ -80,7 +80,7 @@ export interface TrackedUserView {
   phone: string | null;
 }
 
-export type TrackedTitleKind = 'MOVIE' | 'SERIES';
+export type TrackedTitleKind = 'MOVIE' | 'SERIES' | 'BOOK';
 
 export interface TrackedTitleView {
   id: string;
@@ -330,6 +330,7 @@ export class TrackingReadService {
           user: { select: TRACKED_USER_SELECT },
           movie: { select: { id: true, title: true } },
           series: { select: { id: true, title: true } },
+          book: { select: { id: true, title: true } },
         },
       }),
       this.prisma.comment.count({ where }),
@@ -351,7 +352,9 @@ export class TrackingReadService {
               kind: 'SERIES',
               name: row.series.title,
             } as const)
-          : null,
+          : row.book
+            ? ({ id: row.book.id, kind: 'BOOK', name: row.book.title } as const)
+            : null,
       ipAddress: presentIp(row.ipAddress, canViewPii),
     }));
 

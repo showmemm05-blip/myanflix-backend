@@ -4,6 +4,7 @@ import { validate } from 'class-validator';
 import { CreateCommentDto } from './create-comment.dto';
 
 const MOVIE_ID = '11111111-1111-4111-8111-111111111111';
+const BOOK_ID = '44444444-4444-4444-8444-444444444444';
 
 async function validateBody(body: unknown) {
   const instance = plainToInstance(
@@ -65,14 +66,31 @@ describe('CreateCommentDto — target ids', () => {
     expect(await validate(instance)).not.toHaveLength(0);
   });
 
+  it('accepts a book-only comment', async () => {
+    const instance = plainToInstance(CreateCommentDto, {
+      bookId: BOOK_ID,
+      body: 'Great',
+    });
+    expect(await validate(instance)).toHaveLength(0);
+  });
+
+  it('rejects a non-UUID bookId', async () => {
+    const instance = plainToInstance(CreateCommentDto, {
+      bookId: 'not-a-uuid',
+      body: 'Great',
+    });
+    expect(await validate(instance)).not.toHaveLength(0);
+  });
+
   /**
    * The "exactly one target" rule is a cross-field rule, so it is the
-   * service's — this documents that the DTO deliberately lets both through.
+   * service's — this documents that the DTO deliberately lets all three through.
    */
   it('leaves the exactly-one-of rule to the service', async () => {
     const instance = plainToInstance(CreateCommentDto, {
       movieId: MOVIE_ID,
       seriesId: '22222222-2222-4222-8222-222222222222',
+      bookId: BOOK_ID,
       body: 'Great',
     });
     expect(await validate(instance)).toHaveLength(0);

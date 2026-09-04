@@ -82,6 +82,9 @@ const CONTENT_TYPES: Record<string, string> = {
   '.srt': 'application/x-subrip',
   '.vtt': 'text/vtt',
   '.ass': 'text/x-ssa',
+  // Book originals — archived under books/<bookId>/, converted page-by-page
+  // to the WebPs that are actually served.
+  '.pdf': 'application/pdf',
 };
 
 /**
@@ -89,7 +92,7 @@ const CONTENT_TYPES: Record<string, string> = {
  * videoObjectKey). A URL only counts as "ours" if its key starts with one of
  * them — see MinioService.ownImageKey.
  */
-const OWN_KEY_PREFIXES = ['images/', 'videos/', 'subtitles/'] as const;
+const OWN_KEY_PREFIXES = ['images/', 'videos/', 'subtitles/', 'books/'] as const;
 
 /**
  * Talks to the storage server (MinIO, or any S3-compatible endpoint) —
@@ -538,6 +541,19 @@ export class MinioService {
       return true;
     } catch (error) {
       if (error instanceof NotFound) return false;
+      throw error;
+    }
+  }
+
+  /** Size in bytes of `key`, or null when it doesn't exist — used to record a book PDF's size after its browser-direct upload lands. */
+  async objectSize(key: string): Promise<number | null> {
+    try {
+      const head = await this.client.send(
+        new HeadObjectCommand({ Bucket: this.bucket, Key: key }),
+      );
+      return head.ContentLength ?? null;
+    } catch (error) {
+      if (error instanceof NotFound) return null;
       throw error;
     }
   }

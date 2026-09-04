@@ -1,6 +1,9 @@
-import type { Category, Movie } from '../../generated/prisma/client';
+import type { Actor, Category, Movie } from '../../generated/prisma/client';
 
-type MovieWithCategories = Movie & { categories?: Category[] };
+type MovieWithCategories = Movie & {
+  categories?: Category[];
+  actors?: Actor[];
+};
 
 /**
  * Re-derives a persisted image URL's host from the current request — see
@@ -30,6 +33,12 @@ export class MovieResponseDto {
       releaseYear: movie.releaseYear,
       duration: movie.duration,
       rating: movie.rating,
+      // Nullable filter metadata — null passes through untouched (it means
+      // "not set", which is real information the clients' auto-hide rule
+      // depends on).
+      director: movie.director,
+      country: movie.country,
+      ageRating: movie.ageRating,
       accessType: movie.accessType,
       status: movie.status,
       seriesId: movie.seriesId,
@@ -37,6 +46,12 @@ export class MovieResponseDto {
       episodeNumber: movie.episodeNumber,
       categories:
         movie.categories?.map((c) => ({ id: c.id, name: c.name })) ?? [],
+      actors:
+        movie.actors?.map((a) => ({
+          id: a.id,
+          name: a.name,
+          imageUrl: resolveImageUrl(a.imageUrl),
+        })) ?? [],
       createdAt: movie.createdAt,
       updatedAt: movie.updatedAt,
     };

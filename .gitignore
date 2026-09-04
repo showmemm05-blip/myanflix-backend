@@ -32,3 +32,4 @@ yarn-error.log*
 /coverage/
 # database backups (scripts/db-backup.sh)
 /backups/
+.next/

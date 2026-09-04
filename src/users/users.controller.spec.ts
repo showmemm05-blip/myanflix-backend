@@ -21,6 +21,7 @@ import { createSeededPermissionResolver } from '../../test/seeded-permission-res
 import { UsersController } from './users.controller';
 import { UsersService } from './users.service';
 import { UserRelationshipsService } from './user-relationships.service';
+import { LevelsService } from '../levels/levels.service';
 
 const USER_ID = 'a3c9d7f0-1111-2222-3333-444455556666';
 
@@ -127,6 +128,9 @@ describe('UsersController — self-service "me" routes (profile, password, avata
           provide: PermissionResolverService,
           useValue: createSeededPermissionResolver(),
         },
+        // Constructor dependency of UsersController (the two /level routes);
+        // the level math itself is covered by levels.service.spec.ts.
+        { provide: LevelsService, useValue: { getLevelsForUsers: jest.fn().mockResolvedValue(new Map()) } },
       ],
     })
       .overrideGuard(PermissionsGuard)

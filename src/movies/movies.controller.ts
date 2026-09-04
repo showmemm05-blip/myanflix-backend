@@ -20,6 +20,8 @@ import { MovieStatus } from '../generated/prisma/client';
 import { AuthorityService } from '../roles/authority.service';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
+import { VideoDurationService } from '../videos/video-duration.service';
+import { BackfillDurationsDto } from './dto/backfill-durations.dto';
 import { CreateMovieDto } from './dto/create-movie.dto';
 import { CreateUploadPlaceholderDto } from './dto/create-upload-placeholder.dto';
 import { MovieQueryDto } from './dto/movie-query.dto';
@@ -34,6 +36,7 @@ export class MoviesController {
     private readonly moviesService: MoviesService,
     private readonly minioService: MinioService,
     private readonly authority: AuthorityService,
+    private readonly videoDurationService: VideoDurationService,
   ) {}
 
   /**
@@ -74,6 +77,17 @@ export class MoviesController {
     return this.moviesService.getPurchasesForUser(user.id, pagination);
   }
 
+  /**
+   * DB-derived filter options for the catalog's filter sheet — see
+   * MoviesService.getFacets. Same auth as the rest of the catalog (the
+   * global JwtAuthGuard — the catalog requires auth by design). Registered
+   * before ':id' so "facets" is never parsed as a movie UUID.
+   */
+  @Get('facets')
+  getFacets() {
+    return this.moviesService.getFacets();
+  }
+
   /** Registered before ':id' so "most-purchased" is never parsed as a movie UUID. */
   @Get('most-purchased')
   async getMostPurchased() {
@@ -101,9 +115,10 @@ export class MoviesController {
   }
 
   /**
-   * Bootstraps a movie for the bulk pre-transcoded upload flow — title only,
-   * status UPLOADING. Everything else is filled in later via PUT /movies/:id
-   * once the upload finishes and the admin edits it.
+   * Bootstraps a movie for the bulk pre-transcoded upload flow — title (and
+   * the runtime the uploader probed from the bundle, when it could), status
+   * UPLOADING. Everything else is filled in later via PUT /movies/:id once
+   * the upload finishes and the admin edits it.
    */
   @Post('upload-placeholder')
   @UseGuards(PermissionsGuard)
@@ -118,8 +133,24 @@ export class MoviesController {
             episodeNumber: dto.episodeNumber!,
           }
         : undefined,
+      { duration: dto.duration },
     );
     return MovieResponseDto.fromEntity(movie, this.resolveImageUrl);
+  }
+
+  /**
+   * Repairs titles that predate runtime capture (Movie.duration still 0)
+   * from the HLS they stream — see VideoDurationService.backfill. Idempotent
+   * and capped at 100 per call; the admin clicks again while `remaining` is
+   * non-zero. Registered before the ':id' routes so "durations" is never
+   * parsed as a movie UUID.
+   */
+  @Post('durations/backfill')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('MOVIES.EDIT')
+  backfillDurations(@Body() dto: BackfillDurationsDto) {
+    return this.videoDurationService.backfill(dto.limit ?? 100);
   }
 
   /**

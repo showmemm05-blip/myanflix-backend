@@ -5,14 +5,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
 import { srtToVtt, withHlsTimestampMap } from './srt-to-vtt';
-import {
-  initialPtsFromTransportStream,
-  PTS_PROBE_BYTES,
-} from './mpegts-pts';
+import { initialPtsFromTransportStream, PTS_PROBE_BYTES } from './mpegts-pts';
 import {
   buildSubtitleMediaPlaylist,
   firstSegmentUri,
   firstVariantUri,
+  resolveRelativeKey,
   rewriteMasterPlaylist,
   totalDurationFromMediaPlaylist,
   type SubtitleRendition,
@@ -328,10 +326,4 @@ export class HlsSubtitlesService {
       skipped: reason,
     };
   }
-}
-
-/** `videos/m/hls/master.m3u8` + `720p/index.m3u8` -> `videos/m/hls/720p/index.m3u8`. */
-function resolveRelativeKey(masterKey: string, relative: string): string {
-  const directory = masterKey.slice(0, masterKey.lastIndexOf('/') + 1);
-  return `${directory}${relative.replace(/^\.\//, '')}`;
 }

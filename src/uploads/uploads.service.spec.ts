@@ -10,6 +10,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
 import { VideosService } from '../videos/videos.service';
+import { VideoDurationService } from '../videos/video-duration.service';
 import { ProcessingService } from '../processing/processing.service';
 import { SubtitlesService } from '../subtitles/subtitles.service';
 import { UploadStatus, VideoStatus } from '../generated/prisma/client';
@@ -51,6 +52,10 @@ describe('UploadsService', () => {
     findLatestForMovie: jest.Mock;
     create: jest.Mock;
     markReady: jest.Mock;
+  };
+  let videoDurationService: {
+    recoverHlsDurationSeconds: jest.Mock;
+    fillMovieDurationIfUnknown: jest.Mock;
   };
   let processingService: {
     processVideo: jest.Mock;
@@ -97,6 +102,12 @@ describe('UploadsService', () => {
       create: jest.fn().mockResolvedValue({ id: 'video-1' }),
       markReady: jest.fn().mockResolvedValue(undefined),
     };
+    // Unknown by default so every pre-existing finalize case keeps the
+    // behaviour it was written against (duration: null, no movie write).
+    videoDurationService = {
+      recoverHlsDurationSeconds: jest.fn().mockResolvedValue(null),
+      fillMovieDurationIfUnknown: jest.fn().mockResolvedValue(true),
+    };
     processingService = {
       processVideo: jest.fn(),
       isActivelyProcessing: jest.fn().mockReturnValue(false),
@@ -112,6 +123,7 @@ describe('UploadsService', () => {
         { provide: StorageService, useValue: storageService },
         { provide: MinioService, useValue: minioService },
         { provide: VideosService, useValue: videosService },
+        { provide: VideoDurationService, useValue: videoDurationService },
         { provide: ProcessingService, useValue: processingService },
         { provide: SubtitlesService, useValue: subtitlesService },
       ],
@@ -505,6 +517,53 @@ describe('UploadsService', () => {
       await service.finalizeExternalUpload('movie-1', dto);
 
       expect(processingService.processVideo).not.toHaveBeenCalled();
+    });
+
+    it(
+      'records the runtime recovered from the HLS master on the Video row and offers it to the ' +
+        'Movie — conditionally, through fillMovieDurationIfUnknown, never a blind write',
+      async () => {
+        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+        minioService.objectExists.mockResolvedValue(true);
+        videoDurationService.recoverHlsDurationSeconds.mockResolvedValue(5430);
+
+        await service.finalizeExternalUpload('movie-1', dto);
+
+        expect(
+          videoDurationService.recoverHlsDurationSeconds,
+        ).toHaveBeenCalledWith('videos/movie-1/hls/master.m3u8');
+        expect(videosService.markReady).toHaveBeenCalledWith(
+          'video-1',
+          expect.objectContaining({ duration: 5430 }),
+        );
+        expect(
+          videoDurationService.fillMovieDurationIfUnknown,
+        ).toHaveBeenCalledWith('movie-1', 5430);
+        // Only ever the status flip — the runtime never goes through a blind
+        // prisma.movie.update that could clobber an admin-typed value.
+        expect(prisma.movie.update).not.toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ duration: expect.anything() }),
+          }),
+        );
+      },
+    );
+
+    it('leaves Video.duration null and never touches the Movie runtime when nothing could be recovered — today\'s behaviour preserved', async () => {
+      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+      minioService.objectExists.mockResolvedValue(true);
+      videoDurationService.recoverHlsDurationSeconds.mockResolvedValue(null);
+
+      const result = await service.finalizeExternalUpload('movie-1', dto);
+
+      expect(videosService.markReady).toHaveBeenCalledWith(
+        'video-1',
+        expect.objectContaining({ duration: null }),
+      );
+      expect(
+        videoDurationService.fillMovieDurationIfUnknown,
+      ).not.toHaveBeenCalled();
+      expect(result).toEqual({ videoId: 'video-1', status: VideoStatus.READY });
     });
   });
 

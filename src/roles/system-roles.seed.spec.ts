@@ -480,6 +480,13 @@ interface PostRbacRoute {
 
 const STAFF_ONLY: Role[] = [Role.SUPER_ADMIN, Role.ADMIN];
 
+/** Staff plus the ingest-only role — content work that isn't destructive. */
+const CONTENT_STAFF: Role[] = [
+  Role.SUPER_ADMIN,
+  Role.ADMIN,
+  Role.CONTENT_UPLOADER,
+];
+
 const POST_RBAC_GUARDED_ROUTES: PostRbacRoute[] = [
   // tracking (admin Tracking section — BACKEND 4)
   {
@@ -532,6 +539,93 @@ const POST_RBAC_GUARDED_ROUTES: PostRbacRoute[] = [
     granular: ['TRACKING.VIEW'],
     allowed: STAFF_ONLY,
   },
+  // books (admin Books section — the add_books migration, extended by
+  // book_language_editions). CONTENT_UPLOADER joins staff everywhere except
+  // DELETE, exactly as it does for movies. Content routes are nested under
+  // an edition because a book id alone does not identify a language.
+  {
+    route: 'POST /books',
+    granular: ['BOOKS.CREATE'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'PUT /books/:id',
+    granular: ['BOOKS.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'DELETE /books/:id',
+    granular: ['BOOKS.DELETE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /books/:id/editions',
+    granular: ['BOOKS.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'PUT /books/:id/editions/:editionId',
+    granular: ['BOOKS.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    // Removing a language destroys its chapters/pages/bookmarks, so it sits
+    // with the other destructive route rather than with the edits.
+    route: 'DELETE /books/:id/editions/:editionId',
+    granular: ['BOOKS.DELETE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    // Conversion is per CHAPTER now — each chapter is its own release with
+    // its own file.
+    route: 'POST /books/:id/editions/:editionId/chapters/:chapterId/process',
+    granular: ['BOOKS.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route:
+      'GET /books/:id/editions/:editionId/chapters/:chapterId/processing-status',
+    granular: ['BOOKS.VIEW'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'POST /books/:id/editions/:editionId/chapters',
+    granular: ['BOOKS.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'PATCH /books/:id/editions/:editionId/chapters/reorder',
+    granular: ['BOOKS.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'PUT /books/:id/editions/:editionId/chapters/:chapterId',
+    granular: ['BOOKS.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'DELETE /books/:id/editions/:editionId/chapters/:chapterId',
+    granular: ['BOOKS.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  // actors (the add_actors migration). The three GET routes are deliberately
+  // NOT here: a film's cast is public catalog metadata, read the same
+  // authenticated-but-ungated way GET /categories is.
+  {
+    route: 'POST /actors',
+    granular: ['ACTORS.CREATE'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'PUT /actors/:id',
+    granular: ['ACTORS.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'DELETE /actors/:id',
+    granular: ['ACTORS.DELETE'],
+    allowed: STAFF_ONLY,
+  },
 ];
 
 const seedFor = (role: Role) => {
@@ -581,21 +675,24 @@ describe('System role seeds', () => {
   });
 
   /**
-   * Sizes as of the `add_tracking` migration: the TRACKING module added four
-   * permissions to the catalogue (so SUPER_ADMIN, which is every permission,
-   * went 61 -> 65) and all four were INSERTed for ADMIN (32 -> 36).
-   * CONTENT_UPLOADER deliberately received none.
+   * Sizes as of the `add_books` migration. The TRACKING module (add_tracking)
+   * took SUPER_ADMIN 61 -> 65 and ADMIN 32 -> 36, granting CONTENT_UPLOADER
+   * nothing. BOOKS then added six permissions to the catalogue (65 -> 71),
+   * INSERTing all six for ADMIN (36 -> 42) and five for CONTENT_UPLOADER
+   * (16 -> 21) — everything but DELETE, mirroring its movie grants. ACTORS
+   * then added four more (71 -> 75), all four to ADMIN (42 -> 46) and three
+   * to CONTENT_UPLOADER (21 -> 24), again everything but DELETE.
    */
-  it('has the expected seed sizes (65 / 36 / 16 / 0, matching the migrations)', () => {
+  it('has the expected seed sizes (75 / 46 / 24 / 0, matching the migrations)', () => {
     expect({
       SUPER_ADMIN: seedFor(Role.SUPER_ADMIN).permissions.length,
       ADMIN: seedFor(Role.ADMIN).permissions.length,
       CONTENT_UPLOADER: seedFor(Role.CONTENT_UPLOADER).permissions.length,
       USER: seedFor(Role.USER).permissions.length,
     }).toEqual({
-      SUPER_ADMIN: 65,
-      ADMIN: 36,
-      CONTENT_UPLOADER: 16,
+      SUPER_ADMIN: 75,
+      ADMIN: 46,
+      CONTENT_UPLOADER: 24,
       USER: 0,
     });
   });
@@ -670,20 +767,28 @@ describe('System role seeds — routes added after the RBAC migration', () => {
   });
 
   /**
-   * Budget for the second table: the whole Tracking section, 10 routes —
-   * 8 read routes under one class-level TRACKING.VIEW plus the two
-   * moderation PATCHes that additionally require their own action.
+   * Budget for the second table, 19 routes:
+   *   10 Tracking — 8 reads under one class-level TRACKING.VIEW plus the two
+   *   moderation PATCHes that additionally require their own action;
+   * + 12 Books — create/edit/delete, three edition (language) routes, the two
+   *   PDF-conversion routes, and the four chapter mutations. The books
+   *   module's remaining routes (the catalog reads, the chapter list and
+   *   content, pages, reading progress) are authenticated but deliberately
+   *   NOT permission-gated: they are how the user site reads, gated instead
+   *   by service-side PUBLISHED filtering exactly like GET /movies.
+   * +  3 Actors — create/edit/delete. Its three reads are ungated for the
+   *   same reason GET /categories is.
    */
   it('covers every post-migration permission-gated route', () => {
-    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(10);
+    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(25);
     expect(
       POST_RBAC_GUARDED_ROUTES.filter((r) => r.granular.length > 1),
     ).toHaveLength(2);
   });
 
-  it('leaves the backend with 89 permission-gated routes in total', () => {
+  it('leaves the backend with 104 permission-gated routes in total', () => {
     const gatedLegacy = GUARDED_ROUTES.filter((r) => r.granular !== null);
-    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(86);
-    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(89);
+    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(101);
+    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(104);
   });
 });

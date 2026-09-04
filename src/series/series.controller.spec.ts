@@ -43,11 +43,21 @@ class FakeJwtAuthGuard implements CanActivate {
 
 describe('SeriesController — publish/unpublish gate (F11)', () => {
   let app: INestApplication<App>;
-  let seriesService: { updateStatus: jest.Mock };
+  let seriesService: {
+    updateStatus: jest.Mock;
+    findAll: jest.Mock;
+    getFacets: jest.Mock;
+  };
 
   beforeEach(async () => {
     seriesService = {
       updateStatus: jest.fn().mockResolvedValue({ id: SERIES_ID }),
+      findAll: jest
+        .fn()
+        .mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 }),
+      getFacets: jest
+        .fn()
+        .mockResolvedValue({ genres: [], languages: [], years: null }),
     };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -150,4 +160,73 @@ describe('SeriesController — publish/unpublish gate (F11)', () => {
       expect(seriesService.updateStatus).toHaveBeenCalled();
     },
   );
+
+  /**
+   * The canonical filter wire format through the REAL global ValidationPipe
+   * (whitelist + forbidNonWhitelisted + transform) — proves the DTO accepts
+   * both CSV and repeated-param arrays and hands the service clean values.
+   */
+  describe('GET /series — canonical filter params', () => {
+    it('parses CSV arrays, numeric ranges and the sort enum', async () => {
+      await request(app.getHttpServer())
+        .get('/series')
+        .query({
+          search: 'thrones',
+          genres: 'Drama,Action',
+          languages: 'Burmese',
+          yearFrom: '2000',
+          yearTo: '2020',
+          sort: 'newest',
+        })
+        .expect(200);
+
+      expect(seriesService.findAll).toHaveBeenCalledWith(
+        expect.objectContaining({
+          search: 'thrones',
+          genres: ['Drama', 'Action'],
+          languages: ['Burmese'],
+          yearFrom: 2000,
+          yearTo: 2020,
+          sort: 'newest',
+        }),
+        Role.SUPER_ADMIN,
+      );
+    });
+
+    it('accepts a repeated param as the same array', async () => {
+      await request(app.getHttpServer())
+        .get('/series?genres=Drama&genres=Action')
+        .expect(200);
+
+      expect(seriesService.findAll).toHaveBeenCalledWith(
+        expect.objectContaining({ genres: ['Drama', 'Action'] }),
+        expect.anything(),
+      );
+    });
+
+    it('rejects a sort value outside the series subset', async () => {
+      await request(app.getHttpServer())
+        .get('/series')
+        .query({ sort: 'mostViewed' })
+        .expect(400);
+
+      expect(seriesService.findAll).not.toHaveBeenCalled();
+    });
+
+    it('rejects an out-of-range year', async () => {
+      await request(app.getHttpServer())
+        .get('/series')
+        .query({ yearFrom: '1500' })
+        .expect(400);
+    });
+  });
+
+  it('GET /series/facets routes to the facets handler, not the :id param route', async () => {
+    const res = await request(app.getHttpServer())
+      .get('/series/facets')
+      .expect(200);
+
+    expect(seriesService.getFacets).toHaveBeenCalled();
+    expect(res.body).toEqual({ genres: [], languages: [], years: null });
+  });
 });

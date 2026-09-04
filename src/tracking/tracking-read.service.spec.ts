@@ -204,6 +204,7 @@ describe('TrackingReadService', () => {
           user: commenter(),
           movie: { id: 'movie-1', title: 'Avengers' },
           series: null,
+          book: null,
         },
       ]);
       prisma.comment.count.mockResolvedValue(1);
@@ -339,7 +340,7 @@ describe('TrackingReadService', () => {
       expect(prisma.comment.findMany.mock.calls[0][0].where).toEqual({});
     });
 
-    it('labels a movie comment and a series comment by kind', async () => {
+    it('labels a movie, series and book comment by kind', async () => {
       prisma.comment.findMany.mockResolvedValue([
         {
           id: 'c1',
@@ -364,6 +365,20 @@ describe('TrackingReadService', () => {
           user: commenter(),
           movie: null,
           series: { id: 'series-1', title: 'Dark' },
+          book: null,
+        },
+        {
+          id: 'c3',
+          body: 'c',
+          status: CommentStatus.VISIBLE,
+          platform: ClientPlatform.WEB,
+          ipAddress: null,
+          parentId: null,
+          createdAt: new Date(),
+          user: commenter(),
+          movie: null,
+          series: null,
+          book: { id: 'book-1', title: 'Dune' },
         },
       ]);
 
@@ -380,6 +395,11 @@ describe('TrackingReadService', () => {
         name: 'Dark',
       });
       expect(result.items[1].parentId).toBe('c1');
+      expect(result.items[2].title).toEqual({
+        id: 'book-1',
+        kind: 'BOOK',
+        name: 'Dune',
+      });
     });
 
     it('paginates by skip/take from page and limit', async () => {

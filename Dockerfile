@@ -16,10 +16,12 @@ FROM node:26-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
-# fluent-ffmpeg shells out to a real ffmpeg binary at runtime — it has to
-# exist in the image; npm doesn't install it.
+# Two CLI toolchains the app shells out to at runtime, neither installed by
+# npm: ffmpeg for fluent-ffmpeg (video transcoding), and poppler-utils for
+# pdfinfo/pdftoppm (the books PDF -> WebP page conversion, see
+# src/books/pdf.util.ts).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # node_modules copied whole (not a fresh --omit=dev install) so the Prisma

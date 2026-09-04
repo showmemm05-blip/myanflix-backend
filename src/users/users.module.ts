@@ -1,5 +1,6 @@
 import { forwardRef, Module } from '@nestjs/common';
 import { RolesModule } from '../roles/roles.module';
+import { LevelsModule } from '../levels/levels.module';
 import { MoviesModule } from '../movies/movies.module';
 import { VideosModule } from '../videos/videos.module';
 import { UsersController } from './users.controller';
@@ -9,6 +10,7 @@ import { UserRelationshipsService } from './user-relationships.service';
 @Module({
   imports: [
     RolesModule,
+    LevelsModule,
     MoviesModule,
     VideosModule,
     // Deliberately a deferred require, not a top-of-file import: this edge

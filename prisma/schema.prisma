@@ -68,6 +68,44 @@ enum SubtitleFormat {
   ASS
 }
 
+/// How a book's content came to exist — the two are deliberately NOT the
+/// same product with a flag: an EDITOR book is chapters of rich text written
+/// in the admin dashboard, a PDF book is an uploaded original converted
+/// page-by-page into WebP images. Readers, admin actions and storage layout
+/// all branch on this.
+enum BookType {
+  EDITOR
+  PDF
+}
+
+/// One lifecycle for both book types. EDITOR books only ever move
+/// DRAFT <-> PUBLISHED. PDF books walk UPLOADING -> PROCESSING ->
+/// READY -> PUBLISHED (or FAILED, retryable back into PROCESSING);
+/// unpublishing returns them to READY. Users only ever see PUBLISHED.
+enum BookStatus {
+  DRAFT
+  UPLOADING
+  PROCESSING
+  READY
+  PUBLISHED
+  FAILED
+}
+
+/// One CHAPTER's own lifecycle, distinct from the edition's publish state.
+///
+/// A written chapter is READY the moment it has text. A PDF chapter carries
+/// its own file, so it walks UPLOADING -> PROCESSING -> READY (or FAILED,
+/// retryable) exactly as a whole edition used to before chapters existed.
+/// PUBLISHED is deliberately absent: publishing is an edition-wide act, and a
+/// half-published book is not a thing.
+enum ChapterStatus {
+  DRAFT
+  UPLOADING
+  PROCESSING
+  READY
+  FAILED
+}
+
 enum TransactionType {
   DEPOSIT
   PURCHASE
@@ -101,6 +139,19 @@ enum PaymentAccountTransactionType {
 enum AccessType {
   FREE
   SUBSCRIPTION
+}
+
+/// MPAA-style age rating for a movie. Stored without punctuation (PG13,
+/// NC17) so the enum member is a valid identifier everywhere; clients render
+/// the display form (PG-13, NC-17). Nullable on Movie: NULL means "unrated /
+/// not yet set", and the catalog's age-rating filter auto-hides until at
+/// least one movie carries a value.
+enum AgeRating {
+  G
+  PG
+  PG13
+  R
+  NC17
 }
 
 enum TransactionStatus {
@@ -183,6 +234,13 @@ model User {
   password    String
   /// Set for phone+OTP accounts. Nullable so username/password accounts are unaffected.
   phone       String?    @unique
+  /// E-mail from "Continue with Google" — verified by Google, stored
+  /// lower-cased. NULL for every phone/username account; never user-editable
+  /// and never exposed through UserResponseDto (nothing widens).
+  email       String?    @unique
+  /// Google's stable account id (the ID token's `sub` claim). Set when an
+  /// account is created by, or linked to, Google sign-in; NULL otherwise.
+  googleId    String?    @unique
   /// Free-text name the user picks for themselves and can edit from their
   /// profile. Purely cosmetic: `username` and `phone` remain the login
   /// identities and are never edited through the profile screen. NULL means
@@ -237,6 +295,7 @@ model User {
   searchQueries                       SearchQuery[]
   watchActivities                     WatchActivity[]
   sessions                            UserSession[]
+  bookReadingProgress                 BookReadingProgress[]
 
   @@index([appRoleId])
   @@map("users")
@@ -347,6 +406,13 @@ model Movie {
   releaseYear   Int
   duration      Int // minutes
   rating        Float       @default(0)
+  /// Optional catalog metadata added for the filter system (2026-09). All
+  /// three are nullable — existing rows simply have no value, the admin
+  /// forms treat them as optional, and the filter UI for each auto-hides
+  /// until the facets endpoint reports at least one real value.
+  director      String?
+  country       String?
+  ageRating     AgeRating?
   /// For an episode (seriesId set), this is vestigial and never consulted —
   /// access is always inherited from the parent series' own accessType, the
   /// same way isPremium used to be inherited before this field existed.
@@ -360,6 +426,7 @@ model Movie {
   updatedAt     DateTime    @updatedAt
 
   categories     Category[]
+  actors         Actor[]
   videos         Video[]
   purchases      Purchase[]
   watchHistory   WatchHistory[]
@@ -433,6 +500,296 @@ model Category {
   series Series[]
 
   @@map("categories")
+}
+
+/// A person in a movie's cast.
+///
+/// `name` is unique so the admin cannot end up with three spellings of one
+/// actor, which is the failure mode a free-text cast field always reaches —
+/// the whole point of a row per person is that "everything they are in" is
+/// one query rather than a string search.
+///
+/// How many movies an actor has is NOT stored: it is `_count.movies` on the
+/// implicit join, so it can never drift from the truth the way a cached
+/// counter does.
+model Actor {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  /// Headshot, persisted as an absolute URL like Movie.posterUrl (and
+  /// re-hosted per request through MinioService.imageUrl). Optional: a cast
+  /// list is useful before anyone has found photographs for it.
+  imageUrl  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  movies Movie[]
+
+  @@map("actors")
+}
+
+// ---------------------------------------------------------------------------
+// Books
+// ---------------------------------------------------------------------------
+
+/// A book as a WORK — one row per title, whatever languages it exists in.
+///
+/// Everything here is language-neutral by deliberate decision: the title,
+/// author, description, cover and categories are shared, and only the
+/// CONTENT differs per language. The content, its publish state and (for a
+/// PDF book) its conversion state all live on BookEdition, one per language.
+///
+/// `type` stays here rather than on the edition: it describes how the work
+/// is authored, and a title that is a scanned PDF in one language and typed
+/// rich text in another would need two different readers for one book.
+model Book {
+  id          String   @id @default(uuid())
+  title       String
+  /// The display name every client reads. Since authors became rows this is
+  /// a denormalised copy of `authorRef.name`, kept equal by BooksService on
+  /// link and by BookAuthorsService on rename — never edited on its own.
+  author      String
+  /// The linked author row. Nullable only for rows that predate the link;
+  /// the service links every book it creates or updates.
+  authorId    String?
+  description String
+  coverUrl    String?
+  type        BookType
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  authorRef  BookAuthor?    @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  categories BookCategory[]
+  editions   BookEdition[]
+  comments   Comment[]
+
+  @@index([type])
+  @@index([authorId])
+  @@map("books")
+}
+
+/// A person credited as the writer of books — the books' twin of Actor.
+///
+/// `Book.author` stays as the denormalised display name every client reads;
+/// the service keeps it equal to `name` on link and on rename. How many
+/// books an author has is `_count.books`, never a stored counter.
+model BookAuthor {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  /// Portrait, persisted absolute like Actor.imageUrl and re-hosted per request.
+  imageUrl  String?
+  bio       String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  books Book[]
+
+  @@map("book_authors")
+}
+
+/// A shelf in the library — the books' own taxonomy, deliberately NOT the
+/// `Category` rows that movies and series share.
+///
+/// A book catalogue's vocabulary is its own: Manga, Manhwa, Light Novel,
+/// Biography. Folding those into the movie categories meant every genre
+/// invented for a book turned up in the movie picker and vice versa, which is
+/// noise in both directions. Same shape as Category, separate table.
+model BookCategory {
+  id          String  @id @default(uuid())
+  name        String  @unique
+  description String?
+
+  books Book[]
+
+  @@map("book_categories")
+}
+
+/// One language of one book: its content, and its own place in the
+/// lifecycle.
+///
+/// Publishing is per edition — a finished Burmese translation goes live
+/// while the English one is still being converted, and readers are only
+/// offered the languages that are actually PUBLISHED. A Book therefore has
+/// no status of its own; it is visible exactly when one of these is.
+model BookEdition {
+  id       String @id @default(uuid())
+  bookId   String
+  /// Language code for this edition, e.g. "my", "en" — an open string like
+  /// Movie.language rather than an enum, so a new language is a dropdown
+  /// entry in the admin, never a migration.
+  language String
+
+  status      BookStatus @default(DRAFT)
+  publishedAt DateTime?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  book            Book                  @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  chapters        BookChapter[]
+  parts           BookPart[]
+  readingProgress BookReadingProgress[]
+
+  /// One edition per language per book — adding a language twice is a
+  /// mistake, not a second edition.
+  @@unique([bookId, language])
+  @@index([status])
+  @@map("book_editions")
+}
+
+/// One chapter of one language — and now the unit of content for BOTH book
+/// types, which is the point of this model.
+///
+/// A written chapter holds `content`: the TipTap/ProseMirror JSON document,
+/// stored as structured JSON (not HTML) so the admin editor and the reader
+/// render it through the same schema and no raw markup is ever persisted or
+/// replayed.
+///
+/// A PDF chapter instead holds its OWN uploaded file and the pages converted
+/// from it — one release per chapter, the way serialised comics actually
+/// ship. That is why the pdf* columns and `status` live here rather than on
+/// the edition: two chapters of the same language convert independently, and
+/// one failing must not stall the rest.
+model BookChapter {
+  id        String        @id @default(uuid())
+  editionId String
+  title     String
+  /// Optional cover for the chapter — the thumbnail a chapter list shows.
+  /// Available to BOTH types; an absolute URL like Book.coverUrl, not a key.
+  imageUrl  String?
+  /// Written chapters only. NULL on a PDF chapter, whose content is `pages`.
+  content   Json?
+  /// 1-based position within its edition. Renumbered sequentially on
+  /// reorder, the same way series episodes renumber episodeNumber. Chapter
+  /// counts may legitimately differ between languages.
+  order     Int
+  status    ChapterStatus @default(DRAFT)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  /// PDF chapters only — MinIO object KEY of this chapter's uploaded file
+  /// (books/<bookId>/<editionId>/<chapterId>/original.pdf), never an
+  /// absolute URL, so the stored value survives host changes. Keys stay
+  /// nested under the BOOK so deleting a book still cleans every language
+  /// and every chapter with one prefix delete.
+  pdfKey          String?
+  /// PDF chapters only — size of this chapter's file in bytes.
+  pdfFileSize     BigInt?
+  /// PDF chapters only — pages the file reports. 0 until it has been probed.
+  pageCount       Int     @default(0)
+  /// PDF chapters only — pages converted and uploaded so far; with pageCount
+  /// this is the admin's real progress figure.
+  processedPages  Int     @default(0)
+  /// PDF chapters only — why the conversion FAILED, shown next to the retry
+  /// action. Cleared when a retry starts.
+  processingError String?
+
+  /// Optional grouping above chapters. NULL = no part; unparted chapters read
+  /// before the first part. SetNull so deleting a part keeps its chapters.
+  partId String?
+
+  edition         BookEdition           @relation(fields: [editionId], references: [id], onDelete: Cascade)
+  part            BookPart?             @relation(fields: [partId], references: [id], onDelete: SetNull)
+  pages           BookPage[]
+  sections        BookSection[]
+  readingProgress BookReadingProgress[]
+
+  @@index([editionId, order])
+  @@index([partId])
+  @@map("book_chapters")
+}
+
+/// An optional grouping of chapters ("Part 1", "Book Two") inside ONE edition.
+/// Purely structural: it owns no content. Numbered by position, never stored.
+model BookPart {
+  id        String   @id @default(uuid())
+  editionId String
+  title     String
+  /// 1-based position among the edition's parts. Renumbered on reorder.
+  order     Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  edition  BookEdition   @relation(fields: [editionId], references: [id], onDelete: Cascade)
+  chapters BookChapter[]
+
+  @@index([editionId, order])
+  @@map("book_parts")
+}
+
+/// An optional subdivision INSIDE a chapter. A written section carries its own
+/// TipTap JSON; a PDF section is a page anchor (startPage) whose range ends
+/// where the next section starts. A chapter with no sections renders exactly
+/// as before - that is how every existing book keeps working untouched.
+model BookSection {
+  id        String   @id @default(uuid())
+  chapterId String
+  title     String
+  /// 1-based position within its chapter. PDF sections are kept sorted by startPage.
+  order     Int
+  /// EDITOR books only - the section's own TipTap/ProseMirror JSON document.
+  content   Json?
+  /// PDF books only - 1-based page within the chapter where this section starts.
+  startPage Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  chapter         BookChapter           @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  readingProgress BookReadingProgress[]
+
+  @@index([chapterId, order])
+  @@map("book_sections")
+}
+
+/// One converted page of a PDF CHAPTER: the WebP object in MinIO plus the
+/// dimensions the reader needs to reserve layout space before the image
+/// loads. Created only AFTER the object is uploaded, so the row's existence
+/// is the idempotent "this page is done" marker a retry can resume from.
+model BookPage {
+  id         String @id @default(uuid())
+  chapterId  String
+  /// 1-based WITHIN ITS CHAPTER — page 1 of chapter 2 is a real page 1, the
+  /// way a serialised release numbers itself.
+  pageNumber Int
+  /// MinIO object KEY
+  /// (books/<bookId>/<editionId>/<chapterId>/pages/page-001.webp) — see
+  /// BookChapter.pdfKey for why keys, not URLs, are persisted.
+  imageKey   String
+  width      Int
+  height     Int
+  fileSize   Int
+
+  chapter BookChapter @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+
+  @@unique([chapterId, pageNumber])
+  @@map("book_pages")
+}
+
+/// One user's reading position in one EDITION — WatchHistory's shape, for
+/// books. Keyed on the edition rather than the book because the same title
+/// in two languages is two different reads: chapter counts and page counts
+/// need not line up, so one shared bookmark could not mean anything in both.
+model BookReadingProgress {
+  id         String   @id @default(uuid())
+  userId     String
+  editionId  String
+  /// EDITOR editions — the chapter the reader was last in. SetNull so
+  /// deleting a chapter demotes the bookmark instead of erasing the row.
+  chapterId  String?
+  /// PDF editions — 1-based page the reader was last on.
+  pageNumber Int?
+  /// The section the reader was last in, when the reader knows it. SetNull
+  /// like chapterId.
+  sectionId  String?
+  progress   Float    @default(0) // percent 0-100
+  updatedAt  DateTime @updatedAt
+
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  edition BookEdition  @relation(fields: [editionId], references: [id], onDelete: Cascade)
+  chapter BookChapter? @relation(fields: [chapterId], references: [id], onDelete: SetNull)
+  section BookSection? @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, editionId])
+  @@index([editionId])
+  @@map("book_reading_progress")
 }
 
 // ---------------------------------------------------------------------------
@@ -931,12 +1288,14 @@ model PaymentMethodType {
 /// every SUBSCRIPTION-access-type title. Disabling a plan (isActive=false)
 /// hides it from new subscribers without affecting anyone already on it.
 model SubscriptionPlan {
-  id        String   @id @default(uuid())
-  name      String
-  price     Decimal  @db.Decimal(12, 2)
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id           String   @id @default(uuid())
+  name         String
+  price        Decimal  @db.Decimal(12, 2)
+  /// Length of one purchase in days; renewals stack this onto the current expiry.
+  durationDays Int      @default(30)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
   subscriptions UserSubscription[]
 
@@ -1021,19 +1380,21 @@ model Notification {
 //     body field a caller could forge.
 // ---------------------------------------------------------------------------
 
-/// A user's comment on a movie or a series, with at most one level of
-/// replies (a reply's own `parentId` is always null — enforced in the
+/// A user's comment on a movie, a series or a book, with at most one level
+/// of replies (a reply's own `parentId` is always null — enforced in the
 /// service, since the schema cannot express depth).
 ///
-/// EXACTLY ONE of `movieId` / `seriesId` is non-null. Postgres cannot express
-/// that as a column constraint through Prisma, so CommentsService validates
-/// it on write and every read filters on the one that is set. A reply
-/// inherits its parent's target and carries the same one.
+/// EXACTLY ONE of `movieId` / `seriesId` / `bookId` is non-null. Postgres
+/// cannot express that as a column constraint through Prisma, so
+/// CommentsService validates it on write and every read filters on the one
+/// that is set. A reply inherits its parent's target and carries the same one.
 model Comment {
   id       String        @id @default(uuid())
   userId   String
   movieId  String?
   seriesId String?
+  /// Exactly one of movieId / seriesId / bookId — enforced in CommentsService.
+  bookId   String?
   /// Null for a top-level comment; the comment being replied to otherwise.
   parentId String?
   body     String
@@ -1047,11 +1408,13 @@ model Comment {
   user    User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   movie   Movie?    @relation(fields: [movieId], references: [id], onDelete: Cascade)
   series  Series?   @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  book    Book?     @relation(fields: [bookId], references: [id], onDelete: Cascade)
   parent  Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
   replies Comment[] @relation("CommentReplies")
 
   @@index([movieId])
   @@index([seriesId])
+  @@index([bookId])
   @@index([userId])
   @@index([parentId])
   @@index([createdAt])
@@ -1189,4 +1552,28 @@ model UserSession {
   @@index([lastSeenAt])
   @@index([ipAddress])
   @@map("user_sessions")
+}
+
+/// One rung of the deposit-based membership ladder. The user's level is
+/// NEVER stored — it is resolved at read time from SUM(APPROVED deposits)
+/// against these thresholds (see LevelsService.getUserLevelStatus), so a
+/// threshold edit here re-ranks every user by definition.
+model UserLevel {
+  id        String   @id @default(uuid())
+  name      String
+  /// Qualifying lifetime deposit total (Ks) required to hold this level.
+  threshold Decimal  @db.Decimal(12, 2)
+  /// One key from the closed LEVEL_BADGE_ICONS set (levels module) — a glyph
+  /// name the frontends draw as inline SVG, never a URL or upload.
+  icon      String
+  /// #RRGGBB badge tint; light/dark gradient shades are derived client-side.
+  color     String
+  /// Display position in the ladder and admin list. Resolution math sorts by
+  /// threshold, not this — order is presentation only.
+  order     Int
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("user_levels")
 }

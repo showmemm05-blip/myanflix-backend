@@ -23,6 +23,12 @@ export interface CreateUserInput {
   role?: Role;
   /** Granular RBAC assignment; omitted means "fall back to the system role matching `role`". */
   appRoleId?: string;
+  /** Set only by "Continue with Google": the verified, lower-cased Google e-mail. */
+  email?: string;
+  /** Set only by "Continue with Google": the ID token's stable `sub` claim. */
+  googleId?: string;
+  /** Initial cosmetic name (Google sign-in seeds it from the token's `name`). */
+  displayName?: string;
 }
 
 /**
@@ -105,6 +111,24 @@ export class UsersService {
     return this.prisma.user.findUnique({ where: { phone } });
   }
 
+  /** Expects an already lower-cased email (GoogleAuthService normalizes it). */
+  async findByEmail(email: string): Promise<User | null> {
+    return this.prisma.user.findUnique({ where: { email } });
+  }
+
+  async findByGoogleId(googleId: string): Promise<User | null> {
+    return this.prisma.user.findUnique({ where: { googleId } });
+  }
+
+  /**
+   * Attaches a Google account to an existing row. Only GoogleAuthService
+   * calls this, and only after it has verified the token AND checked the
+   * row's e-mail matches — never from a user-facing endpoint.
+   */
+  async linkGoogleId(id: string, googleId: string): Promise<User> {
+    return this.prisma.user.update({ where: { id }, data: { googleId } });
+  }
+
   async findById(id: string): Promise<User | null> {
     return this.prisma.user.findUnique({ where: { id } });
   }
@@ -115,9 +139,7 @@ export class UsersService {
     return user;
   }
 
-  async findAll(
-    pagination: PaginationQueryDto & { search?: string },
-  ): Promise<{
+  async findAll(pagination: PaginationQueryDto & { search?: string }): Promise<{
     items: User[];
     total: number;
     walletByUserId: Map<string, WalletSummary>;

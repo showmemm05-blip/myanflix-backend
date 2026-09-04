@@ -1,6 +1,12 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { NotFoundException } from '@nestjs/common';
-import { SeriesService } from './series.service';
+import {
+  SeriesService,
+  buildSeriesWhere,
+  seriesOrderBy,
+  seriesSearchOr,
+} from './series.service';
+import { SeriesSort } from './dto/series-query.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import {
@@ -13,7 +19,7 @@ import {
 describe('SeriesService', () => {
   let service: SeriesService;
   let prisma: {
-    series: { findUnique: jest.Mock; create: jest.Mock; update: jest.Mock; delete: jest.Mock; findMany: jest.Mock; count: jest.Mock };
+    series: { findUnique: jest.Mock; create: jest.Mock; update: jest.Mock; delete: jest.Mock; findMany: jest.Mock; count: jest.Mock; groupBy: jest.Mock; aggregate: jest.Mock };
     movie: { groupBy: jest.Mock; findMany: jest.Mock; count: jest.Mock };
     seriesPurchase: { findMany: jest.Mock };
     watchHistory: { findMany: jest.Mock };
@@ -56,6 +62,11 @@ describe('SeriesService', () => {
         delete: jest.fn(),
         findMany: jest.fn(),
         count: jest.fn(),
+        groupBy: jest.fn().mockResolvedValue([]),
+        aggregate: jest.fn().mockResolvedValue({
+          _min: { releaseYear: null },
+          _max: { releaseYear: null },
+        }),
       },
       movie: { groupBy: jest.fn(), findMany: jest.fn(), count: jest.fn() },
       seriesPurchase: { findMany: jest.fn() },
@@ -135,6 +146,57 @@ describe('SeriesService', () => {
         { episodeNumber: 'asc' },
         { createdAt: 'asc' },
       ]);
+    });
+
+    /**
+     * MovieResponseDto renders an UNLOADED relation as `[]`, which the admin's
+     * edit dialog cannot tell apart from "this episode genuinely has no cast"
+     * — so it seeds its form with the empty list and saves it straight back as
+     * a deliberate deletion. Forgetting an include here therefore silently
+     * wipes an episode's cast and categories on the next unrelated edit, which
+     * is exactly what happened before CATALOG_INCLUDE was shared.
+     */
+    it('loads every relation a movie response carries, so an edit cannot wipe it', async () => {
+      prisma.series.findUnique.mockResolvedValue({ id: 'series-1' });
+      prisma.movie.findMany.mockResolvedValue([]);
+
+      await service.getEpisodes('series-1', Role.ADMIN);
+
+      expect(prisma.movie.findMany.mock.calls[0][0].include).toMatchObject({
+        categories: true,
+        actors: true,
+      });
+    });
+  });
+
+  describe('findEpisodesForAdmin', () => {
+    /**
+     * The companion to getEpisodes' relation test, and the query the bug
+     * actually bit: this one was missing BOTH actors and categories, so the
+     * Series > Ready to Publish screen handed the edit dialog an episode with
+     * neither, and the next save wrote that emptiness back.
+     */
+    it('loads every relation a movie response carries, so an edit cannot wipe it', async () => {
+      prisma.movie.findMany.mockResolvedValue([]);
+      prisma.movie.count.mockResolvedValue(0);
+
+      await service.findEpisodesForAdmin({});
+
+      expect(prisma.movie.findMany.mock.calls[0][0].include).toMatchObject({
+        categories: true,
+        actors: true,
+      });
+    });
+
+    it('still carries the parent show, which is what the queue lists episodes under', async () => {
+      prisma.movie.findMany.mockResolvedValue([]);
+      prisma.movie.count.mockResolvedValue(0);
+
+      await service.findEpisodesForAdmin({});
+
+      expect(prisma.movie.findMany.mock.calls[0][0].include.series).toEqual({
+        select: { id: true, title: true },
+      });
     });
   });
 
@@ -397,6 +459,128 @@ describe('SeriesService', () => {
     });
   });
 
+  describe('findAll — canonical filter params & sort subset', () => {
+    beforeEach(() => {
+      prisma.series.findMany.mockResolvedValue([]);
+      prisma.series.count.mockResolvedValue(0);
+    });
+
+    const findManyArgs = () =>
+      prisma.series.findMany.mock.calls[0][0] as Record<string, unknown>;
+
+    it('defaults to recentlyAdded with a deterministic id tiebreak', async () => {
+      await service.findAll({}, Role.USER);
+      expect(findManyArgs().orderBy).toEqual([
+        { createdAt: 'desc' },
+        { id: 'desc' },
+      ]);
+    });
+
+    it.each([
+      [SeriesSort.NEWEST, [{ releaseYear: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }]],
+      [SeriesSort.OLDEST, [{ releaseYear: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }]],
+      [SeriesSort.TITLE, [{ title: 'asc' }, { id: 'asc' }]],
+    ] as const)('maps sort %s', async (sort, expected) => {
+      await service.findAll({ sort }, Role.USER);
+      expect(findManyArgs().orderBy).toEqual(expected);
+    });
+
+    it('search ORs title+description on plain sorts', async () => {
+      await service.findAll({ search: 'thrones' }, Role.USER);
+      const where = findManyArgs().where as { OR: unknown };
+      expect(where.OR).toEqual([
+        { title: { contains: 'thrones', mode: 'insensitive' } },
+        { description: { contains: 'thrones', mode: 'insensitive' } },
+      ]);
+    });
+
+    it('relevance without a term falls back to the default sort', async () => {
+      await service.findAll({ sort: SeriesSort.RELEVANCE }, Role.USER);
+      expect(findManyArgs().orderBy).toEqual([
+        { createdAt: 'desc' },
+        { id: 'desc' },
+      ]);
+    });
+
+    it('relevance with a term takes the two-tier path: total = count1 + count2, tiers disjoint', async () => {
+      prisma.series.count
+        .mockResolvedValueOnce(2)
+        .mockResolvedValueOnce(1);
+      prisma.series.findMany.mockResolvedValue([]);
+
+      const result = await service.findAll(
+        { search: 'thrones', sort: SeriesSort.RELEVANCE },
+        Role.USER,
+      );
+
+      expect(result.total).toBe(3);
+      const titleCond = { title: { contains: 'thrones', mode: 'insensitive' } };
+      const [tier1Call, tier2Call] = prisma.series.count.mock.calls;
+      expect(tier1Call[0].where.AND).toContainEqual(titleCond);
+      expect(tier2Call[0].where.AND).toContainEqual({ NOT: titleCond });
+    });
+
+    it('USER forcing to PUBLISHED survives every new param', async () => {
+      await service.findAll(
+        {
+          status: SeriesStatus.DRAFT,
+          genres: ['Drama'],
+          languages: ['Burmese', 'English'],
+          yearFrom: 2000,
+          yearTo: 2020,
+          search: 'a',
+        },
+        Role.USER,
+      );
+      const where = findManyArgs().where as Record<string, unknown>;
+      expect(where.status).toBe(SeriesStatus.PUBLISHED);
+    });
+  });
+
+  describe('getFacets', () => {
+    beforeEach(() => {
+      prisma.series.groupBy.mockImplementation(({ by }: { by: string[] }) =>
+        Promise.resolve(
+          by[0] === 'genre'
+            ? [
+                { genre: 'Drama', _count: 1 },
+                { genre: 'Action', _count: 2 },
+              ]
+            : [{ language: 'Burmese', _count: 3 }],
+        ),
+      );
+      prisma.series.aggregate.mockResolvedValue({
+        _min: { releaseYear: 2015 },
+        _max: { releaseYear: 2026 },
+      });
+    });
+
+    it('reports genres/languages/years over PUBLISHED series, count-desc', async () => {
+      const facets = await service.getFacets();
+
+      expect(facets).toEqual({
+        genres: [
+          { value: 'Action', count: 2 },
+          { value: 'Drama', count: 1 },
+        ],
+        languages: [{ value: 'Burmese', count: 3 }],
+        years: { min: 2015, max: 2026 },
+      });
+      for (const call of prisma.series.groupBy.mock.calls) {
+        expect(call[0].where).toEqual({ status: SeriesStatus.PUBLISHED });
+      }
+    });
+
+    it('caches for 60s — a second call within the TTL never hits prisma again', async () => {
+      await service.getFacets();
+      const calls = prisma.series.groupBy.mock.calls.length;
+
+      await service.getFacets();
+
+      expect(prisma.series.groupBy.mock.calls.length).toBe(calls);
+    });
+  });
+
   describe('updateStatus', () => {
     it('throws NotFoundException for an unknown series', async () => {
       prisma.series.findUnique.mockResolvedValue(null);
@@ -617,5 +801,53 @@ describe('SeriesService', () => {
       const result = await service.getPlayerEpisodes('series-1', 'admin-1', Role.SUPER_ADMIN);
       expect(result.seasons).toEqual([]);
     });
+  });
+});
+
+/** The pure series where-builder — the movie builder's subset, same rules. */
+describe('buildSeriesWhere', () => {
+  it('single genre keeps equals-insensitive; 2+ use exact in', () => {
+    expect(buildSeriesWhere({ genres: ['drama'] }, Role.USER).genre).toEqual({
+      equals: 'drama',
+      mode: 'insensitive',
+    });
+    expect(
+      buildSeriesWhere({ genres: ['Drama', 'Action'] }, Role.USER).genre,
+    ).toEqual({ in: ['Drama', 'Action'] });
+  });
+
+  it('swapped year bounds are normalized', () => {
+    expect(
+      buildSeriesWhere({ yearFrom: 2020, yearTo: 2000 }, Role.USER).releaseYear,
+    ).toEqual({ gte: 2000, lte: 2020 });
+  });
+
+  it('USER is forced to PUBLISHED; staff keep their status filter', () => {
+    expect(
+      buildSeriesWhere({ status: SeriesStatus.DRAFT }, Role.USER).status,
+    ).toBe(SeriesStatus.PUBLISHED);
+    expect(
+      buildSeriesWhere({ status: SeriesStatus.DRAFT }, Role.ADMIN).status,
+    ).toBe(SeriesStatus.DRAFT);
+  });
+
+  it('never includes the search term — the caller applies it (OR vs relevance tiers)', () => {
+    const where = buildSeriesWhere({ search: 'thrones' }, Role.USER);
+    expect(where.OR).toBeUndefined();
+    expect(seriesSearchOr('thrones')).toHaveLength(2);
+  });
+});
+
+describe('seriesOrderBy', () => {
+  it('every chain ends in id for deterministic pagination', () => {
+    for (const sort of [
+      SeriesSort.RECENTLY_ADDED,
+      SeriesSort.NEWEST,
+      SeriesSort.OLDEST,
+      SeriesSort.TITLE,
+    ] as const) {
+      const chain = seriesOrderBy(sort);
+      expect(Object.keys(chain[chain.length - 1])).toEqual(['id']);
+    }
   });
 });

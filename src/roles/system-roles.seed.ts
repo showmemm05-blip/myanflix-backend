@@ -49,6 +49,14 @@ export const SYSTEM_ROLE_SEEDS: SystemRoleSeed[] = [
       'SERIES.DELETE',
       'SERIES.PUBLISH',
       'SERIES.UNPUBLISH',
+      // Added by the `add_books` migration, which INSERTs exactly these six
+      // rows for this role — books are content, and content is Admin's.
+      'BOOKS.VIEW',
+      'BOOKS.CREATE',
+      'BOOKS.EDIT',
+      'BOOKS.DELETE',
+      'BOOKS.PUBLISH',
+      'BOOKS.UNPUBLISH',
       'MEDIA.VIEW',
       'MEDIA.UPLOAD',
       'MEDIA.DELETE',
@@ -56,6 +64,13 @@ export const SYSTEM_ROLE_SEEDS: SystemRoleSeed[] = [
       'CATEGORIES.CREATE',
       'CATEGORIES.EDIT',
       'CATEGORIES.DELETE',
+      // Added by the `add_actors` migration, which INSERTs exactly these
+      // four rows for this role — the cast list is catalog metadata, and
+      // catalog metadata is Admin's.
+      'ACTORS.VIEW',
+      'ACTORS.CREATE',
+      'ACTORS.EDIT',
+      'ACTORS.DELETE',
       'DEPOSITS.VIEW',
       'DEPOSITS.APPROVE',
       'DEPOSITS.REJECT',
@@ -95,11 +110,24 @@ export const SYSTEM_ROLE_SEEDS: SystemRoleSeed[] = [
       'SERIES.DELETE',
       'SERIES.PUBLISH',
       'SERIES.UNPUBLISH',
+      // Added by the `add_books` migration — mirrors this role's movie
+      // grants: ingest and publish, but no delete.
+      'BOOKS.VIEW',
+      'BOOKS.CREATE',
+      'BOOKS.EDIT',
+      'BOOKS.PUBLISH',
+      'BOOKS.UNPUBLISH',
       'MEDIA.VIEW',
       'MEDIA.UPLOAD',
       'MEDIA.DELETE',
       'CATEGORIES.CREATE',
       'CATEGORIES.EDIT',
+      // Added by the `add_actors` migration — this role tags the cast while
+      // ingesting a film, but removing a person from the catalogue entirely
+      // is not its job.
+      'ACTORS.VIEW',
+      'ACTORS.CREATE',
+      'ACTORS.EDIT',
     ],
   },
   {

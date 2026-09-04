@@ -1,5 +1,6 @@
 import type { Role, User, UserStatus } from '../../generated/prisma/client';
 import type { WalletSummary } from '../users.service';
+import type { LevelDto } from '../../levels/levels.service';
 
 export class UserResponseDto {
   id: string;
@@ -33,6 +34,13 @@ export class UserResponseDto {
   totalSpent?: number;
   isSubscribed?: boolean;
   subscriptionExpiresAt?: Date | null;
+  /**
+   * Resolved membership level — ADDITIVE, populated only on the admin list
+   * (GET /users), where the table renders the level icon per row. Null when
+   * no enabled level qualifies; absent everywhere else (the detail page
+   * uses GET /users/:id/level for the full status instead).
+   */
+  level?: LevelDto | null;
 
   static fromEntity(
     user: User,

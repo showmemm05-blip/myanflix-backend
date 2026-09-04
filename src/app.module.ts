@@ -12,6 +12,10 @@ import { UsersModule } from './users/users.module';
 import { RolesModule } from './roles/roles.module';
 import { StaffModule } from './staff/staff.module';
 import { CategoriesModule } from './categories/categories.module';
+import { ActorsModule } from './actors/actors.module';
+import { BookCategoriesModule } from './book-categories/book-categories.module';
+import { BookAuthorsModule } from './book-authors/book-authors.module';
+import { BooksModule } from './books/books.module';
 import { MoviesModule } from './movies/movies.module';
 import { VideosModule } from './videos/videos.module';
 import { UploadsModule } from './uploads/uploads.module';
@@ -34,6 +38,7 @@ import { TrackingModule } from './tracking/tracking.module';
 import { TrackingReadModule } from './tracking/tracking-read.module';
 import { CommentsModule } from './comments/comments.module';
 import { FeedbackModule } from './feedback/feedback.module';
+import { LevelsModule } from './levels/levels.module';
 
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
@@ -54,6 +59,7 @@ import { AppService } from './app.service';
     RolesModule,
     StaffModule,
     CategoriesModule,
+    ActorsModule,
     MoviesModule,
     VideosModule,
     UploadsModule,
@@ -68,6 +74,9 @@ import { AppService } from './app.service';
     RealtimeModule,
     SubtitlesModule,
     SeriesModule,
+    BooksModule,
+    BookCategoriesModule,
+    BookAuthorsModule,
     SubscriptionsModule,
     PaymentAccountsModule,
     FinanceSettingsModule,
@@ -76,6 +85,7 @@ import { AppService } from './app.service';
     TrackingReadModule,
     CommentsModule,
     FeedbackModule,
+    LevelsModule,
   ],
   controllers: [AppController],
   providers: [

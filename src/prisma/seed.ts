@@ -20,8 +20,6 @@ import {
   AccessType,
 } from '../generated/prisma/client';
 
-const SUBSCRIPTION_DURATION_DAYS = 30;
-
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
 
@@ -409,13 +407,18 @@ async function seedMovies(categoriesByName: Map<string, { id: string }>) {
 async function seedSubscriptionPlans() {
   const plans = await Promise.all([
     prisma.subscriptionPlan.create({
-      data: { name: 'Basic', price: 5000, isActive: true },
+      data: { name: 'Basic', price: 5000, durationDays: 30, isActive: true },
     }),
     prisma.subscriptionPlan.create({
-      data: { name: 'Premium', price: 9000, isActive: true },
+      data: { name: 'Premium', price: 9000, durationDays: 30, isActive: true },
     }),
     prisma.subscriptionPlan.create({
-      data: { name: 'Family (retired)', price: 12000, isActive: false },
+      data: {
+        name: 'Family (retired)',
+        price: 12000,
+        durationDays: 90,
+        isActive: false,
+      },
     }),
   ]);
   return plans;
@@ -436,7 +439,7 @@ async function seedCommerceAndHistory(
     status: MovieStatus;
     duration: number;
   }[],
-  plans: { id: string; price: Prisma.Decimal }[],
+  plans: { id: string; price: Prisma.Decimal; durationDays: number }[],
 ) {
   const subscriptionPublished = movies.filter(
     (m) =>
@@ -528,7 +531,7 @@ async function seedCommerceAndHistory(
     if (!isHistoricalBuyer) {
       const startedAt = daysAgo(5 + (index % 10));
       const expiresAt = new Date(
-        startedAt.getTime() + SUBSCRIPTION_DURATION_DAYS * 24 * 60 * 60 * 1000,
+        startedAt.getTime() + plan.durationDays * 24 * 60 * 60 * 1000,
       );
       await prisma.userSubscription.create({
         data: {

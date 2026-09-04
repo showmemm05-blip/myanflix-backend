@@ -8,14 +8,124 @@ import {
   type Series,
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  CATALOG_INCLUDE,
+  toFacetValues,
+  type FacetValue,
+} from '../movies/movies.service';
 import { MinioService } from '../common/storage/minio.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
+import { computeTwoTierSlice } from '../common/utils/two-tier-page.util';
 import type { CreateSeriesDto } from './dto/create-series.dto';
 import type { EpisodeQueryDto } from './dto/episode-query.dto';
-import type { SeriesQueryDto } from './dto/series-query.dto';
 import type { UpdateSeriesDto } from './dto/update-series.dto';
+import { SeriesSort, type SeriesQueryDto } from './dto/series-query.dto';
 
 type SeriesWithCategories = Series & { categories?: Category[] };
+
+export interface SeriesFacets {
+  genres: FacetValue[];
+  languages: FacetValue[];
+  years: { min: number; max: number } | null;
+}
+
+const FACETS_TTL_MS = 60_000;
+
+/** Same 1-vs-many rule as the movies catalog — see buildMovieWhere. */
+function facetStringFilter(
+  values: string[],
+): { equals: string; mode: 'insensitive' } | { in: string[] } | undefined {
+  if (values.length === 0) return undefined;
+  if (values.length === 1) return { equals: values[0], mode: 'insensitive' };
+  return { in: values };
+}
+
+/**
+ * The series `where` from the canonical query — everything except the
+ * search term (the relevance sort splits it into tiers; other sorts OR it
+ * in whole). Exported pure for the spec. Same facet semantics as the
+ * movies catalog: OR within a facet, AND across facets.
+ */
+export function buildSeriesWhere(
+  query: SeriesQueryDto,
+  viewerRole: Role,
+): Prisma.SeriesWhereInput {
+  const where: Prisma.SeriesWhereInput = {};
+  if (query.accessType) where.accessType = query.accessType;
+
+  // Regular users can only ever browse PUBLISHED series — any status
+  // filter they pass is ignored, not honored. Staff see everything by
+  // default and may narrow to one status.
+  if (viewerRole === Role.USER) {
+    where.status = SeriesStatus.PUBLISHED;
+  } else if (query.status) {
+    where.status = query.status;
+  }
+
+  const genreFilter = facetStringFilter(query.genres ?? []);
+  if (genreFilter) where.genre = genreFilter;
+
+  const languageFilter = facetStringFilter(query.languages ?? []);
+  if (languageFilter) where.language = languageFilter;
+
+  let { yearFrom, yearTo } = query;
+  if (yearFrom !== undefined && yearTo !== undefined && yearFrom > yearTo) {
+    [yearFrom, yearTo] = [yearTo, yearFrom];
+  }
+  if (yearFrom !== undefined || yearTo !== undefined) {
+    where.releaseYear = {
+      ...(yearFrom !== undefined ? { gte: yearFrom } : {}),
+      ...(yearTo !== undefined ? { lte: yearTo } : {}),
+    };
+  }
+
+  return where;
+}
+
+/** The series search predicate — title OR description, case-insensitive. */
+export function seriesSearchOr(search: string): Prisma.SeriesWhereInput[] {
+  return [
+    { title: { contains: search, mode: 'insensitive' } },
+    { description: { contains: search, mode: 'insensitive' } },
+  ];
+}
+
+/**
+ * orderBy for the plain series sorts (the subset — see SeriesSort). Every
+ * chain ends in `id` so pagination is deterministic across equal keys.
+ */
+const SERIES_SORT_ORDER_BY = {
+  [SeriesSort.RECENTLY_ADDED]: [{ createdAt: 'desc' }, { id: 'desc' }],
+  [SeriesSort.NEWEST]: [
+    { releaseYear: 'desc' },
+    { createdAt: 'desc' },
+    { id: 'desc' },
+  ],
+  [SeriesSort.OLDEST]: [
+    { releaseYear: 'asc' },
+    { createdAt: 'asc' },
+    { id: 'asc' },
+  ],
+  [SeriesSort.TITLE]: [{ title: 'asc' }, { id: 'asc' }],
+} as const satisfies Partial<
+  Record<SeriesSort, Prisma.SeriesOrderByWithRelationInput[]>
+>;
+
+export function seriesOrderBy(
+  sort: keyof typeof SERIES_SORT_ORDER_BY,
+): Prisma.SeriesOrderByWithRelationInput[] {
+  return [...SERIES_SORT_ORDER_BY[sort]];
+}
+
+/** The list-row include — categories plus the derived episode count. */
+const SERIES_LIST_INCLUDE = {
+  categories: true,
+  _count: { select: { episodes: true } },
+} satisfies Prisma.SeriesInclude;
+
+type SeriesListRow = Prisma.SeriesGetPayload<{
+  include: typeof SERIES_LIST_INCLUDE;
+}>;
 
 export interface SeriesRemovalResult {
   deletedEpisodes: number;
@@ -59,29 +169,40 @@ export class SeriesService {
   async findAll(query: SeriesQueryDto, viewerRole: Role) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
+    const search = query.search?.trim() || undefined;
 
-    const where: Prisma.SeriesWhereInput = {};
-    if (query.accessType) where.accessType = query.accessType;
-
-    // Regular users can only ever browse PUBLISHED series — any status
-    // filter they pass is ignored, not honored. Staff see everything by
-    // default and may narrow to one status.
-    if (viewerRole === Role.USER) {
-      where.status = SeriesStatus.PUBLISHED;
-    } else if (query.status) {
-      where.status = query.status;
+    // Relevance needs a term — a stale deep link without one falls back to
+    // the default sort, same rule as the movies catalog.
+    let sort = query.sort ?? SeriesSort.RECENTLY_ADDED;
+    if (sort === SeriesSort.RELEVANCE && !search) {
+      sort = SeriesSort.RECENTLY_ADDED;
     }
 
-    const [items, total] = await this.prisma.$transaction([
-      this.prisma.series.findMany({
+    const where = buildSeriesWhere(query, viewerRole);
+
+    let items: SeriesListRow[];
+    let total: number;
+
+    if (sort === SeriesSort.RELEVANCE) {
+      ({ items, total } = await this.findRelevancePage(
         where,
-        orderBy: { createdAt: 'desc' },
-        skip: (page - 1) * limit,
-        take: limit,
-        include: { categories: true, _count: { select: { episodes: true } } },
-      }),
-      this.prisma.series.count({ where }),
-    ]);
+        search!,
+        page,
+        limit,
+      ));
+    } else {
+      if (search) where.OR = seriesSearchOr(search);
+      [items, total] = await this.prisma.$transaction([
+        this.prisma.series.findMany({
+          where,
+          orderBy: seriesOrderBy(sort),
+          skip: (page - 1) * limit,
+          take: limit,
+          include: SERIES_LIST_INCLUDE,
+        }),
+        this.prisma.series.count({ where }),
+      ]);
+    }
 
     return {
       items: items.map(({ _count, ...series }) => ({
@@ -92,6 +213,120 @@ export class SeriesService {
       page,
       limit,
     };
+  }
+
+  /**
+   * Two-tier relevance page for series — same deterministic title-first
+   * ranking as MoviesService.findRelevancePage (tiers disjoint, total =
+   * count1 + count2, page spliced via computeTwoTierSlice).
+   */
+  private async findRelevancePage(
+    base: Prisma.SeriesWhereInput,
+    search: string,
+    page: number,
+    limit: number,
+  ): Promise<{ items: SeriesListRow[]; total: number }> {
+    const titleMatch: Prisma.SeriesWhereInput = {
+      title: { contains: search, mode: 'insensitive' },
+    };
+    const descriptionMatch: Prisma.SeriesWhereInput = {
+      description: { contains: search, mode: 'insensitive' },
+    };
+    const tier1: Prisma.SeriesWhereInput = { AND: [base, titleMatch] };
+    const tier2: Prisma.SeriesWhereInput = {
+      AND: [base, descriptionMatch, { NOT: titleMatch }],
+    };
+
+    const [count1, count2] = await this.prisma.$transaction([
+      this.prisma.series.count({ where: tier1 }),
+      this.prisma.series.count({ where: tier2 }),
+    ]);
+    const total = count1 + count2;
+
+    const { skip1, take1, skip2, take2 } = computeTwoTierSlice(
+      (page - 1) * limit,
+      limit,
+      count1,
+    );
+    const orderBy: Prisma.SeriesOrderByWithRelationInput[] = [
+      { createdAt: 'desc' },
+      { id: 'desc' },
+    ];
+
+    const [tier1Page, tier2Page] = await Promise.all([
+      take1 > 0
+        ? this.prisma.series.findMany({
+            where: tier1,
+            include: SERIES_LIST_INCLUDE,
+            orderBy,
+            skip: skip1,
+            take: take1,
+          })
+        : Promise.resolve([] as SeriesListRow[]),
+      take2 > 0
+        ? this.prisma.series.findMany({
+            where: tier2,
+            include: SERIES_LIST_INCLUDE,
+            orderBy,
+            skip: skip2,
+            take: take2,
+          })
+        : Promise.resolve([] as SeriesListRow[]),
+    ]);
+
+    return { items: tier1Page.concat(tier2Page), total };
+  }
+
+  private facetsCache: { data: SeriesFacets; expiresAt: number } | null = null;
+
+  /**
+   * DB-derived filter options over PUBLISHED series — the series mirror of
+   * MoviesService.getFacets (same public-set rule, same 60s in-memory TTL,
+   * same "admin edits surface within a minute" trade-off). Series carry no
+   * director/country/ageRating columns in v1, so those facets simply do not
+   * exist here.
+   */
+  async getFacets(): Promise<SeriesFacets> {
+    const now = Date.now();
+    if (this.facetsCache && this.facetsCache.expiresAt > now) {
+      return this.facetsCache.data;
+    }
+
+    const where: Prisma.SeriesWhereInput = { status: SeriesStatus.PUBLISHED };
+
+    // Same `_count: true` + explicit orderBy shape as the movies facets —
+    // display order comes from toFacetValues.
+    const [genres, languages, years] = await this.prisma.$transaction([
+      this.prisma.series.groupBy({
+        by: ['genre'],
+        where,
+        _count: true,
+        orderBy: { genre: 'asc' },
+      }),
+      this.prisma.series.groupBy({
+        by: ['language'],
+        where,
+        _count: true,
+        orderBy: { language: 'asc' },
+      }),
+      this.prisma.series.aggregate({
+        where,
+        _min: { releaseYear: true },
+        _max: { releaseYear: true },
+      }),
+    ]);
+
+    const data: SeriesFacets = {
+      genres: toFacetValues(genres.map((g) => [g.genre, g._count])),
+      languages: toFacetValues(languages.map((g) => [g.language, g._count])),
+      years:
+        years._min.releaseYear == null || years._max.releaseYear == null
+          ? null
+          : { min: years._min.releaseYear, max: years._max.releaseYear },
+    };
+
+    this.facetsCache = { data, expiresAt: now + FACETS_TTL_MS };
+    return data;
   }
 
   async findByIdOrThrow(id: string): Promise<SeriesWithCategories> {
@@ -114,10 +349,7 @@ export class SeriesService {
     viewerRole: Role,
   ): Promise<SeriesWithCategories> {
     const series = await this.findByIdOrThrow(id);
-    if (
-      viewerRole === Role.USER &&
-      series.status !== SeriesStatus.PUBLISHED
-    ) {
+    if (viewerRole === Role.USER && series.status !== SeriesStatus.PUBLISHED) {
       throw new NotFoundException('Series not found');
     }
     return series;
@@ -134,9 +366,9 @@ export class SeriesService {
    * touched, so without this a row would inherit whichever host that one save
    * request happened to arrive on.
    */
-  private withCanonicalImageUrls<T extends { posterUrl?: string | null; coverUrl?: string | null }>(
-    data: T,
-  ): T {
+  private withCanonicalImageUrls<
+    T extends { posterUrl?: string | null; coverUrl?: string | null },
+  >(data: T): T {
     return {
       ...data,
       ...(data.posterUrl !== undefined
@@ -345,7 +577,7 @@ export class SeriesService {
 
     return this.prisma.movie.findMany({
       where,
-      include: { categories: true },
+      include: CATALOG_INCLUDE,
       orderBy: [
         { seasonNumber: 'asc' },
         { episodeNumber: 'asc' },
@@ -459,7 +691,10 @@ export class SeriesService {
     const [items, total] = await this.prisma.$transaction([
       this.prisma.movie.findMany({
         where,
-        include: { series: { select: { id: true, title: true } } },
+        include: {
+          ...CATALOG_INCLUDE,
+          series: { select: { id: true, title: true } },
+        },
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,

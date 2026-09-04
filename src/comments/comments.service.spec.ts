@@ -15,6 +15,7 @@ import { CommentsService, COMMENT_BODY_MAX } from './comments.service';
 const MOVIE_ID = '11111111-1111-4111-8111-111111111111';
 const SERIES_ID = '22222222-2222-4222-8222-222222222222';
 const PARENT_ID = '33333333-3333-4333-8333-333333333333';
+const BOOK_ID = '44444444-4444-4444-8444-444444444444';
 
 function makeActor(overrides: Partial<AuthenticatedUser> = {}): AuthenticatedUser {
   return {
@@ -60,6 +61,7 @@ describe('CommentsService', () => {
     };
     movie: { findUnique: jest.Mock };
     series: { findUnique: jest.Mock };
+    book: { findUnique: jest.Mock };
   };
   let resolver: { can: jest.Mock };
 
@@ -75,6 +77,7 @@ describe('CommentsService', () => {
       },
       movie: { findUnique: jest.fn().mockResolvedValue({ id: MOVIE_ID }) },
       series: { findUnique: jest.fn().mockResolvedValue({ id: SERIES_ID }) },
+      book: { findUnique: jest.fn().mockResolvedValue({ id: BOOK_ID }) },
     };
     resolver = { can: jest.fn().mockResolvedValue(false) };
 
@@ -93,7 +96,7 @@ describe('CommentsService', () => {
     service = module.get(CommentsService);
   });
 
-  describe('create — exactly one of movieId / seriesId', () => {
+  describe('create — exactly one of movieId / seriesId / bookId', () => {
     it('rejects a comment that names both a movie and a series', async () => {
       await expect(
         service.create('user-1', {
@@ -105,29 +108,91 @@ describe('CommentsService', () => {
       expect(prisma.comment.create).not.toHaveBeenCalled();
     });
 
-    it('rejects a comment that names neither', async () => {
+    it('rejects a comment that names a movie and a book', async () => {
+      await expect(
+        service.create('user-1', {
+          movieId: MOVIE_ID,
+          bookId: BOOK_ID,
+          body: 'Great',
+        }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.comment.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a comment that names a series and a book', async () => {
+      await expect(
+        service.create('user-1', {
+          seriesId: SERIES_ID,
+          bookId: BOOK_ID,
+          body: 'Great',
+        }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.comment.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a comment that names all three targets', async () => {
+      await expect(
+        service.create('user-1', {
+          movieId: MOVIE_ID,
+          seriesId: SERIES_ID,
+          bookId: BOOK_ID,
+          body: 'Great',
+        }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.comment.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a comment that names none', async () => {
       await expect(
         service.create('user-1', { body: 'Great' }),
       ).rejects.toThrow(BadRequestException);
       expect(prisma.comment.create).not.toHaveBeenCalled();
     });
 
-    it('accepts a movie comment and stores seriesId as null', async () => {
+    it('accepts a movie comment and stores seriesId / bookId as null', async () => {
       await service.create('user-1', { movieId: MOVIE_ID, body: 'Great' });
 
       expect(prisma.comment.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({ movieId: MOVIE_ID, seriesId: null }),
+          data: expect.objectContaining({
+            movieId: MOVIE_ID,
+            seriesId: null,
+            bookId: null,
+          }),
         }),
       );
     });
 
-    it('accepts a series comment and stores movieId as null', async () => {
+    it('accepts a series comment and stores movieId / bookId as null', async () => {
       await service.create('user-1', { seriesId: SERIES_ID, body: 'Great' });
 
       expect(prisma.comment.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({ movieId: null, seriesId: SERIES_ID }),
+          data: expect.objectContaining({
+            movieId: null,
+            seriesId: SERIES_ID,
+            bookId: null,
+          }),
+        }),
+      );
+    });
+
+    it('accepts a book comment and stores movieId / seriesId as null', async () => {
+      await service.create('user-1', { bookId: BOOK_ID, body: 'Great' });
+
+      expect(prisma.book.findUnique).toHaveBeenCalledWith({
+        where: { id: BOOK_ID },
+        select: { id: true },
+      });
+      expect(prisma.movie.findUnique).not.toHaveBeenCalled();
+      expect(prisma.series.findUnique).not.toHaveBeenCalled();
+      expect(prisma.comment.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            movieId: null,
+            seriesId: null,
+            bookId: BOOK_ID,
+          }),
         }),
       );
     });
@@ -146,6 +211,15 @@ describe('CommentsService', () => {
       await expect(
         service.create('user-1', { seriesId: SERIES_ID, body: 'Great' }),
       ).rejects.toThrow(NotFoundException);
+    });
+
+    it('404s when the book does not exist', async () => {
+      prisma.book.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.create('user-1', { bookId: BOOK_ID, body: 'Great' }),
+      ).rejects.toThrow(NotFoundException);
+      expect(prisma.comment.create).not.toHaveBeenCalled();
     });
   });
 
@@ -203,6 +277,7 @@ describe('CommentsService', () => {
         parentId: null,
         movieId: MOVIE_ID,
         seriesId: null,
+        bookId: null,
       });
 
       await service.create('user-1', {
@@ -218,12 +293,38 @@ describe('CommentsService', () => {
       );
     });
 
+    it('accepts a reply to a top-level comment on the same book', async () => {
+      prisma.comment.findUnique.mockResolvedValue({
+        id: PARENT_ID,
+        parentId: null,
+        movieId: null,
+        seriesId: null,
+        bookId: BOOK_ID,
+      });
+
+      await service.create('user-1', {
+        bookId: BOOK_ID,
+        parentId: PARENT_ID,
+        body: 'agreed',
+      });
+
+      expect(prisma.comment.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            parentId: PARENT_ID,
+            bookId: BOOK_ID,
+          }),
+        }),
+      );
+    });
+
     it('rejects a reply to a reply — the thread can never get three levels deep', async () => {
       prisma.comment.findUnique.mockResolvedValue({
         id: PARENT_ID,
         parentId: 'some-other-comment',
         movieId: MOVIE_ID,
         seriesId: null,
+        bookId: null,
       });
 
       await expect(
@@ -242,6 +343,7 @@ describe('CommentsService', () => {
         parentId: null,
         movieId: 'a-different-movie',
         seriesId: null,
+        bookId: null,
       });
 
       await expect(
@@ -251,6 +353,63 @@ describe('CommentsService', () => {
           body: 'agreed',
         }),
       ).rejects.toThrow(BadRequestException);
+    });
+
+    it('rejects a reply on a book whose parent is on a movie', async () => {
+      prisma.comment.findUnique.mockResolvedValue({
+        id: PARENT_ID,
+        parentId: null,
+        movieId: MOVIE_ID,
+        seriesId: null,
+        bookId: null,
+      });
+
+      await expect(
+        service.create('user-1', {
+          bookId: BOOK_ID,
+          parentId: PARENT_ID,
+          body: 'agreed',
+        }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.comment.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a reply on a movie whose parent is on a book', async () => {
+      prisma.comment.findUnique.mockResolvedValue({
+        id: PARENT_ID,
+        parentId: null,
+        movieId: null,
+        seriesId: null,
+        bookId: BOOK_ID,
+      });
+
+      await expect(
+        service.create('user-1', {
+          movieId: MOVIE_ID,
+          parentId: PARENT_ID,
+          body: 'agreed',
+        }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.comment.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a reply whose parent is on a different book', async () => {
+      prisma.comment.findUnique.mockResolvedValue({
+        id: PARENT_ID,
+        parentId: null,
+        movieId: null,
+        seriesId: null,
+        bookId: 'a-different-book',
+      });
+
+      await expect(
+        service.create('user-1', {
+          bookId: BOOK_ID,
+          parentId: PARENT_ID,
+          body: 'agreed',
+        }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.comment.create).not.toHaveBeenCalled();
     });
 
     it('404s when the parent comment does not exist', async () => {
@@ -318,13 +477,40 @@ describe('CommentsService', () => {
   });
 
   describe('findForTitle', () => {
-    it('requires exactly one of movieId / seriesId', async () => {
+    it('requires exactly one of movieId / seriesId / bookId', async () => {
       await expect(service.findForTitle({})).rejects.toThrow(
         BadRequestException,
       );
       await expect(
         service.findForTitle({ movieId: MOVIE_ID, seriesId: SERIES_ID }),
       ).rejects.toThrow(BadRequestException);
+      await expect(
+        service.findForTitle({ movieId: MOVIE_ID, bookId: BOOK_ID }),
+      ).rejects.toThrow(BadRequestException);
+      await expect(
+        service.findForTitle({
+          movieId: MOVIE_ID,
+          seriesId: SERIES_ID,
+          bookId: BOOK_ID,
+        }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.comment.findMany).not.toHaveBeenCalled();
+    });
+
+    it('reads a book thread with movieId / seriesId pinned to null', async () => {
+      await service.findForTitle({ bookId: BOOK_ID });
+
+      expect(prisma.comment.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            movieId: null,
+            seriesId: null,
+            bookId: BOOK_ID,
+            parentId: null,
+            status: CommentStatus.VISIBLE,
+          },
+        }),
+      );
     });
 
     it('reads only VISIBLE top-level comments, newest first', async () => {
@@ -335,6 +521,7 @@ describe('CommentsService', () => {
           where: {
             movieId: MOVIE_ID,
             seriesId: null,
+            bookId: null,
             parentId: null,
             status: CommentStatus.VISIBLE,
           },

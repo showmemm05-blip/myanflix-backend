@@ -1,7 +1,7 @@
 import { IsOptional, IsUUID } from 'class-validator';
 
 /**
- * Which title's comments to list. Exactly one of the two is required —
+ * Which title's comments to list. Exactly one of the three is required —
  * enforced in the service, same either/or rule as CreateCommentDto.
  *
  * Deliberately not paginated: a title's comment thread is read whole by both
@@ -17,4 +17,8 @@ export class CommentQueryDto {
   @IsOptional()
   @IsUUID('4')
   seriesId?: string;
+
+  @IsOptional()
+  @IsUUID('4')
+  bookId?: string;
 }

@@ -8,8 +8,8 @@ import {
 } from 'class-validator';
 
 /**
- * Exactly one of `movieId` / `seriesId` must be present — the DTO can only
- * check each field's own shape, so that either/or rule is enforced in
+ * Exactly one of `movieId` / `seriesId` / `bookId` must be present — the DTO
+ * can only check each field's own shape, so that either/or rule is enforced in
  * CommentsService.create (which is also where the "reply must belong to the
  * same title" check lives).
  */
@@ -21,6 +21,10 @@ export class CreateCommentDto {
   @IsOptional()
   @IsUUID('4')
   seriesId?: string;
+
+  @IsOptional()
+  @IsUUID('4')
+  bookId?: string;
 
   /** The comment being replied to. Replies are one level deep — see the service. */
   @IsOptional()

@@ -7,9 +7,9 @@ import {
 } from './permission-catalogue';
 
 describe('permission catalogue', () => {
-  it('declares 17 modules and 65 MODULE.ACTION permissions', () => {
-    expect(PERMISSION_CATALOGUE).toHaveLength(17);
-    expect(ALL_PERMISSIONS).toHaveLength(65);
+  it('declares 19 modules and 75 MODULE.ACTION permissions', () => {
+    expect(PERMISSION_CATALOGUE).toHaveLength(19);
+    expect(ALL_PERMISSIONS).toHaveLength(75);
   });
 
   it('generates every permission as MODULE.ACTION with no duplicates', () => {
@@ -30,7 +30,7 @@ describe('permission catalogue', () => {
     });
 
     it('rejects an unknown module, an unknown action and the old bundled names', () => {
-      expect(isPermission('BOOKS.VIEW')).toBe(false);
+      expect(isPermission('PODCASTS.VIEW')).toBe(false);
       expect(isPermission('MOVIES.ARCHIVE')).toBe(false);
       expect(isPermission('MOVIE_CREATE')).toBe(false);
     });

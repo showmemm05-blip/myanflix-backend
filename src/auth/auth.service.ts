@@ -9,6 +9,7 @@ import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import type { StringValue } from 'ms';
 import { createHash, randomUUID } from 'node:crypto';
+import type { User } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import { OtpService } from '../otp/otp.service';
@@ -177,6 +178,32 @@ export class AuthService {
     const tokens = await this.issueTokens(authenticatedUser);
     // Same session bookkeeping as password login — this is the sign-in path
     // both the website and the mobile app actually use.
+    this.trackingService.fireAndForget(
+      'session start',
+      this.trackingService.startSession(user.id),
+    );
+    return { user: authenticatedUser, ...tokens };
+  }
+
+  /**
+   * The tail every sign-in shares: the ACTIVE gate, the token pair, the
+   * session row. Public so Google sign-in (GoogleAuthService) ends exactly
+   * the way a phone OTP sign-in does. verifyPhoneOtp above deliberately
+   * keeps its own inline copy — that path is frozen by design.
+   */
+  async completeSignIn(
+    user: User,
+  ): Promise<{ user: AuthenticatedUser } & AuthTokens> {
+    if (user.status !== 'ACTIVE') {
+      throw new UnauthorizedException('This account is no longer active');
+    }
+    const authenticatedUser: AuthenticatedUser = {
+      id: user.id,
+      username: user.username,
+      role: user.role,
+      appRoleId: user.appRoleId,
+    };
+    const tokens = await this.issueTokens(authenticatedUser);
     this.trackingService.fireAndForget(
       'session start',
       this.trackingService.startSession(user.id),

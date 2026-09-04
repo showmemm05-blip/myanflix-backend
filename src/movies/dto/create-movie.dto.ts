@@ -13,7 +13,7 @@ import {
   MinLength,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { AccessType } from '../../generated/prisma/client';
+import { AccessType, AgeRating } from '../../generated/prisma/client';
 
 export class CreateMovieDto {
   @IsString()
@@ -63,9 +63,36 @@ export class CreateMovieDto {
   @IsEnum(AccessType)
   accessType?: AccessType = AccessType.SUBSCRIPTION;
 
+  /**
+   * Optional filter metadata (2026-09). The service maps an empty string to
+   * null on create/update so the admin can clear a value by blanking the
+   * field; UpdateMovieDto inherits all three via PartialType.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  director?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  country?: string;
+
+  /** Null clears it back to "Unrated" — @IsOptional lets null through untouched. */
+  @IsOptional()
+  @IsEnum(AgeRating)
+  ageRating?: AgeRating | null;
+
   @IsOptional()
   @IsArray()
   @ArrayUnique()
   @IsUUID('4', { each: true })
   categoryIds?: string[];
+
+  /** The cast — Actor ids, managed under /actors. Same shape as categoryIds. */
+  @IsOptional()
+  @IsArray()
+  @ArrayUnique()
+  @IsUUID('4', { each: true })
+  actorIds?: string[];
 }

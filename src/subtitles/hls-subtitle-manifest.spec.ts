@@ -3,6 +3,7 @@ import {
   buildSubtitleMediaPlaylist,
   firstSegmentUri,
   firstVariantUri,
+  resolveRelativeKey,
   rewriteMasterPlaylist,
   totalDurationFromMediaPlaylist,
   type SubtitleRendition,
@@ -337,5 +338,17 @@ describe('media timeline recovery', () => {
 
   it('returns null for a playlist that lists no segments', () => {
     expect(firstSegmentUri('#EXTM3U\n#EXT-X-ENDLIST\n')).toBeNull();
+  });
+
+  it('resolves a plain relative variant URI against the master directory', () => {
+    expect(
+      resolveRelativeKey('videos/m/hls/master.m3u8', '720p/index.m3u8'),
+    ).toBe('videos/m/hls/720p/index.m3u8');
+  });
+
+  it('strips a leading ./ from the relative URI', () => {
+    expect(
+      resolveRelativeKey('videos/m/hls/master.m3u8', './720p/index.m3u8'),
+    ).toBe('videos/m/hls/720p/index.m3u8');
   });
 });

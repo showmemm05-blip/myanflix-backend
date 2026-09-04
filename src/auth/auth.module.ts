@@ -8,6 +8,9 @@ import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { JwtStrategy } from './strategies/jwt.strategy';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { GoogleAuthController } from './google/google-auth.controller';
+import { GoogleAuthService } from './google/google-auth.service';
+import { GoogleTokenVerifier } from './google/google-token.verifier';
 
 @Module({
   imports: [
@@ -22,8 +25,14 @@ import { JwtAuthGuard } from './guards/jwt-auth.guard';
     // registration only needs to exist to make JwtService injectable.
     JwtModule.register({}),
   ],
-  controllers: [AuthController],
-  providers: [AuthService, JwtStrategy, JwtAuthGuard],
+  controllers: [AuthController, GoogleAuthController],
+  providers: [
+    AuthService,
+    GoogleAuthService,
+    GoogleTokenVerifier,
+    JwtStrategy,
+    JwtAuthGuard,
+  ],
   exports: [JwtAuthGuard],
 })
 export class AuthModule {}

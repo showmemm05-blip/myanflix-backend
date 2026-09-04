@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { access, readdir, rm, writeFile } from 'node:fs/promises';
@@ -17,6 +18,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
 import { VideosService } from '../videos/videos.service';
+import { VideoDurationService } from '../videos/video-duration.service';
 import { ProcessingService } from '../processing/processing.service';
 import {
   SubtitlesService,
@@ -63,11 +65,13 @@ type CompleteUploadResult =
 
 @Injectable()
 export class UploadsService {
+  private readonly logger = new Logger(UploadsService.name);
   constructor(
     private readonly prisma: PrismaService,
     private readonly storageService: StorageService,
     private readonly minioService: MinioService,
     private readonly videosService: VideosService,
+    private readonly videoDurationService: VideoDurationService,
     private readonly processingService: ProcessingService,
     private readonly subtitlesService: SubtitlesService,
   ) {}
@@ -410,6 +414,14 @@ export class UploadsService {
       );
     }
 
+    // The master and every rendition playlist were just verified to exist,
+    // so the runtime can be read from the HLS the viewer will actually play
+    // (the EXTINF sum of the first variant) — a few KB from MinIO, no ffmpeg.
+    // Fail-soft by construction: recover never throws, and null simply
+    // leaves Video.duration unknown exactly as this flow always did.
+    const durationSeconds =
+      await this.videoDurationService.recoverHlsDurationSeconds(masterKey);
+
     const video = await this.videosService.create({
       movieId,
       originalFilename: 'original.mp4',
@@ -417,7 +429,7 @@ export class UploadsService {
     });
 
     await this.videosService.markReady(video.id, {
-      duration: null,
+      duration: durationSeconds,
       resolution: null,
       hlsMasterPath: masterKey,
       renditions: renditions.map((resolution) => ({
@@ -425,6 +437,26 @@ export class UploadsService {
         playlistPath: `${this.storageService.hlsRenditionKeyPrefix(movieId, resolution)}/index.m3u8`,
       })),
     });
+
+    // Conditional (guarded by duration = 0 in the DB predicate): a runtime the
+    // browser probe sent at placeholder time, or one an admin typed meanwhile,
+    // is never overwritten — human > automatic.
+    if (durationSeconds !== null) {
+      try {
+        await this.videoDurationService.fillMovieDurationIfUnknown(
+          movieId,
+          durationSeconds,
+        );
+      } catch (error) {
+        // The video is already READY; a runtime is cosmetic and the backfill
+        // endpoint can fill it later. Never fail a finalize over it.
+        this.logger.warn(
+          `Could not fill duration for movie ${movieId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
 
     for (const relativePath of subtitlePaths) {
       const filename = basename(relativePath);

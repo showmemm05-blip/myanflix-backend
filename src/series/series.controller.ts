@@ -53,6 +53,17 @@ export class SeriesController {
     return this.seriesService.findAll(query, user.role);
   }
 
+  /**
+   * DB-derived filter options for the series tab's filter sheet — see
+   * SeriesService.getFacets. Same auth as the rest of the catalog (global
+   * JwtAuthGuard). Registered before ':id' so "facets" is never parsed as a
+   * series UUID.
+   */
+  @Get('facets')
+  getFacets() {
+    return this.seriesService.getFacets();
+  }
+
   /** Registered before ':id' so "me" is never parsed as a series UUID. */
   @Get('me/purchases')
   getMyPurchases(@CurrentUser() user: AuthenticatedUser) {

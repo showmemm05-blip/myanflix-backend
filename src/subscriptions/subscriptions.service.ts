@@ -7,7 +7,8 @@ import { decimalToNumber } from '../common/utils/decimal.util';
 import type { CreatePlanDto } from './dto/create-plan.dto';
 import type { UpdatePlanDto } from './dto/update-plan.dto';
 
-const SUBSCRIPTION_DURATION_DAYS = 30;
+/** Applied when a plan is created without an explicit durationDays (API back-compat). */
+const DEFAULT_PLAN_DURATION_DAYS = 30;
 
 @Injectable()
 export class SubscriptionsService {
@@ -31,7 +32,12 @@ export class SubscriptionsService {
   }
 
   async createPlan(dto: CreatePlanDto) {
-    const plan = await this.prisma.subscriptionPlan.create({ data: dto });
+    const plan = await this.prisma.subscriptionPlan.create({
+      data: {
+        ...dto,
+        durationDays: dto.durationDays ?? DEFAULT_PLAN_DURATION_DAYS,
+      },
+    });
     return { ...plan, price: decimalToNumber(plan.price) };
   }
 
@@ -54,7 +60,9 @@ export class SubscriptionsService {
     return {
       isActive: Boolean(active),
       expiresAt: active?.expiresAt ?? null,
+      planId: active?.planId ?? null,
       planName: active?.plan.name ?? null,
+      durationDays: active?.plan.durationDays ?? null,
     };
   }
 
@@ -62,7 +70,7 @@ export class SubscriptionsService {
    * Debits the wallet, then either extends the caller's current active
    * subscription (renewing early never wastes remaining days — the new
    * period starts from the existing expiry, not from now) or starts a fresh
-   * SUBSCRIPTION_DURATION_DAYS-day period. Wallet debit + subscription row +
+   * plan.durationDays-day period. Wallet debit + subscription row +
    * ledger transaction happen atomically, mirroring the old purchase flow.
    */
   async subscribe(userId: string, planId: string) {
@@ -87,7 +95,7 @@ export class SubscriptionsService {
       });
       const base = current ? current.expiresAt : now;
       const expiresAt = new Date(
-        base.getTime() + SUBSCRIPTION_DURATION_DAYS * 24 * 60 * 60 * 1000,
+        base.getTime() + plan.durationDays * 24 * 60 * 60 * 1000,
       );
 
       const subscription = await tx.userSubscription.create({

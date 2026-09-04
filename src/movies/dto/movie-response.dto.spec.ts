@@ -30,6 +30,9 @@ describe('MovieResponseDto.fromEntity', () => {
     releaseYear: 2024,
     duration: 118,
     rating: 4.5,
+    director: 'Some Director',
+    country: 'Myanmar',
+    ageRating: 'PG13',
     accessType: 'SUBSCRIPTION',
     status: 'PUBLISHED',
     seriesId: null,
@@ -71,6 +74,9 @@ describe('MovieResponseDto.fromEntity', () => {
       releaseYear: 2024,
       duration: 118,
       rating: 4.5,
+      director: 'Some Director',
+      country: 'Myanmar',
+      ageRating: 'PG13',
       accessType: 'SUBSCRIPTION',
       status: 'PUBLISHED',
       seriesId: null,
@@ -80,6 +86,22 @@ describe('MovieResponseDto.fromEntity', () => {
       createdAt: movie.createdAt,
       updatedAt: movie.updatedAt,
     });
+  });
+
+  it('passes NULL optional metadata through untouched — "not set" is real information the auto-hide rule needs', () => {
+    const result = MovieResponseDto.fromEntity(
+      {
+        ...movie,
+        director: null,
+        country: null,
+        ageRating: null,
+      } as typeof movie,
+      resolveImageUrl,
+    );
+
+    expect(result.director).toBeNull();
+    expect(result.country).toBeNull();
+    expect(result.ageRating).toBeNull();
   });
 
   it('passes an external poster through and keeps a missing one null', () => {

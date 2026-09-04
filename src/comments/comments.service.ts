@@ -61,7 +61,7 @@ interface CommentRow {
 }
 
 /**
- * Comments on a movie or a series.
+ * Comments on a movie, a series or a book.
  *
  * Public to read, authenticated to write, one level of replies. The tracking
  * columns (platform, ipAddress) are captured from the request context on
@@ -89,10 +89,14 @@ export class CommentsService {
   async create(userId: string, dto: CreateCommentDto): Promise<CommentView> {
     const movieId = dto.movieId ?? null;
     const seriesId = dto.seriesId ?? null;
+    const bookId = dto.bookId ?? null;
 
-    if ((movieId === null) === (seriesId === null)) {
+    const targets = [movieId, seriesId, bookId].filter(
+      (id) => id !== null,
+    ).length;
+    if (targets !== 1) {
       throw new BadRequestException(
-        'A comment must belong to exactly one of a movie or a series',
+        'A comment must belong to exactly one of a movie, a series or a book',
       );
     }
 
@@ -112,18 +116,30 @@ export class CommentsService {
         select: { id: true },
       });
       if (!movie) throw new NotFoundException('Movie not found');
-    } else {
+    } else if (seriesId) {
       const series = await this.prisma.series.findUnique({
-        where: { id: seriesId! },
+        where: { id: seriesId },
         select: { id: true },
       });
       if (!series) throw new NotFoundException('Series not found');
+    } else {
+      const book = await this.prisma.book.findUnique({
+        where: { id: bookId! },
+        select: { id: true },
+      });
+      if (!book) throw new NotFoundException('Book not found');
     }
 
     if (dto.parentId) {
       const parent = await this.prisma.comment.findUnique({
         where: { id: dto.parentId },
-        select: { id: true, parentId: true, movieId: true, seriesId: true },
+        select: {
+          id: true,
+          parentId: true,
+          movieId: true,
+          seriesId: true,
+          bookId: true,
+        },
       });
       if (!parent) throw new NotFoundException('Comment not found');
       // One level only: replying to a reply attaches to the thread it is
@@ -131,7 +147,11 @@ export class CommentsService {
       if (parent.parentId) {
         throw new BadRequestException('Replies cannot be replied to');
       }
-      if (parent.movieId !== movieId || parent.seriesId !== seriesId) {
+      if (
+        parent.movieId !== movieId ||
+        parent.seriesId !== seriesId ||
+        parent.bookId !== bookId
+      ) {
         throw new BadRequestException(
           'A reply must be on the same title as the comment it replies to',
         );
@@ -145,6 +165,7 @@ export class CommentsService {
         userId,
         movieId,
         seriesId,
+        bookId,
         parentId: dto.parentId ?? null,
         body,
         platform,
@@ -172,17 +193,24 @@ export class CommentsService {
   async findForTitle(query: CommentQueryDto): Promise<CommentView[]> {
     const movieId = query.movieId ?? null;
     const seriesId = query.seriesId ?? null;
+    const bookId = query.bookId ?? null;
 
-    if ((movieId === null) === (seriesId === null)) {
+    const targets = [movieId, seriesId, bookId].filter(
+      (id) => id !== null,
+    ).length;
+    if (targets !== 1) {
       throw new BadRequestException(
-        'Specify exactly one of movieId or seriesId',
+        'Specify exactly one of movieId, seriesId or bookId',
       );
     }
 
+    // All three set explicitly (nulls included) so a movie thread can never
+    // leak into a book thread or vice versa.
     const comments = await this.prisma.comment.findMany({
       where: {
         movieId,
         seriesId,
+        bookId,
         parentId: null,
         status: CommentStatus.VISIBLE,
       },

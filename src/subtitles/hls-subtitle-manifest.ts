@@ -182,6 +182,19 @@ export function totalDurationFromMediaPlaylist(
   return seen ? total : null;
 }
 
+/**
+ * `videos/m/hls/master.m3u8` + `720p/index.m3u8` -> `videos/m/hls/720p/index.m3u8`.
+ * Shared by subtitle publishing and runtime recovery (VideoDurationService),
+ * which both walk from a master to the variant it names.
+ */
+export function resolveRelativeKey(
+  masterKey: string,
+  relative: string,
+): string {
+  const directory = masterKey.slice(0, masterKey.lastIndexOf('/') + 1);
+  return `${directory}${relative.replace(/^\.\//, '')}`;
+}
+
 /** Whether this master mentions subtitles at all — the no-op fast path's guard. */
 function hasSubtitleArtifacts(master: string): boolean {
   return master

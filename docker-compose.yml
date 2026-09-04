@@ -52,6 +52,16 @@ services:
       # split deployment — there, the host serving the API is the one machine
       # with no cache server on it.
       STREAM_PUBLIC_BASE_URL_IS_PUBLIC: ${STREAM_PUBLIC_BASE_URL_IS_PUBLIC:-}
+      # "Continue with Google" on the website: the OAuth Web client ID the
+      # backend verifies every Google ID token's audience against. Must equal
+      # the website's NEXT_PUBLIC_GOOGLE_CLIENT_ID. Empty = feature disabled
+      # (POST /auth/google answers 503); phone login is unaffected.
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      # Client secret of that same OAuth Web client — needed only by the
+      # popup auth-code flow (POST /auth/google with `code`), which the
+      # backend exchanges server-side. Empty = code path answers 503; the
+      # ID-token (`credential`) path and phone login are unaffected.
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
     extra_hosts:
       # host.docker.internal is automatic on Docker Desktop (macOS/Windows);
       # this makes it also resolve on Linux Docker engines.
