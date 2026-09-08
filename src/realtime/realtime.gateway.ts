@@ -31,6 +31,9 @@ export interface DepositCreatedPayload {
   username: string;
   /** Cosmetic label the user set; `username` above stays the login identity. */
   displayName: string | null;
+  /** Contact identities, so the admin's live row can show one without a refetch. */
+  phone: string | null;
+  email: string | null;
   amount: number;
   paymentMethod: string;
   accountName: string | null;
@@ -61,6 +64,9 @@ export interface WithdrawalCreatedPayload {
   username: string;
   /** Cosmetic label the user set; `username` above stays the login identity. */
   displayName: string | null;
+  /** Contact identities, so the admin's live row can show one without a refetch. */
+  phone: string | null;
+  email: string | null;
   amount: number;
   accountType: string;
   accountName: string;
@@ -325,7 +331,9 @@ export class RealtimeGateway
     userId: string,
     payload: DepositUpdatedPayload,
   ): void {
-    this.server.to([userRoom(userId), adminRoom()]).emit('deposit.updated', payload);
+    this.server
+      .to([userRoom(userId), adminRoom()])
+      .emit('deposit.updated', payload);
   }
 
   notifyUserNotificationCreated(
@@ -348,7 +356,9 @@ export class RealtimeGateway
     userId: string,
     payload: WithdrawalUpdatedPayload,
   ): void {
-    this.server.to([userRoom(userId), adminRoom()]).emit('withdrawal.updated', payload);
+    this.server
+      .to([userRoom(userId), adminRoom()])
+      .emit('withdrawal.updated', payload);
   }
 
   /**
@@ -361,7 +371,9 @@ export class RealtimeGateway
    * `applyMovement` itself, which runs inside the caller's transaction and
    * could still roll back.
    */
-  notifyAdminsPaymentAccountUpdated(payload: PaymentAccountUpdatedPayload): void {
+  notifyAdminsPaymentAccountUpdated(
+    payload: PaymentAccountUpdatedPayload,
+  ): void {
     this.server.to(adminRoom()).emit('payment-account.updated', payload);
   }
 }

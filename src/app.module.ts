@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
+import { ThrottlerModule } from '@nestjs/throttler';
 
 import { ConfigModule } from './config/config.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -41,6 +42,8 @@ import { FeedbackModule } from './feedback/feedback.module';
 import { LevelsModule } from './levels/levels.module';
 
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import { AppThrottlerGuard } from './common/throttling/app-throttler.guard';
+import { buildThrottlerOptions } from './common/throttling/throttling.config';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 
 import { AppController } from './app.controller';
@@ -53,6 +56,9 @@ import { AppService } from './app.service';
     // Powers UploadCleanupService's daily abandoned-multipart-upload sweep —
     // the first scheduled/cron job anywhere in this backend.
     ScheduleModule.forRoot(),
+    // Rate limiting — see common/throttling/throttling.config.ts for the
+    // buckets. Enforced by AppThrottlerGuard below.
+    ThrottlerModule.forRoot(buildThrottlerOptions()),
 
     AuthModule,
     UsersModule,
@@ -91,6 +97,9 @@ import { AppService } from './app.service';
   providers: [
     AppService,
     { provide: APP_GUARD, useClass: JwtAuthGuard },
+    // Order relative to JwtAuthGuard is irrelevant: the auth routes it
+    // protects most tightly are @Public, and both guards are independent.
+    { provide: APP_GUARD, useClass: AppThrottlerGuard },
     {
       provide: APP_PIPE,
       useValue: new ValidationPipe({

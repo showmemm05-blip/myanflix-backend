@@ -229,7 +229,7 @@ describe('DepositsService', () => {
 
       expect(prisma.user.findUniqueOrThrow).toHaveBeenCalledWith({
         where: { id: 'user-1' },
-        select: { username: true, displayName: true },
+        select: { username: true, displayName: true, phone: true, email: true },
       });
       expect(gateway.notifyAdminsDepositCreated).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -361,6 +361,7 @@ describe('DepositsService', () => {
                 username: true,
                 displayName: true,
                 phone: true,
+                email: true,
               },
             },
           },
@@ -528,6 +529,7 @@ describe('DepositsService', () => {
                 username: true,
                 displayName: true,
                 phone: true,
+                email: true,
               },
             },
           },
@@ -737,6 +739,7 @@ describe('DepositsService', () => {
                 username: true,
                 displayName: true,
                 phone: true,
+                email: true,
               },
             },
           },
@@ -832,6 +835,7 @@ describe('DepositsService', () => {
               username: true,
               displayName: true,
               phone: true,
+              email: true,
             },
           },
         },

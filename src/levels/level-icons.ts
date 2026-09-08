@@ -12,5 +12,3 @@ export const LEVEL_BADGE_ICONS = [
   'wings-crystal',
   'radiant-crystal',
 ] as const;
-
-export type LevelBadgeIcon = (typeof LEVEL_BADGE_ICONS)[number];

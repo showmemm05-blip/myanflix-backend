@@ -16,6 +16,10 @@ import {
 import { MinioService } from '../common/storage/minio.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import { computeTwoTierSlice } from '../common/utils/two-tier-page.util';
+import {
+  facetStringFilter,
+  numberRange,
+} from '../common/utils/facet-filter.util';
 import type { CreateSeriesDto } from './dto/create-series.dto';
 import type { EpisodeQueryDto } from './dto/episode-query.dto';
 import type { UpdateSeriesDto } from './dto/update-series.dto';
@@ -30,15 +34,6 @@ export interface SeriesFacets {
 }
 
 const FACETS_TTL_MS = 60_000;
-
-/** Same 1-vs-many rule as the movies catalog — see buildMovieWhere. */
-function facetStringFilter(
-  values: string[],
-): { equals: string; mode: 'insensitive' } | { in: string[] } | undefined {
-  if (values.length === 0) return undefined;
-  if (values.length === 1) return { equals: values[0], mode: 'insensitive' };
-  return { in: values };
-}
 
 /**
  * The series `where` from the canonical query — everything except the
@@ -68,16 +63,8 @@ export function buildSeriesWhere(
   const languageFilter = facetStringFilter(query.languages ?? []);
   if (languageFilter) where.language = languageFilter;
 
-  let { yearFrom, yearTo } = query;
-  if (yearFrom !== undefined && yearTo !== undefined && yearFrom > yearTo) {
-    [yearFrom, yearTo] = [yearTo, yearFrom];
-  }
-  if (yearFrom !== undefined || yearTo !== undefined) {
-    where.releaseYear = {
-      ...(yearFrom !== undefined ? { gte: yearFrom } : {}),
-      ...(yearTo !== undefined ? { lte: yearTo } : {}),
-    };
-  }
+  const yearRange = numberRange(query.yearFrom, query.yearTo);
+  if (yearRange) where.releaseYear = yearRange;
 
   return where;
 }

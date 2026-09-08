@@ -13,6 +13,7 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { SkipThrottle } from '@nestjs/throttler';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { MinioService } from '../common/storage/minio.service';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
@@ -302,7 +303,8 @@ export class BooksController {
     return { started: true };
   }
 
-  /** Polled by the admin while a language is UPLOADING/PROCESSING. */
+  /** Polled by the admin while a language is UPLOADING/PROCESSING — never rate limited. */
+  @SkipThrottle()
   @Get(':id/editions/:editionId/chapters/:chapterId/processing-status')
   @UseGuards(PermissionsGuard)
   @RequirePermissions('BOOKS.VIEW')

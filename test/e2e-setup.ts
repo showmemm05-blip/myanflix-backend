@@ -10,8 +10,12 @@
  * every module, including ones that construct an S3 client eagerly) but are
  * never actually exercised by the deposit/notification/realtime e2e specs,
  * so placeholder-but-valid values are enough.
+ *
+ * THROTTLE_DISABLED: the e2e specs hammer the API from one address; the
+ * production rate limits are covered by their own supertest spec instead.
  */
 process.env.NODE_ENV = 'test';
+process.env.THROTTLE_DISABLED = 'true';
 process.env.DATABASE_URL =
   'postgresql://myanflix:53bab13f980d57719d8f13b6c3b16602@localhost:5432/myanflix_test?schema=public';
 process.env.JWT_SECRET = 'e2e-test-jwt-secret-not-for-production';

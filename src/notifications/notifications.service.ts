@@ -5,11 +5,7 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
-import type {
-  Notification,
-  NotificationType,
-} from '../generated/prisma/client';
-import type { Prisma } from '../generated/prisma/client';
+import type { Notification } from '../generated/prisma/client';
 
 @Injectable()
 export class NotificationsService {
@@ -58,19 +54,5 @@ export class NotificationsService {
       where: { userId, isRead: false },
       data: { isRead: true },
     });
-  }
-
-  /** Used by DepositsService — creation always happens inside its own $transaction. */
-  async createWithinTransaction(
-    tx: Prisma.TransactionClient,
-    data: {
-      userId: string;
-      type: NotificationType;
-      title: string;
-      message: string;
-      payload?: object;
-    },
-  ): Promise<Notification> {
-    return tx.notification.create({ data });
   }
 }

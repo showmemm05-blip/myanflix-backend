@@ -10,6 +10,7 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { SkipThrottle } from '@nestjs/throttler';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
@@ -31,6 +32,8 @@ export class VideosController {
     return this.videosService.getWatchHistoryForUser(user.id, pagination);
   }
 
+  /** Polled by the admin while transcoding — never rate limited. */
+  @SkipThrottle()
   @Get('status/:movieId')
   @UseGuards(PermissionsGuard)
   @RequirePermissions('MEDIA.VIEW')
@@ -38,6 +41,8 @@ export class VideosController {
     return this.videosService.getLatestStatusForMovie(movieId);
   }
 
+  /** Playback bootstrap — never rate limited. */
+  @SkipThrottle()
   @Get(':movieId/stream')
   async getStream(
     @Param('movieId', ParseUUIDPipe) movieId: string,

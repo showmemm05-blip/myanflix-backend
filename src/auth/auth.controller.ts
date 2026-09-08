@@ -1,5 +1,6 @@
 import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
 import { Public } from '../common/decorators/public.decorator';
+import { ThrottleAuth } from '../common/throttling/throttling.config';
 import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
@@ -14,12 +15,14 @@ export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   @Public()
+  @ThrottleAuth('session')
   @Post('register')
   register(@Body() dto: RegisterDto) {
     return this.authService.register(dto);
   }
 
   @Public()
+  @ThrottleAuth('credential')
   @HttpCode(HttpStatus.OK)
   @Post('login')
   login(@Body() dto: LoginDto) {
@@ -27,6 +30,7 @@ export class AuthController {
   }
 
   @Public()
+  @ThrottleAuth('credential')
   @HttpCode(HttpStatus.OK)
   @Post('phone/check')
   checkPhone(@Body() dto: CheckPhoneDto) {
@@ -34,6 +38,7 @@ export class AuthController {
   }
 
   @Public()
+  @ThrottleAuth('credential')
   @HttpCode(HttpStatus.OK)
   @Post('phone/verify-password')
   verifyPhonePassword(@Body() dto: VerifyPhonePasswordDto) {
@@ -41,6 +46,7 @@ export class AuthController {
   }
 
   @Public()
+  @ThrottleAuth('otpRequest')
   @HttpCode(HttpStatus.OK)
   @Post('otp/request')
   async requestOtp(@Body() dto: RequestOtpDto) {
@@ -49,6 +55,7 @@ export class AuthController {
   }
 
   @Public()
+  @ThrottleAuth('credential')
   @HttpCode(HttpStatus.OK)
   @Post('otp/verify')
   verifyOtp(@Body() dto: VerifyOtpDto) {
@@ -56,6 +63,7 @@ export class AuthController {
   }
 
   @Public()
+  @ThrottleAuth('session')
   @HttpCode(HttpStatus.OK)
   @Post('refresh')
   refresh(@Body() dto: RefreshTokenDto) {
@@ -63,6 +71,7 @@ export class AuthController {
   }
 
   @Public()
+  @ThrottleAuth('session')
   @HttpCode(HttpStatus.OK)
   @Post('logout')
   async logout(@Body() dto: RefreshTokenDto) {

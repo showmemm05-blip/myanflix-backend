@@ -13,6 +13,10 @@ import { MinioService } from '../common/storage/minio.service';
 import { TrackingService } from '../tracking/tracking.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import { computeTwoTierSlice } from '../common/utils/two-tier-page.util';
+import {
+  facetStringFilter,
+  numberRange,
+} from '../common/utils/facet-filter.util';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { CreateMovieDto } from './dto/create-movie.dto';
 import type { UpdateMovieDto } from './dto/update-movie.dto';
@@ -51,37 +55,6 @@ export interface MovieFacets {
 }
 
 const FACETS_TTL_MS = 60_000;
-
-/**
- * 1-vs-many rule for a string facet: a single value keeps today's legacy
- * `?genre=` behavior (exact match, case-proof); two or more use `in` with
- * exact casing, which is safe because multi-values only ever come from the
- * facets endpoint (they are real DB spellings, not user input).
- */
-function facetStringFilter(
-  values: string[],
-): { equals: string; mode: 'insensitive' } | { in: string[] } | undefined {
-  if (values.length === 0) return undefined;
-  if (values.length === 1) return { equals: values[0], mode: 'insensitive' };
-  return { in: values };
-}
-
-/**
- * gte/lte range with swapped bounds normalized (from > to is treated as the
- * user dragging the handles past each other, not an empty set).
- */
-function numberRange(
-  from: number | undefined,
-  to: number | undefined,
-): { gte?: number; lte?: number } | undefined {
-  if (from === undefined && to === undefined) return undefined;
-  if (from !== undefined && to !== undefined && from > to)
-    [from, to] = [to, from];
-  return {
-    ...(from !== undefined ? { gte: from } : {}),
-    ...(to !== undefined ? { lte: to } : {}),
-  };
-}
 
 /**
  * groupBy rows -> offered facet values: null/empty values dropped (a movie

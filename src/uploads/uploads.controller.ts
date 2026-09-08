@@ -14,6 +14,7 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { SkipThrottle } from '@nestjs/throttler';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { InitUploadDto } from './dto/init-upload.dto';
@@ -80,6 +81,8 @@ export class UploadsController {
     await this.uploadsService.saveChunk(uploadId, chunkNumber, file.buffer);
   }
 
+  /** Polled by the admin during an upload — never rate limited. */
+  @SkipThrottle()
   @Get(':uploadId/status')
   getStatus(@Param('uploadId', ParseUUIDPipe) uploadId: string) {
     return this.uploadsService.getStatus(uploadId);

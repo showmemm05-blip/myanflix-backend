@@ -72,7 +72,7 @@ export class WithdrawalsService {
 
     const user = await this.prisma.user.findUniqueOrThrow({
       where: { id: userId },
-      select: { username: true, displayName: true },
+      select: { username: true, displayName: true, phone: true, email: true },
     });
 
     this.realtimeGateway.notifyAdminsWithdrawalCreated({
@@ -80,6 +80,8 @@ export class WithdrawalsService {
       userId: withdrawal.userId,
       username: user.username,
       displayName: user.displayName,
+      phone: user.phone,
+      email: user.email,
       amount: decimalToNumber(withdrawal.amount),
       accountType: withdrawal.accountType,
       accountName: withdrawal.accountName,
@@ -125,6 +127,7 @@ export class WithdrawalsService {
               username: true,
               displayName: true,
               phone: true,
+              email: true,
             },
           },
         },
@@ -237,6 +240,7 @@ export class WithdrawalsService {
               username: true,
               displayName: true,
               phone: true,
+              email: true,
             },
           },
         },
@@ -326,6 +330,7 @@ export class WithdrawalsService {
               username: true,
               displayName: true,
               phone: true,
+              email: true,
             },
           },
         },
@@ -419,12 +424,17 @@ export class WithdrawalsService {
               username: true,
               displayName: true,
               phone: true,
+              email: true,
             },
           },
         },
       });
 
-      return { withdrawal: updatedWithdrawal, oldPaymentAccountId, newPaymentAccountId };
+      return {
+        withdrawal: updatedWithdrawal,
+        oldPaymentAccountId,
+        newPaymentAccountId,
+      };
     });
     const updated = result.withdrawal;
 
@@ -436,7 +446,9 @@ export class WithdrawalsService {
         (id): id is string => id !== null,
       ),
     )) {
-      this.realtimeGateway.notifyAdminsPaymentAccountUpdated({ paymentAccountId });
+      this.realtimeGateway.notifyAdminsPaymentAccountUpdated({
+        paymentAccountId,
+      });
     }
 
     this.realtimeGateway.notifyUserWithdrawalUpdated(updated.userId, {

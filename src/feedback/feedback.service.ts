@@ -6,7 +6,6 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { requestClientContext } from '../common/storage/request-host.context';
-import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { CreateFeedbackDto } from './dto/create-feedback.dto';
 
 /** Hard bounds on a feedback message, enforced here as well as in the DTO. */
@@ -80,34 +79,5 @@ export class FeedbackService {
     });
 
     return created;
-  }
-
-  /**
-   * The caller's own submissions, newest first — so a client can show "we
-   * got your report" history. `adminNote` is deliberately never selected:
-   * it is internal triage text, not something the author may read.
-   */
-  async findMine(userId: string, pagination: PaginationQueryDto) {
-    const page = pagination.page ?? 1;
-    const limit = pagination.limit ?? 20;
-
-    const [items, total] = await this.prisma.$transaction([
-      this.prisma.feedback.findMany({
-        where: { userId },
-        orderBy: { createdAt: 'desc' },
-        skip: (page - 1) * limit,
-        take: limit,
-        select: {
-          id: true,
-          category: true,
-          message: true,
-          status: true,
-          createdAt: true,
-        },
-      }),
-      this.prisma.feedback.count({ where: { userId } }),
-    ]);
-
-    return { items, total, page, limit };
   }
 }

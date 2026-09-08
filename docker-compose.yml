@@ -62,6 +62,10 @@ services:
       # backend exchanges server-side. Empty = code path answers 503; the
       # ID-token (`credential`) path and phone login are unaffected.
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      # API rate limiting kill switch — "true" disables it. Never in prod.
+      THROTTLE_DISABLED: ${THROTTLE_DISABLED:-false}
+      # Only these peers may set X-Forwarded-For for rate limiting (empty = API reached directly).
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
     extra_hosts:
       # host.docker.internal is automatic on Docker Desktop (macOS/Windows);
       # this makes it also resolve on Linux Docker engines.

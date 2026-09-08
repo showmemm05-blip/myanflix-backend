@@ -90,6 +90,21 @@ class EnvironmentVariables {
   @IsString()
   @MinLength(1)
   STREAM_PUBLIC_BASE_URL!: string;
+
+  /**
+   * "true" switches API rate limiting off entirely (AppThrottlerGuard).
+   * Meant for the jest/e2e environment only — leave unset in production.
+   * Kept a string on purpose: implicit conversion would turn "false" into
+   * boolean true.
+   */
+  @IsOptional()
+  @IsIn(['true', 'false'])
+  THROTTLE_DISABLED?: string;
+
+  /** Comma-separated proxy IPs whose X-Forwarded-For is trusted for rate-limit keys. Empty = none. */
+  @IsOptional()
+  @IsString()
+  TRUSTED_PROXIES?: string;
 }
 
 export function validateEnv(

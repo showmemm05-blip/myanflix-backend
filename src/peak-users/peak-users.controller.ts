@@ -1,4 +1,5 @@
 import { Body, Controller, Get, Patch, UseGuards } from '@nestjs/common';
+import { SkipThrottle } from '@nestjs/throttler';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Public } from '../common/decorators/public.decorator';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
@@ -18,6 +19,7 @@ export class PeakUsersController {
 
   /** Public total only — never exposes the actual/additional split. */
   @Public()
+  @SkipThrottle()
   @Get()
   getPublicTotal() {
     return this.peakUsersService.getPublicTotal();

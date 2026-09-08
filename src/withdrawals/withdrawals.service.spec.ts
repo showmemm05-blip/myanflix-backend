@@ -185,7 +185,7 @@ describe('WithdrawalsService', () => {
       // notification — it must never be selecting payout details.
       expect(prisma.user.findUniqueOrThrow).toHaveBeenCalledWith({
         where: { id: 'user-1' },
-        select: { username: true, displayName: true },
+        select: { username: true, displayName: true, phone: true, email: true },
       });
     });
 
@@ -360,6 +360,7 @@ describe('WithdrawalsService', () => {
                 username: true,
                 displayName: true,
                 phone: true,
+                email: true,
               },
             },
           },
@@ -648,6 +649,7 @@ describe('WithdrawalsService', () => {
               username: true,
               displayName: true,
               phone: true,
+              email: true,
             },
           },
         },

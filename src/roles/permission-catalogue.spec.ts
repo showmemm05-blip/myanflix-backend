@@ -2,7 +2,6 @@ import {
   ALL_PERMISSIONS,
   PERMISSION_CATALOGUE,
   getPermissionCatalogue,
-  isPermission,
   normalizePermissions,
 } from './permission-catalogue';
 
@@ -22,18 +21,6 @@ describe('permission catalogue', () => {
   it('uses unique module keys', () => {
     const keys = PERMISSION_CATALOGUE.map((module) => module.key);
     expect(new Set(keys).size).toBe(keys.length);
-  });
-
-  describe('isPermission', () => {
-    it('accepts a catalogue value', () => {
-      expect(isPermission('MOVIES.PUBLISH')).toBe(true);
-    });
-
-    it('rejects an unknown module, an unknown action and the old bundled names', () => {
-      expect(isPermission('PODCASTS.VIEW')).toBe(false);
-      expect(isPermission('MOVIES.ARCHIVE')).toBe(false);
-      expect(isPermission('MOVIE_CREATE')).toBe(false);
-    });
   });
 
   describe('normalizePermissions', () => {

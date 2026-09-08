@@ -127,13 +127,6 @@ export const ALL_PERMISSIONS: Permission[] = PERMISSION_CATALOGUE.flatMap(
     module.actions.map((action) => `${module.key}.${action}` as Permission),
 );
 
-const PERMISSION_SET: ReadonlySet<string> = new Set<string>(ALL_PERMISSIONS);
-
-/** Narrows an arbitrary string to a known permission (validates API input). */
-export function isPermission(value: string): value is Permission {
-  return PERMISSION_SET.has(value);
-}
-
 /**
  * Filters + de-duplicates an arbitrary string list down to known permissions,
  * returned in catalogue order so stored/returned sets are always comparable.

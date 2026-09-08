@@ -72,7 +72,7 @@ export class DepositsService {
 
     const user = await this.prisma.user.findUniqueOrThrow({
       where: { id: userId },
-      select: { username: true, displayName: true },
+      select: { username: true, displayName: true, phone: true, email: true },
     });
 
     this.realtimeGateway.notifyAdminsDepositCreated({
@@ -80,6 +80,8 @@ export class DepositsService {
       userId: deposit.userId,
       username: user.username,
       displayName: user.displayName,
+      phone: user.phone,
+      email: user.email,
       amount: decimalToNumber(deposit.amount),
       paymentMethod: deposit.paymentMethod,
       accountName: deposit.accountName,
@@ -123,6 +125,7 @@ export class DepositsService {
               username: true,
               displayName: true,
               phone: true,
+              email: true,
             },
           },
         },
@@ -173,7 +176,11 @@ export class DepositsService {
    * approve racing a reject) can only ever credit the wallet once. Sockets
    * are emitted only after the transaction has actually committed.
    */
-  async approve(depositId: string, admin: AuthenticatedUser, dto: ApproveDepositDto = {}) {
+  async approve(
+    depositId: string,
+    admin: AuthenticatedUser,
+    dto: ApproveDepositDto = {},
+  ) {
     const result = await this.prisma.$transaction(async (tx) => {
       const deposit = await tx.deposit.findUnique({ where: { id: depositId } });
       if (!deposit) throw new NotFoundException('Deposit not found');
@@ -258,6 +265,7 @@ export class DepositsService {
               username: true,
               displayName: true,
               phone: true,
+              email: true,
             },
           },
         },
@@ -266,7 +274,12 @@ export class DepositsService {
         where: { userId: deposit.userId },
       });
 
-      return { deposit: updated, notification, balance: wallet.balance, accountToCredit };
+      return {
+        deposit: updated,
+        notification,
+        balance: wallet.balance,
+        accountToCredit,
+      };
     });
 
     if (result.accountToCredit) {
@@ -412,6 +425,7 @@ export class DepositsService {
               username: true,
               displayName: true,
               phone: true,
+              email: true,
             },
           },
         },
@@ -496,6 +510,7 @@ export class DepositsService {
               username: true,
               displayName: true,
               phone: true,
+              email: true,
             },
           },
         },
@@ -601,12 +616,17 @@ export class DepositsService {
               username: true,
               displayName: true,
               phone: true,
+              email: true,
             },
           },
         },
       });
 
-      return { deposit: updatedDeposit, oldPaymentAccountId, newPaymentAccountId };
+      return {
+        deposit: updatedDeposit,
+        oldPaymentAccountId,
+        newPaymentAccountId,
+      };
     });
     const updated = result.deposit;
 
@@ -620,7 +640,9 @@ export class DepositsService {
         (id): id is string => id !== null,
       ),
     )) {
-      this.realtimeGateway.notifyAdminsPaymentAccountUpdated({ paymentAccountId });
+      this.realtimeGateway.notifyAdminsPaymentAccountUpdated({
+        paymentAccountId,
+      });
     }
 
     this.realtimeGateway.notifyUserDepositUpdated(updated.userId, {

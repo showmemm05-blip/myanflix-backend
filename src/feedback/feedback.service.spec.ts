@@ -236,31 +236,4 @@ describe('FeedbackService', () => {
     });
   });
 
-  describe('findMine', () => {
-    it('scopes to the caller, newest first, and never selects adminNote', async () => {
-      prisma.feedback.count.mockResolvedValue(1);
-      prisma.feedback.findMany.mockResolvedValue([createdRow()]);
-
-      const result = await service.findMine('user-1', { page: 1, limit: 20 });
-
-      const args = prisma.feedback.findMany.mock.calls[0][0];
-      expect(args.where).toEqual({ userId: 'user-1' });
-      expect(args.orderBy).toEqual({ createdAt: 'desc' });
-      expect(args.select.adminNote).toBeUndefined();
-      expect(result).toEqual({
-        items: [createdRow()],
-        total: 1,
-        page: 1,
-        limit: 20,
-      });
-    });
-
-    it('defaults to page 1 / limit 20 when pagination is omitted', async () => {
-      await service.findMine('user-1', {});
-
-      const args = prisma.feedback.findMany.mock.calls[0][0];
-      expect(args.skip).toBe(0);
-      expect(args.take).toBe(20);
-    });
-  });
 });

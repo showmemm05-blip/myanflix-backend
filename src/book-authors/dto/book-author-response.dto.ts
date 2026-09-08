@@ -3,24 +3,6 @@ import type { ImageUrlResolver } from '../../books/dto/book-response.dto';
 
 type BookAuthorWithBookCount = BookAuthor & { _count: { books: number } };
 
-/** The slice of an author a book carries as `authorRef`. */
-export type BookAuthorRefRow = {
-  id: string;
-  name: string;
-  imageUrl: string | null;
-};
-
-export function toBookAuthorRef(
-  row: BookAuthorRefRow,
-  resolveImageUrl: ImageUrlResolver,
-) {
-  return {
-    id: row.id,
-    name: row.name,
-    imageUrl: resolveImageUrl(row.imageUrl),
-  };
-}
-
 export class BookAuthorResponseDto {
   static fromEntity(
     author: BookAuthorWithBookCount,
