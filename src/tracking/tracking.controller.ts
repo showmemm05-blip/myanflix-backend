@@ -59,8 +59,9 @@ export class TrackingController {
   moderateComment(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: ModerateCommentDto,
+    @CurrentUser() actor: AuthenticatedUser,
   ) {
-    return this.trackingReadService.moderateComment(id, dto);
+    return this.trackingReadService.moderateComment(id, dto, actor);
   }
 
   @Get('feedback')

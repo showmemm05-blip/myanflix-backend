@@ -23,6 +23,7 @@ describe('AppModule', () => {
     MINIO_ACCESS_KEY: 'test-access-key',
     MINIO_SECRET_KEY: 'test-secret-key',
     STREAM_PUBLIC_BASE_URL: 'http://localhost:8080',
+    STREAM_SIGNING_SECRET: 'test-stream-signing-secret-at-least-32-chars',
   };
 
   let saved: Record<string, string | undefined>;

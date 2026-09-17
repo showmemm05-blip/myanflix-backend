@@ -6,6 +6,7 @@ import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { HlsSubtitlesService } from '../subtitles/hls-subtitles.service';
+import { AuditService } from '../audit/audit.service';
 import { probeVideo, transcodeToHls } from './ffmpeg.util';
 import { rm, writeFile } from 'node:fs/promises';
 
@@ -26,10 +27,20 @@ void writeFile; // imported only so jest.mock('node:fs/promises') covers it; pro
 
 describe('ProcessingService', () => {
   let service: ProcessingService;
-  let videosService: { markProcessing: jest.Mock; markFailed: jest.Mock; updateOriginalPath: jest.Mock; markReady: jest.Mock };
-  let prisma: { movie: { update: jest.Mock } };
-  let minioService: { objectExists: jest.Mock; uploadFile: jest.Mock; uploadDirectory: jest.Mock };
+  let videosService: {
+    markProcessing: jest.Mock;
+    markFailed: jest.Mock;
+    updateOriginalPath: jest.Mock;
+    markReady: jest.Mock;
+  };
+  let prisma: { movie: { update: jest.Mock; findUnique: jest.Mock } };
+  let minioService: {
+    objectExists: jest.Mock;
+    uploadFile: jest.Mock;
+    uploadDirectory: jest.Mock;
+  };
   let hlsSubtitlesService: { publishForVideo: jest.Mock };
+  let audit: { record: jest.Mock };
   let storageService: {
     hlsDir: jest.Mock;
     ensureDir: jest.Mock;
@@ -51,7 +62,14 @@ describe('ProcessingService', () => {
       updateOriginalPath: jest.fn().mockResolvedValue(undefined),
       markReady: jest.fn().mockResolvedValue(undefined),
     };
-    prisma = { movie: { update: jest.fn().mockResolvedValue(undefined) } };
+    prisma = {
+      movie: {
+        update: jest.fn().mockResolvedValue(undefined),
+        findUnique: jest
+          .fn()
+          .mockResolvedValue({ title: 'A Movie', status: 'DRAFT' }),
+      },
+    };
     minioService = {
       objectExists: jest.fn().mockResolvedValue(false),
       uploadFile: jest.fn().mockResolvedValue(undefined),
@@ -60,12 +78,23 @@ describe('ProcessingService', () => {
     hlsSubtitlesService = {
       publishForVideo: jest.fn().mockResolvedValue({ published: [] }),
     };
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
     storageService = {
-      hlsDir: jest.fn((movieId: string) => `/storage/videos/${movieId}/hls`),
+      // Mirrors the real StorageService: every local file the pipeline
+      // touches lives under <STORAGE_PATH>/temp/ so one sweep can clean it.
+      hlsDir: jest.fn(
+        (movieId: string) => `/storage/temp/videos/${movieId}/hls`,
+      ),
       ensureDir: jest.fn().mockResolvedValue(undefined),
-      originalObjectKey: jest.fn((movieId: string, ext: string) => `videos/${movieId}/original${ext}`),
-      hlsRenditionKeyPrefix: jest.fn((movieId: string, name: string) => `videos/${movieId}/hls/${name}`),
-      hlsMasterKey: jest.fn((movieId: string) => `videos/${movieId}/hls/master.m3u8`),
+      originalObjectKey: jest.fn(
+        (movieId: string, ext: string) => `videos/${movieId}/original${ext}`,
+      ),
+      hlsRenditionKeyPrefix: jest.fn(
+        (movieId: string, name: string) => `videos/${movieId}/hls/${name}`,
+      ),
+      hlsMasterKey: jest.fn(
+        (movieId: string) => `videos/${movieId}/hls/master.m3u8`,
+      ),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -76,6 +105,7 @@ describe('ProcessingService', () => {
         { provide: StorageService, useValue: storageService },
         { provide: MinioService, useValue: minioService },
         { provide: HlsSubtitlesService, useValue: hlsSubtitlesService },
+        { provide: AuditService, useValue: audit },
       ],
     }).compile();
 
@@ -87,20 +117,31 @@ describe('ProcessingService', () => {
       // height: 240 -> pickRenditions() selects exactly one tier (240p),
       // keeping this focused on the archive-skip behavior rather than
       // exercising every rendition.
-      probeVideoMock.mockResolvedValue({ durationSeconds: 120, width: 426, height: 240 });
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 120,
+        width: 426,
+        height: 240,
+      });
       transcodeToHlsMock.mockResolvedValue(undefined);
     });
 
     it('uploads the original when it is not already archived', async () => {
       minioService.objectExists.mockResolvedValue(false);
 
-      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
 
       expect(minioService.uploadFile).toHaveBeenCalledWith(
         'videos/movie-1/original.mp4',
-        '/storage/videos/movie-1/original.mp4',
+        '/storage/temp/videos/movie-1/original.mp4',
       );
-      expect(videosService.updateOriginalPath).toHaveBeenCalledWith('video-1', 'videos/movie-1/original.mp4');
+      expect(videosService.updateOriginalPath).toHaveBeenCalledWith(
+        'video-1',
+        'videos/movie-1/original.mp4',
+      );
     });
 
     /**
@@ -111,14 +152,21 @@ describe('ProcessingService', () => {
     it('skips re-uploading the original when it is already archived', async () => {
       minioService.objectExists.mockResolvedValue(true);
 
-      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
 
       const originalUploadCalls = minioService.uploadFile.mock.calls.filter(
         ([key]) => key === 'videos/movie-1/original.mp4',
       );
       expect(originalUploadCalls).toHaveLength(0);
       // Still recorded as the video's original location either way.
-      expect(videosService.updateOriginalPath).toHaveBeenCalledWith('video-1', 'videos/movie-1/original.mp4');
+      expect(videosService.updateOriginalPath).toHaveBeenCalledWith(
+        'video-1',
+        'videos/movie-1/original.mp4',
+      );
     });
 
     it('still uploads the master playlist and renditions when only the original is already archived', async () => {
@@ -127,7 +175,11 @@ describe('ProcessingService', () => {
         async (key) => key === 'videos/movie-1/original.mp4',
       );
 
-      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
 
       expect(minioService.uploadDirectory).toHaveBeenCalledWith(
         expect.stringContaining('240p'),
@@ -153,20 +205,36 @@ describe('ProcessingService', () => {
    */
   describe('republishing subtitles after a transcode', () => {
     beforeEach(() => {
-      probeVideoMock.mockResolvedValue({ durationSeconds: 120, width: 426, height: 240 });
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 120,
+        width: 426,
+        height: 240,
+      });
       transcodeToHlsMock.mockResolvedValue(undefined);
     });
 
     it('republishes the subtitle renditions once the new master is uploaded', async () => {
-      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
 
-      expect(hlsSubtitlesService.publishForVideo).toHaveBeenCalledWith('video-1');
+      expect(hlsSubtitlesService.publishForVideo).toHaveBeenCalledWith(
+        'video-1',
+      );
     });
 
     it('does not fail the transcode when publishing them fails', async () => {
-      hlsSubtitlesService.publishForVideo.mockRejectedValue(new Error('MinIO unreachable'));
+      hlsSubtitlesService.publishForVideo.mockRejectedValue(
+        new Error('MinIO unreachable'),
+      );
 
-      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
 
       expect(videosService.markFailed).not.toHaveBeenCalled();
       expect(prisma.movie.update).toHaveBeenCalledWith({
@@ -182,7 +250,11 @@ describe('ProcessingService', () => {
       // tiers), giving room to prove "the first tier is skipped, later ones
       // still run" rather than a single-tier test that can't distinguish
       // "skipped everything" from "skipped nothing."
-      probeVideoMock.mockResolvedValue({ durationSeconds: 300, width: 854, height: 480 });
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 300,
+        width: 854,
+        height: 480,
+      });
       transcodeToHlsMock.mockResolvedValue(undefined);
       minioService.objectExists.mockResolvedValue(false);
     });
@@ -192,9 +264,15 @@ describe('ProcessingService', () => {
         async (key) => key === 'videos/movie-1/hls/480p/index.m3u8',
       );
 
-      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
 
-      expect(transcodeToHlsMock).not.toHaveBeenCalledWith(expect.objectContaining({ targetHeight: 480 }));
+      expect(transcodeToHlsMock).not.toHaveBeenCalledWith(
+        expect.objectContaining({ targetHeight: 480 }),
+      );
       expect(minioService.uploadDirectory).not.toHaveBeenCalledWith(
         expect.any(String),
         'videos/movie-1/hls/480p',
@@ -206,18 +284,36 @@ describe('ProcessingService', () => {
         async (key) => key === 'videos/movie-1/hls/480p/index.m3u8',
       );
 
-      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
 
-      expect(transcodeToHlsMock).toHaveBeenCalledWith(expect.objectContaining({ targetHeight: 360 }));
-      expect(transcodeToHlsMock).toHaveBeenCalledWith(expect.objectContaining({ targetHeight: 240 }));
-      expect(minioService.uploadDirectory).toHaveBeenCalledWith(expect.any(String), 'videos/movie-1/hls/360p');
-      expect(minioService.uploadDirectory).toHaveBeenCalledWith(expect.any(String), 'videos/movie-1/hls/240p');
+      expect(transcodeToHlsMock).toHaveBeenCalledWith(
+        expect.objectContaining({ targetHeight: 360 }),
+      );
+      expect(transcodeToHlsMock).toHaveBeenCalledWith(
+        expect.objectContaining({ targetHeight: 240 }),
+      );
+      expect(minioService.uploadDirectory).toHaveBeenCalledWith(
+        expect.any(String),
+        'videos/movie-1/hls/360p',
+      );
+      expect(minioService.uploadDirectory).toHaveBeenCalledWith(
+        expect.any(String),
+        'videos/movie-1/hls/240p',
+      );
     });
 
     it('clears any stale partial local output before re-transcoding a tier that was interrupted', async () => {
       minioService.objectExists.mockResolvedValue(false); // nothing finished — everything gets redone
 
-      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
 
       expect(rmMock).toHaveBeenCalledWith(
         expect.stringContaining('480p'),
@@ -230,7 +326,11 @@ describe('ProcessingService', () => {
         async (key) => key === 'videos/movie-1/hls/480p/index.m3u8',
       );
 
-      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
 
       expect(videosService.markReady).toHaveBeenCalledWith(
         'video-1',
@@ -247,13 +347,21 @@ describe('ProcessingService', () => {
 
   describe('isActivelyProcessing / active-job tracking', () => {
     it('reports a video as actively processing only while processVideo() is still running', async () => {
-      probeVideoMock.mockResolvedValue({ durationSeconds: 60, width: 320, height: 240 });
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 60,
+        width: 320,
+        height: 240,
+      });
       transcodeToHlsMock.mockResolvedValue(undefined);
       minioService.objectExists.mockResolvedValue(false);
 
       expect(service.isActivelyProcessing('video-1')).toBe(false);
 
-      const promise = service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      const promise = service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
       // Still resolving at this point — mocked async calls haven't settled.
       expect(service.isActivelyProcessing('video-1')).toBe(true);
 
@@ -264,7 +372,37 @@ describe('ProcessingService', () => {
     it('clears the active-job flag even when processing fails', async () => {
       probeVideoMock.mockRejectedValue(new Error('boom'));
 
-      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+
+      expect(service.isActivelyProcessing('video-1')).toBe(false);
+    });
+
+    it('reserve() refuses a second reservation and release() clears it', () => {
+      expect(service.reserve('video-1')).toBe(true);
+      expect(service.isActivelyProcessing('video-1')).toBe(true);
+
+      expect(service.reserve('video-1')).toBe(false);
+      // Another video is unaffected.
+      expect(service.reserve('video-2')).toBe(true);
+
+      service.release('video-1');
+      expect(service.isActivelyProcessing('video-1')).toBe(false);
+      expect(service.reserve('video-1')).toBe(true);
+    });
+
+    it('a reservation handed to processVideo() is cleared by its finally, even when the run fails', async () => {
+      probeVideoMock.mockRejectedValue(new Error('boom'));
+      expect(service.reserve('video-1')).toBe(true);
+
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
 
       expect(service.isActivelyProcessing('video-1')).toBe(false);
     });
@@ -276,14 +414,24 @@ describe('ProcessingService', () => {
     });
 
     it('records the failure and cleans up scratch files', async () => {
-      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
 
-      expect(videosService.markFailed).toHaveBeenCalledWith('video-1', 'ffprobe blew up');
-      expect(rmMock).toHaveBeenCalledWith('/storage/videos/movie-1/hls', {
+      expect(videosService.markFailed).toHaveBeenCalledWith(
+        'video-1',
+        'ffprobe blew up',
+      );
+      expect(rmMock).toHaveBeenCalledWith('/storage/temp/videos/movie-1/hls', {
         recursive: true,
         force: true,
       });
-      expect(rmMock).toHaveBeenCalledWith('/storage/videos/movie-1/original.mp4', { force: true });
+      expect(rmMock).toHaveBeenCalledWith(
+        '/storage/temp/videos/movie-1/original.mp4',
+        { force: true },
+      );
     });
 
     /**
@@ -293,32 +441,133 @@ describe('ProcessingService', () => {
      * an unhandled rejection is fatal in Node.
      */
     it('does not reject when the records were deleted mid-processing', async () => {
-      const notFound = Object.assign(new Error('No record was found for an update.'), {
-        code: 'P2025',
-      });
+      const notFound = Object.assign(
+        new Error('No record was found for an update.'),
+        {
+          code: 'P2025',
+        },
+      );
       videosService.markFailed.mockRejectedValue(notFound);
 
       await expect(
-        service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4'),
+        service.processVideo(
+          'video-1',
+          'movie-1',
+          '/storage/temp/videos/movie-1/original.mp4',
+        ),
       ).resolves.toBeUndefined();
     });
 
     it('still cleans up scratch files even when the records are gone', async () => {
       videosService.markFailed.mockRejectedValue(
-        Object.assign(new Error('No record was found for an update.'), { code: 'P2025' }),
+        Object.assign(new Error('No record was found for an update.'), {
+          code: 'P2025',
+        }),
       );
 
-      await service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4');
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
 
-      expect(rmMock).toHaveBeenCalledWith('/storage/videos/movie-1/original.mp4', { force: true });
+      expect(rmMock).toHaveBeenCalledWith(
+        '/storage/temp/videos/movie-1/original.mp4',
+        { force: true },
+      );
     });
 
     it('does not reject when scratch cleanup itself fails', async () => {
       rmMock.mockRejectedValue(new Error('EBUSY'));
 
       await expect(
-        service.processVideo('video-1', 'movie-1', '/storage/videos/movie-1/original.mp4'),
+        service.processVideo(
+          'video-1',
+          'movie-1',
+          '/storage/temp/videos/movie-1/original.mp4',
+        ),
       ).resolves.toBeUndefined();
+    });
+  });
+  describe('audit — SYSTEM rows with no actor', () => {
+    beforeEach(() => {
+      // The failure block above leaves rm() rejecting; a clean scratch dir here.
+      rmMock.mockResolvedValue(undefined);
+    });
+
+    it('auto-publish after a transcode is movie.publish by the system, after the status write', async () => {
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 120,
+        width: 426,
+        height: 240,
+      });
+      transcodeToHlsMock.mockResolvedValue(undefined);
+
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+
+      expect(audit.record).toHaveBeenCalledTimes(1);
+      expect(audit.record).toHaveBeenCalledWith({
+        action: 'movie.publish',
+        actor: null,
+        target: { type: 'movie', id: 'movie-1', label: 'A Movie' },
+        before: { status: 'DRAFT' },
+        after: { status: 'PUBLISHED' },
+        metadata: { trigger: 'transcode_complete', videoId: 'video-1' },
+      });
+      expect(prisma.movie.update.mock.invocationCallOrder[0]).toBeLessThan(
+        audit.record.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('a failed transcode is movie.status_change → DRAFT by the system with the error', async () => {
+      probeVideoMock.mockRejectedValue(new Error('ffprobe blew up'));
+      // A title mid-transcode sits at PROCESSING; falling back to DRAFT is a
+      // real status change (DRAFT → DRAFT would be a dropped no-op row).
+      prisma.movie.findUnique.mockResolvedValue({
+        title: 'A Movie',
+        status: 'PROCESSING',
+      });
+
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+
+      expect(audit.record).toHaveBeenCalledTimes(1);
+      expect(audit.record).toHaveBeenCalledWith({
+        action: 'movie.status_change',
+        actor: null,
+        target: { type: 'movie', id: 'movie-1', label: 'A Movie' },
+        before: { status: 'PROCESSING' },
+        after: { status: 'DRAFT' },
+        metadata: {
+          trigger: 'transcode_failed',
+          videoId: 'video-1',
+          error: 'ffprobe blew up',
+        },
+      });
+    });
+
+    it('writes no row when the movie vanished mid-processing (nothing to change)', async () => {
+      probeVideoMock.mockRejectedValue(new Error('boom'));
+      videosService.markFailed.mockRejectedValue(
+        Object.assign(new Error('No record was found for an update.'), {
+          code: 'P2025',
+        }),
+      );
+
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+
+      expect(audit.record).not.toHaveBeenCalled();
     });
   });
 });

@@ -1,6 +1,7 @@
 import {
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '../generated/prisma/client';
@@ -12,6 +13,13 @@ import {
   type PermissionSubject,
 } from '../roles/permission-resolver.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
+import { AuditService } from '../audit/audit.service';
+import {
+  paymentAccountSnapshot,
+  paymentMethodTypeSnapshot,
+} from '../audit/audit-snapshots';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
+import { paymentAccountLabel } from './payment-account-label';
 import type { CreatePaymentAccountDto } from './dto/create-payment-account.dto';
 import type { UpdatePaymentAccountDto } from './dto/update-payment-account.dto';
 import type { CreatePaymentMethodTypeDto } from './dto/create-payment-method-type.dto';
@@ -114,12 +122,15 @@ type TransactionCustomer = NonNullable<
 
 @Injectable()
 export class PaymentAccountsService {
+  private readonly logger = new Logger(PaymentAccountsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly paymentAccountLedgerService: PaymentAccountLedgerService,
     private readonly realtimeGateway: RealtimeGateway,
     private readonly minioService: MinioService,
     private readonly permissionResolver: PermissionResolverService,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -167,7 +178,7 @@ export class PaymentAccountsService {
     return types.map((t) => this.toTypeResponse(t));
   }
 
-  async createType(dto: CreatePaymentMethodTypeDto) {
+  async createType(dto: CreatePaymentMethodTypeDto, actor: AuthenticatedUser) {
     const existing = await this.prisma.paymentMethodType.findUnique({
       where: { label: dto.label },
     });
@@ -180,13 +191,32 @@ export class PaymentAccountsService {
       data: {
         label: dto.label,
         requiresBankName: dto.requiresBankName ?? false,
-        logoUrl: dto.logoUrl,
+        // Canonicalised like every other persisted image URL (see
+        // MinioService.canonicalImageUrl): the admin posts back whatever host
+        // it fetched the logo on, and storing that verbatim is exactly how
+        // the two surviving KBZPay/WavePay rows got pinned to a LAN IP that
+        // stopped existing on the next network hop.
+        logoUrl: this.minioService.canonicalImageUrl(dto.logoUrl),
       },
+    });
+    await this.audit.record({
+      action: 'payment_method_type.create',
+      actor,
+      target: {
+        type: 'payment_method_type',
+        id: created.id,
+        label: created.label,
+      },
+      after: paymentMethodTypeSnapshot(created),
     });
     return this.toTypeResponse(created);
   }
 
-  async updateType(id: string, dto: UpdatePaymentMethodTypeDto) {
+  async updateType(
+    id: string,
+    dto: UpdatePaymentMethodTypeDto,
+    actor: AuthenticatedUser,
+  ) {
     const existing = await this.prisma.paymentMethodType.findUnique({
       where: { id },
     });
@@ -210,30 +240,60 @@ export class PaymentAccountsService {
       // whole point of "label is the single source of truth" (see the
       // PaymentAccount.type doc comment in schema.prisma).
       const updated = await this.prisma.$transaction(async (tx) => {
-        await tx.paymentAccount.updateMany({
+        const fanOut = await tx.paymentAccount.updateMany({
           where: { type: existing.label },
           data: { type: nextLabel },
         });
-        return tx.paymentMethodType.update({
+        const renamed = await tx.paymentMethodType.update({
           where: { id },
           data: {
             label: nextLabel,
             requiresBankName: dto.requiresBankName,
-            logoUrl: dto.logoUrl,
+            // Same normalisation as createType — an omitted logoUrl stays
+            // undefined and Prisma leaves the column alone.
+            logoUrl: this.minioService.canonicalImageUrl(dto.logoUrl),
           },
         });
+        // One audit row for the rename AND its fan-out, committed with both.
+        await this.audit.record({
+          action: 'payment_method_type.update',
+          actor,
+          target: {
+            type: 'payment_method_type',
+            id,
+            label: renamed.label,
+          },
+          before: paymentMethodTypeSnapshot(existing),
+          after: paymentMethodTypeSnapshot(renamed),
+          metadata: {
+            previousLabel: existing.label,
+            affectedAccounts: fanOut.count,
+          },
+          tx,
+        });
+        return renamed;
       });
       return this.toTypeResponse(updated);
     }
 
     const updated = await this.prisma.paymentMethodType.update({
       where: { id },
-      data: { requiresBankName: dto.requiresBankName, logoUrl: dto.logoUrl },
+      data: {
+        requiresBankName: dto.requiresBankName,
+        logoUrl: this.minioService.canonicalImageUrl(dto.logoUrl),
+      },
+    });
+    await this.audit.record({
+      action: 'payment_method_type.update',
+      actor,
+      target: { type: 'payment_method_type', id, label: updated.label },
+      before: paymentMethodTypeSnapshot(existing),
+      after: paymentMethodTypeSnapshot(updated),
     });
     return this.toTypeResponse(updated);
   }
 
-  async removeType(id: string) {
+  async removeType(id: string, actor: AuthenticatedUser) {
     const existing = await this.prisma.paymentMethodType.findUnique({
       where: { id },
     });
@@ -249,7 +309,32 @@ export class PaymentAccountsService {
     }
 
     await this.prisma.paymentMethodType.delete({ where: { id } });
+    await this.audit.record({
+      action: 'payment_method_type.delete',
+      actor,
+      target: { type: 'payment_method_type', id, label: existing.label },
+      before: paymentMethodTypeSnapshot(existing),
+    });
+
+    // Nothing deleted the logo before this, so every removed payment method
+    // left its image in images/payment/ forever with no row left pointing at
+    // it. After the DB delete and the audit row, and best-effort: the method
+    // is already gone, and a leaked object must not fail the request.
+    if (existing.logoUrl) await this.deleteLogoObject(existing.logoUrl, id);
+
     return { deleted: true };
+  }
+
+  /** Best-effort cleanup of one payment method's logo, keyed off the stored URL. */
+  private async deleteLogoObject(url: string, typeId: string): Promise<void> {
+    try {
+      const key = this.minioService.keyFromPublicUrl(url);
+      if (key) await this.minioService.deleteObject(key);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to clean up the logo for payment method ${typeId}: ${(error as Error).message}`,
+      );
+    }
   }
 
   async findOne(id: string) {
@@ -261,30 +346,65 @@ export class PaymentAccountsService {
     return this.toAdminResponse(account);
   }
 
-  async create(dto: CreatePaymentAccountDto, actorUserId: string) {
+  async create(dto: CreatePaymentAccountDto, actor: AuthenticatedUser) {
     const account = await this.prisma.paymentAccount.create({
       data: {
         ...dto,
-        createdByUserId: actorUserId,
-        updatedByUserId: actorUserId,
+        createdByUserId: actor.id,
+        updatedByUserId: actor.id,
       },
       include: ADMIN_INCLUDE,
     });
-    return this.toAdminResponse(account);
-  }
-
-  async update(id: string, dto: UpdatePaymentAccountDto, actorUserId: string) {
-    await this.assertExists(id);
-    const account = await this.prisma.paymentAccount.update({
-      where: { id },
-      data: { ...dto, updatedByUserId: actorUserId },
-      include: ADMIN_INCLUDE,
+    await this.audit.record({
+      action: 'payment_account.create',
+      actor,
+      target: {
+        type: 'payment_account',
+        id: account.id,
+        label: paymentAccountLabel(account),
+      },
+      after: paymentAccountSnapshot(account),
     });
     return this.toAdminResponse(account);
   }
 
-  async remove(id: string) {
-    await this.assertExists(id);
+  async update(
+    id: string,
+    dto: UpdatePaymentAccountDto,
+    actor: AuthenticatedUser,
+  ) {
+    // Full pre-read (not just an existence check) so the audit row can diff
+    // the old values against the new ones.
+    const before = await this.prisma.paymentAccount.findUnique({
+      where: { id },
+    });
+    if (!before) throw new NotFoundException('Payment account not found');
+
+    const account = await this.prisma.paymentAccount.update({
+      where: { id },
+      data: { ...dto, updatedByUserId: actor.id },
+      include: ADMIN_INCLUDE,
+    });
+    await this.audit.record({
+      action: 'payment_account.update',
+      actor,
+      target: {
+        type: 'payment_account',
+        id,
+        label: paymentAccountLabel(account),
+      },
+      before: paymentAccountSnapshot(before),
+      after: paymentAccountSnapshot(account),
+    });
+    return this.toAdminResponse(account);
+  }
+
+  async remove(id: string, actor: AuthenticatedUser) {
+    const before = await this.prisma.paymentAccount.findUnique({
+      where: { id },
+    });
+    if (!before) throw new NotFoundException('Payment account not found');
+
     const inUse = await this.prisma.paymentAccountTransaction.count({
       where: { paymentAccountId: id },
     });
@@ -294,6 +414,16 @@ export class PaymentAccountsService {
       );
     }
     await this.prisma.paymentAccount.delete({ where: { id } });
+    await this.audit.record({
+      action: 'payment_account.delete',
+      actor,
+      target: {
+        type: 'payment_account',
+        id,
+        label: paymentAccountLabel(before),
+      },
+      before: paymentAccountSnapshot(before),
+    });
     return { deleted: true };
   }
 
@@ -301,13 +431,13 @@ export class PaymentAccountsService {
   async recordTransaction(
     accountId: string,
     dto: CreateManualPaymentAccountTransactionDto,
-    actorUserId: string,
+    actor: AuthenticatedUser,
   ) {
     const { account, entry } =
       await this.paymentAccountLedgerService.recordManualEntry(
         accountId,
         dto,
-        actorUserId,
+        actor,
       );
     // recordManualEntry owns and has already committed its own transaction
     // by the time we're back here, so it's safe to notify now.

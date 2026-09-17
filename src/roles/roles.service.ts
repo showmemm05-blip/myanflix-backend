@@ -19,6 +19,8 @@ import {
 } from './permission-catalogue';
 import { PermissionResolverService } from './permission-resolver.service';
 import { isSystemRoleKey } from './system-roles.seed';
+import { AuditService } from '../audit/audit.service';
+import { roleSnapshot } from '../audit/audit-snapshots';
 
 /** The permission that lets someone edit roles — the one the lockout guard protects. */
 const ROLES_EDIT: Permission = 'ROLES.EDIT';
@@ -45,6 +47,7 @@ export class RolesService {
     private readonly prisma: PrismaService,
     private readonly resolver: PermissionResolverService,
     private readonly authority: AuthorityService,
+    private readonly audit: AuditService,
   ) {}
 
   /** Module/action tree for the permission matrix UI. */
@@ -105,11 +108,21 @@ export class RolesService {
     // A brand-new id can't be cached yet, but a key collision with a
     // previously-deleted role could be — cheap insurance.
     this.resolver.invalidate(role.id);
+    await this.audit.record({
+      action: 'role.create',
+      actor,
+      target: { type: 'role', id: role.id, label: role.name },
+      after: roleSnapshot(role),
+    });
     return this.toResponse(role, 0);
   }
 
   /** Rename / re-describe. The protected role is read-only; `key` never changes. */
-  async update(id: string, dto: UpdateAppRoleDto): Promise<AppRoleResponseDto> {
+  async update(
+    id: string,
+    dto: UpdateAppRoleDto,
+    actor: AuthenticatedUser,
+  ): Promise<AppRoleResponseDto> {
     const existing = await this.findByIdOrThrow(id);
     this.assertNotProtected(existing);
 
@@ -125,6 +138,13 @@ export class RolesService {
     });
 
     this.resolver.invalidate(id);
+    await this.audit.record({
+      action: 'role.update',
+      actor,
+      target: { type: 'role', id, label: updated.name },
+      before: roleSnapshot(existing),
+      after: roleSnapshot(updated),
+    });
     return this.toResponse(updated, await this.countUsers(updated));
   }
 
@@ -133,9 +153,20 @@ export class RolesService {
    * what is stored so unchanged rows are left alone, then the resolver cache
    * for this role is dropped — the change is live on the next request.
    *
-   * Two escalation guards run first: the actor may not grant anything they do
-   * not hold (P1), and may not edit the role they are themselves assigned to
-   * (which would otherwise be a one-request self-promotion to anything).
+   * The guards run in this order, and the order decides which message the
+   * user sees when several would fail:
+   *  1. the protected role is read-only (409);
+   *  2. a built-in role's permissions are only a Super Admin's to change
+   *     (403) — built-ins are the fallback for every legacy account, so a
+   *     change there reaches accounts the editor may never touch;
+   *  3. the actor may not edit the role they are themselves assigned to
+   *     (403 — otherwise a one-request self-promotion to anything);
+   *  4. the ceiling on the DIFF (P1, 403): nothing may be added, and nothing
+   *     may be removed, that the actor does not hold. Checking only the
+   *     incoming set let a small ROLES.EDIT holder strip the built-in Admin
+   *     role bare (F-004).
+   * Then the lockout guard (409) refuses stripping ROLES.EDIT from the last
+   * role that can reach it.
    */
   async replacePermissions(
     id: string,
@@ -144,12 +175,10 @@ export class RolesService {
   ): Promise<AppRoleResponseDto> {
     const existing = await this.findByIdOrThrow(id);
     this.assertNotProtected(existing);
+    await this.assertSystemRoleEditableBy(existing, actor);
     await this.assertNotOwnRole(existing, actor);
 
     const next = normalizePermissions(permissions);
-    await this.authority.assertCanGrant(actor, next);
-    await this.assertNotLastRoleManager(existing, next);
-
     const current = new Set(existing.permissions.map((p) => p.permission));
     const wanted = new Set<string>(next);
     const toAdd = next.filter((permission) => !current.has(permission));
@@ -157,20 +186,35 @@ export class RolesService {
       (permission) => !wanted.has(permission),
     );
 
+    // Grant before revoke: the grant message is the one the F4 specs pin.
+    await this.authority.assertCanGrant(actor, toAdd);
+    await this.authority.assertCanRevoke(actor, toRemove);
+    await this.assertNotLastRoleManager(existing, next);
+
     if (toAdd.length > 0 || toRemove.length > 0) {
-      await this.prisma.$transaction([
-        this.prisma.appRolePermission.deleteMany({
+      await this.prisma.$transaction(async (tx) => {
+        await tx.appRolePermission.deleteMany({
           where: { roleId: id, permission: { in: toRemove } },
-        }),
-        this.prisma.appRolePermission.createMany({
+        });
+        await tx.appRolePermission.createMany({
           data: toAdd.map((permission) => ({ roleId: id, permission })),
           skipDuplicates: true,
-        }),
-        this.prisma.appRole.update({
+        });
+        await tx.appRole.update({
           where: { id },
           data: { updatedAt: new Date() },
-        }),
-      ]);
+        });
+        // Committed with the permission rows — or rolled back with them.
+        await this.audit.record({
+          action: 'role.permissions_change',
+          actor,
+          target: { type: 'role', id, label: existing.name },
+          before: roleSnapshot(existing),
+          after: roleSnapshot({ ...existing, permissions: next }),
+          metadata: { added: toAdd, removed: toRemove },
+          tx,
+        });
+      });
     }
 
     this.resolver.invalidate(id);
@@ -179,12 +223,12 @@ export class RolesService {
   }
 
   /** Only custom roles with nobody assigned can go. Everything else is a 409. */
-  async remove(id: string): Promise<void> {
+  async remove(id: string, actor: AuthenticatedUser): Promise<void> {
     const existing = await this.findByIdOrThrow(id);
 
     if (existing.isSystem) {
       throw new ConflictException(
-        'Built-in roles cannot be deleted. You can edit their permissions instead.',
+        'Built-in roles cannot be deleted. A Super Admin can change their permissions instead.',
       );
     }
 
@@ -197,6 +241,12 @@ export class RolesService {
 
     await this.prisma.appRole.delete({ where: { id } });
     this.resolver.invalidate(id);
+    await this.audit.record({
+      action: 'role.delete',
+      actor,
+      target: { type: 'role', id, label: existing.name },
+      before: roleSnapshot(existing),
+    });
   }
 
   private async findByIdOrThrow(id: string): Promise<RoleRow> {
@@ -230,6 +280,23 @@ export class RolesService {
         'The Super Admin role is protected — its name and permissions cannot be changed.',
       );
     }
+  }
+
+  /**
+   * F-004: what a built-in role may do is only a Super Admin's to change.
+   * Built-ins are the NULL-appRoleId fallback for legacy accounts (see
+   * `countUsers`), so an edit there reaches accounts the editor may never be
+   * allowed to touch. Renaming stays open — a label confers nothing.
+   */
+  private async assertSystemRoleEditableBy(
+    role: RoleRow,
+    actor: AuthenticatedUser,
+  ): Promise<void> {
+    if (!role.isSystem) return;
+    if (await this.authority.isEffectiveSuperAdmin(actor)) return;
+    throw new ForbiddenException(
+      'Only a Super Admin can change the permissions of a built-in role.',
+    );
   }
 
   /**

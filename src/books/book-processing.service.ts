@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import sharp from 'sharp';
@@ -6,6 +7,8 @@ import { BookType, ChapterStatus, Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
+import { bookChapterSnapshot } from '../audit/audit-snapshots';
+import { AuditService } from '../audit/audit.service';
 import { probePdf, renderPdfPageToPng } from './pdf.util';
 
 /**
@@ -26,6 +29,15 @@ const WEBP_QUALITY = 82;
  * a wide pool would starve everything else for no wall-clock win.
  */
 const PAGE_CONCURRENCY = 2;
+
+/** The chapter row as the pipeline loads it: with the ids it needs to build keys. */
+type ProcessableChapter = Prisma.BookChapterGetPayload<{
+  include: {
+    edition: {
+      select: { id: true; book: { select: { id: true; type: true } } };
+    };
+  };
+}>;
 
 /**
  * PDF -> per-page WebP conversion, per CHAPTER — each chapter is its own
@@ -57,6 +69,7 @@ export class BookProcessingService {
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
     private readonly storageService: StorageService,
+    private readonly audit: AuditService,
   ) {}
 
   isActivelyProcessing(chapterId: string): boolean {
@@ -64,10 +77,31 @@ export class BookProcessingService {
   }
 
   /**
+   * Claims the chapter for the caller BEFORE it does any async work —
+   * synchronous on purpose: a check-and-add with no await in between
+   * cannot interleave with another request, so of N simultaneous start
+   * requests exactly one gets `true`. The caller must either hand the
+   * chapter to processChapter() (whose finally clears the claim once the
+   * run owns it) or release() it on every throw in between — otherwise the
+   * chapter stays refused until the process restarts.
+   */
+  reserve(chapterId: string): boolean {
+    if (this.activeChapterIds.has(chapterId)) return false;
+    this.activeChapterIds.add(chapterId);
+    return true;
+  }
+
+  /** Gives a reserve() back when the start request fails before the pipeline takes over. */
+  release(chapterId: string): void {
+    this.activeChapterIds.delete(chapterId);
+  }
+
+  /**
    * Original PDF -> pdftoppm -> sharp -> WebP per page -> MinIO + BookPage
    * rows. Runs in the background; the triggering request does not wait.
    */
   async processChapter(chapterId: string): Promise<void> {
+    // Idempotent after a reserve(); the finally is what releases it.
     this.activeChapterIds.add(chapterId);
     try {
       await this.runPipeline(chapterId);
@@ -77,10 +111,24 @@ export class BookProcessingService {
   }
 
   private async runPipeline(chapterId: string): Promise<void> {
-    const scratchDir = this.storageService.bookScratchDir(chapterId);
+    // One directory per RUN under the chapter's scratch root, so a run that
+    // finishes (and removes its own directory in the finally below) can
+    // never delete the original.pdf / page PNGs of another run for the
+    // same chapter. The run id is minted here, but the root itself is now
+    // nested by book and edition like every other book path, so the full
+    // directory can only be resolved once the chapter row has been read —
+    // hence the null until then, and the guard in the finally.
+    const runId = randomUUID();
+    // What the finally has to remove — null until the directory exists. The
+    // pipeline itself works off its own const below, because a `let` loses
+    // its non-null narrowing inside the worker closure.
+    let createdScratchDir: string | null = null;
+    // The row as it was before this run touched it — the `before` of the
+    // READY/FAILED audit event. Declared out here so the catch can see it.
+    let chapter: ProcessableChapter | null = null;
 
     try {
-      const chapter = await this.prisma.bookChapter.findUnique({
+      chapter = await this.prisma.bookChapter.findUnique({
         where: { id: chapterId },
         include: {
           edition: {
@@ -109,6 +157,11 @@ export class BookProcessingService {
         data: { status: ChapterStatus.PROCESSING, processingError: null },
       });
 
+      const scratchDir = join(
+        this.storageService.bookScratchDir(bookId, editionId, chapterId),
+        runId,
+      );
+      createdScratchDir = scratchDir;
       await this.storageService.ensureDir(scratchDir);
       const localPdf = join(scratchDir, 'original.pdf');
       await this.minioService.downloadFile(chapter.pdfKey, localPdf);
@@ -153,16 +206,33 @@ export class BookProcessingService {
         }
       };
       await Promise.all(
-        Array.from({ length: Math.min(PAGE_CONCURRENCY, pending.length) }, worker),
+        Array.from(
+          { length: Math.min(PAGE_CONCURRENCY, pending.length) },
+          worker,
+        ),
       );
 
-      await this.prisma.bookChapter.update({
+      const ready = await this.prisma.bookChapter.update({
         where: { id: chapterId },
         data: { status: ChapterStatus.READY },
       });
       this.logger.log(
         `Chapter ${chapterId} converted: ${pageCount} pages ready`,
       );
+      // Nobody is on the request: the conversion finishing is a system event.
+      await this.audit.record({
+        action: 'book_chapter.status_change',
+        actor: null,
+        target: { type: 'book_chapter', id: chapterId, label: ready.title },
+        before: bookChapterSnapshot(chapter),
+        after: bookChapterSnapshot(ready),
+        metadata: {
+          trigger: 'pdf_conversion_complete',
+          bookId,
+          editionId,
+          pageCount,
+        },
+      });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       this.logger.error(
@@ -173,9 +243,22 @@ export class BookProcessingService {
       // book deleted mid-conversion makes this update throw P2025, and an
       // unhandled rejection here would take the whole container down.
       try {
-        await this.prisma.bookChapter.update({
+        const failed = await this.prisma.bookChapter.update({
           where: { id: chapterId },
           data: { status: ChapterStatus.FAILED, processingError: reason },
+        });
+        await this.audit.record({
+          action: 'book_chapter.status_change',
+          actor: null,
+          target: { type: 'book_chapter', id: chapterId, label: failed.title },
+          before: chapter ? bookChapterSnapshot(chapter) : null,
+          after: bookChapterSnapshot(failed),
+          metadata: {
+            trigger: 'pdf_conversion_failed',
+            bookId: chapter?.edition.book.id ?? null,
+            editionId: chapter?.editionId ?? null,
+            reason,
+          },
         });
       } catch (updateError) {
         if (
@@ -192,7 +275,14 @@ export class BookProcessingService {
         }
       }
     } finally {
-      await rm(scratchDir, { recursive: true, force: true }).catch(() => {});
+      // Still null when the run bailed out before the chapter row resolved —
+      // nothing was created, so there is nothing to remove.
+      if (createdScratchDir) {
+        await rm(createdScratchDir, {
+          recursive: true,
+          force: true,
+        }).catch(() => {});
+      }
     }
   }
 
@@ -220,6 +310,11 @@ export class BookProcessingService {
         .webp({ quality: WEBP_QUALITY })
         .toBuffer({ resolveWithObject: true });
 
+      // Pages stay under books/, NOT under images/, even though they are
+      // images: images/ is public by key and a converted page is paid
+      // content that must only ever be reachable through a signed link.
+      // The source PDF went the other way, to documents/, because it is
+      // source and is never served at all.
       const imageKey = this.storageService.bookPageKey(
         ids.bookId,
         ids.editionId,

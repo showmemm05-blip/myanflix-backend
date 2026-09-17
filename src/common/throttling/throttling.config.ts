@@ -85,6 +85,15 @@ export function clientIpOf(req: Record<string, unknown>): string {
  * keeps "09..." and "+959..." in one bucket exactly as the DTO will. A body
  * that is missing the field or is not an object falls back to the IP so a
  * malformed request still counts against someone.
+ *
+ * Every primitive is stringified exactly as the ValidationPipe's
+ * enableImplicitConversion (app.module.ts) will stringify it before the DTO
+ * sees it, so `"09777000777"`, `9777000777` and `959777000777` all land in
+ * `phone:+959777000777`, and `"12345"` / `12345` / `true` in `user:12345` /
+ * `user:true`. Null, arrays and objects fall back to the IP: null and arrays
+ * are rejected by the pipe with 400, and a plain object stringifies to
+ * "[object Object]", which no phone regex accepts and which names no real
+ * account — so no real credential ever gets a second bucket.
  */
 export const credentialTargetTracker: ThrottlerGetTrackerFunction = (req) => {
   const body = req.body as unknown;
@@ -93,15 +102,36 @@ export const credentialTargetTracker: ThrottlerGetTrackerFunction = (req) => {
       phone?: unknown;
       username?: unknown;
     };
-    if (typeof phone === 'string' && phone.trim()) {
-      return `phone:${normalizePhone(phone)}`;
+    const phoneText = credentialText(phone);
+    if (phoneText !== null) {
+      return `phone:${normalizePhone(phoneText)}`;
     }
-    if (typeof username === 'string' && username.trim()) {
-      return `user:${username.trim().toLowerCase()}`;
+    const userText = credentialText(username);
+    if (userText !== null) {
+      return `user:${userText.toLowerCase()}`;
     }
   }
   return `ip:${clientIpOf(req)}`;
 };
+
+/**
+ * The trimmed text of a credential value as the pipe will read it: any
+ * string, number or boolean (the only primitives JSON can carry) becomes
+ * `String(value)`; null, undefined, objects, arrays and blank strings yield
+ * null (see credentialTargetTracker for why those are safe to leave keyed
+ * by IP).
+ */
+function credentialText(value: unknown): string | null {
+  if (
+    typeof value !== 'string' &&
+    typeof value !== 'number' &&
+    typeof value !== 'boolean'
+  ) {
+    return null;
+  }
+  const text = String(value).trim();
+  return text || null;
+}
 
 /** True when the route did NOT opt into the named throttler. */
 function notOptedIn(name: string) {

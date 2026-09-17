@@ -12,6 +12,9 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { OptionalAuth } from '../common/decorators/optional-auth.decorator';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { MinioService } from '../common/storage/minio.service';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
@@ -24,7 +27,9 @@ import { MovieResponseDto } from '../movies/dto/movie-response.dto';
 /**
  * Reads are open to any authenticated caller — the cast of a film is public
  * catalog metadata, exactly like its categories, so the user site reads this
- * without a permission. Mutations are gated per route.
+ * without a permission. The list and detail reads are also open to guests
+ * (@OptionalAuth) for the catalogue's cast filter; they return only actor
+ * metadata and re-hosted headshot URLs. Mutations are gated per route.
  */
 @Controller('actors')
 export class ActorsController {
@@ -38,8 +43,10 @@ export class ActorsController {
     this.minioService.imageUrl(url);
 
   @Get()
+  @OptionalAuth()
   async findAll(@Query() query: ActorQueryDto) {
-    const { items, total, page, limit } = await this.actorsService.findAll(query);
+    const { items, total, page, limit } =
+      await this.actorsService.findAll(query);
     return {
       items: items.map((a) =>
         ActorResponseDto.fromEntity(a, this.resolveImageUrl),
@@ -51,6 +58,7 @@ export class ActorsController {
   }
 
   @Get(':id')
+  @OptionalAuth()
   async findOne(@Param('id', ParseUUIDPipe) id: string) {
     const actor = await this.actorsService.findByIdOrThrow(id);
     return ActorResponseDto.fromEntity(actor, this.resolveImageUrl);
@@ -68,8 +76,11 @@ export class ActorsController {
   @Post()
   @UseGuards(PermissionsGuard)
   @RequirePermissions('ACTORS.CREATE')
-  async create(@Body() dto: CreateActorDto) {
-    const actor = await this.actorsService.create(dto);
+  async create(
+    @Body() dto: CreateActorDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    const actor = await this.actorsService.create(dto, user);
     return ActorResponseDto.fromEntity(actor, this.resolveImageUrl);
   }
 
@@ -79,8 +90,9 @@ export class ActorsController {
   async update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateActorDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    const actor = await this.actorsService.update(id, dto);
+    const actor = await this.actorsService.update(id, dto, user);
     return ActorResponseDto.fromEntity(actor, this.resolveImageUrl);
   }
 
@@ -88,7 +100,10 @@ export class ActorsController {
   @HttpCode(HttpStatus.NO_CONTENT)
   @UseGuards(PermissionsGuard)
   @RequirePermissions('ACTORS.DELETE')
-  async remove(@Param('id', ParseUUIDPipe) id: string) {
-    await this.actorsService.remove(id);
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    await this.actorsService.remove(id, user);
   }
 }

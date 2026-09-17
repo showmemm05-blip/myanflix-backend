@@ -23,6 +23,16 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
+import type { AuditAction } from '../audit/audit-actions';
+import {
+  bookChapterSnapshot,
+  bookEditionSnapshot,
+  bookPartSnapshot,
+  bookSectionSnapshot,
+  bookSnapshot,
+} from '../audit/audit-snapshots';
+import { AuditService } from '../audit/audit.service';
 import { BookAuthorsService } from '../book-authors/book-authors.service';
 import { BookProcessingService } from './book-processing.service';
 import type { BookQueryDto } from './dto/book-query.dto';
@@ -115,6 +125,23 @@ const positionOrder = () => [
   { id: 'asc' as const },
 ];
 
+/**
+ * Which audit action an edition PUT records, decided by the status line it
+ * crosses: → PUBLISHED = publish, PUBLISHED → other = unpublish, other →
+ * other = status_change, no status movement = a plain update (which the
+ * audit service drops when nothing else changed either).
+ */
+function editionActionFor(before: BookStatus, after: BookStatus): AuditAction {
+  if (before === after) return 'book_edition.update';
+  if (after === BookStatus.PUBLISHED) return 'book_edition.publish';
+  if (before === BookStatus.PUBLISHED) return 'book_edition.unpublish';
+  return 'book_edition.status_change';
+}
+
+/** "Title · language" — how an edition is named in the audit log. */
+const editionLabel = (bookTitle: string | null | undefined, language: string) =>
+  `${bookTitle ?? ''} · ${language}`;
+
 @Injectable()
 export class BooksService {
   private readonly logger = new Logger(BooksService.name);
@@ -125,6 +152,7 @@ export class BooksService {
     private readonly storageService: StorageService,
     private readonly bookProcessing: BookProcessingService,
     private readonly bookAuthors: BookAuthorsService,
+    private readonly audit: AuditService,
   ) {}
 
   // ---------------------------------------------------------------------
@@ -233,10 +261,13 @@ export class BooksService {
    * always equal `authorRef.name`, because that string is what every
    * existing client reads.
    */
-  private async resolveAuthor(dto: {
-    author?: string;
-    authorId?: string;
-  }): Promise<{ id: string; name: string } | null> {
+  private async resolveAuthor(
+    dto: {
+      author?: string;
+      authorId?: string;
+    },
+    actor: AuthenticatedUser,
+  ): Promise<{ id: string; name: string } | null> {
     if (dto.authorId) {
       try {
         return await this.bookAuthors.findByIdOrThrow(dto.authorId);
@@ -250,7 +281,9 @@ export class BooksService {
       }
     }
     if (dto.author?.trim()) {
-      return this.bookAuthors.findOrCreateByName(dto.author);
+      // The actor rides along so an author row born from the book form is
+      // still attributed to the staff member who typed the name.
+      return this.bookAuthors.findOrCreateByName(dto.author, actor);
     }
     return null;
   }
@@ -259,13 +292,16 @@ export class BooksService {
     return { author: row.name, authorRef: { connect: { id: row.id } } };
   }
 
-  async create(dto: CreateBookDto): Promise<BookWithRelations> {
+  async create(
+    dto: CreateBookDto,
+    actor: AuthenticatedUser,
+  ): Promise<BookWithRelations> {
     const { categoryIds, language, author, authorId, ...data } = dto;
     // Never null here: the DTO requires `author` unless `authorId` is given.
-    const authorRow = await this.resolveAuthor({ author, authorId });
+    const authorRow = await this.resolveAuthor({ author, authorId }, actor);
     if (!authorRow) throw new BadRequestException('A book needs an author');
 
-    return this.prisma.book.create({
+    const book = await this.prisma.book.create({
       data: {
         ...data,
         ...this.authorData(authorRow),
@@ -280,51 +316,176 @@ export class BooksService {
       },
       include: CATALOG_INCLUDE,
     });
+
+    await this.audit.record({
+      action: 'book.create',
+      actor,
+      target: { type: 'book', id: book.id, label: book.title },
+      after: bookSnapshot(book),
+      metadata: { language },
+    });
+    return book;
   }
 
-  async update(id: string, dto: UpdateBookDto): Promise<BookWithRelations> {
-    await this.assertBookExists(id);
+  async update(
+    id: string,
+    dto: UpdateBookDto,
+    actor: AuthenticatedUser,
+  ): Promise<BookWithRelations> {
+    // The audit diff needs the old values, so this is a real pre-read rather
+    // than the id-only existence check it used to be.
+    const before = await this.prisma.book.findUnique({
+      where: { id },
+      include: { categories: true },
+    });
+    if (!before) throw new NotFoundException('Book not found');
     const { categoryIds, author, authorId, ...data } = dto;
-    const authorRow = await this.resolveAuthor({ author, authorId });
+    const authorRow = await this.resolveAuthor({ author, authorId }, actor);
+    // Canonicalised once, so the value written and the value compared below
+    // are the same string — the admin echoes a fetched record back on save,
+    // and that echo must read as "unchanged", not as a replacement.
+    const nextCoverUrl =
+      data.coverUrl !== undefined
+        ? this.minioService.canonicalImageUrl(data.coverUrl)
+        : undefined;
 
-    return this.prisma.book.update({
+    const after = await this.prisma.book.update({
       where: { id },
       data: {
         ...data,
         ...(authorRow ? this.authorData(authorRow) : {}),
-        ...(data.coverUrl !== undefined
-          ? { coverUrl: this.minioService.canonicalImageUrl(data.coverUrl) }
-          : {}),
+        ...(nextCoverUrl !== undefined ? { coverUrl: nextCoverUrl } : {}),
         categories: categoryIds
           ? { set: categoryIds.map((cid) => ({ id: cid })) }
           : undefined,
       },
       include: CATALOG_INCLUDE,
     });
+
+    await this.audit.record({
+      action: 'book.update',
+      actor,
+      target: { type: 'book', id, label: after.title },
+      before: bookSnapshot(before),
+      after: bookSnapshot(after),
+    });
+
+    // A replaced (or cleared) cover used to leave its old object behind
+    // forever: nothing else ever pointed at it again, and remove() only
+    // clears the cover a book holds at the moment it is deleted. Every cover
+    // change therefore leaked one file. The row already holds the new value,
+    // so the old key is unreferenced unless another book shares it — which
+    // the helper checks before deleting.
+    if (
+      nextCoverUrl !== undefined &&
+      before.coverUrl &&
+      before.coverUrl !== nextCoverUrl
+    ) {
+      await this.deleteCoverObject(before.coverUrl, id, 'replaced');
+    }
+    return after;
+  }
+
+  /**
+   * Best-effort removal of one cover object, shared by update() (a replaced
+   * cover) and remove() (a deleted book). Three things it refuses to do
+   * silently, because each one is how covers went missing or lingered:
+   *
+   *  - skip a URL it cannot turn back into a key. The old code did
+   *    `if (key) delete` and said nothing when key was null, so a stored
+   *    value in an unexpected shape was never cleaned and never reported.
+   *  - delete an object another book still references. Covers are
+   *    `images/book/<uuid>` and are uploaded before any row exists, so the
+   *    same URL can legitimately be attached to two books; the guard mirrors
+   *    SeriesService.isImageKeyStillReferenced.
+   *  - let a storage error pass as a warning. A cover that survives its book
+   *    is exactly what the admin notices, so it is logged at error level
+   *    with the key, the way series cleanup reports its failures.
+   *
+   * Never throws: storage is second and best-effort, the row change has
+   * already happened, and a leaked object must not fail the request.
+   */
+  private async deleteCoverObject(
+    coverUrl: string,
+    bookId: string,
+    reason: 'replaced' | 'deleted',
+  ): Promise<void> {
+    const key = this.minioService.keyFromPublicUrl(coverUrl);
+    if (!key) {
+      this.logger.warn(
+        `Cover of ${reason} book ${bookId} is not one of our objects, left in place: ${coverUrl}`,
+      );
+      return;
+    }
+    try {
+      const stillReferenced = await this.prisma.book.count({
+        where: { coverUrl: { contains: key } },
+      });
+      if (stillReferenced > 0) return;
+      await this.minioService.deleteObject(key);
+    } catch (error) {
+      this.logger.error(
+        `Cover object of ${reason} book ${bookId} was not removed (${key}): ${(error as Error).message}`,
+      );
+    }
   }
 
   /**
    * DB row first (cascading to editions, chapters, pages and bookmarks),
    * storage second and best-effort — the same order and reasoning as
    * MoviesService.remove. Every edition's objects live under the book's own
-   * key prefix, so one prefix delete still reaches all of them.
+   * key prefix, so one prefix delete still reaches all of them — but there
+   * are now TWO such prefixes: the generated reader pages under books/ and
+   * the uploaded source PDFs under documents/books/. Both mirror the same
+   * book/edition/chapter depth, so each stays a single prefix delete.
+   *
+   * The cover is the one object that lives under NEITHER: it is an
+   * `images/book/<uuid>` upload made before the row existed, so no prefix
+   * delete can reach it and it needs its own step — see deleteCoverObject.
    */
-  async remove(id: string): Promise<void> {
-    const book = await this.prisma.book.findUnique({ where: { id } });
+  async remove(id: string, actor: AuthenticatedUser): Promise<void> {
+    const book = await this.prisma.book.findUnique({
+      where: { id },
+      include: { categories: true },
+    });
     if (!book) throw new NotFoundException('Book not found');
+    // What the cascade is about to take with it — counted before the delete
+    // because afterwards there is nothing left to count.
+    const [editions, chapters] = await Promise.all([
+      this.prisma.bookEdition.count({ where: { bookId: id } }),
+      this.prisma.bookChapter.count({ where: { edition: { bookId: id } } }),
+    ]);
 
     await this.prisma.book.delete({ where: { id } });
 
+    await this.audit.record({
+      action: 'book.delete',
+      actor,
+      target: { type: 'book', id, label: book.title },
+      before: bookSnapshot(book),
+      metadata: { deletedEditions: editions, deletedChapters: chapters },
+    });
+
     try {
-      await this.minioService.deleteByPrefix(`books/${id}/`);
-      if (book.coverUrl) {
-        const key = this.minioService.keyFromPublicUrl(book.coverUrl);
-        if (key) await this.minioService.deleteObject(key);
-      }
+      await this.minioService.deleteByPrefix(
+        `${this.storageService.bookPrefix(id)}/`,
+      );
+      await this.minioService.deleteByPrefix(
+        `${this.storageService.bookDocumentPrefix(id)}/`,
+      );
     } catch (error) {
       this.logger.warn(
         `Failed to clean up storage for deleted book ${id}: ${(error as Error).message}`,
       );
+    }
+
+    // Deliberately OUTSIDE the try above. The cover was the last statement
+    // inside it, so any failure in either prefix delete threw past it and the
+    // cover quietly survived its book — the one leftover an admin actually
+    // sees. The helper is best-effort on its own, so the two cleanups can no
+    // longer take each other down.
+    if (book.coverUrl) {
+      await this.deleteCoverObject(book.coverUrl, id, 'deleted');
     }
   }
 
@@ -343,10 +504,11 @@ export class BooksService {
   async addEdition(
     bookId: string,
     dto: CreateBookEditionDto,
+    actor: AuthenticatedUser,
   ): Promise<EditionWithCounts> {
     const book = await this.prisma.book.findUnique({
       where: { id: bookId },
-      select: { type: true },
+      select: { type: true, title: true },
     });
     if (!book) throw new NotFoundException('Book not found');
 
@@ -360,7 +522,7 @@ export class BooksService {
       );
     }
 
-    return this.prisma.bookEdition.create({
+    const created = await this.prisma.bookEdition.create({
       data: { bookId, ...this.newEditionData(book.type, dto.language) },
       include: {
         _count: { select: { chapters: true } },
@@ -375,15 +537,29 @@ export class BooksService {
         },
       },
     });
+
+    await this.audit.record({
+      action: 'book_edition.create',
+      actor,
+      target: {
+        type: 'book_edition',
+        id: created.id,
+        label: editionLabel(book.title, created.language),
+      },
+      after: bookEditionSnapshot(created),
+      metadata: { bookId },
+    });
+    return created;
   }
 
   async updateEdition(
     bookId: string,
     editionId: string,
     dto: UpdateBookEditionDto,
+    actor: AuthenticatedUser,
   ): Promise<EditionWithCounts> {
     const edition = await this.editionOrThrow(bookId, editionId, {
-      book: { select: { type: true } },
+      book: { select: { type: true, title: true } },
     });
 
     if (dto.status !== undefined) {
@@ -404,7 +580,7 @@ export class BooksService {
       }
     }
 
-    return this.prisma.bookEdition.update({
+    const updated = await this.prisma.bookEdition.update({
       where: { id: editionId },
       data: {
         ...(dto.language !== undefined ? { language: dto.language } : {}),
@@ -428,6 +604,23 @@ export class BooksService {
         },
       },
     });
+
+    // One row per PUT: the status line it crosses picks the action, and the
+    // diff carries every field that moved (a rename riding along with a
+    // publish lands in the same row).
+    await this.audit.record({
+      action: editionActionFor(edition.status, updated.status),
+      actor,
+      target: {
+        type: 'book_edition',
+        id: editionId,
+        label: editionLabel(edition.book.title, updated.language),
+      },
+      before: bookEditionSnapshot(edition),
+      after: bookEditionSnapshot(updated),
+      metadata: { bookId },
+    });
+    return updated;
   }
 
   /**
@@ -436,20 +629,45 @@ export class BooksService {
    * book with no languages is unreachable content, and deleting the book is
    * the honest way to say that.
    */
-  async removeEdition(bookId: string, editionId: string): Promise<void> {
-    await this.editionOrThrow(bookId, editionId);
+  async removeEdition(
+    bookId: string,
+    editionId: string,
+    actor: AuthenticatedUser,
+  ): Promise<void> {
+    const edition = await this.editionOrThrow(bookId, editionId, {
+      book: { select: { title: true } },
+    });
     const count = await this.prisma.bookEdition.count({ where: { bookId } });
     if (count <= 1) {
       throw new BadRequestException(
         'A book must keep at least one language — delete the book instead',
       );
     }
+    const chapters = await this.prisma.bookChapter.count({
+      where: { editionId },
+    });
 
     await this.prisma.bookEdition.delete({ where: { id: editionId } });
+
+    await this.audit.record({
+      action: 'book_edition.delete',
+      actor,
+      target: {
+        type: 'book_edition',
+        id: editionId,
+        label: editionLabel(edition.book.title, edition.language),
+      },
+      before: bookEditionSnapshot(edition),
+      metadata: { bookId, deletedChapters: chapters },
+    });
 
     try {
       await this.minioService.deleteByPrefix(
         `${this.storageService.bookEditionPrefix(bookId, editionId)}/`,
+      );
+      // The edition's source PDFs live in the parallel documents/ tree.
+      await this.minioService.deleteByPrefix(
+        `${this.storageService.bookDocumentEditionPrefix(bookId, editionId)}/`,
       );
     } catch (error) {
       this.logger.warn(
@@ -509,6 +727,7 @@ export class BooksService {
     bookId: string,
     editionId: string,
     dto: CreateBookChapterDto,
+    actor: AuthenticatedUser,
   ): Promise<ChapterWithHierarchy> {
     const edition = await this.editionOrThrow(bookId, editionId, {
       book: { select: { type: true } },
@@ -538,6 +757,14 @@ export class BooksService {
       },
     });
 
+    await this.audit.record({
+      action: 'book_chapter.create',
+      actor,
+      target: { type: 'book_chapter', id: created.id, label: created.title },
+      after: bookChapterSnapshot(created),
+      metadata: { bookId, editionId },
+    });
+
     // A chapter born into a part lands at the end of the edition's order;
     // regrouping moves it up behind its part-mates and renumbers.
     if (dto.partId) {
@@ -552,6 +779,7 @@ export class BooksService {
     editionId: string,
     chapterId: string,
     dto: UpdateBookChapterDto,
+    actor: AuthenticatedUser,
   ): Promise<ChapterWithHierarchy> {
     const current = await this.assertChapterInEdition(
       bookId,
@@ -578,10 +806,24 @@ export class BooksService {
       },
     });
 
-    if (partChanged) {
-      await this.normalizeReadingOrder(editionId);
-      return this.decoratedChapterOrThrow(editionId, chapterId);
-    }
+    // Moving between parts renumbers the edition, so the logged `order` is
+    // taken after that, not from the pre-renumber write.
+    if (partChanged) await this.normalizeReadingOrder(editionId);
+    const settled =
+      (partChanged
+        ? await this.prisma.bookChapter.findUnique({ where: { id: chapterId } })
+        : null) ?? updated;
+
+    await this.audit.record({
+      action: 'book_chapter.update',
+      actor,
+      target: { type: 'book_chapter', id: chapterId, label: settled.title },
+      before: bookChapterSnapshot(current),
+      after: bookChapterSnapshot(settled),
+      metadata: { bookId, editionId },
+    });
+
+    if (partChanged) return this.decoratedChapterOrThrow(editionId, chapterId);
     return (await this.decorateChapters(editionId, [updated]))[0];
   }
 
@@ -589,15 +831,40 @@ export class BooksService {
     bookId: string,
     editionId: string,
     chapterId: string,
+    actor: AuthenticatedUser,
   ): Promise<void> {
-    await this.assertChapterInEdition(bookId, editionId, chapterId);
+    const chapter = await this.assertChapterInEdition(
+      bookId,
+      editionId,
+      chapterId,
+    );
+    const sections = await this.prisma.bookSection.count({
+      where: { chapterId },
+    });
     await this.prisma.bookChapter.delete({ where: { id: chapterId } });
 
+    await this.audit.record({
+      action: 'book_chapter.delete',
+      actor,
+      target: { type: 'book_chapter', id: chapterId, label: chapter.title },
+      before: bookChapterSnapshot(chapter),
+      metadata: {
+        bookId,
+        editionId,
+        deletedSections: sections,
+        deletedPages: chapter.pageCount,
+      },
+    });
+
     // The rows cascade; the bytes do not. Best-effort and warn-only, the same
-    // order and reasoning as remove().
+    // order and reasoning as remove(). Two prefixes: the generated pages and
+    // the uploaded source PDF, which sits in the mirrored documents/ tree.
     try {
       await this.minioService.deleteByPrefix(
         `${this.storageService.bookChapterPrefix(bookId, editionId, chapterId)}/`,
+      );
+      await this.minioService.deleteByPrefix(
+        `${this.storageService.bookDocumentChapterPrefix(bookId, editionId, chapterId)}/`,
       );
     } catch (error) {
       this.logger.warn(
@@ -616,12 +883,18 @@ export class BooksService {
     bookId: string,
     editionId: string,
     dto: ReorderChaptersDto,
+    actor: AuthenticatedUser,
   ): Promise<void> {
-    await this.editionOrThrow(bookId, editionId);
+    const edition = await this.editionOrThrow(bookId, editionId, {
+      book: { select: { title: true } },
+    });
 
+    // In stored order, so the audit row can say what the list looked like
+    // before this call rewrote it.
     const chapters = await this.prisma.bookChapter.findMany({
       where: { editionId },
       select: { id: true },
+      orderBy: positionOrder(),
     });
     const existingIds = new Set(chapters.map((c) => c.id));
 
@@ -647,6 +920,22 @@ export class BooksService {
     // For a part-less edition (and a list the grouped admin UI sends) the
     // order just written IS canonical, so this issues no writes at all.
     await this.normalizeReadingOrder(editionId);
+
+    await this.audit.record({
+      action: 'book_chapter.reorder',
+      actor,
+      target: {
+        type: 'book_chapter',
+        id: null,
+        label: editionLabel(edition.book.title, edition.language),
+      },
+      metadata: {
+        bookId,
+        editionId,
+        before: chapters.map((c) => c.id),
+        after: [...dto.chapterIds],
+      },
+    });
   }
 
   /** Chapter list for one edition — summaries only; content is its own route. */
@@ -822,14 +1111,23 @@ export class BooksService {
   /**
    * Kick off (or retry) one language's PDF -> WebP conversion.
    * Fire-and-forget like video transcoding: the caller gets an immediate
-   * response and the admin polls getProcessingStatus. Accepting PROCESSING
-   * only when this process isn't actually running it is the orphan-recovery
-   * path — see UploadsService.reprocessVideo.
+   * response and the admin polls getProcessingStatus.
+   *
+   * The chapter is reserved in BookProcessingService synchronously, before
+   * the first await after the row is read, so of N simultaneous presses
+   * exactly one starts the pipeline and the rest get a 409 — a read-then-
+   * check on the row alone let every parallel request pass while the
+   * in-memory set was still empty. Every throw between the reservation and
+   * processChapter() releases it, otherwise the next press would be
+   * refused until the process restarts. A PROCESSING row with no
+   * reservation is still the orphan-recovery retry (a crash or a restart
+   * left it there) — see UploadsService.reprocessVideo.
    */
   async startProcessing(
     bookId: string,
     editionId: string,
     chapterId: string,
+    actor: AuthenticatedUser,
   ): Promise<void> {
     const edition = await this.editionOrThrow(bookId, editionId, {
       book: { select: { type: true } },
@@ -844,30 +1142,51 @@ export class BooksService {
     if (!chapter || chapter.editionId !== editionId) {
       throw new NotFoundException('Chapter not found');
     }
-    if (
-      chapter.status === ChapterStatus.PROCESSING &&
-      this.bookProcessing.isActivelyProcessing(chapterId)
-    ) {
+    if (!this.bookProcessing.reserve(chapterId)) {
       throw new ConflictException('This chapter is already being processed');
     }
 
-    // The PDF lands at a fixed key via the browser-direct upload (see
-    // ResourceUploadTypeRegistry's "book" entry, whose relativePath carries
-    // the edition and chapter) — record it on first processing so everything
-    // downstream reads the row, not the convention.
-    const pdfKey =
-      chapter.pdfKey ??
-      this.storageService.bookPdfKey(bookId, editionId, chapterId);
-    const size = await this.minioService.objectSize(pdfKey);
-    if (size === null) {
-      throw new BadRequestException(
-        'No uploaded PDF found for this chapter — upload the file first',
-      );
+    try {
+      // The PDF lands at a fixed key via the browser-direct upload (see
+      // ResourceUploadTypeRegistry's "book" entry, whose relativePath carries
+      // the edition and chapter) — record it on first processing so everything
+      // downstream reads the row, not the convention. The fallback MUST be
+      // built with bookPdfKey rather than spelled out here: the convention
+      // moved to documents/books/ and a second hand-written copy of it is
+      // exactly how the two sides would drift apart.
+      const pdfKey =
+        chapter.pdfKey ??
+        this.storageService.bookPdfKey(bookId, editionId, chapterId);
+      const size = await this.minioService.objectSize(pdfKey);
+      if (size === null) {
+        throw new BadRequestException(
+          'No uploaded PDF found for this chapter — upload the file first',
+        );
+      }
+      await this.prisma.bookChapter.update({
+        where: { id: chapterId },
+        data: { pdfKey, pdfFileSize: BigInt(size) },
+      });
+
+      // The start is the staff member's act; the READY/FAILED outcome is the
+      // pipeline's own system event (see BookProcessingService).
+      await this.audit.record({
+        action: 'book_chapter.process',
+        actor,
+        target: { type: 'book_chapter', id: chapterId, label: chapter.title },
+        metadata: {
+          bookId,
+          editionId,
+          pdfKey,
+          pdfFileSize: size,
+          previousStatus: chapter.status,
+          retry: chapter.status !== ChapterStatus.DRAFT,
+        },
+      });
+    } catch (error) {
+      this.bookProcessing.release(chapterId);
+      throw error;
     }
-    await this.prisma.bookChapter.update({
-      where: { id: chapterId },
-      data: { pdfKey, pdfFileSize: BigInt(size) },
-    });
 
     void this.bookProcessing.processChapter(chapterId);
   }
@@ -1045,6 +1364,7 @@ export class BooksService {
     bookId: string,
     editionId: string,
     dto: CreateBookPartDto,
+    actor: AuthenticatedUser,
   ): Promise<PartWithCounts> {
     await this.editionOrThrow(bookId, editionId);
     const last = await this.prisma.bookPart.findFirst({
@@ -1055,6 +1375,13 @@ export class BooksService {
     const created = await this.prisma.bookPart.create({
       data: { editionId, title: dto.title, order: (last?.order ?? 0) + 1 },
     });
+    await this.audit.record({
+      action: 'book_part.create',
+      actor,
+      target: { type: 'book_part', id: created.id, label: created.title },
+      after: bookPartSnapshot(created),
+      metadata: { bookId, editionId },
+    });
     // A new part is empty, so the reading order is untouched.
     return this.partWithCountsOrThrow(editionId, created.id);
   }
@@ -1064,11 +1391,20 @@ export class BooksService {
     editionId: string,
     partId: string,
     dto: UpdateBookPartDto,
+    actor: AuthenticatedUser,
   ): Promise<PartWithCounts> {
-    await this.partOrThrow(bookId, editionId, partId);
-    await this.prisma.bookPart.update({
+    const before = await this.partOrThrow(bookId, editionId, partId);
+    const after = await this.prisma.bookPart.update({
       where: { id: partId },
       data: { ...(dto.title !== undefined ? { title: dto.title } : {}) },
+    });
+    await this.audit.record({
+      action: 'book_part.update',
+      actor,
+      target: { type: 'book_part', id: partId, label: after.title },
+      before: bookPartSnapshot(before),
+      after: bookPartSnapshot(after),
+      metadata: { bookId, editionId },
     });
     return this.partWithCountsOrThrow(editionId, partId);
   }
@@ -1078,12 +1414,16 @@ export class BooksService {
     bookId: string,
     editionId: string,
     dto: ReorderPartsDto,
+    actor: AuthenticatedUser,
   ): Promise<void> {
-    await this.editionOrThrow(bookId, editionId);
+    const edition = await this.editionOrThrow(bookId, editionId, {
+      book: { select: { title: true } },
+    });
 
     const parts = await this.prisma.bookPart.findMany({
       where: { editionId },
       select: { id: true },
+      orderBy: positionOrder(),
     });
     const existingIds = new Set(parts.map((p) => p.id));
     if (
@@ -1104,6 +1444,22 @@ export class BooksService {
       ),
     );
     await this.normalizeReadingOrder(editionId);
+
+    await this.audit.record({
+      action: 'book_part.reorder',
+      actor,
+      target: {
+        type: 'book_part',
+        id: null,
+        label: editionLabel(edition.book.title, edition.language),
+      },
+      metadata: {
+        bookId,
+        editionId,
+        before: parts.map((p) => p.id),
+        after: [...dto.partIds],
+      },
+    });
   }
 
   /**
@@ -1114,10 +1470,22 @@ export class BooksService {
     bookId: string,
     editionId: string,
     partId: string,
+    actor: AuthenticatedUser,
   ): Promise<void> {
-    await this.partOrThrow(bookId, editionId, partId);
+    const part = await this.partOrThrow(bookId, editionId, partId);
+    const unparted = await this.prisma.bookChapter.count({
+      where: { partId },
+    });
     await this.prisma.bookPart.delete({ where: { id: partId } });
     await this.normalizeReadingOrder(editionId);
+
+    await this.audit.record({
+      action: 'book_part.delete',
+      actor,
+      target: { type: 'book_part', id: partId, label: part.title },
+      before: bookPartSnapshot(part),
+      metadata: { bookId, editionId, unpartedChapters: unparted },
+    });
   }
 
   // ---------------------------------------------------------------------
@@ -1231,6 +1599,7 @@ export class BooksService {
     editionId: string,
     chapterId: string,
     dto: CreateBookSectionDto,
+    actor: AuthenticatedUser,
   ): Promise<SectionWithNumber> {
     const { type, chapter } = await this.sectionChapterOrThrow(
       bookId,
@@ -1258,6 +1627,14 @@ export class BooksService {
     });
     if (!written) await this.resortPdfSections(chapterId);
 
+    await this.audit.record({
+      action: 'book_section.create',
+      actor,
+      target: { type: 'book_section', id: created.id, label: created.title },
+      after: bookSectionSnapshot(created),
+      metadata: { bookId, editionId, chapterId },
+    });
+
     return this.numberedSectionOrThrow(editionId, chapterId, created.id);
   }
 
@@ -1267,6 +1644,7 @@ export class BooksService {
     chapterId: string,
     sectionId: string,
     dto: UpdateBookSectionDto,
+    actor: AuthenticatedUser,
   ): Promise<SectionWithNumber> {
     const { type, chapter, section } = await this.sectionOrThrow(
       bookId,
@@ -1276,7 +1654,7 @@ export class BooksService {
     );
     await this.assertSectionShape(type, chapter, dto, false, sectionId);
 
-    await this.prisma.bookSection.update({
+    const updated = await this.prisma.bookSection.update({
       where: { id: sectionId },
       data: {
         ...(dto.title !== undefined ? { title: dto.title } : {}),
@@ -1294,6 +1672,15 @@ export class BooksService {
       await this.resortPdfSections(chapterId);
     }
 
+    await this.audit.record({
+      action: 'book_section.update',
+      actor,
+      target: { type: 'book_section', id: sectionId, label: updated.title },
+      before: bookSectionSnapshot(section),
+      after: bookSectionSnapshot(updated),
+      metadata: { bookId, editionId, chapterId },
+    });
+
     return this.numberedSectionOrThrow(editionId, chapterId, sectionId);
   }
 
@@ -1303,8 +1690,9 @@ export class BooksService {
     editionId: string,
     chapterId: string,
     dto: ReorderSectionsDto,
+    actor: AuthenticatedUser,
   ): Promise<void> {
-    const { type } = await this.sectionChapterOrThrow(
+    const { type, chapter } = await this.sectionChapterOrThrow(
       bookId,
       editionId,
       chapterId,
@@ -1318,6 +1706,7 @@ export class BooksService {
     const sections = await this.prisma.bookSection.findMany({
       where: { chapterId },
       select: { id: true },
+      orderBy: positionOrder(),
     });
     const existingIds = new Set(sections.map((s) => s.id));
     if (
@@ -1337,6 +1726,19 @@ export class BooksService {
         }),
       ),
     );
+
+    await this.audit.record({
+      action: 'book_section.reorder',
+      actor,
+      target: { type: 'book_section', id: null, label: chapter.title },
+      metadata: {
+        bookId,
+        editionId,
+        chapterId,
+        before: sections.map((s) => s.id),
+        after: [...dto.sectionIds],
+      },
+    });
   }
 
   /** Plain delete — numbering is positional, so the gap it leaves is invisible. */
@@ -1345,9 +1747,23 @@ export class BooksService {
     editionId: string,
     chapterId: string,
     sectionId: string,
+    actor: AuthenticatedUser,
   ): Promise<void> {
-    await this.sectionOrThrow(bookId, editionId, chapterId, sectionId);
+    const { section } = await this.sectionOrThrow(
+      bookId,
+      editionId,
+      chapterId,
+      sectionId,
+    );
     await this.prisma.bookSection.delete({ where: { id: sectionId } });
+
+    await this.audit.record({
+      action: 'book_section.delete',
+      actor,
+      target: { type: 'book_section', id: sectionId, label: section.title },
+      before: bookSectionSnapshot(section),
+      metadata: { bookId, editionId, chapterId },
+    });
   }
 
   // ---------------------------------------------------------------------
@@ -1380,14 +1796,6 @@ export class BooksService {
   // ---------------------------------------------------------------------
   // Guards
   // ---------------------------------------------------------------------
-
-  private async assertBookExists(id: string): Promise<void> {
-    const exists = await this.prisma.book.findUnique({
-      where: { id },
-      select: { id: true },
-    });
-    if (!exists) throw new NotFoundException('Book not found');
-  }
 
   /**
    * The edition, if it belongs to this book. Staff-facing: no publish check,
@@ -1429,17 +1837,21 @@ export class BooksService {
     return edition;
   }
 
+  /**
+   * The chapter, if it belongs to this edition of this book. The whole row,
+   * because the callers that write it (update/delete) need the old values
+   * for their audit snapshot.
+   */
   private async assertChapterInEdition(
     bookId: string,
     editionId: string,
     chapterId: string,
     options: { allowAnyType?: boolean } = {},
-  ): Promise<{ editionId: string; partId: string | null }> {
+  ): Promise<BookChapter> {
     void options;
     await this.editionOrThrow(bookId, editionId);
     const chapter = await this.prisma.bookChapter.findUnique({
       where: { id: chapterId },
-      select: { editionId: true, partId: true },
     });
     if (!chapter || chapter.editionId !== editionId) {
       throw new NotFoundException('Chapter not found');

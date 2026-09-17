@@ -29,6 +29,11 @@ services:
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
       JWT_ACCESS_EXPIRES_IN: ${JWT_ACCESS_EXPIRES_IN:-15m}
       JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-7d}
+      # Scratch only, on the backend-storage volume below. Every transient
+      # file lives under <STORAGE_PATH>/temp/ (uploads/, videos/,
+      # documents/books/) — the single directory the cleanup sweep walks.
+      # Anything durable is an object in MinIO, never here. Layout:
+      # ../docs/media-storage-layout.md.
       STORAGE_PATH: /app/storage
       # Local: reaches ../storage-server's MinIO via the host machine's
       # published port. Real deployment: point this at the Movie Storage
@@ -52,6 +57,12 @@ services:
       # split deployment — there, the host serving the API is the one machine
       # with no cache server on it.
       STREAM_PUBLIC_BASE_URL_IS_PUBLIC: ${STREAM_PUBLIC_BASE_URL_IS_PUBLIC:-}
+      # Signs the path token on every playback link; must equal the cache
+      # server's STREAM_SIGNING_SECRET. Deliberately no default — a missing
+      # secret refuses to boot rather than minting links nobody can play.
+      STREAM_SIGNING_SECRET: ${STREAM_SIGNING_SECRET}
+      # Lifetime of a signed playback link in seconds (default 12 h).
+      STREAM_URL_TTL_SECONDS: ${STREAM_URL_TTL_SECONDS:-43200}
       # "Continue with Google" on the website: the OAuth Web client ID the
       # backend verifies every Google ID token's audience against. Must equal
       # the website's NEXT_PUBLIC_GOOGLE_CLIENT_ID. Empty = feature disabled
@@ -75,7 +86,10 @@ services:
     volumes:
       # Uploads/ffmpeg scratch space — HLS output is pushed to MinIO and
       # deleted from here once processed; this only ever holds transient
-      # in-flight data now, not what actually gets streamed.
+      # in-flight data now, not what actually gets streamed. Everything the
+      # app writes here is under /app/storage/temp/; a volume that predates
+      # that move also carries orphaned uploads/, videos/ and books/
+      # directories, which are safe to delete once by hand.
       - backend-storage:/app/storage
 
 volumes:

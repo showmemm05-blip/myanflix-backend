@@ -99,6 +99,16 @@ export const PERMISSION_CATALOGUE = [
     actions: ['VIEW', 'COMMENTS_MODERATE', 'FEEDBACK_MANAGE', 'PII_VIEW'],
   },
   { key: 'SETTINGS', label: 'Settings', actions: ['VIEW', 'MANAGE'] },
+  {
+    // VIEW is the only action: the log is append-only and read through
+    // GET /audit alone. It exposes staff IPs and user agents un-masked, so
+    // no seeded role besides the protected SUPER_ADMIN (which holds the
+    // whole catalogue implicitly) receives it — deliberately no migration
+    // INSERT for ADMIN.
+    key: 'AUDIT',
+    label: 'Audit log',
+    actions: ['VIEW'],
+  },
 ] as const;
 
 type Catalogue = typeof PERMISSION_CATALOGUE;

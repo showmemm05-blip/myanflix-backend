@@ -1,7 +1,8 @@
 generator client {
-  provider     = "prisma-client"
-  output       = "../src/generated/prisma"
-  moduleFormat = "cjs"
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  moduleFormat    = "cjs"
+  previewFeatures = ["partialIndexes"]
 }
 
 datasource db {
@@ -224,6 +225,17 @@ enum FeedbackStatus {
   DISMISSED
 }
 
+/// Which admin area a staff action belongs to — the coarse filter on the
+/// audit log screen. Assigned per action by the catalogue in
+/// src/audit/audit-actions.ts, never chosen by the caller.
+enum AuditCategory {
+  CONTENT
+  USERS
+  FINANCE
+  STAFF
+  SYSTEM
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
@@ -246,7 +258,12 @@ model User {
   /// identities and are never edited through the profile screen. NULL means
   /// "not set" — clients fall back to username/phone for display.
   displayName String?
-  /// MinIO object KEY for the profile picture (e.g. images/avatars/<userId>-<epochMs>.png) — never an absolute URL.
+  /// MinIO object KEY for the profile picture
+  /// (images/user/<userId>/<epochMs>.<jpg|png|webp>) — never an absolute URL.
+  /// The epoch-ms filename is the version stamp, so a replaced picture can
+  /// never collide with the cache server's entry for the old one, and the
+  /// per-user folder makes every avatar this user ever uploaded reachable in
+  /// one prefix delete (UsersService.deleteAvatarObjects).
   avatar      String?
   role        Role       @default(USER)
   /// Granular RBAC assignment (see AppRole). NULL falls back to the seeded
@@ -296,6 +313,7 @@ model User {
   watchActivities                     WatchActivity[]
   sessions                            UserSession[]
   bookReadingProgress                 BookReadingProgress[]
+  auditLogs                           AuditLog[]
 
   @@index([appRoleId])
   @@map("users")
@@ -665,11 +683,16 @@ model BookChapter {
   createdAt DateTime      @default(now())
   updatedAt DateTime      @updatedAt
 
-  /// PDF chapters only — MinIO object KEY of this chapter's uploaded file
-  /// (books/<bookId>/<editionId>/<chapterId>/original.pdf), never an
-  /// absolute URL, so the stored value survives host changes. Keys stay
-  /// nested under the BOOK so deleting a book still cleans every language
-  /// and every chapter with one prefix delete.
+  /// PDF chapters only — MinIO object KEY of this chapter's uploaded SOURCE
+  /// file (documents/books/<bookId>/<editionId>/<chapterId>/original.pdf),
+  /// never an absolute URL, so the stored value survives host changes. It
+  /// sits under documents/, not books/: books/ holds only the GENERATED
+  /// reader pages, while the whole documents/ namespace is denied at the
+  /// cache server and unsignable, so a source PDF can never be handed out.
+  /// Keys stay nested under the BOOK on both sides, so deleting a book still
+  /// cleans every language and every chapter with a fixed pair of prefix
+  /// deletes — `books/<bookId>/` and `documents/books/<bookId>/`, which is
+  /// what BooksService.remove issues.
   pdfKey          String?
   /// PDF chapters only — size of this chapter's file in bytes.
   pdfFileSize     BigInt?
@@ -829,7 +852,15 @@ model Subtitle {
   language  String // e.g. "en", "my"
   label     String // e.g. "English", "Myanmar"
   format    SubtitleFormat
-  objectKey String // MinIO key, e.g. subtitles/<subtitleId>/original.<ext>
+  /// MinIO key of the uploaded SOURCE file, always foldered by the OWNING
+  /// MOVIE: subtitles/<movieId>/<filename>. A single upload names the file
+  /// after this row's id (subtitles/<movieId>/<subtitleId>.srt — a video can
+  /// have more than one track per language, so the language is not unique);
+  /// an external bundle keeps the operator's own basename
+  /// (subtitles/<movieId>/english.vtt), which is how they identify the
+  /// track. Keying by movie is what lets the one `subtitles/<movieId>` scope
+  /// sign every track /stream hands out, whichever path uploaded it.
+  objectKey String
   isDefault Boolean        @default(false)
   createdAt DateTime       @default(now())
   updatedAt DateTime       @updatedAt
@@ -851,13 +882,18 @@ model UploadSession {
   totalChunks  Int
   tempDir      String
   status       UploadStatus @default(IN_PROGRESS)
-  /// Set only for the externally-pre-transcoded upload flow — e.g.
-  /// "original.mp4", "hls/720p/index.m3u8", "hls/720p/segment_000.ts".
+  /// Set only for the externally-pre-transcoded upload flow — the path of
+  /// this file INSIDE the bundle the operator dropped, e.g. "original.mkv",
+  /// "hls/720p/index.m3u8", "hls/720p/segment_000.ts", "subtitles/english.vtt".
   /// Null means the classic single-video-file flow (unchanged behavior):
   /// completeUpload() merges into the movie's original file and kicks off
-  /// transcoding. When set, completeUpload() instead uploads the merged
-  /// file straight to `videos/<movieId>/<relativePath>` and does nothing
-  /// else — no Video row, no processVideo() call.
+  /// transcoding. When set, completeUpload() instead uploads the merged file
+  /// to whatever object key ResourceUploadTypeRegistry.buildKey maps this
+  /// relativePath onto, and does nothing else — no Video row, no
+  /// processVideo() call. That mapping is NOT a plain join: video assets land
+  /// under `videos/<movieId>/<relativePath>`, but a "subtitles/" path is a
+  /// SOURCE file and is routed out of the video prefix to
+  /// `subtitles/<movieId>/<basename>`.
   relativePath String?
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
@@ -1052,6 +1088,17 @@ model Deposit {
   receivingPaymentAccount PaymentAccount?             @relation("DepositReceivingAccount", fields: [receivingPaymentAccountId], references: [id], onDelete: SetNull)
   ledgerEntries           PaymentAccountTransaction[] @relation("DepositLedgerEntries")
 
+  /// One LIVE deposit per reference — enforced by the database so concurrent
+  /// submissions cannot slip past the service-level pre-check. REJECTED is
+  /// excluded so a user can resubmit after a mistaken rejection — see
+  /// DepositsService.create. A P2002 on insert is mapped to 409 there.
+  /// The predicate is written the way Postgres stores it (`= ANY (ARRAY[...])`
+  /// rather than `IN (...)`) so `prisma migrate diff` sees no drift.
+  /// The plain @@index([reference]) below stays: list queries include REJECTED rows.
+  /// Side effect of the partial @@unique: the generated client lists
+  /// `reference` in DepositWhereUniqueInput — never findUnique/upsert by
+  /// reference alone, it is only unique among PENDING/APPROVED rows.
+  @@unique([reference], where: raw("status = ANY (ARRAY['PENDING'::\"DepositStatus\", 'APPROVED'::\"DepositStatus\"])"), map: "deposits_reference_active_key")
   @@index([userId])
   @@index([status])
   @@index([reference])
@@ -1576,4 +1623,59 @@ model UserLevel {
   updatedAt DateTime @updatedAt
 
   @@map("user_levels")
+}
+
+// ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+/// Append-only record of one important staff action. Rows are never updated
+/// or deleted by the app.
+///
+/// Who/what/when is denormalised on purpose: the actor columns are a
+/// snapshot taken at write time so the row keeps saying "boss (Admin)" after
+/// that account is renamed, re-roled or deleted, and `actor` (SetNull) is
+/// only the CURRENT state for the admin to link to when it still exists.
+/// Only staff actions land here — AuditService drops anything performed by
+/// a `Role.USER` account, so end-user self-service is never recorded.
+model AuditLog {
+  id               String         @id @default(uuid())
+  createdAt        DateTime       @default(now())
+  category         AuditCategory
+  /// Dotted `<target>.<verb>` key, e.g. movie.update, deposit.approve.
+  /// Catalogue: src/audit/audit-actions.ts
+  action           String
+  /// Snapshot of the actor at the time — survives account deletion/rename.
+  /// A background job (transcode result, PDF conversion) has no actor: it
+  /// stores actorId/actorRole null and actorUsername 'system'.
+  actorId          String?
+  actorUsername    String
+  actorDisplayName String?
+  actorRole        Role?
+  actorAppRoleId   String?
+  actorAppRoleName String?
+  /// What was affected. targetType is a snake_case noun from
+  /// src/audit/audit-actions.ts (movie, series, book, book_edition, ...).
+  targetType       String
+  targetId         String?
+  targetLabel      String?
+  /// [{ field, from, to }] computed from before/after; null for creates,
+  /// deletes and pure events.
+  changes          Json?
+  before           Json?
+  after            Json?
+  /// Free-form extras: request summary, bulk results, reason, related ids.
+  metadata         Json?
+  ip               String?
+  userAgent        String?
+  platform         ClientPlatform @default(UNKNOWN)
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([actorId, createdAt])
+  @@index([targetType, targetId, createdAt])
+  @@index([action, createdAt])
+  @@index([category, createdAt])
+  @@map("audit_logs")
 }

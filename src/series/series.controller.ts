@@ -13,9 +13,10 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { OptionalAuth } from '../common/decorators/optional-auth.decorator';
 import { MinioService } from '../common/storage/minio.service';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
-import { SeriesStatus } from '../generated/prisma/client';
+import { Role, SeriesStatus } from '../generated/prisma/client';
 import { AuthorityService } from '../roles/authority.service';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
@@ -45,21 +46,28 @@ export class SeriesController {
   private readonly resolveImageUrl: ImageUrlResolver = (url) =>
     this.minioService.imageUrl(url);
 
+  /**
+   * Guests may browse series (@OptionalAuth) — scoped as Role.USER, which
+   * restricts the list to PUBLISHED shows. A staff token keeps its full view.
+   */
   @Get()
+  @OptionalAuth()
   findAll(
     @Query() query: SeriesQueryDto,
-    @CurrentUser() user: AuthenticatedUser,
+    @CurrentUser() user?: AuthenticatedUser,
   ) {
-    return this.seriesService.findAll(query, user.role);
+    const viewerRole = user?.role ?? Role.USER;
+    return this.seriesService.findAll(query, viewerRole);
   }
 
   /**
    * DB-derived filter options for the series tab's filter sheet — see
-   * SeriesService.getFacets. Same auth as the rest of the catalog (global
-   * JwtAuthGuard). Registered before ':id' so "facets" is never parsed as a
-   * series UUID.
+   * SeriesService.getFacets. Same auth as the rest of the catalog (open to
+   * guests via @OptionalAuth; computed over PUBLISHED rows only). Registered
+   * before ':id' so "facets" is never parsed as a series UUID.
    */
   @Get('facets')
+  @OptionalAuth()
   getFacets() {
     return this.seriesService.getFacets();
   }
@@ -101,12 +109,16 @@ export class SeriesController {
     return { count };
   }
 
+  /** Guests see PUBLISHED series only — anything else is a 404 for them, same as for a regular user. */
   @Get(':id')
+  @OptionalAuth()
   findOne(
     @Param('id', ParseUUIDPipe) id: string,
-    @CurrentUser() user: AuthenticatedUser,
+    @CurrentUser() user?: AuthenticatedUser,
   ) {
-    return this.seriesService.getForViewer(id, user.id, user.role);
+    const viewerRole = user?.role ?? Role.USER;
+    const viewerId = user?.id;
+    return this.seriesService.getForViewer(id, viewerId, viewerRole);
   }
 
   @Get(':id/seasons')
@@ -117,16 +129,19 @@ export class SeriesController {
     return this.seriesService.getSeasons(id, user.role);
   }
 
+  /** Episode metadata only (MovieResponseDto — no stream/HLS fields), so guests may read it. */
   @Get(':id/episodes')
+  @OptionalAuth()
   async getEpisodes(
     @Param('id', ParseUUIDPipe) id: string,
-    @CurrentUser() user: AuthenticatedUser,
+    @CurrentUser() user?: AuthenticatedUser,
     @Query('seasonNumber', new ParseIntPipe({ optional: true }))
     seasonNumber?: number,
   ) {
+    const viewerRole = user?.role ?? Role.USER;
     const episodes = await this.seriesService.getEpisodes(
       id,
-      user.role,
+      viewerRole,
       seasonNumber,
     );
     return episodes.map((e) =>
@@ -146,15 +161,19 @@ export class SeriesController {
   @Post()
   @UseGuards(PermissionsGuard)
   @RequirePermissions('SERIES.CREATE')
-  create(@Body() dto: CreateSeriesDto) {
-    return this.seriesService.create(dto);
+  create(@Body() dto: CreateSeriesDto, @CurrentUser() user: AuthenticatedUser) {
+    return this.seriesService.create(dto, user);
   }
 
   @Put(':id')
   @UseGuards(PermissionsGuard)
   @RequirePermissions('SERIES.EDIT')
-  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateSeriesDto) {
-    return this.seriesService.update(id, dto);
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateSeriesDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.seriesService.update(id, dto, user);
   }
 
   /**
@@ -185,7 +204,7 @@ export class SeriesController {
         'You do not have permission to unpublish series',
       );
     }
-    return this.seriesService.updateStatus(id, dto.status);
+    return this.seriesService.updateStatus(id, dto.status, user);
   }
 
   /**
@@ -197,7 +216,10 @@ export class SeriesController {
   @Delete(':id')
   @UseGuards(PermissionsGuard)
   @RequirePermissions('SERIES.DELETE')
-  remove(@Param('id', ParseUUIDPipe) id: string) {
-    return this.seriesService.remove(id);
+  remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.seriesService.remove(id, user);
   }
 }

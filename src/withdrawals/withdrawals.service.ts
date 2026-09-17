@@ -9,17 +9,54 @@ import { WalletService } from '../wallet/wallet.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { FinanceSettingsService } from '../finance-settings/finance-settings.service';
 import { PaymentAccountLedgerService } from '../payment-accounts/payment-account-ledger.service';
+import { AuditService } from '../audit/audit.service';
+import { withdrawalSnapshot } from '../audit/audit-snapshots';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import {
   NotificationType,
   TransactionType,
   WithdrawalStatus,
 } from '../generated/prisma/client';
+import type { Withdrawal } from '../generated/prisma/client';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import type { CreateWithdrawalDto } from './dto/create-withdrawal.dto';
 import type { RejectWithdrawalDto } from './dto/reject-withdrawal.dto';
 import type { UpdateTransferAccountDto } from './dto/update-transfer-account.dto';
 import type { WithdrawalQueryDto } from './dto/withdrawal-query.dto';
+
+/** Audit-log label: a withdrawal has no reference, so amount plus whose it is. */
+function withdrawalLabel(withdrawal: {
+  amount: unknown;
+  user?: { username: string } | null;
+}): string {
+  const amount = `${decimalToNumber(withdrawal.amount as never)} Ks`;
+  return withdrawal.user ? `${amount} · @${withdrawal.user.username}` : amount;
+}
+
+/**
+ * Only the "which of OUR accounts we sent it from" record — the fields
+ * updateTransferAccount may change — so its audit row diffs exactly that.
+ */
+function transferAccountSnapshot(withdrawal: Partial<Withdrawal>) {
+  const {
+    transferAccountType,
+    transferAccountSubname,
+    transferAccountName,
+    transferAccountNumber,
+    transferTransactionCode,
+    transferTransactionTime,
+    transferPaymentAccountId,
+  } = withdrawalSnapshot(withdrawal);
+  return {
+    transferAccountType,
+    transferAccountSubname,
+    transferAccountName,
+    transferAccountNumber,
+    transferTransactionCode,
+    transferTransactionTime,
+    transferPaymentAccountId,
+  };
+}
 
 @Injectable()
 export class WithdrawalsService {
@@ -29,6 +66,7 @@ export class WithdrawalsService {
     private readonly realtimeGateway: RealtimeGateway,
     private readonly financeSettingsService: FinanceSettingsService,
     private readonly paymentAccountLedgerService: PaymentAccountLedgerService,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -249,6 +287,21 @@ export class WithdrawalsService {
         where: { userId: withdrawal.userId },
       });
 
+      // Inside the transaction, so the audit row commits with the approval
+      // (and rolls back with it).
+      await this.audit.record({
+        action: 'withdrawal.approve',
+        actor: admin,
+        target: {
+          type: 'withdrawal',
+          id: withdrawalId,
+          label: withdrawalLabel(updated),
+        },
+        before: withdrawalSnapshot(withdrawal),
+        after: withdrawalSnapshot(updated),
+        tx,
+      });
+
       return { withdrawal: updated, notification, balance: wallet.balance };
     });
 
@@ -335,6 +388,20 @@ export class WithdrawalsService {
           },
         },
       });
+      await this.audit.record({
+        action: 'withdrawal.reject',
+        actor: admin,
+        target: {
+          type: 'withdrawal',
+          id: withdrawalId,
+          label: withdrawalLabel(updated),
+        },
+        before: withdrawalSnapshot(withdrawal),
+        after: withdrawalSnapshot(updated),
+        metadata: { reason: dto.reason },
+        tx,
+      });
+
       return { withdrawal: updated, notification };
     });
 
@@ -428,6 +495,22 @@ export class WithdrawalsService {
             },
           },
         },
+      });
+
+      // `updatedWithdrawal` is read after syncWithdrawalLink's claim, so its
+      // transferPaymentAccountId already reflects the re-link.
+      await this.audit.record({
+        action: 'withdrawal.transfer_account_update',
+        actor: admin,
+        target: {
+          type: 'withdrawal',
+          id: withdrawalId,
+          label: withdrawalLabel(updatedWithdrawal),
+        },
+        before: transferAccountSnapshot(withdrawal),
+        after: transferAccountSnapshot(updatedWithdrawal),
+        metadata: { oldPaymentAccountId, newPaymentAccountId },
+        tx,
       });
 
       return {

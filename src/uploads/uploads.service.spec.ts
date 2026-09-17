@@ -13,7 +13,22 @@ import { VideosService } from '../videos/videos.service';
 import { VideoDurationService } from '../videos/video-duration.service';
 import { ProcessingService } from '../processing/processing.service';
 import { SubtitlesService } from '../subtitles/subtitles.service';
-import { UploadStatus, VideoStatus } from '../generated/prisma/client';
+import { AuditService } from '../audit/audit.service';
+import { ResourceUploadTypeRegistry } from './resource-upload-type.registry';
+import {
+  MovieStatus,
+  Role,
+  UploadStatus,
+  VideoStatus,
+} from '../generated/prisma/client';
+
+/** A staff actor for the audit calls — the mocked AuditService records nothing. */
+const ACTOR = {
+  id: 'admin-1',
+  username: 'boss',
+  role: Role.ADMIN,
+  appRoleId: null,
+} as const;
 
 jest.mock('node:fs/promises', () => ({
   ...jest.requireActual('node:fs/promises'),
@@ -27,7 +42,7 @@ const readdirMock = readdir as jest.Mock;
 describe('UploadsService', () => {
   let service: UploadsService;
   let prisma: {
-    movie: { findUnique: jest.Mock; update: jest.Mock };
+    movie: { findUnique: jest.Mock; update: jest.Mock; updateMany: jest.Mock };
     uploadSession: {
       findFirst: jest.Mock;
       create: jest.Mock;
@@ -42,11 +57,14 @@ describe('UploadsService', () => {
     originalObjectKey: jest.Mock;
     hlsMasterKey: jest.Mock;
     hlsRenditionKeyPrefix: jest.Mock;
+    imageObjectKey: jest.Mock;
   };
   let minioService: {
     downloadFile: jest.Mock;
     objectExists: jest.Mock;
     uploadFile: jest.Mock;
+    uploadBuffer: jest.Mock;
+    publicUrl: jest.Mock;
   };
   let videosService: {
     findLatestForMovie: jest.Mock;
@@ -60,14 +78,25 @@ describe('UploadsService', () => {
   let processingService: {
     processVideo: jest.Mock;
     isActivelyProcessing: jest.Mock;
+    reserve: jest.Mock;
+    release: jest.Mock;
   };
   let subtitlesService: { createFromExistingKey: jest.Mock };
+  let audit: { record: jest.Mock };
+  let resourceTypes: { resolve: jest.Mock };
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
 
     prisma = {
-      movie: { findUnique: jest.fn(), update: jest.fn() },
+      movie: {
+        findUnique: jest.fn(),
+        update: jest.fn(),
+        // The compare-and-set status flips win by default; a case that
+        // wants a lost race overrides this with { count: 0 }.
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
       uploadSession: {
         findFirst: jest.fn(),
         create: jest.fn(),
@@ -75,12 +104,12 @@ describe('UploadsService', () => {
       },
     };
     storageService = {
-      uploadSessionDir: jest.fn((id: string) => `/storage/uploads/${id}`),
+      uploadSessionDir: jest.fn((id: string) => `/storage/temp/uploads/${id}`),
       ensureDir: jest.fn().mockResolvedValue(undefined),
-      videoDir: jest.fn((movieId: string) => `/storage/videos/${movieId}`),
+      videoDir: jest.fn((movieId: string) => `/storage/temp/videos/${movieId}`),
       originalVideoPath: jest.fn(
         (movieId: string, ext: string) =>
-          `/storage/videos/${movieId}/original${ext}`,
+          `/storage/temp/videos/${movieId}/original${ext}`,
       ),
       originalObjectKey: jest.fn(
         (movieId: string, ext: string) => `videos/${movieId}/original${ext}`,
@@ -91,11 +120,17 @@ describe('UploadsService', () => {
       hlsRenditionKeyPrefix: jest.fn(
         (movieId: string, name: string) => `videos/${movieId}/hls/${name}`,
       ),
+      imageObjectKey: jest.fn(
+        (purpose: string, imageId: string, ext: string) =>
+          `images/${purpose}/${imageId}${ext}`,
+      ),
     };
     minioService = {
       downloadFile: jest.fn().mockResolvedValue(undefined),
       objectExists: jest.fn().mockResolvedValue(true),
       uploadFile: jest.fn().mockResolvedValue(undefined),
+      uploadBuffer: jest.fn().mockResolvedValue(undefined),
+      publicUrl: jest.fn((key: string) => `https://cdn.example/${key}`),
     };
     videosService = {
       findLatestForMovie: jest.fn(),
@@ -111,9 +146,23 @@ describe('UploadsService', () => {
     processingService = {
       processVideo: jest.fn(),
       isActivelyProcessing: jest.fn().mockReturnValue(false),
+      reserve: jest.fn().mockReturnValue(true),
+      release: jest.fn(),
     };
     subtitlesService = {
       createFromExistingKey: jest.fn().mockResolvedValue({ id: 'subtitle-1' }),
+    };
+    // Mirrors the real ResourceUploadTypeRegistry routing (asserted for real
+    // in resource-upload-type.registry.spec.ts): every bundle file keeps the
+    // movie's video namespace except an uploaded subtitle SOURCE, which
+    // moves to subtitles/<movieId>/<filename>.
+    resourceTypes = {
+      resolve: jest.fn().mockReturnValue({
+        buildKey: (resourceId: string, relativePath: string) =>
+          relativePath.startsWith('subtitles/')
+            ? `subtitles/${resourceId}/${relativePath.slice('subtitles/'.length)}`
+            : `videos/${resourceId}/${relativePath}`,
+      }),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -126,6 +175,8 @@ describe('UploadsService', () => {
         { provide: VideoDurationService, useValue: videoDurationService },
         { provide: ProcessingService, useValue: processingService },
         { provide: SubtitlesService, useValue: subtitlesService },
+        { provide: AuditService, useValue: audit },
+        { provide: ResourceUploadTypeRegistry, useValue: resourceTypes },
       ],
     }).compile();
 
@@ -327,6 +378,68 @@ describe('UploadsService', () => {
         'no valid rendition folder (240p, 360p, 480p, 720p, or 1080p) with an index.m3u8 was found',
       ]);
     });
+
+    it(
+      'looks a subtitle source up where it was actually uploaded — subtitles/<movieId>/<filename>, ' +
+        'not beside the video assets',
+      async () => {
+        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+        minioService.objectExists.mockResolvedValue(true);
+
+        await service.validateExternalBundle('movie-1', {
+          relativePaths: [
+            'original.mp4',
+            'hls/master.m3u8',
+            'hls/720p/index.m3u8',
+            'subtitles/english.vtt',
+          ],
+        });
+
+        expect(minioService.objectExists).toHaveBeenCalledWith(
+          'subtitles/movie-1/english.vtt',
+        );
+        expect(minioService.objectExists).not.toHaveBeenCalledWith(
+          'videos/movie-1/subtitles/english.vtt',
+        );
+      },
+    );
+
+    it(
+      'rejects a bundle whose subtitle files share a filename — both would be stored at the same ' +
+        'key, so the second would silently overwrite the first',
+      async () => {
+        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+        minioService.objectExists.mockResolvedValue(true);
+
+        const result = await service.validateExternalBundle('movie-1', {
+          relativePaths: [
+            'original.mp4',
+            'hls/master.m3u8',
+            'hls/720p/index.m3u8',
+            'subtitles/english.vtt',
+            'subtitles/extra/English.vtt',
+          ],
+        });
+
+        expect(result.valid).toBe(false);
+        expect(result.structureErrors).toEqual([
+          'subtitle filenames must be unique — "subtitles/extra/English.vtt" and "subtitles/english.vtt" would both be stored as english.vtt',
+        ]);
+      },
+    );
+
+    it('reports a missing original whatever container the operator used', async () => {
+      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+      minioService.objectExists.mockResolvedValue(true);
+
+      const result = await service.validateExternalBundle('movie-1', {
+        relativePaths: ['hls/master.m3u8', 'hls/720p/index.m3u8'],
+      });
+
+      expect(result.structureErrors).toEqual([
+        'original.<ext> is missing from the bundle root',
+      ]);
+    });
   });
 
   describe('finalizeExternalUpload', () => {
@@ -339,12 +452,23 @@ describe('UploadsService', () => {
       'subtitles/myanmar.vtt',
     ];
     const dto = { relativePaths: bundlePaths };
+    /** The bulk flow's source state — what every finalize normally starts from. */
+    const uploadingMovie = {
+      id: 'movie-1',
+      title: 'Movie 1',
+      status: MovieStatus.UPLOADING,
+      seriesId: null,
+    };
+    const movieWithStatus = (status: MovieStatus) => ({
+      ...uploadingMovie,
+      status,
+    });
 
     it('throws NotFoundException when the movie does not exist', async () => {
       prisma.movie.findUnique.mockResolvedValue(null);
 
       await expect(
-        service.finalizeExternalUpload('movie-1', dto),
+        service.finalizeExternalUpload('movie-1', dto, ACTOR),
       ).rejects.toThrow(NotFoundException);
     });
 
@@ -352,18 +476,22 @@ describe('UploadsService', () => {
       'rejects and marks the movie FAILED — not touching MinIO or creating anything — when the ' +
         'uploaded set violates the fixed folder structure',
       async () => {
-        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+        prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
 
         await expect(
-          service.finalizeExternalUpload('movie-1', {
-            relativePaths: ['hls/master.m3u8'],
-          }), // no original.mp4, no rendition
+          service.finalizeExternalUpload(
+            'movie-1',
+            {
+              relativePaths: ['hls/master.m3u8'],
+            },
+            ACTOR,
+          ), // no original.mp4, no rendition
         ).rejects.toThrow(BadRequestException);
         expect(minioService.objectExists).not.toHaveBeenCalled();
         expect(videosService.create).not.toHaveBeenCalled();
         expect(videosService.markReady).not.toHaveBeenCalled();
-        expect(prisma.movie.update).toHaveBeenCalledWith({
-          where: { id: 'movie-1' },
+        expect(prisma.movie.updateMany).toHaveBeenCalledWith({
+          where: { id: 'movie-1', status: 'UPLOADING' },
           data: { status: 'FAILED' },
         });
       },
@@ -373,18 +501,18 @@ describe('UploadsService', () => {
       're-validates server-side, marks the movie FAILED, and refuses to finalize when a required ' +
         'file is actually missing from MinIO',
       async () => {
-        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+        prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
         minioService.objectExists.mockImplementation(
           async (key: string) => key !== 'videos/movie-1/hls/480p/index.m3u8',
         );
 
         await expect(
-          service.finalizeExternalUpload('movie-1', dto),
+          service.finalizeExternalUpload('movie-1', dto, ACTOR),
         ).rejects.toThrow(BadRequestException);
         expect(videosService.create).not.toHaveBeenCalled();
         expect(videosService.markReady).not.toHaveBeenCalled();
-        expect(prisma.movie.update).toHaveBeenCalledWith({
-          where: { id: 'movie-1' },
+        expect(prisma.movie.updateMany).toHaveBeenCalledWith({
+          where: { id: 'movie-1', status: 'UPLOADING' },
           data: { status: 'FAILED' },
         });
       },
@@ -394,10 +522,14 @@ describe('UploadsService', () => {
       'creates the Video row and calls markReady() with the exact same hlsMasterKey() the ' +
         'transcode-based flow would produce — the assertion that proves streaming stays unchanged',
       async () => {
-        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+        prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
         minioService.objectExists.mockResolvedValue(true);
 
-        const result = await service.finalizeExternalUpload('movie-1', dto);
+        const result = await service.finalizeExternalUpload(
+          'movie-1',
+          dto,
+          ACTOR,
+        );
 
         expect(videosService.create).toHaveBeenCalledWith({
           movieId: 'movie-1',
@@ -432,33 +564,38 @@ describe('UploadsService', () => {
         'flow flips its movie to PUBLISHED after transcoding, but stopping one step short: this ' +
         'flow must never publish automatically',
       async () => {
-        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+        prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
         minioService.objectExists.mockResolvedValue(true);
 
-        await service.finalizeExternalUpload('movie-1', dto);
+        await service.finalizeExternalUpload('movie-1', dto, ACTOR);
 
-        expect(prisma.movie.update).toHaveBeenCalledWith({
-          where: { id: 'movie-1' },
+        expect(prisma.movie.updateMany).toHaveBeenCalledWith({
+          where: { id: 'movie-1', status: 'UPLOADING' },
           data: { status: 'READY_TO_PUBLISH' },
         });
-        expect(prisma.movie.update).not.toHaveBeenCalledWith(
+        expect(prisma.movie.updateMany).not.toHaveBeenCalledWith(
           expect.objectContaining({ data: { status: 'PUBLISHED' } }),
         );
+        expect(prisma.movie.update).not.toHaveBeenCalled();
       },
     );
 
     it('ignores unrecognized top-level folder names instead of publishing them as renditions', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+      prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
       minioService.objectExists.mockResolvedValue(true);
 
-      await service.finalizeExternalUpload('movie-1', {
-        relativePaths: [
-          'original.mp4',
-          'hls/master.m3u8',
-          'hls/720p/index.m3u8',
-          'hls/weird-name/index.m3u8',
-        ],
-      });
+      await service.finalizeExternalUpload(
+        'movie-1',
+        {
+          relativePaths: [
+            'original.mp4',
+            'hls/master.m3u8',
+            'hls/720p/index.m3u8',
+            'hls/weird-name/index.m3u8',
+          ],
+        },
+        ACTOR,
+      );
 
       expect(videosService.markReady).toHaveBeenCalledWith(
         'video-1',
@@ -474,47 +611,102 @@ describe('UploadsService', () => {
     });
 
     it('auto-creates a Subtitle row for every subtitles/*.vtt|srt|ass file, inferring language/label/format from the filename', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+      prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
       minioService.objectExists.mockResolvedValue(true);
 
-      await service.finalizeExternalUpload('movie-1', dto);
+      await service.finalizeExternalUpload('movie-1', dto, ACTOR);
 
       expect(subtitlesService.createFromExistingKey).toHaveBeenCalledWith({
         videoId: 'video-1',
         language: 'en',
         label: 'English',
         format: 'VTT',
-        objectKey: 'videos/movie-1/subtitles/english.vtt',
+        objectKey: 'subtitles/movie-1/english.vtt',
       });
       expect(subtitlesService.createFromExistingKey).toHaveBeenCalledWith({
         videoId: 'video-1',
         language: 'my',
         label: 'Myanmar',
         format: 'VTT',
-        objectKey: 'videos/movie-1/subtitles/myanmar.vtt',
+        objectKey: 'subtitles/movie-1/myanmar.vtt',
       });
     });
 
+    it(
+      'takes the original\'s extension from the bundle instead of assuming ".mp4" — an .mkv master ' +
+        'is a normal bundle and used to be impossible to finalize at all',
+      async () => {
+        prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+        minioService.objectExists.mockResolvedValue(true);
+
+        await service.finalizeExternalUpload(
+          'movie-1',
+          {
+            relativePaths: [
+              'original.mkv',
+              'hls/master.m3u8',
+              'hls/720p/index.m3u8',
+            ],
+          },
+          ACTOR,
+        );
+
+        expect(minioService.objectExists).toHaveBeenCalledWith(
+          'videos/movie-1/original.mkv',
+        );
+        expect(videosService.create).toHaveBeenCalledWith({
+          movieId: 'movie-1',
+          originalFilename: 'original.mkv',
+          originalPath: 'videos/movie-1/original.mkv',
+        });
+      },
+    );
+
+    it('refuses a bundle carrying two originals — only one of them could ever be the Video row', async () => {
+      prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+
+      await expect(
+        service.finalizeExternalUpload(
+          'movie-1',
+          {
+            relativePaths: [
+              'original.mp4',
+              'original.mkv',
+              'hls/master.m3u8',
+              'hls/720p/index.m3u8',
+            ],
+          },
+          ACTOR,
+        ),
+      ).rejects.toThrow(BadRequestException);
+      expect(minioService.objectExists).not.toHaveBeenCalled();
+      expect(videosService.create).not.toHaveBeenCalled();
+    });
+
     it('finalizes fine with zero subtitle files — subtitles are optional', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+      prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
       minioService.objectExists.mockResolvedValue(true);
 
-      await service.finalizeExternalUpload('movie-1', {
-        relativePaths: [
-          'original.mp4',
-          'hls/master.m3u8',
-          'hls/720p/index.m3u8',
-        ],
-      });
+      await service.finalizeExternalUpload(
+        'movie-1',
+        {
+          relativePaths: [
+            'original.mp4',
+            'hls/master.m3u8',
+            'hls/720p/index.m3u8',
+          ],
+        },
+        ACTOR,
+      );
 
       expect(subtitlesService.createFromExistingKey).not.toHaveBeenCalled();
     });
 
     it('never touches processingService — finalizing an external upload never runs ffmpeg', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+      prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
       minioService.objectExists.mockResolvedValue(true);
 
-      await service.finalizeExternalUpload('movie-1', dto);
+      await service.finalizeExternalUpload('movie-1', dto, ACTOR);
 
       expect(processingService.processVideo).not.toHaveBeenCalled();
     });
@@ -523,11 +715,11 @@ describe('UploadsService', () => {
       'records the runtime recovered from the HLS master on the Video row and offers it to the ' +
         'Movie — conditionally, through fillMovieDurationIfUnknown, never a blind write',
       async () => {
-        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+        prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
         minioService.objectExists.mockResolvedValue(true);
         videoDurationService.recoverHlsDurationSeconds.mockResolvedValue(5430);
 
-        await service.finalizeExternalUpload('movie-1', dto);
+        await service.finalizeExternalUpload('movie-1', dto, ACTOR);
 
         expect(
           videoDurationService.recoverHlsDurationSeconds,
@@ -549,12 +741,16 @@ describe('UploadsService', () => {
       },
     );
 
-    it('leaves Video.duration null and never touches the Movie runtime when nothing could be recovered — today\'s behaviour preserved', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+    it("leaves Video.duration null and never touches the Movie runtime when nothing could be recovered — today's behaviour preserved", async () => {
+      prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
       minioService.objectExists.mockResolvedValue(true);
       videoDurationService.recoverHlsDurationSeconds.mockResolvedValue(null);
 
-      const result = await service.finalizeExternalUpload('movie-1', dto);
+      const result = await service.finalizeExternalUpload(
+        'movie-1',
+        dto,
+        ACTOR,
+      );
 
       expect(videosService.markReady).toHaveBeenCalledWith(
         'video-1',
@@ -565,13 +761,243 @@ describe('UploadsService', () => {
       ).not.toHaveBeenCalled();
       expect(result).toEqual({ videoId: 'video-1', status: VideoStatus.READY });
     });
+
+    describe('state guard — only an UPLOADING or FAILED bundle movie is ever finalized', () => {
+      it.each([
+        MovieStatus.PUBLISHED,
+        MovieStatus.ARCHIVED,
+        MovieStatus.DRAFT,
+        MovieStatus.PROCESSING,
+      ])(
+        'refuses with ConflictException and writes nothing when the movie is %s',
+        async (status) => {
+          prisma.movie.findUnique.mockResolvedValue(movieWithStatus(status));
+
+          await expect(
+            service.finalizeExternalUpload('movie-1', dto, ACTOR),
+          ).rejects.toThrow(ConflictException);
+
+          expect(videosService.create).not.toHaveBeenCalled();
+          expect(subtitlesService.createFromExistingKey).not.toHaveBeenCalled();
+          expect(prisma.movie.update).not.toHaveBeenCalled();
+          expect(prisma.movie.updateMany).not.toHaveBeenCalled();
+          expect(audit.record).not.toHaveBeenCalled();
+        },
+      );
+
+      it(
+        'never fails a live title: an invalid bundle on a PUBLISHED movie is a 409 (not a 400) ' +
+          'and the movie keeps its status',
+        async () => {
+          prisma.movie.findUnique.mockResolvedValue(
+            movieWithStatus(MovieStatus.PUBLISHED),
+          );
+
+          await expect(
+            service.finalizeExternalUpload(
+              'movie-1',
+              { relativePaths: ['nope.txt'] },
+              ACTOR,
+            ),
+          ).rejects.toThrow(ConflictException);
+
+          expect(prisma.movie.updateMany).not.toHaveBeenCalled();
+          expect(prisma.movie.update).not.toHaveBeenCalled();
+          expect(audit.record).not.toHaveBeenCalled();
+        },
+      );
+
+      it(
+        'replays idempotently on a READY_TO_PUBLISH movie — returns the existing READY video, ' +
+          'creates nothing and records nothing',
+        async () => {
+          prisma.movie.findUnique.mockResolvedValue(
+            movieWithStatus(MovieStatus.READY_TO_PUBLISH),
+          );
+          videosService.findLatestForMovie.mockResolvedValue({
+            id: 'video-9',
+            status: VideoStatus.READY,
+          });
+
+          const result = await service.finalizeExternalUpload(
+            'movie-1',
+            dto,
+            ACTOR,
+          );
+
+          expect(result).toEqual({
+            videoId: 'video-9',
+            status: VideoStatus.READY,
+          });
+          expect(minioService.objectExists).not.toHaveBeenCalled();
+          expect(videosService.create).not.toHaveBeenCalled();
+          expect(subtitlesService.createFromExistingKey).not.toHaveBeenCalled();
+          expect(prisma.movie.updateMany).not.toHaveBeenCalled();
+          expect(audit.record).not.toHaveBeenCalled();
+        },
+      );
+
+      it('refuses with ConflictException when a READY_TO_PUBLISH movie has no READY video', async () => {
+        prisma.movie.findUnique.mockResolvedValue(
+          movieWithStatus(MovieStatus.READY_TO_PUBLISH),
+        );
+        videosService.findLatestForMovie.mockResolvedValue({
+          id: 'video-9',
+          status: VideoStatus.FAILED,
+        });
+
+        await expect(
+          service.finalizeExternalUpload('movie-1', dto, ACTOR),
+        ).rejects.toThrow(ConflictException);
+        expect(videosService.create).not.toHaveBeenCalled();
+        expect(audit.record).not.toHaveBeenCalled();
+      });
+
+      it('retries a FAILED movie: flips it with a compare-and-set on FAILED and records movie.upload', async () => {
+        prisma.movie.findUnique.mockResolvedValue(
+          movieWithStatus(MovieStatus.FAILED),
+        );
+
+        const result = await service.finalizeExternalUpload(
+          'movie-1',
+          dto,
+          ACTOR,
+        );
+
+        expect(result).toEqual({
+          videoId: 'video-1',
+          status: VideoStatus.READY,
+        });
+        expect(prisma.movie.updateMany).toHaveBeenCalledWith({
+          where: { id: 'movie-1', status: 'FAILED' },
+          data: { status: 'READY_TO_PUBLISH' },
+        });
+        expect(audit.record).toHaveBeenCalledTimes(1);
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: 'movie.upload',
+            before: { status: 'FAILED' },
+            after: { status: 'READY_TO_PUBLISH' },
+          }),
+        );
+      });
+
+      it(
+        'invalid bundle on an UPLOADING movie is still a 400 that marks it FAILED via compare-and-set ' +
+          'and records movie.status_change (trigger finalize_failed)',
+        async () => {
+          prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+
+          await expect(
+            service.finalizeExternalUpload(
+              'movie-1',
+              { relativePaths: ['nope.txt'] },
+              ACTOR,
+            ),
+          ).rejects.toThrow(BadRequestException);
+
+          expect(prisma.movie.updateMany).toHaveBeenCalledWith({
+            where: { id: 'movie-1', status: 'UPLOADING' },
+            data: { status: 'FAILED' },
+          });
+          expect(audit.record).toHaveBeenCalledTimes(1);
+          expect(audit.record).toHaveBeenCalledWith(
+            expect.objectContaining({
+              action: 'movie.status_change',
+              before: { status: 'UPLOADING' },
+              after: { status: 'FAILED' },
+              metadata: expect.objectContaining({ trigger: 'finalize_failed' }),
+            }),
+          );
+        },
+      );
+
+      it('records no status_change row when the FAILED compare-and-set finds the movie already moved on', async () => {
+        prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+        prisma.movie.updateMany.mockResolvedValue({ count: 0 });
+
+        await expect(
+          service.finalizeExternalUpload(
+            'movie-1',
+            { relativePaths: ['nope.txt'] },
+            ACTOR,
+          ),
+        ).rejects.toThrow(BadRequestException);
+
+        expect(prisma.movie.updateMany).toHaveBeenCalledTimes(1);
+        expect(audit.record).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('concurrency', () => {
+      it(
+        'three parallel finalizes for one movie join a single run — one Video, one subtitle set, ' +
+          'one audit row, and every caller gets the same answer',
+        async () => {
+          prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+
+          const results = await Promise.all([
+            service.finalizeExternalUpload('movie-1', dto, ACTOR),
+            service.finalizeExternalUpload('movie-1', dto, ACTOR),
+            service.finalizeExternalUpload('movie-1', dto, ACTOR),
+          ]);
+
+          expect(videosService.create).toHaveBeenCalledTimes(1);
+          // Two subtitle files in the bundle — once each, not once per caller.
+          expect(subtitlesService.createFromExistingKey).toHaveBeenCalledTimes(
+            2,
+          );
+          expect(audit.record).toHaveBeenCalledTimes(1);
+          expect(results).toEqual([
+            { videoId: 'video-1', status: VideoStatus.READY },
+            { videoId: 'video-1', status: VideoStatus.READY },
+            { videoId: 'video-1', status: VideoStatus.READY },
+          ]);
+        },
+      );
+
+      it(
+        'keeps the READY video and only skips the status flip when the compare-and-set loses ' +
+          '(an admin changed the status mid-run) — recorded as movie.upload with statusFlipSkipped',
+        async () => {
+          prisma.movie.findUnique
+            .mockResolvedValueOnce(uploadingMovie)
+            .mockResolvedValueOnce({ status: MovieStatus.PUBLISHED });
+          prisma.movie.updateMany.mockResolvedValue({ count: 0 });
+
+          const result = await service.finalizeExternalUpload(
+            'movie-1',
+            dto,
+            ACTOR,
+          );
+
+          expect(result).toEqual({
+            videoId: 'video-1',
+            status: VideoStatus.READY,
+          });
+          expect(prisma.movie.update).not.toHaveBeenCalled();
+          expect(audit.record).toHaveBeenCalledTimes(1);
+          expect(audit.record).toHaveBeenCalledWith(
+            expect.objectContaining({
+              action: 'movie.upload',
+              before: { status: 'UPLOADING' },
+              after: { status: 'PUBLISHED' },
+              metadata: expect.objectContaining({
+                videoId: 'video-1',
+                statusFlipSkipped: true,
+              }),
+            }),
+          );
+        },
+      );
+    });
   });
 
   describe('reprocessVideo', () => {
     it('throws NotFoundException when no video exists for the movie', async () => {
       videosService.findLatestForMovie.mockResolvedValue(null);
 
-      await expect(service.reprocessVideo('movie-1')).rejects.toThrow(
+      await expect(service.reprocessVideo('movie-1', ACTOR)).rejects.toThrow(
         NotFoundException,
       );
     });
@@ -584,7 +1010,7 @@ describe('UploadsService', () => {
         originalFilename: 'movie.mp4',
       });
 
-      await expect(service.reprocessVideo('movie-1')).rejects.toThrow(
+      await expect(service.reprocessVideo('movie-1', ACTOR)).rejects.toThrow(
         BadRequestException,
       );
       expect(processingService.processVideo).not.toHaveBeenCalled();
@@ -598,7 +1024,7 @@ describe('UploadsService', () => {
         originalFilename: 'movie.mp4',
       });
 
-      await expect(service.reprocessVideo('movie-1')).rejects.toThrow(
+      await expect(service.reprocessVideo('movie-1', ACTOR)).rejects.toThrow(
         BadRequestException,
       );
     });
@@ -608,17 +1034,17 @@ describe('UploadsService', () => {
       videosService.findLatestForMovie.mockResolvedValue({
         id: 'video-1',
         status: VideoStatus.FAILED,
-        originalPath: '/storage/videos/movie-1/original.mp4',
+        originalPath: '/storage/temp/videos/movie-1/original.mp4',
         originalFilename: 'movie.mp4',
       });
 
-      const result = await service.reprocessVideo('movie-1');
+      const result = await service.reprocessVideo('movie-1', ACTOR);
 
       expect(minioService.downloadFile).not.toHaveBeenCalled();
       expect(processingService.processVideo).toHaveBeenCalledWith(
         'video-1',
         'movie-1',
-        '/storage/videos/movie-1/original.mp4',
+        '/storage/temp/videos/movie-1/original.mp4',
       );
       expect(result).toEqual({
         videoId: 'video-1',
@@ -638,16 +1064,16 @@ describe('UploadsService', () => {
           originalFilename: 'movie.mp4',
         });
 
-        await service.reprocessVideo('movie-1');
+        await service.reprocessVideo('movie-1', ACTOR);
 
         expect(minioService.downloadFile).toHaveBeenCalledWith(
           'videos/movie-1/original.mp4',
-          '/storage/videos/movie-1/original.mp4',
+          '/storage/temp/videos/movie-1/original.mp4',
         );
         expect(processingService.processVideo).toHaveBeenCalledWith(
           'video-1',
           'movie-1',
-          '/storage/videos/movie-1/original.mp4',
+          '/storage/temp/videos/movie-1/original.mp4',
         );
       },
     );
@@ -657,11 +1083,11 @@ describe('UploadsService', () => {
       videosService.findLatestForMovie.mockResolvedValue({
         id: 'video-1',
         status: VideoStatus.FAILED,
-        originalPath: '/storage/videos/movie-1/original.mp4',
+        originalPath: '/storage/temp/videos/movie-1/original.mp4',
         originalFilename: 'movie.mp4',
       });
 
-      await service.reprocessVideo('movie-1');
+      await service.reprocessVideo('movie-1', ACTOR);
 
       expect(prisma.uploadSession.create).not.toHaveBeenCalled();
     });
@@ -670,7 +1096,7 @@ describe('UploadsService', () => {
       const processingVideo = {
         id: 'video-1',
         status: VideoStatus.PROCESSING,
-        originalPath: '/storage/videos/movie-1/original.mp4',
+        originalPath: '/storage/temp/videos/movie-1/original.mp4',
         originalFilename: 'movie.mp4',
       };
 
@@ -682,7 +1108,7 @@ describe('UploadsService', () => {
           videosService.findLatestForMovie.mockResolvedValue(processingVideo);
           processingService.isActivelyProcessing.mockReturnValue(false);
 
-          const result = await service.reprocessVideo('movie-1');
+          const result = await service.reprocessVideo('movie-1', ACTOR);
 
           expect(processingService.isActivelyProcessing).toHaveBeenCalledWith(
             'video-1',
@@ -690,7 +1116,7 @@ describe('UploadsService', () => {
           expect(processingService.processVideo).toHaveBeenCalledWith(
             'video-1',
             'movie-1',
-            '/storage/videos/movie-1/original.mp4',
+            '/storage/temp/videos/movie-1/original.mp4',
           );
           expect(result).toEqual({
             videoId: 'video-1',
@@ -706,11 +1132,101 @@ describe('UploadsService', () => {
           videosService.findLatestForMovie.mockResolvedValue(processingVideo);
           processingService.isActivelyProcessing.mockReturnValue(true);
 
-          await expect(service.reprocessVideo('movie-1')).rejects.toThrow(
-            ConflictException,
-          );
+          await expect(
+            service.reprocessVideo('movie-1', ACTOR),
+          ).rejects.toThrow(ConflictException);
           expect(processingService.processVideo).not.toHaveBeenCalled();
         },
+      );
+    });
+
+    describe('the synchronous reservation — one of N simultaneous presses starts the pipeline', () => {
+      const failedVideo = {
+        id: 'video-1',
+        status: VideoStatus.FAILED,
+        originalPath: 'videos/movie-1/original.mp4',
+        originalFilename: 'movie.mp4',
+      };
+
+      it('refuses with ConflictException when the video is already reserved, without starting or logging anything', async () => {
+        videosService.findLatestForMovie.mockResolvedValue(failedVideo);
+        processingService.reserve.mockReturnValue(false);
+
+        await expect(service.reprocessVideo('movie-1', ACTOR)).rejects.toThrow(
+          ConflictException,
+        );
+
+        expect(processingService.reserve).toHaveBeenCalledWith('video-1');
+        expect(minioService.downloadFile).not.toHaveBeenCalled();
+        expect(processingService.processVideo).not.toHaveBeenCalled();
+        expect(audit.record).not.toHaveBeenCalled();
+      });
+
+      it('gives the reservation back when the original cannot be brought back from MinIO', async () => {
+        accessMock.mockRejectedValue(new Error('ENOENT'));
+        videosService.findLatestForMovie.mockResolvedValue(failedVideo);
+        minioService.downloadFile.mockRejectedValue(new Error('minio down'));
+
+        await expect(service.reprocessVideo('movie-1', ACTOR)).rejects.toThrow(
+          'minio down',
+        );
+
+        expect(processingService.release).toHaveBeenCalledWith('video-1');
+        expect(processingService.processVideo).not.toHaveBeenCalled();
+        expect(audit.record).not.toHaveBeenCalled();
+      });
+
+      it('never releases after a successful start — the pipeline owns the reservation from then on', async () => {
+        accessMock.mockResolvedValue(undefined);
+        videosService.findLatestForMovie.mockResolvedValue({
+          ...failedVideo,
+          originalPath: '/storage/temp/videos/movie-1/original.mp4',
+        });
+
+        await service.reprocessVideo('movie-1', ACTOR);
+
+        expect(processingService.release).not.toHaveBeenCalled();
+        expect(processingService.processVideo).toHaveBeenCalledTimes(1);
+      });
+    });
+  });
+
+  describe('saveImage', () => {
+    it('files the image in the folder its purpose names — the purpose is never guessed or defaulted', async () => {
+      const url = await service.saveImage(
+        'actor',
+        'portrait.png',
+        Buffer.from('bytes'),
+      );
+
+      expect(storageService.imageObjectKey).toHaveBeenCalledWith(
+        'actor',
+        expect.any(String),
+        '.png',
+      );
+      expect(minioService.uploadBuffer).toHaveBeenCalledWith(
+        expect.stringMatching(/^images\/actor\/[0-9a-f-]{36}\.png$/),
+        expect.any(Buffer),
+      );
+      expect(url).toMatch(/^https:\/\/cdn\.example\/images\/actor\//);
+    });
+
+    it('keeps every purpose in its own folder', async () => {
+      await service.saveImage('payment', 'kbzpay.webp', Buffer.from('bytes'));
+
+      expect(minioService.uploadBuffer).toHaveBeenCalledWith(
+        expect.stringContaining('images/payment/'),
+        expect.any(Buffer),
+      );
+    });
+
+    it('falls back to .jpg only for the EXTENSION when the uploaded filename has none', async () => {
+      await service.saveImage('movie', 'poster', Buffer.from('bytes'));
+
+      expect(storageService.imageObjectKey).toHaveBeenCalledWith(
+        'movie',
+        expect.any(String),
+        '.jpg',
       );
     });
   });

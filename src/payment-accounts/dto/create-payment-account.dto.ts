@@ -6,6 +6,7 @@ import {
   IsString,
   MaxLength,
 } from 'class-validator';
+import { ToBoolean } from '../../common/decorators/to-boolean.decorator';
 
 export class CreatePaymentAccountDto {
   /**
@@ -50,7 +51,17 @@ export class CreatePaymentAccountDto {
   @MaxLength(500)
   note?: string;
 
+  /**
+   * Create-time default is Prisma `@default(true)` (prisma/schema.prisma
+   * PaymentAccount.isActive). No class initializer on purpose:
+   * UpdatePaymentAccountDto = PartialType(CreatePaymentAccountDto) inherits
+   * initializers and the global transform pipe (src/app.module.ts) would
+   * inject `true` into every PATCH that omits the field — re-activating a
+   * retired account on an unrelated edit. Precedent:
+   * src/subscriptions/dto/create-plan.dto.ts.
+   */
   @IsOptional()
+  @ToBoolean()
   @IsBoolean()
-  isActive?: boolean = true;
+  isActive?: boolean;
 }

@@ -30,5 +30,6 @@ export class ActorQueryDto extends PaginationQueryDto {
   /** Matches on name — what the cast picker types into. */
   @IsOptional()
   @IsString()
+  @MaxLength(200)
   search?: string;
 }

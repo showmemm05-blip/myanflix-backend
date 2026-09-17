@@ -8,6 +8,7 @@ import {
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { AuditService } from '../audit/audit.service';
 import { WalletService } from './wallet.service';
 import { WalletAdjustmentsService } from './wallet-adjustments.service';
 
@@ -103,6 +104,10 @@ describe('WalletAdjustmentsService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: WalletService, useValue: walletService },
         { provide: RealtimeGateway, useValue: gateway },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -119,6 +124,8 @@ describe('WalletAdjustmentsService', () => {
         ...data,
         createdAt: new Date(),
         performedBy: { id: 'admin-1', username: 'superadmin' },
+        // Joined only for the audit row's target label.
+        user: { username: 'john' },
       }),
     );
     prisma.notification.create.mockImplementation(
@@ -277,9 +284,9 @@ describe('WalletAdjustmentsService', () => {
           type: TransactionType.ADJUSTMENT_DEBIT,
         }),
       });
-      expect(prisma.notification.create.mock.calls[0][0].data.message).toContain(
-        'decreased',
-      );
+      expect(
+        prisma.notification.create.mock.calls[0][0].data.message,
+      ).toContain('decreased');
       expect(gateway.notifyUserBalanceUpdated).toHaveBeenCalledWith(
         'user-1',
         1000,

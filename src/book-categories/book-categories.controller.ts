@@ -11,6 +11,8 @@ import {
   Put,
   UseGuards,
 } from '@nestjs/common';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { BookCategoriesService } from './book-categories.service';
@@ -43,8 +45,11 @@ export class BookCategoriesController {
   @Post()
   @UseGuards(PermissionsGuard)
   @RequirePermissions('BOOKS.CREATE')
-  create(@Body() dto: CreateBookCategoryDto) {
-    return this.service.create(dto);
+  create(
+    @Body() dto: CreateBookCategoryDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.service.create(dto, user);
   }
 
   @Put(':id')
@@ -53,15 +58,19 @@ export class BookCategoriesController {
   update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateBookCategoryDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.service.update(id, dto);
+    return this.service.update(id, dto, user);
   }
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   @UseGuards(PermissionsGuard)
   @RequirePermissions('BOOKS.DELETE')
-  async remove(@Param('id', ParseUUIDPipe) id: string) {
-    await this.service.remove(id);
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    await this.service.remove(id, user);
   }
 }

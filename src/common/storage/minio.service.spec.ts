@@ -2,6 +2,11 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { MinioService } from './minio.service';
 import { requestHostContext } from './request-host.context';
+import {
+  StreamKeyNotSignable,
+  quantizedExpiry,
+  signScope,
+} from './stream-signature';
 
 /**
  * Covers imageUrl() only — the read-time repair for PERSISTED image URLs.
@@ -21,6 +26,7 @@ describe('MinioService.imageUrl', () => {
     // The cache server's protocol/port — this base's HOST is deliberately
     // never used by playbackUrl() inside a request.
     STREAM_PUBLIC_BASE_URL: 'http://192.168.100.27:8080',
+    STREAM_SIGNING_SECRET: 'unit-test-stream-signing-secret-0123456789',
     MINIO_ENDPOINT: 'http://minio:9000',
     MINIO_ACCESS_KEY: 'key',
     MINIO_SECRET_KEY: 'secret',
@@ -77,9 +83,9 @@ describe('MinioService.imageUrl', () => {
       'https://picsum.photos/seed/Some%20Title/400/600',
       'not-a-url-at-all',
     ]) {
-      expect(asRequestFrom('192.168.100.27', () => service.imageUrl(external))).toBe(
-        external,
-      );
+      expect(
+        asRequestFrom('192.168.100.27', () => service.imageUrl(external)),
+      ).toBe(external);
     }
   });
 
@@ -222,5 +228,136 @@ describe('MinioService.playbackUrl with a public cache address', () => {
     );
 
     expect(url).toBe('http://213.111.155.181:8080/movies/images/abc-123.jpeg');
+  });
+});
+
+/**
+ * The signed playback link: the same host rules as playbackUrl(), plus the
+ * `/s/<expires>/<signature>/` prefix the cache server's secure_link checks.
+ * The signature is recomputed here from the module's own primitives on top
+ * of the expiry read back out of the URL — what is being proven is the URL
+ * SHAPE and the wiring of scope/secret/TTL, not the hash (that has its own
+ * spec next to stream-signature.ts).
+ */
+describe('MinioService.signedPlaybackUrl', () => {
+  const SECRET = 'unit-test-stream-signing-secret-0123456789';
+  const MOVIE_ID = 'f41b5f3d-cadf-40ab-b789-4192ee772a5e';
+  const masterKey = `videos/${MOVIE_ID}/hls/master.m3u8`;
+  const SIGNED = /^(https?:\/\/[^/]+)\/s\/(\d+)\/([\w-]+)\/movies\/(.+)$/;
+
+  const buildService = async (
+    overrides: Record<string, string>,
+  ): Promise<MinioService> => {
+    const env: Record<string, string> = {
+      MINIO_BUCKET: 'movies',
+      STREAM_PUBLIC_BASE_URL: 'http://213.111.155.181:8080',
+      STREAM_SIGNING_SECRET: SECRET,
+      MINIO_ENDPOINT: 'http://minio:9000',
+      MINIO_ACCESS_KEY: 'key',
+      MINIO_SECRET_KEY: 'secret',
+      ...overrides,
+    };
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        MinioService,
+        {
+          provide: ConfigService,
+          useValue: { get: jest.fn((key: string) => env[key]) },
+        },
+      ],
+    }).compile();
+    return module.get(MinioService);
+  };
+
+  it('derives the host from the request and puts the token in the path', async () => {
+    const service = await buildService({});
+
+    const url = requestHostContext.run({ hostname: '192.168.1.5' }, () =>
+      service.signedPlaybackUrl(masterKey),
+    );
+
+    const match = SIGNED.exec(url);
+    expect(match).not.toBeNull();
+    const [, base, expires, signature, key] = match!;
+    expect(base).toBe('http://192.168.1.5:8080');
+    expect(key).toBe(masterKey);
+    expect(signature).toBe(
+      signScope(`videos/${MOVIE_ID}/hls`, Number(expires), SECRET),
+    );
+  });
+
+  it('uses the configured base verbatim when it is marked public', async () => {
+    const service = await buildService({
+      STREAM_PUBLIC_BASE_URL_IS_PUBLIC: 'true',
+    });
+
+    const url = requestHostContext.run({ hostname: '185.165.169.16' }, () =>
+      service.signedPlaybackUrl(masterKey),
+    );
+
+    expect(url).toMatch(
+      new RegExp(
+        `^http://213\\.111\\.155\\.181:8080/s/\\d+/[\\w-]+/movies/${masterKey}$`,
+      ),
+    );
+  });
+
+  it('expires 12 h from the current hour boundary by default, hour-quantised', async () => {
+    const service = await buildService({});
+    const now = Math.floor(Date.now() / 1000);
+
+    const expires = Number(
+      SIGNED.exec(service.signedPlaybackUrl(masterKey))![2],
+    );
+
+    expect(expires).toBe(quantizedExpiry(now, 43_200));
+    expect(expires % 3600).toBe(0);
+    expect(expires - now).toBeGreaterThan(43_200 - 3600);
+    expect(expires - now).toBeLessThanOrEqual(43_200);
+  });
+
+  it('honours STREAM_URL_TTL_SECONDS', async () => {
+    const service = await buildService({ STREAM_URL_TTL_SECONDS: '7200' });
+    const now = Math.floor(Date.now() / 1000);
+
+    const expires = Number(
+      SIGNED.exec(service.signedPlaybackUrl(masterKey))![2],
+    );
+
+    expect(expires).toBe(quantizedExpiry(now, 7200));
+  });
+
+  it('signs one scope for every object of a title, so relative playlist URIs stay covered', async () => {
+    const service = await buildService({});
+
+    const [master, segment] = [
+      masterKey,
+      `videos/${MOVIE_ID}/hls/720p/segment_000.ts`,
+    ].map((key) => SIGNED.exec(service.signedPlaybackUrl(key))!);
+
+    // Same expiry, same signature — only the key differs.
+    expect(segment[2]).toBe(master[2]);
+    expect(segment[3]).toBe(master[3]);
+  });
+
+  it('refuses an image key — images stay on the plain, public URL', async () => {
+    const service = await buildService({});
+
+    expect(() => service.signedPlaybackUrl('images/abc-123.jpeg')).toThrow(
+      StreamKeyNotSignable,
+    );
+    expect(() =>
+      service.signedPlaybackUrl(`videos/${MOVIE_ID}/original.mp4`),
+    ).toThrow(StreamKeyNotSignable);
+  });
+
+  it('leaves playbackUrl() itself unsigned', async () => {
+    const service = await buildService({});
+
+    const url = requestHostContext.run({ hostname: '192.168.1.5' }, () =>
+      service.playbackUrl('images/abc-123.jpeg'),
+    );
+
+    expect(url).toBe('http://192.168.1.5:8080/movies/images/abc-123.jpeg');
   });
 });

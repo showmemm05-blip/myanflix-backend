@@ -23,10 +23,12 @@ export interface AuthoritySubject extends PermissionSubject {
  * place so every path that confers authority is a thin call rather than its
  * own hand-rolled check.
  *
- * **P1 — grant ceiling** (`assertCanGrant`): nobody may hand out authority
- * they do not themselves hold. Applied to every incoming permission set: role
- * create/edit, and the permission set of any role being assigned to an
- * account. The protected role resolves to every permission, so a Super Admin
+ * **P1 — grant ceiling** (`assertCanGrant` / `assertCanRevoke`): nobody may
+ * hand out, or take away, authority they do not themselves hold. Applied in
+ * both directions of every permission diff: role create/edit, and what an
+ * account gains or loses when a role is assigned to it. Checking only the
+ * incoming set let a ROLES.EDIT holder hollow out the built-in Admin role
+ * (F-004). The protected role resolves to every permission, so a Super Admin
  * is never affected by it.
  *
  * **P2 — tier protection** (`assertActorIsSuperAdmin`): only a holder of the
@@ -55,6 +57,27 @@ export class AuthorityService {
     actor: PermissionSubject,
     permissions: readonly string[],
   ): Promise<void> {
+    await this.assertHeld(actor, permissions, 'grant');
+  }
+
+  /**
+   * P1, the other direction. Refuses (403) unless every permission being
+   * taken away is already in the actor's own effective set — F-004: the
+   * ceiling used to look only at what was added, so an empty save stripped
+   * everything, permissions the editor never held included.
+   */
+  async assertCanRevoke(
+    actor: PermissionSubject,
+    permissions: readonly string[],
+  ): Promise<void> {
+    await this.assertHeld(actor, permissions, 'remove');
+  }
+
+  private async assertHeld(
+    actor: PermissionSubject,
+    permissions: readonly string[],
+    verb: 'grant' | 'remove',
+  ): Promise<void> {
     if (permissions.length === 0) return;
 
     const held = await this.resolver.permissionsFor(actor);
@@ -64,7 +87,7 @@ export class AuthorityService {
     if (missing.length === 0) return;
 
     throw new ForbiddenException(
-      `You cannot grant permissions you do not have yourself: ${missing.join(', ')}.`,
+      `You cannot ${verb} permissions you do not have yourself: ${missing.join(', ')}.`,
     );
   }
 
@@ -103,16 +126,30 @@ export class AuthorityService {
    * changing a staff member's role, and PATCH /users/:id/role. Handing someone
    * a role hands them its whole permission set, so the set goes through the
    * grant ceiling exactly as a role edit does.
+   *
+   * With `current` (the account's present assignment) the move is also held
+   * to the revoke ceiling: whatever the account loses must be held by the
+   * actor too (F-004). Without it — a brand-new account — there is nothing
+   * to lose and behaviour is unchanged.
    */
   async assertCanAssignRole(
     actor: PermissionSubject,
     assignment: PermissionSubject,
+    current?: PermissionSubject,
   ): Promise<void> {
     if (await this.isSuperAdminTier(assignment)) {
       await this.assertActorIsSuperAdmin(actor);
     }
     const role = await this.resolver.resolveForUser(assignment);
-    await this.assertCanGrant(actor, [...(role?.permissions ?? [])]);
+    const after = role?.permissions ?? new Set<Permission>();
+    await this.assertCanGrant(actor, [...after]);
+
+    if (!current) return;
+    const before = await this.resolver.permissionsFor(current);
+    await this.assertCanRevoke(
+      actor,
+      [...before].filter((permission) => !after.has(permission)),
+    );
   }
 
   /**
@@ -197,6 +234,39 @@ export class AuthorityService {
       throw new ConflictException(
         'This is the last account that can manage roles. Give another active account a role with Roles > Edit first.',
       );
+    }
+  }
+
+  /**
+   * The status-change gate shared by PATCH /staff/:id/status and
+   * PATCH /users/:id/status (F-001: the users route used to skip every one of
+   * these). In order: nobody changes their own status (403); a Super
+   * Admin-tier target is only a Super Admin's to touch, in either direction
+   * (P2, 403); and any move away from ACTIVE — SUSPENDED or BANNED alike —
+   * runs both lockout guards (409). The 409s are defence in depth: an active
+   * Super Admin actor always counts as a remaining one, so they only fire on
+   * inconsistent data.
+   */
+  async assertCanChangeStatus(
+    actor: AuthoritySubject,
+    target: AuthoritySubject,
+    nextStatus: UserStatus,
+  ): Promise<void> {
+    if (target.id === actor.id) {
+      throw new ForbiddenException('You cannot deactivate your own account.');
+    }
+
+    if (await this.isSuperAdminTier(target)) {
+      await this.assertActorIsSuperAdmin(actor);
+    }
+
+    if (nextStatus !== UserStatus.ACTIVE) {
+      if (await this.isEffectiveSuperAdmin(target)) {
+        await this.assertNotLastActiveSuperAdmin(target.id);
+      }
+      // F8: suspending the last roles manager locks everyone out just as
+      // effectively as stripping the permission would.
+      await this.assertNotLastRoleManagerAccount(target, null);
     }
   }
 

@@ -14,6 +14,7 @@ import {
 import { AuthorityService } from './authority.service';
 import { ALL_PERMISSIONS } from './permission-catalogue';
 import { PermissionResolverService } from './permission-resolver.service';
+import { AuditService } from '../audit/audit.service';
 import { RolesService } from './roles.service';
 
 describe('RolesService', () => {
@@ -83,6 +84,26 @@ describe('RolesService', () => {
     permissions: [{ permission: 'ROLES.VIEW' }, { permission: 'ROLES.EDIT' }],
   };
 
+  /** The seeded, unprotected built-in Admin role — the one F-004 hollowed out. */
+  const adminRole = {
+    ...customRole,
+    id: 'role-admin',
+    key: Role.ADMIN,
+    name: 'Admin',
+    isSystem: true,
+    permissions: seededRoleRow(Role.ADMIN).permissions.map((permission) => ({
+      permission,
+    })),
+  };
+
+  /** Assigned to ROLE_MANAGER: may reach the route, holds only ROLES.*. */
+  const roleManagerActor: AuthenticatedUser = {
+    id: 'rm-1',
+    username: 'rm',
+    role: Role.ADMIN,
+    appRoleId: 'role-manager',
+  };
+
   beforeEach(async () => {
     prisma = {
       appRole: {
@@ -97,7 +118,10 @@ describe('RolesService', () => {
         createMany: jest.fn().mockReturnValue('createMany-op'),
       },
       user: { count: jest.fn().mockResolvedValue(0) },
-      $transaction: jest.fn().mockResolvedValue([]),
+      // Interactive form: the callback runs against the same mocked client.
+      $transaction: jest.fn((run: (tx: unknown) => Promise<unknown>) =>
+        run(prisma),
+      ),
     };
     resolver = createRoleAwarePermissionResolver([
       seededRoleRow(Role.SUPER_ADMIN, 'role-super'),
@@ -112,6 +136,12 @@ describe('RolesService', () => {
         key: 'ROLE_MANAGER',
         permissions: ['ROLES.VIEW', 'ROLES.EDIT'],
       },
+      // A delegated editor that also holds one of MOVIE_MANAGER's permissions.
+      {
+        id: 'role-editor',
+        key: 'ROLE_EDITOR',
+        permissions: ['MOVIES.VIEW', 'ROLES.VIEW', 'ROLES.EDIT'],
+      },
     ]);
 
     const module: TestingModule = await Test.createTestingModule({
@@ -122,6 +152,10 @@ describe('RolesService', () => {
         AuthorityService,
         { provide: PrismaService, useValue: prisma },
         { provide: PermissionResolverService, useValue: resolver },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -129,11 +163,11 @@ describe('RolesService', () => {
   });
 
   describe('getCatalogue', () => {
-    it('returns all 19 modules and all 75 permissions for the matrix UI', () => {
+    it('returns all 20 modules and all 76 permissions for the matrix UI', () => {
       const catalogue = service.getCatalogue();
 
-      expect(catalogue.modules).toHaveLength(19);
-      expect(catalogue.permissions).toHaveLength(75);
+      expect(catalogue.modules).toHaveLength(20);
+      expect(catalogue.permissions).toHaveLength(76);
       expect(catalogue.modules[0]).toEqual({
         key: 'DASHBOARD',
         label: 'Dashboard',
@@ -281,9 +315,11 @@ describe('RolesService', () => {
         name: 'Film Manager',
       });
 
-      const updated = await service.update('role-custom', {
-        name: 'Film Manager',
-      });
+      const updated = await service.update(
+        'role-custom',
+        { name: 'Film Manager' },
+        actor,
+      );
 
       expect(updated.name).toBe('Film Manager');
       // The key is immutable — renaming must never move it.
@@ -297,7 +333,7 @@ describe('RolesService', () => {
       prisma.appRole.findUnique.mockResolvedValue(customRole);
       prisma.appRole.update.mockResolvedValue(customRole);
 
-      await service.update('role-custom', { description: '   ' });
+      await service.update('role-custom', { description: '   ' }, actor);
 
       expect(prisma.appRole.update).toHaveBeenCalledWith(
         expect.objectContaining({ data: { description: null } }),
@@ -308,7 +344,7 @@ describe('RolesService', () => {
       prisma.appRole.findUnique.mockResolvedValue(superAdminRole);
 
       await expect(
-        service.update('role-super', { name: 'Owner' }),
+        service.update('role-super', { name: 'Owner' }, actor),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(prisma.appRole.update).not.toHaveBeenCalled();
     });
@@ -317,7 +353,7 @@ describe('RolesService', () => {
       prisma.appRole.findUnique.mockResolvedValue(null);
 
       await expect(
-        service.update('nope', { name: 'Whatever' }),
+        service.update('nope', { name: 'Whatever' }, actor),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
@@ -422,6 +458,84 @@ describe('RolesService', () => {
       });
     });
 
+    /**
+     * The ceiling used to look only at the incoming set, so an empty save
+     * stripped everything — 46 permissions off the built-in Admin role in
+     * one 200 response, by an editor who held none of them.
+     */
+    describe('revoke ceiling and built-in gate (F-004)', () => {
+      it('F-004: refuses to remove permissions the actor does not hold (403, names them)', async () => {
+        prisma.appRole.findUnique.mockResolvedValue(customRole);
+
+        await expect(
+          service.replacePermissions('role-custom', [], roleManagerActor),
+        ).rejects.toThrow(
+          'You cannot remove permissions you do not have yourself: MOVIES.VIEW, MOVIES.CREATE.',
+        );
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+      });
+
+      it('F-004: a limited editor may remove exactly what they hold', async () => {
+        prisma.appRole.findUnique.mockResolvedValue(customRole);
+
+        await service.replacePermissions('role-custom', ['MOVIES.CREATE'], {
+          id: 're-1',
+          username: 're',
+          role: Role.ADMIN,
+          appRoleId: 'role-editor',
+        });
+
+        expect(prisma.$transaction).toHaveBeenCalled();
+        expect(prisma.appRolePermission.deleteMany).toHaveBeenCalledWith({
+          where: { roleId: 'role-custom', permission: { in: ['MOVIES.VIEW'] } },
+        });
+      });
+
+      it('F-004: the ceiling applies to the diff, not to untouched permissions', async () => {
+        prisma.appRole.findUnique.mockResolvedValue(customRole);
+
+        // Only ROLES.VIEW is added (and held); the MOVIES.* rows stay as they are.
+        await service.replacePermissions(
+          'role-custom',
+          ['MOVIES.VIEW', 'MOVIES.CREATE', 'ROLES.VIEW'],
+          roleManagerActor,
+        );
+
+        expect(prisma.$transaction).toHaveBeenCalled();
+        expect(prisma.appRolePermission.createMany).toHaveBeenCalledWith({
+          data: [{ roleId: 'role-custom', permission: 'ROLES.VIEW' }],
+          skipDuplicates: true,
+        });
+      });
+
+      it('F-004: refuses a non-Super-Admin editing a built-in role (403)', async () => {
+        prisma.appRole.findUnique.mockResolvedValue(adminRole);
+
+        await expect(
+          service.replacePermissions(
+            'role-admin',
+            ['DASHBOARD.VIEW'],
+            roleManagerActor,
+          ),
+        ).rejects.toThrow(
+          'Only a Super Admin can change the permissions of a built-in role.',
+        );
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+      });
+
+      it('F-004: still lets a Super Admin edit a built-in role', async () => {
+        prisma.appRole.findUnique.mockResolvedValue(adminRole);
+
+        await service.replacePermissions(
+          'role-admin',
+          ['DASHBOARD.VIEW'],
+          actor,
+        );
+
+        expect(prisma.$transaction).toHaveBeenCalled();
+      });
+    });
+
     describe('lockout guard', () => {
       it('refuses to strip ROLES.EDIT from the last role that can manage roles (409)', async () => {
         prisma.appRole.findUnique.mockResolvedValue(roleManagerRole);
@@ -480,7 +594,7 @@ describe('RolesService', () => {
       prisma.appRole.findUnique.mockResolvedValue(customRole);
       prisma.user.count.mockResolvedValue(0);
 
-      await service.remove('role-custom');
+      await service.remove('role-custom', actor);
 
       expect(prisma.appRole.delete).toHaveBeenCalledWith({
         where: { id: 'role-custom' },
@@ -492,7 +606,7 @@ describe('RolesService', () => {
       prisma.appRole.findUnique.mockResolvedValue(customRole);
       prisma.user.count.mockResolvedValue(2);
 
-      await expect(service.remove('role-custom')).rejects.toBeInstanceOf(
+      await expect(service.remove('role-custom', actor)).rejects.toBeInstanceOf(
         ConflictException,
       );
       expect(prisma.appRole.delete).not.toHaveBeenCalled();
@@ -505,7 +619,7 @@ describe('RolesService', () => {
         key: Role.ADMIN,
       });
 
-      await expect(service.remove('role-custom')).rejects.toBeInstanceOf(
+      await expect(service.remove('role-custom', actor)).rejects.toBeInstanceOf(
         ConflictException,
       );
       expect(prisma.appRole.delete).not.toHaveBeenCalled();
@@ -514,7 +628,7 @@ describe('RolesService', () => {
     it('throws 404 for an unknown role', async () => {
       prisma.appRole.findUnique.mockResolvedValue(null);
 
-      await expect(service.remove('nope')).rejects.toBeInstanceOf(
+      await expect(service.remove('nope', actor)).rejects.toBeInstanceOf(
         NotFoundException,
       );
     });

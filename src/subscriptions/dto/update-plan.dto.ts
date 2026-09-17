@@ -8,6 +8,7 @@ import {
   ValidateIf,
 } from 'class-validator';
 import { Type } from 'class-transformer';
+import { ToBoolean } from '../../common/decorators/to-boolean.decorator';
 
 /**
  * Written out rather than `PartialType(CreatePlanDto)` on purpose: PartialType
@@ -36,6 +37,7 @@ export class UpdatePlanDto {
   durationDays?: number;
 
   @ValidateIf((_, value) => value !== undefined)
+  @ToBoolean()
   @IsBoolean()
   isActive?: boolean;
 }

@@ -13,10 +13,11 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { OptionalAuth } from '../common/decorators/optional-auth.decorator';
 import { MinioService } from '../common/storage/minio.service';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
-import { MovieStatus } from '../generated/prisma/client';
+import { MovieStatus, Role } from '../generated/prisma/client';
 import { AuthorityService } from '../roles/authority.service';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
@@ -48,15 +49,23 @@ export class MoviesController {
   private readonly resolveImageUrl: ImageUrlResolver = (url) =>
     this.minioService.imageUrl(url);
 
+  /**
+   * Guests may browse the catalogue (@OptionalAuth) — they are scoped as
+   * Role.USER, which is what makes the service return PUBLISHED standalone
+   * movies only. A staff token on the same route keeps its full view.
+   */
   @Get()
+  @OptionalAuth()
   async findAll(
     @Query() query: MovieQueryDto,
-    @CurrentUser() user: AuthenticatedUser,
+    @CurrentUser() user?: AuthenticatedUser,
   ) {
+    const viewerRole = user?.role ?? Role.USER;
+    const viewerId = user?.id;
     const { items, total, page, limit } = await this.moviesService.findAll(
       query,
-      user.role,
-      user.id,
+      viewerRole,
+      viewerId,
     );
     return {
       items: items.map((m) =>
@@ -79,17 +88,20 @@ export class MoviesController {
 
   /**
    * DB-derived filter options for the catalog's filter sheet — see
-   * MoviesService.getFacets. Same auth as the rest of the catalog (the
-   * global JwtAuthGuard — the catalog requires auth by design). Registered
-   * before ':id' so "facets" is never parsed as a movie UUID.
+   * MoviesService.getFacets. Same auth as the rest of the catalog (open to
+   * guests via @OptionalAuth; the facets are computed over PUBLISHED rows
+   * only). Registered before ':id' so "facets" is never parsed as a movie
+   * UUID.
    */
   @Get('facets')
+  @OptionalAuth()
   getFacets() {
     return this.moviesService.getFacets();
   }
 
   /** Registered before ':id' so "most-purchased" is never parsed as a movie UUID. */
   @Get('most-purchased')
+  @OptionalAuth()
   async getMostPurchased() {
     const movies = await this.moviesService.getMostPurchased();
     return movies.map((m) =>
@@ -97,20 +109,26 @@ export class MoviesController {
     );
   }
 
+  /** Guests see PUBLISHED movies only — anything else is a 404 for them, same as for a regular user. */
   @Get(':id')
+  @OptionalAuth()
   async findOne(
     @Param('id', ParseUUIDPipe) id: string,
-    @CurrentUser() user: AuthenticatedUser,
+    @CurrentUser() user?: AuthenticatedUser,
   ) {
-    const movie = await this.moviesService.findByIdOrThrow(id, user.role);
+    const viewerRole = user?.role ?? Role.USER;
+    const movie = await this.moviesService.findByIdOrThrow(id, viewerRole);
     return MovieResponseDto.fromEntity(movie, this.resolveImageUrl);
   }
 
   @Post()
   @UseGuards(PermissionsGuard)
   @RequirePermissions('MOVIES.CREATE')
-  async create(@Body() dto: CreateMovieDto) {
-    const movie = await this.moviesService.create(dto);
+  async create(
+    @Body() dto: CreateMovieDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    const movie = await this.moviesService.create(dto, user);
     return MovieResponseDto.fromEntity(movie, this.resolveImageUrl);
   }
 
@@ -123,7 +141,10 @@ export class MoviesController {
   @Post('upload-placeholder')
   @UseGuards(PermissionsGuard)
   @RequirePermissions('MOVIES.CREATE')
-  async createUploadPlaceholder(@Body() dto: CreateUploadPlaceholderDto) {
+  async createUploadPlaceholder(
+    @Body() dto: CreateUploadPlaceholderDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
     const movie = await this.moviesService.createUploadPlaceholder(
       dto.title,
       dto.seriesId
@@ -134,6 +155,7 @@ export class MoviesController {
           }
         : undefined,
       { duration: dto.duration },
+      user,
     );
     return MovieResponseDto.fromEntity(movie, this.resolveImageUrl);
   }
@@ -149,8 +171,11 @@ export class MoviesController {
   @HttpCode(HttpStatus.OK)
   @UseGuards(PermissionsGuard)
   @RequirePermissions('MOVIES.EDIT')
-  backfillDurations(@Body() dto: BackfillDurationsDto) {
-    return this.videoDurationService.backfill(dto.limit ?? 100);
+  backfillDurations(
+    @Body() dto: BackfillDurationsDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.videoDurationService.backfill(dto.limit ?? 100, user);
   }
 
   /**
@@ -190,7 +215,7 @@ export class MoviesController {
       }
     }
 
-    const movie = await this.moviesService.update(id, dto);
+    const movie = await this.moviesService.update(id, dto, user);
     return MovieResponseDto.fromEntity(movie, this.resolveImageUrl);
   }
 
@@ -198,7 +223,10 @@ export class MoviesController {
   @HttpCode(HttpStatus.NO_CONTENT)
   @UseGuards(PermissionsGuard)
   @RequirePermissions('MOVIES.DELETE')
-  async remove(@Param('id', ParseUUIDPipe) id: string) {
-    await this.moviesService.remove(id);
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    await this.moviesService.remove(id, user);
   }
 }

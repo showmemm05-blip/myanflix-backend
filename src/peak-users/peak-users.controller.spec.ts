@@ -162,7 +162,7 @@ describe('PeakUsersController', () => {
       expect(service.setAdditional).not.toHaveBeenCalled();
     });
 
-    it('updates via the service with the acting admin id for SUPER_ADMIN', async () => {
+    it('updates via the service with the acting admin for SUPER_ADMIN', async () => {
       const response = await request(app.getHttpServer())
         .patch('/peak-users/additional')
         .set('x-test-role', 'SUPER_ADMIN')
@@ -171,7 +171,7 @@ describe('PeakUsersController', () => {
 
       expect(service.setAdditional).toHaveBeenCalledWith(
         { additionalPeak: 500 },
-        'admin-1',
+        expect.objectContaining({ id: 'admin-1' }),
       );
       expect(response.body.displayedPeak).toBe(637);
     });
@@ -185,7 +185,7 @@ describe('PeakUsersController', () => {
 
       expect(service.setAdditional).toHaveBeenCalledWith(
         { additionalPeak: 0 },
-        'admin-1',
+        expect.objectContaining({ id: 'admin-1' }),
       );
     });
 

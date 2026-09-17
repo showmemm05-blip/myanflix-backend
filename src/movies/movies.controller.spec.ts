@@ -4,12 +4,15 @@ import {
   ExecutionContext,
   INestApplication,
   Injectable,
+  UnauthorizedException,
   ValidationPipe,
 } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
+import { AuthGuard, type IAuthGuard } from '@nestjs/passport';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import { MovieStatus, Role } from '../generated/prisma/client';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { MinioService } from '../common/storage/minio.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthorityService } from '../roles/authority.service';
@@ -104,7 +107,12 @@ describe('MoviesController — publish/unpublish gate (F11)', () => {
     videoDurationService = {
       backfill: jest
         .fn()
-        .mockResolvedValue({ scanned: 0, updated: 0, failed: [], remaining: 0 }),
+        .mockResolvedValue({
+          scanned: 0,
+          updated: 0,
+          failed: [],
+          remaining: 0,
+        }),
     };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -189,6 +197,41 @@ describe('MoviesController — publish/unpublish gate (F11)', () => {
     expect(moviesService.update).toHaveBeenCalled();
     // No status in the payload — the gate must not even look the movie up.
     expect(moviesService.getStatusOrThrow).not.toHaveBeenCalled();
+  });
+
+  /**
+   * F-002: through the REAL ValidationPipe a partial PUT must reach the
+   * service without a resurrected `accessType` — CreateMovieDto used to carry
+   * `= SUBSCRIPTION`, which PartialType copied into every UpdateMovieDto.
+   * `toEqual` ignores own `undefined` props (ES2023 class fields), which is
+   * exactly the shape an empty body must produce.
+   */
+  it('F-002: a status-only PUT reaches the service without an accessType', async () => {
+    moviesService.getStatusOrThrow.mockResolvedValue(MovieStatus.DRAFT);
+
+    await request(app.getHttpServer())
+      .put(`/movies/${MOVIE_ID}`)
+      .set('x-test-role', Role.SUPER_ADMIN)
+      .send({ status: MovieStatus.PUBLISHED })
+      .expect(200);
+
+    const dto = moviesService.update.mock.calls[0][1] as Record<
+      string,
+      unknown
+    >;
+    expect(dto.accessType).toBeUndefined();
+    expect(dto).not.toHaveProperty('accessType');
+    expect(dto).toEqual({ status: MovieStatus.PUBLISHED });
+  });
+
+  it('F-002: an empty PUT body reaches the service as an empty dto', async () => {
+    await request(app.getHttpServer())
+      .put(`/movies/${MOVIE_ID}`)
+      .set('x-test-role', Role.SUPER_ADMIN)
+      .send({})
+      .expect(200);
+
+    expect(moviesService.update.mock.calls[0][1]).toEqual({});
   });
 
   it('F11: still allows editing a PUBLISHED movie that stays published', async () => {
@@ -360,6 +403,7 @@ describe('MoviesController — publish/unpublish gate (F11)', () => {
         'Bulk Title',
         undefined,
         { duration: 91 },
+        expect.objectContaining({ id: 'admin-1' }),
       );
     });
 
@@ -373,6 +417,7 @@ describe('MoviesController — publish/unpublish gate (F11)', () => {
         'Bulk Title',
         undefined,
         { duration: undefined },
+        expect.objectContaining({ id: 'admin-1' }),
       );
     });
 
@@ -381,14 +426,17 @@ describe('MoviesController — publish/unpublish gate (F11)', () => {
       [-5, 'negative'],
       [6001, 'over the 100 h sanity bound'],
       [90.5, 'not whole minutes'],
-    ])('rejects duration %p (%s) with 400 before the service runs', async (duration) => {
-      await request(app.getHttpServer())
-        .post('/movies/upload-placeholder')
-        .send({ title: 'Bulk Title', duration })
-        .expect(400);
+    ])(
+      'rejects duration %p (%s) with 400 before the service runs',
+      async (duration) => {
+        await request(app.getHttpServer())
+          .post('/movies/upload-placeholder')
+          .send({ title: 'Bulk Title', duration })
+          .expect(400);
 
-      expect(moviesService.createUploadPlaceholder).not.toHaveBeenCalled();
-    });
+        expect(moviesService.createUploadPlaceholder).not.toHaveBeenCalled();
+      },
+    );
   });
 
   describe('POST /movies/durations/backfill', () => {
@@ -401,10 +449,15 @@ describe('MoviesController — publish/unpublish gate (F11)', () => {
       });
 
       const res = await asEditor(
-        request(app.getHttpServer()).post('/movies/durations/backfill').send({}),
+        request(app.getHttpServer())
+          .post('/movies/durations/backfill')
+          .send({}),
       ).expect(200);
 
-      expect(videoDurationService.backfill).toHaveBeenCalledWith(100);
+      expect(videoDurationService.backfill).toHaveBeenCalledWith(
+        100,
+        expect.objectContaining({ id: 'admin-1' }),
+      );
       expect(res.body).toEqual({
         scanned: 6,
         updated: 6,
@@ -419,7 +472,10 @@ describe('MoviesController — publish/unpublish gate (F11)', () => {
           .post('/movies/durations/backfill')
           .send({ limit: 25 }),
       ).expect(200);
-      expect(videoDurationService.backfill).toHaveBeenCalledWith(25);
+      expect(videoDurationService.backfill).toHaveBeenCalledWith(
+        25,
+        expect.objectContaining({ id: 'admin-1' }),
+      );
 
       await asEditor(
         request(app.getHttpServer())
@@ -438,5 +494,184 @@ describe('MoviesController — publish/unpublish gate (F11)', () => {
 
       expect(videoDurationService.backfill).not.toHaveBeenCalled();
     });
+  });
+});
+
+/**
+ * The guest read paths through the REAL JwtAuthGuard. Only the passport
+ * step underneath it is stubbed (AuthGuard() is memoized, so the spy lands
+ * on the exact prototype JwtAuthGuard extends): a request with no
+ * Authorization header must never reach it and must scope the service to
+ * Role.USER; one with a header must go through it and keep the staff view.
+ */
+describe('MoviesController — guest catalogue (@OptionalAuth)', () => {
+  let app: INestApplication<App>;
+  let moviesService: {
+    findAll: jest.Mock;
+    findByIdOrThrow: jest.Mock;
+    getFacets: jest.Mock;
+    getMostPurchased: jest.Mock;
+    getPurchasesForUser: jest.Mock;
+  };
+  let passportCanActivate: jest.SpyInstance;
+
+  const admin = {
+    id: 'admin-1',
+    username: 'boss',
+    role: Role.ADMIN,
+    appRoleId: null,
+  };
+
+  beforeEach(async () => {
+    passportCanActivate = jest
+      .spyOn(AuthGuard('jwt').prototype as IAuthGuard, 'canActivate')
+      .mockImplementation((context: ExecutionContext) => {
+        const req = context
+          .switchToHttp()
+          .getRequest<{ user?: Record<string, unknown> }>();
+        req.user = admin;
+        return true;
+      });
+
+    moviesService = {
+      findAll: jest
+        .fn()
+        .mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 }),
+      findByIdOrThrow: jest.fn().mockResolvedValue({
+        id: MOVIE_ID,
+        title: 'A Movie',
+        description: '',
+        posterUrl: null,
+        coverUrl: null,
+        thumbnailUrl: null,
+        genre: '',
+        language: '',
+        releaseYear: 2026,
+        duration: 100,
+        rating: 0,
+        accessType: 'FREE',
+        status: MovieStatus.PUBLISHED,
+        seriesId: null,
+        seasonNumber: null,
+        episodeNumber: null,
+        categories: [],
+        actors: [],
+        createdAt: new Date('2026-01-01'),
+        updatedAt: new Date('2026-01-01'),
+      }),
+      getFacets: jest.fn().mockResolvedValue({
+        genres: [],
+        languages: [],
+        countries: [],
+        ageRatings: [],
+        directors: [],
+        years: null,
+      }),
+      getMostPurchased: jest.fn().mockResolvedValue([]),
+      getPurchasesForUser: jest
+        .fn()
+        .mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 }),
+    };
+
+    const moduleFixture: TestingModule = await Test.createTestingModule({
+      controllers: [MoviesController],
+      providers: [
+        { provide: MoviesService, useValue: moviesService },
+        { provide: VideoDurationService, useValue: {} },
+        { provide: MinioService, useValue: { imageUrl: (u: string) => u } },
+        // None of the routes under test carry PermissionsGuard, but the
+        // controller's other routes do, so its dependencies must resolve.
+        { provide: AuthorityService, useValue: {} },
+        { provide: PermissionResolverService, useValue: {} },
+        { provide: PrismaService, useValue: {} },
+        { provide: APP_GUARD, useClass: JwtAuthGuard },
+      ],
+    }).compile();
+
+    app = moduleFixture.createNestApplication();
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        transform: true,
+        forbidNonWhitelisted: true,
+        transformOptions: { enableImplicitConversion: true },
+      }),
+    );
+    await app.init();
+  });
+
+  afterEach(async () => {
+    passportCanActivate.mockRestore();
+    await app.close();
+  });
+
+  it('GET /movies without a token: 200, scoped to Role.USER with no viewer id, passport untouched', async () => {
+    await request(app.getHttpServer()).get('/movies').expect(200);
+
+    expect(passportCanActivate).not.toHaveBeenCalled();
+    expect(moviesService.findAll).toHaveBeenCalledWith(
+      expect.anything(),
+      Role.USER,
+      undefined,
+    );
+  });
+
+  it('GET /movies/:id without a token: looked up as Role.USER', async () => {
+    await request(app.getHttpServer()).get(`/movies/${MOVIE_ID}`).expect(200);
+
+    expect(passportCanActivate).not.toHaveBeenCalled();
+    expect(moviesService.findByIdOrThrow).toHaveBeenCalledWith(
+      MOVIE_ID,
+      Role.USER,
+    );
+  });
+
+  it('GET /movies/facets and /movies/most-purchased are open to guests', async () => {
+    await request(app.getHttpServer()).get('/movies/facets').expect(200);
+    await request(app.getHttpServer())
+      .get('/movies/most-purchased')
+      .expect(200);
+
+    expect(passportCanActivate).not.toHaveBeenCalled();
+    expect(moviesService.getFacets).toHaveBeenCalled();
+    expect(moviesService.getMostPurchased).toHaveBeenCalled();
+  });
+
+  it('GET /movies with a token: goes through passport and keeps the staff view', async () => {
+    await request(app.getHttpServer())
+      .get('/movies')
+      .set('Authorization', 'Bearer staff-token')
+      .expect(200);
+
+    expect(passportCanActivate).toHaveBeenCalledTimes(1);
+    expect(moviesService.findAll).toHaveBeenCalledWith(
+      expect.anything(),
+      Role.ADMIN,
+      'admin-1',
+    );
+  });
+
+  it('GET /movies with a bad token: still a 401 so the client refreshes', async () => {
+    passportCanActivate.mockImplementation(() => {
+      throw new UnauthorizedException();
+    });
+
+    await request(app.getHttpServer())
+      .get('/movies')
+      .set('Authorization', 'Bearer expired')
+      .expect(401);
+
+    expect(moviesService.findAll).not.toHaveBeenCalled();
+  });
+
+  it('GET /movies/me/purchases stays protected: no token is a 401', async () => {
+    passportCanActivate.mockImplementation(() => {
+      throw new UnauthorizedException();
+    });
+
+    await request(app.getHttpServer()).get('/movies/me/purchases').expect(401);
+
+    expect(passportCanActivate).toHaveBeenCalledTimes(1);
+    expect(moviesService.getPurchasesForUser).not.toHaveBeenCalled();
   });
 });

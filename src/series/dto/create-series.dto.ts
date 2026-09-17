@@ -50,10 +50,19 @@ export class CreateSeriesDto {
   @Max(2100)
   releaseYear!: number;
 
-  /** One access type for the whole show — episodes are never gated individually. */
+  /**
+   * One access type for the whole show — episodes are never gated individually.
+   *
+   * Create-time default is Prisma `@default(SUBSCRIPTION)` (prisma/schema.prisma
+   * Series.accessType). No class initializer on purpose: UpdateSeriesDto =
+   * PartialType(CreateSeriesDto) inherits initializers (@nestjs/mapped-types
+   * type-helpers.utils inheritPropertyInitializers) and the global transform
+   * pipe (src/app.module.ts) would inject the value into every PUT that omits
+   * the field — see the precedent in src/subscriptions/dto/create-plan.dto.ts.
+   */
   @IsOptional()
   @IsEnum(AccessType)
-  accessType?: AccessType = AccessType.SUBSCRIPTION;
+  accessType?: AccessType;
 
   @IsOptional()
   @IsArray()

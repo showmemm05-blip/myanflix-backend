@@ -65,8 +65,9 @@ export class RolesController {
   update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateAppRoleDto,
+    @CurrentUser() actor: AuthenticatedUser,
   ) {
-    return this.rolesService.update(id, dto);
+    return this.rolesService.update(id, dto, actor);
   }
 
   @Put(':id/permissions')
@@ -82,7 +83,10 @@ export class RolesController {
   @Delete(':id')
   @RequirePermissions('ROLES.DELETE')
   @HttpCode(HttpStatus.NO_CONTENT)
-  async remove(@Param('id', ParseUUIDPipe) id: string): Promise<void> {
-    await this.rolesService.remove(id);
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() actor: AuthenticatedUser,
+  ): Promise<void> {
+    await this.rolesService.remove(id, actor);
   }
 }

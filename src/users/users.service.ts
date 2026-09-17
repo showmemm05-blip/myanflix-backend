@@ -10,11 +10,14 @@ import type { User, UserStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { PASSWORD_SALT_ROUNDS } from '../auth/password.constants';
 import { MinioService } from '../common/storage/minio.service';
+import { StorageService } from '../common/storage/storage.service';
 import { AuthorityService } from '../roles/authority.service';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { Role, TransactionType } from '../generated/prisma/client';
+import { AuditService } from '../audit/audit.service';
+import { userSnapshot } from '../audit/audit-snapshots';
 
 export interface CreateUserInput {
   username: string;
@@ -33,16 +36,15 @@ export interface CreateUserInput {
 
 /**
  * File extension is derived from the VALIDATED MIME type — never from the
- * client-supplied filename, which is attacker-controlled.
+ * client-supplied filename, which is attacker-controlled. The leading dot is
+ * part of the value because that is the form every StorageService key
+ * builder takes (extname()'s form), so nothing has to re-add it.
  */
 const AVATAR_MIME_TO_EXTENSION: Record<string, string> = {
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/webp': 'webp',
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
 };
-
-/** Cleanup only ever deletes objects under this prefix — never arbitrary keys a row might somehow hold. */
-const AVATAR_KEY_PREFIX = 'images/avatars/';
 
 /**
  * The multipart Content-Type header is attacker-controlled, so the declared
@@ -91,7 +93,9 @@ export class UsersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
+    private readonly storageService: StorageService,
     private readonly authority: AuthorityService,
+    private readonly audit: AuditService,
   ) {}
 
   async create(input: CreateUserInput): Promise<User> {
@@ -269,10 +273,10 @@ export class UsersService {
       );
     }
 
-    const target = await this.findByIdOrThrow(id);
+    const target = await this.findWithAppRoleOrThrow(id);
     const systemRole = await this.prisma.appRole.findUnique({
       where: { key: role },
-      select: { id: true },
+      select: { id: true, name: true },
     });
     const assignment = { role, appRoleId: systemRole?.id ?? null };
 
@@ -280,8 +284,12 @@ export class UsersService {
     if (await this.authority.isSuperAdminTier(target)) {
       await this.authority.assertActorIsSuperAdmin(actor);
     }
-    // ...(b) nor promote anyone into it, nor grant a set you lack (P1).
-    await this.authority.assertCanAssignRole(actor, assignment);
+    // ...(b) nor promote anyone into it, nor grant a set you lack (P1), nor
+    // (F-004) demote them off a set you lack.
+    await this.authority.assertCanAssignRole(actor, assignment, {
+      role: target.role,
+      appRoleId: target.appRoleId,
+    });
 
     // (d)/F7: the staff guards, on the endpoint that used to bypass them.
     if (
@@ -295,15 +303,83 @@ export class UsersService {
       assignment,
     );
 
-    return this.prisma.user.update({
+    const updated = await this.prisma.user.update({
       where: { id },
       data: { role, ...(systemRole && { appRoleId: systemRole.id }) },
     });
+
+    // The assignment is re-pointed only when the system role exists; otherwise
+    // the AppRole stays whatever it was — mirror that in the "after" name.
+    await this.audit.record({
+      action: 'user.role_change',
+      actor,
+      target: { type: 'user', id, label: `@${updated.username}` },
+      before: userSnapshot(target),
+      after: userSnapshot({
+        ...updated,
+        appRole: systemRole ? { name: systemRole.name } : target.appRole,
+      }),
+    });
+    this.audit.invalidateActorCache(id);
+    return updated;
   }
 
-  async updateStatus(id: string, status: UserStatus): Promise<User> {
-    await this.findByIdOrThrow(id);
-    return this.prisma.user.update({ where: { id }, data: { status } });
+  /**
+   * Activate / suspend / ban. Like `updateRole` (F2/F7) this route used to run
+   * with nothing but USERS.SUSPEND and no checks at all — F-001: a small
+   * custom role could suspend a Super Admin (even the last one) or itself.
+   * It now runs the same status-change gate as PATCH /staff/:id/status, and a
+   * staff-tier target additionally needs STAFF.EDIT, because USERS.SUSPEND is
+   * a "customers" permission.
+   */
+  async updateStatus(
+    id: string,
+    status: UserStatus,
+    actor: AuthenticatedUser,
+  ): Promise<User> {
+    const target = await this.findWithAppRoleOrThrow(id);
+    await this.authority.assertCanChangeStatus(
+      actor,
+      { id, role: target.role, appRoleId: target.appRoleId },
+      status,
+    );
+    if (target.role !== Role.USER) {
+      await this.authority.assertHas(
+        actor,
+        'STAFF.EDIT',
+        'Staff accounts are managed from the Staff page.',
+      );
+    }
+
+    const updated = await this.prisma.user.update({
+      where: { id },
+      data: { status },
+    });
+
+    await this.audit.record({
+      action: 'user.status_change',
+      actor,
+      target: { type: 'user', id, label: `@${updated.username}` },
+      before: userSnapshot(target),
+      after: userSnapshot({ ...updated, appRole: target.appRole }),
+    });
+    return updated;
+  }
+
+  /**
+   * The audit "before" read for the staff-facing mutations: the row plus the
+   * assigned AppRole's name, so the log can say "Admin → Movie Manager"
+   * rather than two opaque ids.
+   */
+  private async findWithAppRoleOrThrow(
+    id: string,
+  ): Promise<User & { appRole: { name: string } | null }> {
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      include: { appRole: { select: { name: true } } },
+    });
+    if (!user) throw new NotFoundException('User not found');
+    return user;
   }
 
   /**
@@ -383,13 +459,13 @@ export class UsersService {
     }
 
     const previousKey = (await this.findByIdOrThrow(userId)).avatar;
-    const key = `${AVATAR_KEY_PREFIX}${userId}-${Date.now()}.${extension}`;
+    const key = this.storageService.avatarKey(userId, Date.now(), extension);
     await this.minioService.uploadBuffer(key, file.buffer);
     const user = await this.prisma.user.update({
       where: { id: userId },
       data: { avatar: key },
     });
-    await this.deleteAvatarObject(previousKey);
+    await this.deleteAvatarObject(userId, previousKey);
     return user;
   }
 
@@ -400,18 +476,43 @@ export class UsersService {
       where: { id: userId },
       data: { avatar: null },
     });
-    await this.deleteAvatarObject(previousKey);
+    await this.deleteAvatarObject(userId, previousKey);
     return user;
   }
 
   /**
-   * Best-effort delete of a replaced/removed avatar object. Guarded to the
-   * avatar prefix so this can never delete an arbitrary key, and never
-   * throws — the DB row is already updated, and a leaked object is
-   * preferable to failing the user's request.
+   * Every profile picture this user has ever uploaded, in ONE prefix delete —
+   * for account deletion, where clearing the row leaves the bytes behind.
+   * Only possible because avatars are foldered per user: the flat shape this
+   * replaced (`images/avatars/<userId>-<stamp>.<ext>`) left no way to reach
+   * anything but the CURRENT key, so every failed replacement leaked forever.
+   * Best-effort and never throws, for the same reason as the single-object
+   * cleanup below: the row is the user-facing action, orphaned bytes are not.
    */
-  private async deleteAvatarObject(key: string | null): Promise<void> {
-    if (!key || !key.startsWith(AVATAR_KEY_PREFIX)) return;
+  async deleteAvatarObjects(userId: string): Promise<void> {
+    const prefix = `${this.storageService.avatarPrefix(userId)}/`;
+    try {
+      await this.minioService.deleteByPrefix(prefix);
+    } catch (error) {
+      this.logger.warn(
+        `Could not delete avatar objects under "${prefix}": ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * Best-effort delete of a replaced/removed avatar object. Guarded to THIS
+   * user's own folder — not merely to the images/ tree — so a malformed or
+   * tampered `avatar` value can never reach another user's picture, and never
+   * throws: the DB row is already updated, and a leaked object is preferable
+   * to failing the user's request.
+   */
+  private async deleteAvatarObject(
+    userId: string,
+    key: string | null,
+  ): Promise<void> {
+    const prefix = `${this.storageService.avatarPrefix(userId)}/`;
+    if (!key || !key.startsWith(prefix)) return;
     try {
       await this.minioService.deleteObject(key);
     } catch (error) {

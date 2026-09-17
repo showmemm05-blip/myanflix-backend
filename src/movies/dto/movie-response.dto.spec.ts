@@ -1,4 +1,8 @@
-import { MovieResponseDto } from './movie-response.dto';
+import {
+  MovieResponseDto,
+  maxQualityOf,
+  type MovieQualitySource,
+} from './movie-response.dto';
 import type { Category, Movie } from '../../generated/prisma/client';
 
 /**
@@ -22,9 +26,9 @@ describe('MovieResponseDto.fromEntity', () => {
     title: 'Some Title',
     description: 'A description',
     // Baked with a LAN IP the machine no longer has.
-    posterUrl: 'http://192.168.10.122:8080/movies/images/poster.jpeg',
-    coverUrl: 'http://192.168.10.122:8080/movies/images/cover.jpeg',
-    thumbnailUrl: 'http://192.168.10.122:8080/movies/images/thumb.jpeg',
+    posterUrl: 'http://192.168.10.122:8080/movies/images/movie/poster.jpeg',
+    coverUrl: 'http://192.168.10.122:8080/movies/images/movie/cover.jpeg',
+    thumbnailUrl: 'http://192.168.10.122:8080/movies/images/movie/thumb.jpeg',
     genre: 'Drama',
     language: 'Burmese',
     releaseYear: 2024,
@@ -43,19 +47,22 @@ describe('MovieResponseDto.fromEntity', () => {
     categories: [{ id: 'cat-1', name: 'Action' }] as Category[],
   } as unknown as Movie & { categories: Category[] };
 
+  const withVideos = (videos: MovieQualitySource[]) =>
+    ({ ...movie, videos }) as typeof movie & { videos: MovieQualitySource[] };
+
   beforeEach(() => resolveImageUrl.mockClear());
 
   it('re-hosts every one of the three persisted image fields', () => {
     const result = MovieResponseDto.fromEntity(movie, resolveImageUrl);
 
     expect(result.posterUrl).toBe(
-      'http://current-host:8080/movies/images/poster.jpeg',
+      'http://current-host:8080/movies/images/movie/poster.jpeg',
     );
     expect(result.coverUrl).toBe(
-      'http://current-host:8080/movies/images/cover.jpeg',
+      'http://current-host:8080/movies/images/movie/cover.jpeg',
     );
     expect(result.thumbnailUrl).toBe(
-      'http://current-host:8080/movies/images/thumb.jpeg',
+      'http://current-host:8080/movies/images/movie/thumb.jpeg',
     );
     // Regression guard: a field added later must go through the resolver
     // too, not be copied straight off the row.
@@ -120,5 +127,82 @@ describe('MovieResponseDto.fromEntity', () => {
     );
     expect(result.coverUrl).toBeNull();
     expect(result.thumbnailUrl).toBeNull();
+  });
+
+  it('reports the highest READY rendition as maxQuality', () => {
+    const result = MovieResponseDto.fromEntity(
+      withVideos([
+        {
+          status: 'READY',
+          renditions: [
+            { resolution: '240p' },
+            { resolution: '480p' },
+            { resolution: '720p' },
+          ],
+        },
+      ]),
+      resolveImageUrl,
+    );
+
+    expect(result.maxQuality).toBe('720p');
+  });
+
+  it('leaves maxQuality null when the relation was not loaded', () => {
+    expect(MovieResponseDto.fromEntity(movie, resolveImageUrl).maxQuality).toBe(
+      null,
+    );
+  });
+});
+
+/**
+ * The badge is the one field derived rather than copied, and it is a promise
+ * about what a viewer can actually be served — so every way the data can be
+ * partial has to end in "no badge" rather than a guess.
+ */
+describe('maxQualityOf', () => {
+  it('returns null with no videos at all', () => {
+    expect(maxQualityOf([])).toBeNull();
+    expect(maxQualityOf(undefined)).toBeNull();
+  });
+
+  it('ignores a video that is still processing — nothing is servable yet', () => {
+    expect(
+      maxQualityOf([
+        { status: 'PROCESSING', renditions: [{ resolution: '1080p' }] },
+      ]),
+    ).toBeNull();
+  });
+
+  it('takes the highest across several READY videos', () => {
+    expect(
+      maxQualityOf([
+        { status: 'READY', renditions: [{ resolution: '480p' }] },
+        { status: 'READY', renditions: [{ resolution: '1080p' }] },
+      ]),
+    ).toBe('1080p');
+  });
+
+  it('passes an unseen rendition name through so the ladder can grow without a backend change', () => {
+    expect(
+      maxQualityOf([
+        {
+          status: 'READY',
+          renditions: [{ resolution: '1080p' }, { resolution: '2160p' }],
+        },
+      ]),
+    ).toBe('2160p');
+  });
+
+  it('badges nothing when the JSON is not the shape we expect', () => {
+    expect(maxQualityOf([{ status: 'READY', renditions: null }])).toBeNull();
+    expect(
+      maxQualityOf([{ status: 'READY', renditions: { resolution: '720p' } }]),
+    ).toBeNull();
+    expect(
+      maxQualityOf([{ status: 'READY', renditions: [{ resolution: 42 }] }]),
+    ).toBeNull();
+    expect(
+      maxQualityOf([{ status: 'READY', renditions: [{ resolution: 'hd' }] }]),
+    ).toBeNull();
   });
 });

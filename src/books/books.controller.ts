@@ -35,10 +35,7 @@ import {
 import type { ImageUrlResolver } from './dto/book-response.dto';
 import { CreateBookDto } from './dto/create-book.dto';
 import { UpdateBookDto } from './dto/update-book.dto';
-import {
-  CreateBookEditionDto,
-  UpdateBookEditionDto,
-} from './dto/edition.dto';
+import { CreateBookEditionDto, UpdateBookEditionDto } from './dto/edition.dto';
 import {
   CreateBookChapterDto,
   ReorderChaptersDto,
@@ -105,8 +102,11 @@ export class BooksController {
   @Post()
   @UseGuards(PermissionsGuard)
   @RequirePermissions('BOOKS.CREATE')
-  async create(@Body() dto: CreateBookDto) {
-    const book = await this.booksService.create(dto);
+  async create(
+    @Body() dto: CreateBookDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    const book = await this.booksService.create(dto, user);
     return BookResponseDto.fromEntity(book, this.resolveImageUrl);
   }
 
@@ -116,8 +116,9 @@ export class BooksController {
   async update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateBookDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    const book = await this.booksService.update(id, dto);
+    const book = await this.booksService.update(id, dto, user);
     return BookResponseDto.fromEntity(book, this.resolveImageUrl);
   }
 
@@ -125,8 +126,11 @@ export class BooksController {
   @HttpCode(HttpStatus.NO_CONTENT)
   @UseGuards(PermissionsGuard)
   @RequirePermissions('BOOKS.DELETE')
-  async remove(@Param('id', ParseUUIDPipe) id: string) {
-    await this.booksService.remove(id);
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    await this.booksService.remove(id, user);
   }
 
   // ---------------------------------------------------------------------
@@ -139,8 +143,9 @@ export class BooksController {
   async addEdition(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateBookEditionDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    const edition = await this.booksService.addEdition(id, dto);
+    const edition = await this.booksService.addEdition(id, dto, user);
     return BookEditionResponseDto.fromEntity(edition);
   }
 
@@ -182,7 +187,12 @@ export class BooksController {
       }
     }
 
-    const edition = await this.booksService.updateEdition(id, editionId, dto);
+    const edition = await this.booksService.updateEdition(
+      id,
+      editionId,
+      dto,
+      user,
+    );
     return BookEditionResponseDto.fromEntity(edition);
   }
 
@@ -193,8 +203,9 @@ export class BooksController {
   async removeEdition(
     @Param('id', ParseUUIDPipe) id: string,
     @Param('editionId', ParseUUIDPipe) editionId: string,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    await this.booksService.removeEdition(id, editionId);
+    await this.booksService.removeEdition(id, editionId, user);
   }
 
   // ---------------------------------------------------------------------
@@ -241,8 +252,9 @@ export class BooksController {
     @Param('id', ParseUUIDPipe) id: string,
     @Param('editionId', ParseUUIDPipe) editionId: string,
     @Body() dto: CreateBookPartDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    const part = await this.booksService.createPart(id, editionId, dto);
+    const part = await this.booksService.createPart(id, editionId, dto, user);
     return BookPartResponseDto.fromEntity(part);
   }
 
@@ -255,8 +267,9 @@ export class BooksController {
     @Param('id', ParseUUIDPipe) id: string,
     @Param('editionId', ParseUUIDPipe) editionId: string,
     @Body() dto: ReorderPartsDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    await this.booksService.reorderParts(id, editionId, dto);
+    await this.booksService.reorderParts(id, editionId, dto, user);
   }
 
   @Put(':id/editions/:editionId/parts/:partId')
@@ -267,8 +280,15 @@ export class BooksController {
     @Param('editionId', ParseUUIDPipe) editionId: string,
     @Param('partId', ParseUUIDPipe) partId: string,
     @Body() dto: UpdateBookPartDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    const part = await this.booksService.updatePart(id, editionId, partId, dto);
+    const part = await this.booksService.updatePart(
+      id,
+      editionId,
+      partId,
+      dto,
+      user,
+    );
     return BookPartResponseDto.fromEntity(part);
   }
 
@@ -281,8 +301,9 @@ export class BooksController {
     @Param('id', ParseUUIDPipe) id: string,
     @Param('editionId', ParseUUIDPipe) editionId: string,
     @Param('partId', ParseUUIDPipe) partId: string,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    await this.booksService.deletePart(id, editionId, partId);
+    await this.booksService.deletePart(id, editionId, partId, user);
   }
 
   // ---------------------------------------------------------------------
@@ -298,8 +319,9 @@ export class BooksController {
     @Param('id', ParseUUIDPipe) id: string,
     @Param('editionId', ParseUUIDPipe) editionId: string,
     @Param('chapterId', ParseUUIDPipe) chapterId: string,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    await this.booksService.startProcessing(id, editionId, chapterId);
+    await this.booksService.startProcessing(id, editionId, chapterId, user);
     return { started: true };
   }
 
@@ -341,8 +363,14 @@ export class BooksController {
     @Param('id', ParseUUIDPipe) id: string,
     @Param('editionId', ParseUUIDPipe) editionId: string,
     @Body() dto: CreateBookChapterDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    const chapter = await this.booksService.createChapter(id, editionId, dto);
+    const chapter = await this.booksService.createChapter(
+      id,
+      editionId,
+      dto,
+      user,
+    );
     return toChapterSummary(chapter, this.resolveImageUrl);
   }
 
@@ -355,8 +383,9 @@ export class BooksController {
     @Param('id', ParseUUIDPipe) id: string,
     @Param('editionId', ParseUUIDPipe) editionId: string,
     @Body() dto: ReorderChaptersDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    await this.booksService.reorderChapters(id, editionId, dto);
+    await this.booksService.reorderChapters(id, editionId, dto, user);
   }
 
   @Get(':id/editions/:editionId/chapters/:chapterId')
@@ -383,12 +412,14 @@ export class BooksController {
     @Param('editionId', ParseUUIDPipe) editionId: string,
     @Param('chapterId', ParseUUIDPipe) chapterId: string,
     @Body() dto: UpdateBookChapterDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
     const chapter = await this.booksService.updateChapter(
       id,
       editionId,
       chapterId,
       dto,
+      user,
     );
     return toChapterSummary(chapter, this.resolveImageUrl);
   }
@@ -401,8 +432,9 @@ export class BooksController {
     @Param('id', ParseUUIDPipe) id: string,
     @Param('editionId', ParseUUIDPipe) editionId: string,
     @Param('chapterId', ParseUUIDPipe) chapterId: string,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    await this.booksService.deleteChapter(id, editionId, chapterId);
+    await this.booksService.deleteChapter(id, editionId, chapterId, user);
   }
 
   // ---------------------------------------------------------------------
@@ -434,12 +466,14 @@ export class BooksController {
     @Param('editionId', ParseUUIDPipe) editionId: string,
     @Param('chapterId', ParseUUIDPipe) chapterId: string,
     @Body() dto: CreateBookSectionDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
     const section = await this.booksService.createSection(
       id,
       editionId,
       chapterId,
       dto,
+      user,
     );
     return toSectionDetail(section);
   }
@@ -454,8 +488,15 @@ export class BooksController {
     @Param('editionId', ParseUUIDPipe) editionId: string,
     @Param('chapterId', ParseUUIDPipe) chapterId: string,
     @Body() dto: ReorderSectionsDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    await this.booksService.reorderSections(id, editionId, chapterId, dto);
+    await this.booksService.reorderSections(
+      id,
+      editionId,
+      chapterId,
+      dto,
+      user,
+    );
   }
 
   @Put(':id/editions/:editionId/chapters/:chapterId/sections/:sectionId')
@@ -467,6 +508,7 @@ export class BooksController {
     @Param('chapterId', ParseUUIDPipe) chapterId: string,
     @Param('sectionId', ParseUUIDPipe) sectionId: string,
     @Body() dto: UpdateBookSectionDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
     const section = await this.booksService.updateSection(
       id,
@@ -474,6 +516,7 @@ export class BooksController {
       chapterId,
       sectionId,
       dto,
+      user,
     );
     return toSectionDetail(section);
   }
@@ -487,8 +530,15 @@ export class BooksController {
     @Param('editionId', ParseUUIDPipe) editionId: string,
     @Param('chapterId', ParseUUIDPipe) chapterId: string,
     @Param('sectionId', ParseUUIDPipe) sectionId: string,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    await this.booksService.deleteSection(id, editionId, chapterId, sectionId);
+    await this.booksService.deleteSection(
+      id,
+      editionId,
+      chapterId,
+      sectionId,
+      user,
+    );
   }
 
   // ---------------------------------------------------------------------
@@ -516,7 +566,10 @@ export class BooksController {
     );
     return pages.map((page) => ({
       pageNumber: page.pageNumber,
-      url: this.minioService.playbackUrl(page.imageKey),
+      // Signed like a stream: one chapter-scoped token shared by every page
+      // in the array, so the pictures are gated by the same members-only
+      // rule this route already enforces instead of being public by key.
+      url: this.minioService.signedPlaybackUrl(page.imageKey),
       width: page.width,
       height: page.height,
     }));

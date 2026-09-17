@@ -11,6 +11,7 @@ import { UsersService } from '../users/users.service';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { AuthorityService } from '../roles/authority.service';
 import { PermissionResolverService } from '../roles/permission-resolver.service';
+import { AuditService } from '../audit/audit.service';
 import {
   createRoleAwarePermissionResolver,
   seededRoleRow,
@@ -25,15 +26,22 @@ import { StaffService } from './staff.service';
 describe('StaffService — role assignment', () => {
   let service: StaffService;
   let prisma: {
-    user: { findUnique: jest.Mock; update: jest.Mock; count: jest.Mock };
-    appRole: { findUnique: jest.Mock };
+    user: {
+      findUnique: jest.Mock;
+      update: jest.Mock;
+      delete: jest.Mock;
+      count: jest.Mock;
+    };
+    appRole: { findUnique: jest.Mock; findMany: jest.Mock };
   };
   let usersService: {
     findByUsername: jest.Mock;
     findByIdOrThrow: jest.Mock;
     create: jest.Mock;
+    deleteAvatarObjects: jest.Mock;
   };
   let resolver: ReturnType<typeof createRoleAwarePermissionResolver>;
+  let audit: { record: jest.Mock; invalidateActorCache: jest.Mock };
 
   const actor: AuthenticatedUser = {
     id: 'boss-1',
@@ -76,6 +84,7 @@ describe('StaffService — role assignment', () => {
     'role-user': { id: 'role-user', key: Role.USER },
     'role-custom': { id: 'role-custom', key: 'MOVIE_MANAGER' },
     'role-staffmgr': { id: 'role-staffmgr', key: 'STAFF_MANAGER' },
+    'role-staffsub': { id: 'role-staffsub', key: 'STAFF_SUB' },
     'role-rolemgr': { id: 'role-rolemgr', key: 'ROLE_MANAGER' },
   };
 
@@ -115,6 +124,9 @@ describe('StaffService — role assignment', () => {
       findByUsername: jest.fn().mockResolvedValue(null),
       findByIdOrThrow: jest.fn().mockResolvedValue(staffRow),
       create: jest.fn().mockResolvedValue({ id: 'staff-new' }),
+      // Deleting a staff row also sweeps that user's avatar folder — see
+      // StaffService.remove; best-effort, so it resolves rather than throws.
+      deleteAvatarObjects: jest.fn().mockResolvedValue(undefined),
     };
     resolver = createRoleAwarePermissionResolver([
       seededRoleRow(Role.SUPER_ADMIN, 'role-super'),
@@ -141,6 +153,12 @@ describe('StaffService — role assignment', () => {
         key: 'ROLE_MANAGER',
         permissions: ['ROLES.VIEW', 'ROLES.EDIT'],
       },
+      // A strict subset of STAFF_MANAGER — a move the staff manager fully covers.
+      {
+        id: 'role-staffsub',
+        key: 'STAFF_SUB',
+        permissions: ['STAFF.VIEW', 'STAFF.EDIT'],
+      },
     ]);
 
     const module: TestingModule = await Test.createTestingModule({
@@ -150,11 +168,19 @@ describe('StaffService — role assignment', () => {
         AuthorityService,
         { provide: PrismaService, useValue: prisma },
         { provide: UsersService, useValue: usersService },
+        {
+          provide: AuditService,
+          useValue: {
+            record: jest.fn().mockResolvedValue(undefined),
+            invalidateActorCache: jest.fn(),
+          },
+        },
         { provide: PermissionResolverService, useValue: resolver },
       ],
     }).compile();
 
     service = module.get(StaffService);
+    audit = module.get(AuditService);
   });
 
   describe('create', () => {
@@ -477,11 +503,46 @@ describe('StaffService — role assignment', () => {
       ).rejects.toThrow(/last account that can manage roles/);
       expect(prisma.user.update).not.toHaveBeenCalled();
     });
+
+    it('F-004: refuses to move an account off a role whose permissions the actor does not hold', async () => {
+      // staffRow is a Content Uploader: moving it onto STAFF_MANAGER takes
+      // away MOVIES.*/SERIES.*/… — none of which the staff manager holds.
+      await expect(
+        service.updateStaffFields(
+          'staff-1',
+          { appRoleId: 'role-staffmgr' },
+          staffManager,
+        ),
+      ).rejects.toThrow(
+        /You cannot remove permissions you do not have yourself/,
+      );
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('F-004: still lets a limited actor move an account between two roles they fully cover', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        ...staffRow,
+        role: Role.ADMIN,
+        appRoleId: 'role-staffmgr',
+      });
+
+      await service.updateStaffFields(
+        'staff-1',
+        { appRoleId: 'role-staffsub' },
+        staffManager,
+      );
+
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { role: Role.ADMIN, appRoleId: 'role-staffsub' },
+        }),
+      );
+    });
   });
 
   describe('resetPassword (F3)', () => {
     it("F3: refuses to reset a Super Admin's password without holding the role", async () => {
-      usersService.findByIdOrThrow.mockResolvedValue(superAdminRow);
+      prisma.user.findUnique.mockResolvedValue(superAdminRow);
 
       await expect(
         service.resetPassword(
@@ -496,7 +557,7 @@ describe('StaffService — role assignment', () => {
     });
 
     it("F3: still lets a Super Admin reset a Super Admin's password", async () => {
-      usersService.findByIdOrThrow.mockResolvedValue(superAdminRow);
+      prisma.user.findUnique.mockResolvedValue(superAdminRow);
 
       await service.resetPassword(
         'staff-1',
@@ -529,7 +590,7 @@ describe('StaffService — role assignment', () => {
     };
 
     it('F3: refuses to suspend a Super Admin without holding the role', async () => {
-      usersService.findByIdOrThrow.mockResolvedValue(superAdminRow);
+      prisma.user.findUnique.mockResolvedValue(superAdminRow);
 
       await expect(
         service.updateStatus(
@@ -541,8 +602,32 @@ describe('StaffService — role assignment', () => {
       expect(prisma.user.update).not.toHaveBeenCalled();
     });
 
+    it('refuses to change your own status', async () => {
+      await expect(
+        service.updateStatus('boss-1', { status: UserStatus.SUSPENDED }, actor),
+      ).rejects.toThrow('You cannot deactivate your own account.');
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('allows a Super Admin to reactivate a suspended Super Admin', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        ...superAdminRow,
+        status: UserStatus.SUSPENDED,
+      });
+
+      await service.updateStatus(
+        'staff-1',
+        { status: UserStatus.ACTIVE },
+        actor,
+      );
+
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { status: UserStatus.ACTIVE } }),
+      );
+    });
+
     it('F8: refuses to suspend the last account that can manage roles', async () => {
-      usersService.findByIdOrThrow.mockResolvedValue(roleManagerRow);
+      prisma.user.findUnique.mockResolvedValue(roleManagerRow);
       prisma.appRole.findMany.mockResolvedValue([
         { id: 'role-rolemgr', key: 'ROLE_MANAGER', isSystem: false },
       ]);
@@ -559,7 +644,7 @@ describe('StaffService — role assignment', () => {
     });
 
     it('F8: allows the suspend once another active roles manager remains', async () => {
-      usersService.findByIdOrThrow.mockResolvedValue(roleManagerRow);
+      prisma.user.findUnique.mockResolvedValue(roleManagerRow);
       prisma.appRole.findMany.mockResolvedValue([
         { id: 'role-rolemgr', key: 'ROLE_MANAGER', isSystem: false },
       ]);
@@ -575,7 +660,7 @@ describe('StaffService — role assignment', () => {
     });
 
     it('F8: refuses to delete the last account that can manage roles', async () => {
-      usersService.findByIdOrThrow.mockResolvedValue(roleManagerRow);
+      prisma.user.findUnique.mockResolvedValue(roleManagerRow);
       prisma.appRole.findMany.mockResolvedValue([
         { id: 'role-rolemgr', key: 'ROLE_MANAGER', isSystem: false },
       ]);
@@ -588,7 +673,7 @@ describe('StaffService — role assignment', () => {
     });
 
     it('F3: refuses to delete a Super Admin without holding the role (P2)', async () => {
-      usersService.findByIdOrThrow.mockResolvedValue(superAdminRow);
+      prisma.user.findUnique.mockResolvedValue(superAdminRow);
 
       await expect(
         service.remove('staff-1', staffManager),
@@ -602,6 +687,84 @@ describe('StaffService — role assignment', () => {
       expect(prisma.user.delete).toHaveBeenCalledWith({
         where: { id: 'staff-1' },
       });
+    });
+  });
+
+  /**
+   * Every /staff/:id mutation used to load its target by id alone, so a
+   * STAFF.EDIT holder could reset any subscriber's password (account
+   * takeover) and STAFF.DELETE could cascade-delete a subscriber's ledger.
+   * The target must be a staff-tier account; anything else is a 404, the same
+   * answer GET /staff gives for it.
+   */
+  describe('F-005: /staff mutations only touch staff-tier accounts', () => {
+    const subscriberRow = {
+      ...staffRow,
+      id: 'user-1',
+      role: Role.USER,
+      appRoleId: null,
+      appRole: null,
+    };
+
+    beforeEach(() => {
+      prisma.user.findUnique.mockResolvedValue(subscriberRow);
+    });
+
+    it('refuses to rename a subscriber through PATCH /staff/:id', async () => {
+      await expect(
+        service.updateStaffFields('user-1', { username: 'renamed' }, actor),
+      ).rejects.toThrow(new NotFoundException('Staff account not found'));
+      expect(prisma.user.update).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
+    it('refuses to promote a subscriber through PATCH /staff/:id (PATCH /users/:id/role is the route)', async () => {
+      await expect(
+        service.updateStaffFields('user-1', { role: Role.ADMIN }, actor),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses to reset a subscriber's password", async () => {
+      await expect(
+        service.resetPassword('user-1', { newPassword: 'password123' }, actor),
+      ).rejects.toThrow(new NotFoundException('Staff account not found'));
+      expect(prisma.user.update).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
+    it('refuses to suspend a subscriber through the staff route', async () => {
+      await expect(
+        service.updateStatus('user-1', { status: UserStatus.SUSPENDED }, actor),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('refuses to delete a subscriber (and their cascaded ledger)', async () => {
+      await expect(service.remove('user-1', actor)).rejects.toThrow(
+        new NotFoundException('Staff account not found'),
+      );
+      expect(prisma.user.delete).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
+    it('still answers 404 for an unknown id on every path', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.updateStaffFields('missing', { username: 'x' }, actor),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(
+        service.resetPassword('missing', { newPassword: 'password123' }, actor),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(
+        service.updateStatus('missing', { status: UserStatus.ACTIVE }, actor),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.remove('missing', actor)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      expect(prisma.user.update).not.toHaveBeenCalled();
+      expect(prisma.user.delete).not.toHaveBeenCalled();
     });
   });
 });

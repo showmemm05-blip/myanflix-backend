@@ -1,0 +1,20 @@
+{
+  // The root tsconfig.json and tsconfig.build.json both EXCLUDE `scripts`,
+  // and they have to: their `rootDir` is ./src, so a script that imports
+  // ../src/** would break `nest build` with TS6059. The side effect is that
+  // typescript-eslint's project service cannot find a project for a file in
+  // here, and an unlintable script is how a generator quietly rots.
+  //
+  // This project exists only for the editor and for eslint: it is never
+  // built (noEmit), it is not referenced by nest build, and it widens
+  // rootDir to the package root so `../src/...` imports resolve. The project
+  // service picks the NEAREST tsconfig.json to a file, so this one — not the
+  // root — is what types scripts/*.ts.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "noEmit": true
+  },
+  "include": ["**/*.ts"],
+  "exclude": []
+}

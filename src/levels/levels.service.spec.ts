@@ -2,6 +2,9 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { Role } from '../generated/prisma/client';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
+import { AuditService } from '../audit/audit.service';
 import {
   LevelsService,
   resolveLevelStatus,
@@ -108,7 +111,14 @@ describe('resolveLevelStatus (pure math)', () => {
   });
 
   it('resolution sorts by threshold regardless of input order', () => {
-    const shuffled = [LADDER[4], LADDER[0], LADDER[5], LADDER[2], LADDER[1], LADDER[3]];
+    const shuffled = [
+      LADDER[4],
+      LADDER[0],
+      LADDER[5],
+      LADDER[2],
+      LADDER[1],
+      LADDER[3],
+    ];
     const status = resolveLevelStatus(1350, shuffled);
     expect(status.level?.name).toBe('Gold');
     expect(status.nextLevel?.name).toBe('Platinum');
@@ -132,6 +142,14 @@ describe('resolveLevelStatus (pure math)', () => {
     expect(almost.progressPercent).toBe(100);
   });
 });
+
+/** The acting admin every write receives — the audit log's "who". */
+const actor: AuthenticatedUser = {
+  id: 'admin-1',
+  username: 'boss',
+  role: Role.SUPER_ADMIN,
+  appRoleId: null,
+};
 
 describe('LevelsService', () => {
   let service: LevelsService;
@@ -168,6 +186,10 @@ describe('LevelsService', () => {
       providers: [
         LevelsService,
         { provide: PrismaService, useValue: prisma },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -195,8 +217,18 @@ describe('LevelsService', () => {
         _sum: { amount: new Prisma.Decimal(1350) },
       });
       prisma.userLevel.findMany.mockResolvedValue([
-        makeRow({ id: 'l1', name: 'Gold', threshold: new Prisma.Decimal(1000), order: 1 }),
-        makeRow({ id: 'l2', name: 'Platinum', threshold: new Prisma.Decimal(5000), order: 2 }),
+        makeRow({
+          id: 'l1',
+          name: 'Gold',
+          threshold: new Prisma.Decimal(1000),
+          order: 1,
+        }),
+        makeRow({
+          id: 'l2',
+          name: 'Platinum',
+          threshold: new Prisma.Decimal(5000),
+          order: 2,
+        }),
       ]);
 
       const status = await service.getUserLevelStatus('user-1');
@@ -214,7 +246,9 @@ describe('LevelsService', () => {
     });
 
     it('maps a null aggregate (no qualifying rows) to zero', async () => {
-      prisma.transaction.aggregate.mockResolvedValue({ _sum: { amount: null } });
+      prisma.transaction.aggregate.mockResolvedValue({
+        _sum: { amount: null },
+      });
       prisma.userLevel.findMany.mockResolvedValue([]);
 
       const status = await service.getUserLevelStatus('user-1');
@@ -238,8 +272,18 @@ describe('LevelsService', () => {
       // No groupBy row at all for the user — total defaults to 0.
       prisma.transaction.groupBy.mockResolvedValue([]);
       prisma.userLevel.findMany.mockResolvedValue([
-        makeRow({ id: 'l1', name: 'Starter', threshold: new Prisma.Decimal(0), order: 1 }),
-        makeRow({ id: 'l2', name: 'Bronze', threshold: new Prisma.Decimal(100), order: 2 }),
+        makeRow({
+          id: 'l1',
+          name: 'Starter',
+          threshold: new Prisma.Decimal(0),
+          order: 1,
+        }),
+        makeRow({
+          id: 'l2',
+          name: 'Bronze',
+          threshold: new Prisma.Decimal(100),
+          order: 2,
+        }),
       ]);
 
       const result = await service.getLevelsForUsers(['user-1']);
@@ -255,8 +299,18 @@ describe('LevelsService', () => {
       ]);
       // No zero-threshold rung enabled — a total below 100 qualifies for nothing.
       prisma.userLevel.findMany.mockResolvedValue([
-        makeRow({ id: 'l2', name: 'Bronze', threshold: new Prisma.Decimal(100), order: 2 }),
-        makeRow({ id: 'l4', name: 'Gold', threshold: new Prisma.Decimal(1000), order: 4 }),
+        makeRow({
+          id: 'l2',
+          name: 'Bronze',
+          threshold: new Prisma.Decimal(100),
+          order: 2,
+        }),
+        makeRow({
+          id: 'l4',
+          name: 'Gold',
+          threshold: new Prisma.Decimal(1000),
+          order: 4,
+        }),
       ]);
 
       const result = await service.getLevelsForUsers([
@@ -291,7 +345,10 @@ describe('LevelsService', () => {
       prisma.userLevel.findFirst.mockResolvedValueOnce({ id: 'other' });
 
       await expect(
-        service.create({ name: 'Gold', threshold: 2000, icon: 'shield', color: '#F0B90B' }),
+        service.create(
+          { name: 'Gold', threshold: 2000, icon: 'shield', color: '#F0B90B' },
+          actor,
+        ),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(prisma.userLevel.create).not.toHaveBeenCalled();
     });
@@ -302,7 +359,10 @@ describe('LevelsService', () => {
         .mockResolvedValueOnce({ id: 'other' }); // threshold check
 
       await expect(
-        service.create({ name: 'Ruby', threshold: 1000, icon: 'shield', color: '#FF0000' }),
+        service.create(
+          { name: 'Ruby', threshold: 1000, icon: 'shield', color: '#FF0000' },
+          actor,
+        ),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(prisma.userLevel.create).not.toHaveBeenCalled();
     });
@@ -311,15 +371,22 @@ describe('LevelsService', () => {
       prisma.userLevel.findFirst.mockResolvedValue(null);
       prisma.userLevel.aggregate.mockResolvedValue({ _max: { order: 6 } });
       prisma.userLevel.create.mockResolvedValue(
-        makeRow({ name: 'Ruby', threshold: new Prisma.Decimal(20000), order: 7 }),
+        makeRow({
+          name: 'Ruby',
+          threshold: new Prisma.Decimal(20000),
+          order: 7,
+        }),
       );
 
-      const created = await service.create({
-        name: 'Ruby',
-        threshold: 20000,
-        icon: 'shield',
-        color: '#FF0000',
-      });
+      const created = await service.create(
+        {
+          name: 'Ruby',
+          threshold: 20000,
+          icon: 'shield',
+          color: '#FF0000',
+        },
+        actor,
+      );
 
       expect(prisma.userLevel.create).toHaveBeenCalledWith({
         data: expect.objectContaining({ order: 7 }),
@@ -331,9 +398,9 @@ describe('LevelsService', () => {
   describe('update', () => {
     it('404s on an unknown id', async () => {
       prisma.userLevel.findUnique.mockResolvedValue(null);
-      await expect(service.update('missing', { name: 'X' })).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
+      await expect(
+        service.update('missing', { name: 'X' }, actor),
+      ).rejects.toBeInstanceOf(NotFoundException);
     });
 
     it('excludes self from the duplicate-threshold check', async () => {
@@ -341,7 +408,9 @@ describe('LevelsService', () => {
       prisma.userLevel.findFirst.mockResolvedValue({ id: 'level-1' }); // same row
       prisma.userLevel.update.mockResolvedValue(makeRow());
 
-      await expect(service.update('level-1', { threshold: 0 })).resolves.toBeDefined();
+      await expect(
+        service.update('level-1', { threshold: 0 }, actor),
+      ).resolves.toBeDefined();
     });
   });
 
@@ -356,15 +425,20 @@ describe('LevelsService', () => {
       prisma.$transaction.mockResolvedValue([]);
       prisma.userLevel.update.mockImplementation((args: unknown) => args);
 
-      const result = await service.reorder({
-        items: [
-          { id: 'l2', order: 1 },
-          { id: 'l1', order: 2 },
-        ],
-      });
+      const result = await service.reorder(
+        {
+          items: [
+            { id: 'l2', order: 1 },
+            { id: 'l1', order: 2 },
+          ],
+        },
+        actor,
+      );
 
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-      expect((prisma.$transaction.mock.calls[0][0] as unknown[]).length).toBe(2);
+      expect((prisma.$transaction.mock.calls[0][0] as unknown[]).length).toBe(
+        2,
+      );
       expect(result.map((l) => l.id)).toEqual(['l2', 'l1']);
     });
 
@@ -372,12 +446,15 @@ describe('LevelsService', () => {
       prisma.userLevel.findMany.mockResolvedValueOnce([{ id: 'l1' }]);
 
       await expect(
-        service.reorder({
-          items: [
-            { id: 'l1', order: 1 },
-            { id: 'ghost', order: 2 },
-          ],
-        }),
+        service.reorder(
+          {
+            items: [
+              { id: 'l1', order: 1 },
+              { id: 'ghost', order: 2 },
+            ],
+          },
+          actor,
+        ),
       ).rejects.toBeInstanceOf(NotFoundException);
       expect(prisma.$transaction).not.toHaveBeenCalled();
     });

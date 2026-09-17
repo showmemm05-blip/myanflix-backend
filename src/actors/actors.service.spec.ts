@@ -3,8 +3,18 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import { ActorsService } from './actors.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
+import { AuditService } from '../audit/audit.service';
+import { Role } from '../generated/prisma/client';
 
 const ACTOR_ID = 'actor-1';
+
+/** A staff actor for the audit calls — the mocked AuditService records nothing. */
+const STAFF = {
+  id: 'admin-1',
+  username: 'boss',
+  role: Role.ADMIN,
+  appRoleId: null,
+} as const;
 
 describe('ActorsService', () => {
   let service: ActorsService;
@@ -51,7 +61,7 @@ describe('ActorsService', () => {
     };
     minioService = {
       canonicalImageUrl: jest.fn((url: string | null) => url),
-      keyFromPublicUrl: jest.fn(() => 'images/headshot.jpg'),
+      keyFromPublicUrl: jest.fn(() => 'images/actor/headshot.jpg'),
       deleteObject: jest.fn().mockResolvedValue(undefined),
     };
 
@@ -60,6 +70,10 @@ describe('ActorsService', () => {
         ActorsService,
         { provide: PrismaService, useValue: prisma },
         { provide: MinioService, useValue: minioService },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -90,7 +104,9 @@ describe('ActorsService', () => {
 
     it('always counts movies from the join rather than a stored column', async () => {
       await service.findAll({});
-      expect(argsOf().include).toEqual({ _count: { select: { movies: true } } });
+      expect(argsOf().include).toEqual({
+        _count: { select: { movies: true } },
+      });
     });
   });
 
@@ -99,7 +115,7 @@ describe('ActorsService', () => {
       prisma.actor.findUnique.mockResolvedValue(actor());
 
       await expect(
-        service.create({ name: 'Kyaw Kyaw' }),
+        service.create({ name: 'Kyaw Kyaw' }, STAFF),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(prisma.actor.create).not.toHaveBeenCalled();
     });
@@ -108,7 +124,10 @@ describe('ActorsService', () => {
       prisma.actor.findUnique.mockResolvedValue(null);
       prisma.actor.create.mockResolvedValue(actor());
 
-      await service.create({ name: 'New Person', imageUrl: 'http://x/i.jpg' });
+      await service.create(
+        { name: 'New Person', imageUrl: 'http://x/i.jpg' },
+        STAFF,
+      );
 
       expect(minioService.canonicalImageUrl).toHaveBeenCalledWith(
         'http://x/i.jpg',
@@ -121,7 +140,7 @@ describe('ActorsService', () => {
       prisma.actor.findUnique.mockResolvedValue(null);
 
       await expect(
-        service.update('nope', { name: 'X' }),
+        service.update('nope', { name: 'X' }, STAFF),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
 
@@ -132,7 +151,7 @@ describe('ActorsService', () => {
       prisma.actor.update.mockResolvedValue(actor());
 
       await expect(
-        service.update(ACTOR_ID, { name: 'Kyaw Kyaw' }),
+        service.update(ACTOR_ID, { name: 'Kyaw Kyaw' }, STAFF),
       ).resolves.toBeDefined();
     });
 
@@ -142,7 +161,7 @@ describe('ActorsService', () => {
         .mockResolvedValueOnce(actor({ id: 'someone-else' }));
 
       await expect(
-        service.update(ACTOR_ID, { name: 'Taken' }),
+        service.update(ACTOR_ID, { name: 'Taken' }, STAFF),
       ).rejects.toBeInstanceOf(ConflictException);
     });
 
@@ -154,10 +173,10 @@ describe('ActorsService', () => {
         actor({ imageUrl: 'http://x/new.jpg' }),
       );
 
-      await service.update(ACTOR_ID, { imageUrl: 'http://x/new.jpg' });
+      await service.update(ACTOR_ID, { imageUrl: 'http://x/new.jpg' }, STAFF);
 
       expect(minioService.deleteObject).toHaveBeenCalledWith(
-        'images/headshot.jpg',
+        'images/actor/headshot.jpg',
       );
     });
 
@@ -172,7 +191,11 @@ describe('ActorsService', () => {
           actor({ imageUrl: 'http://x/same.jpg' }),
         );
 
-        await service.update(ACTOR_ID, { imageUrl: 'http://x/same.jpg' });
+        await service.update(
+          ACTOR_ID,
+          { imageUrl: 'http://x/same.jpg' },
+          STAFF,
+        );
 
         expect(minioService.deleteObject).not.toHaveBeenCalled();
       },
@@ -186,7 +209,7 @@ describe('ActorsService', () => {
         actor({ imageUrl: 'http://x/kept.jpg' }),
       );
 
-      await service.update(ACTOR_ID, { name: 'Renamed' });
+      await service.update(ACTOR_ID, { name: 'Renamed' }, STAFF);
 
       expect(minioService.deleteObject).not.toHaveBeenCalled();
     });
@@ -198,7 +221,7 @@ describe('ActorsService', () => {
         actor({ imageUrl: 'http://x/i.jpg' }),
       );
 
-      await service.remove(ACTOR_ID);
+      await service.remove(ACTOR_ID, STAFF);
 
       expect(prisma.actor.delete).toHaveBeenCalledWith({
         where: { id: ACTOR_ID },
@@ -212,13 +235,13 @@ describe('ActorsService', () => {
       );
       minioService.deleteObject.mockRejectedValue(new Error('storage down'));
 
-      await expect(service.remove(ACTOR_ID)).resolves.toBeUndefined();
+      await expect(service.remove(ACTOR_ID, STAFF)).resolves.toBeUndefined();
       expect(prisma.actor.delete).toHaveBeenCalled();
     });
 
     it('404s an unknown actor instead of silently succeeding', async () => {
       prisma.actor.findUnique.mockResolvedValue(null);
-      await expect(service.remove('nope')).rejects.toBeInstanceOf(
+      await expect(service.remove('nope', STAFF)).rejects.toBeInstanceOf(
         NotFoundException,
       );
     });

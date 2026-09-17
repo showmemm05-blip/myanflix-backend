@@ -92,6 +92,34 @@ class EnvironmentVariables {
   STREAM_PUBLIC_BASE_URL!: string;
 
   /**
+   * Secret behind the `/s/<expires>/<signature>/` token on every playback
+   * link (MinioService.signedPlaybackUrl). The cache server's nginx verifies
+   * the same token with the same value, so this MUST equal
+   * STREAM_SIGNING_SECRET in cacheserver/.env. No default on purpose: a
+   * backend that boots without one would mint links nobody can play.
+   */
+  @IsString()
+  @MinLength(32, {
+    message: 'STREAM_SIGNING_SECRET must be at least 32 characters',
+  })
+  STREAM_SIGNING_SECRET!: string;
+
+  /**
+   * Lifetime of a signed playback link, in seconds. Hour-quantised at
+   * signing time (quantizedExpiry: expiry = floor(now / 1h) * 1h + TTL), so
+   * the effective lifetime is between TTL-1h and TTL — a TTL under one
+   * hour would mint links that are already expired late in each hour.
+   */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(3600, {
+    message:
+      'STREAM_URL_TTL_SECONDS must be at least 3600 (links are minted on hour boundaries)',
+  })
+  STREAM_URL_TTL_SECONDS: number = 43200;
+
+  /**
    * "true" switches API rate limiting off entirely (AppThrottlerGuard).
    * Meant for the jest/e2e environment only — leave unset in production.
    * Kept a string on purpose: implicit conversion would turn "false" into

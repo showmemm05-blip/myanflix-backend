@@ -3,7 +3,10 @@ import { Role, TransactionType } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { AuditService } from '../audit/audit.service';
+import { subscriptionPlanSnapshot } from '../audit/audit-snapshots';
 import { decimalToNumber } from '../common/utils/decimal.util';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import type { CreatePlanDto } from './dto/create-plan.dto';
 import type { UpdatePlanDto } from './dto/update-plan.dto';
 
@@ -16,6 +19,7 @@ export class SubscriptionsService {
     private readonly prisma: PrismaService,
     private readonly walletService: WalletService,
     private readonly realtimeGateway: RealtimeGateway,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -31,21 +35,40 @@ export class SubscriptionsService {
     return plans.map((p) => ({ ...p, price: decimalToNumber(p.price) }));
   }
 
-  async createPlan(dto: CreatePlanDto) {
+  async createPlan(dto: CreatePlanDto, actor: AuthenticatedUser) {
     const plan = await this.prisma.subscriptionPlan.create({
       data: {
         ...dto,
         durationDays: dto.durationDays ?? DEFAULT_PLAN_DURATION_DAYS,
       },
     });
+    await this.audit.record({
+      action: 'subscription_plan.create',
+      actor,
+      target: { type: 'subscription_plan', id: plan.id, label: plan.name },
+      after: subscriptionPlanSnapshot(plan),
+    });
     return { ...plan, price: decimalToNumber(plan.price) };
   }
 
-  async updatePlan(id: string, dto: UpdatePlanDto) {
-    await this.assertPlanExists(id);
+  async updatePlan(id: string, dto: UpdatePlanDto, actor: AuthenticatedUser) {
+    // Full pre-read (not just an existence check) so the audit row can diff
+    // the old price/duration against the new ones.
+    const before = await this.prisma.subscriptionPlan.findUnique({
+      where: { id },
+    });
+    if (!before) throw new NotFoundException('Subscription plan not found');
+
     const plan = await this.prisma.subscriptionPlan.update({
       where: { id },
       data: dto,
+    });
+    await this.audit.record({
+      action: 'subscription_plan.update',
+      actor,
+      target: { type: 'subscription_plan', id, label: plan.name },
+      before: subscriptionPlanSnapshot(before),
+      after: subscriptionPlanSnapshot(plan),
     });
     return { ...plan, price: decimalToNumber(plan.price) };
   }
@@ -123,13 +146,5 @@ export class SubscriptionsService {
     );
 
     return result.subscription;
-  }
-
-  private async assertPlanExists(id: string): Promise<void> {
-    const exists = await this.prisma.subscriptionPlan.findUnique({
-      where: { id },
-      select: { id: true },
-    });
-    if (!exists) throw new NotFoundException('Subscription plan not found');
   }
 }

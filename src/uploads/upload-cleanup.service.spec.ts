@@ -1,18 +1,36 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { readdir, rm, stat } from 'node:fs/promises';
 import { UploadCleanupService } from './upload-cleanup.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
-import { UploadStatus } from '../generated/prisma/client';
+import { StorageService } from '../common/storage/storage.service';
+import { UploadStatus, VideoStatus } from '../generated/prisma/client';
+
+jest.mock('node:fs/promises', () => ({
+  ...jest.requireActual('node:fs/promises'),
+  readdir: jest.fn(),
+  rm: jest.fn(),
+  stat: jest.fn(),
+}));
+
+const readdirMock = readdir as jest.Mock;
+const rmMock = rm as jest.Mock;
+const statMock = stat as jest.Mock;
+
+const HOURS = 60 * 60 * 1000;
 
 describe('UploadCleanupService', () => {
   let service: UploadCleanupService;
   let prisma: {
     multipartUploadSession: { findMany: jest.Mock; update: jest.Mock };
+    uploadSession: { findMany: jest.Mock };
+    video: { findMany: jest.Mock };
   };
   let minioService: {
     abortMultipartUpload: jest.Mock;
     listInProgressMultipartUploads: jest.Mock;
   };
+  let storageService: { scratchRoot: string };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -22,17 +40,24 @@ describe('UploadCleanupService', () => {
         findMany: jest.fn().mockResolvedValue([]),
         update: jest.fn(),
       },
+      uploadSession: { findMany: jest.fn().mockResolvedValue([]) },
+      video: { findMany: jest.fn().mockResolvedValue([]) },
     };
     minioService = {
       abortMultipartUpload: jest.fn().mockResolvedValue(undefined),
       listInProgressMultipartUploads: jest.fn().mockResolvedValue([]),
     };
+    storageService = { scratchRoot: '/storage/temp' };
+    // Every scratch root is empty unless a case says otherwise.
+    readdirMock.mockResolvedValue([]);
+    rmMock.mockResolvedValue(undefined);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         UploadCleanupService,
         { provide: PrismaService, useValue: prisma },
         { provide: MinioService, useValue: minioService },
+        { provide: StorageService, useValue: storageService },
       ],
     }).compile();
 
@@ -127,6 +152,108 @@ describe('UploadCleanupService', () => {
     await service.sweepAbandonedMultipartUploads();
 
     expect(minioService.abortMultipartUpload).not.toHaveBeenCalled();
+  });
+
+  describe('sweepStaleLocalScratch', () => {
+    /** Makes exactly one scratch root non-empty; every other root stays empty. */
+    const onlyRootHas = (rootPath: string, entries: string[]) =>
+      readdirMock.mockImplementation(async (path: string) =>
+        path === rootPath ? entries : [],
+      );
+
+    it('removes a scratch directory whose run stopped touching it a day ago', async () => {
+      onlyRootHas('/storage/temp/uploads', ['session-dead']);
+      statMock.mockResolvedValue({ mtimeMs: Date.now() - 30 * HOURS });
+
+      await service.sweepStaleLocalScratch();
+
+      expect(rmMock).toHaveBeenCalledWith(
+        '/storage/temp/uploads/session-dead',
+        {
+          recursive: true,
+          force: true,
+        },
+      );
+    });
+
+    it('leaves a directory that was written to within the window — it belongs to a live run', async () => {
+      onlyRootHas('/storage/temp/uploads', ['session-busy']);
+      statMock.mockResolvedValue({ mtimeMs: Date.now() - 2 * HOURS });
+
+      await service.sweepStaleLocalScratch();
+
+      expect(rmMock).not.toHaveBeenCalled();
+    });
+
+    it(
+      'never deletes the chunks of an upload session the client could still resume, however long ' +
+        'it has been idle',
+      async () => {
+        onlyRootHas('/storage/temp/uploads', ['session-resumable']);
+        statMock.mockResolvedValue({ mtimeMs: Date.now() - 30 * HOURS });
+        prisma.uploadSession.findMany.mockResolvedValue([
+          { id: 'session-resumable' },
+        ]);
+
+        await service.sweepStaleLocalScratch();
+
+        expect(rmMock).not.toHaveBeenCalled();
+        expect(prisma.uploadSession.findMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({
+              status: UploadStatus.IN_PROGRESS,
+              updatedAt: expect.objectContaining({ gte: expect.any(Date) }),
+            }),
+          }),
+        );
+      },
+    );
+
+    it(
+      "never deletes a transcode's working directory while its Video is PROCESSING — ffmpeg writes " +
+        'into a subdirectory, so the directory mtime alone would call a long run abandoned',
+      async () => {
+        onlyRootHas('/storage/temp/videos', ['movie-1']);
+        statMock.mockResolvedValue({ mtimeMs: Date.now() - 30 * HOURS });
+        prisma.video.findMany.mockResolvedValue([{ movieId: 'movie-1' }]);
+
+        await service.sweepStaleLocalScratch();
+
+        expect(rmMock).not.toHaveBeenCalled();
+        expect(prisma.video.findMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { status: VideoStatus.PROCESSING },
+          }),
+        );
+      },
+    );
+
+    it('walks only the scratch roots the media taxonomy declares, all of them under <STORAGE_PATH>/temp', async () => {
+      await service.sweepStaleLocalScratch();
+
+      const walked = readdirMock.mock.calls.map(([path]) => path as string);
+      expect(walked).toEqual([
+        '/storage/temp/uploads',
+        '/storage/temp/videos',
+        '/storage/temp/audio',
+        '/storage/temp/documents/books',
+      ]);
+    });
+
+    it('skips a root no feature has written yet instead of failing the whole sweep', async () => {
+      readdirMock.mockImplementation(async (path: string) => {
+        if (path === '/storage/temp/audio') throw new Error('ENOENT');
+        return path === '/storage/temp/videos' ? ['movie-old'] : [];
+      });
+      statMock.mockResolvedValue({ mtimeMs: Date.now() - 30 * HOURS });
+
+      await service.sweepStaleLocalScratch();
+
+      expect(rmMock).toHaveBeenCalledWith('/storage/temp/videos/movie-old', {
+        recursive: true,
+        force: true,
+      });
+    });
   });
 
   it('leaves a recently-initiated orphan alone — it may just be mid-flight, not abandoned yet', async () => {

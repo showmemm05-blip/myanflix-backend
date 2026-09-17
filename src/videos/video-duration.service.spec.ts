@@ -3,7 +3,16 @@ import { Logger } from '@nestjs/common';
 import { VideoDurationService } from './video-duration.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
-import { VideoStatus } from '../generated/prisma/client';
+import { AuditService } from '../audit/audit.service';
+import { Role, VideoStatus } from '../generated/prisma/client';
+
+/** A staff actor for the audit calls — the mocked AuditService records nothing. */
+const ACTOR = {
+  id: 'admin-1',
+  username: 'boss',
+  role: Role.ADMIN,
+  appRoleId: null,
+} as const;
 
 const MOVIE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const VIDEO_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -69,6 +78,10 @@ describe('VideoDurationService', () => {
         VideoDurationService,
         { provide: PrismaService, useValue: prisma },
         { provide: MinioService, useValue: minioService },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -206,7 +219,7 @@ describe('VideoDurationService', () => {
     });
 
     it('caps take at 100 whatever the caller asks for, and selects only unknown-runtime movies with a READY HLS video', async () => {
-      await service.backfill(5000);
+      await service.backfill(5000, ACTOR);
 
       expect(prisma.movie.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -226,12 +239,12 @@ describe('VideoDurationService', () => {
     });
 
     it('honours a smaller limit and floors nonsense at 1', async () => {
-      await service.backfill(7);
+      await service.backfill(7, ACTOR);
       expect(prisma.movie.findMany).toHaveBeenLastCalledWith(
         expect.objectContaining({ take: 7 }),
       );
 
-      await service.backfill(0);
+      await service.backfill(0, ACTOR);
       expect(prisma.movie.findMany).toHaveBeenLastCalledWith(
         expect.objectContaining({ take: 1 }),
       );
@@ -245,7 +258,7 @@ describe('VideoDurationService', () => {
       ]);
       prisma.movie.count.mockResolvedValue(3);
 
-      const result = await service.backfill(100);
+      const result = await service.backfill(100, ACTOR);
 
       expect(result).toEqual({
         scanned: 2,
@@ -273,7 +286,7 @@ describe('VideoDurationService', () => {
       prisma.movie.findMany.mockResolvedValue([movieRow(MOVIE_ID, MASTER_KEY)]);
       prisma.movie.updateMany.mockResolvedValue({ count: 0 });
 
-      const result = await service.backfill(100);
+      const result = await service.backfill(100, ACTOR);
 
       expect(result.scanned).toBe(1);
       expect(result.updated).toBe(0);
@@ -281,7 +294,7 @@ describe('VideoDurationService', () => {
     });
 
     it('is a no-op on an empty set — safe to click repeatedly', async () => {
-      await expect(service.backfill(100)).resolves.toEqual({
+      await expect(service.backfill(100, ACTOR)).resolves.toEqual({
         scanned: 0,
         updated: 0,
         failed: [],

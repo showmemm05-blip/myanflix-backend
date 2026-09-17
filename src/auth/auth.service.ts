@@ -224,25 +224,26 @@ export class AuthService {
       throw new UnauthorizedException('Invalid or expired refresh token');
     }
 
-    const stored = await this.prisma.refreshToken.findUnique({
-      where: { id: payload.jti },
+    // Rotate: the old refresh token is single-use. Verify AND consume it in ONE
+    // conditional statement. Under READ COMMITTED a concurrent UPDATE on the
+    // same row waits for the first to commit, re-evaluates the WHERE on the new
+    // row version (revoked = true) and matches 0 rows, so exactly one caller
+    // ever sees count === 1 — parallel replays of one token get a 401.
+    const consumed = await this.prisma.refreshToken.updateMany({
+      where: {
+        id: payload.jti,
+        userId: payload.sub,
+        tokenHash: hashToken(refreshToken),
+        revoked: false,
+        expiresAt: { gt: new Date() },
+      },
+      data: { revoked: true },
     });
-    if (
-      !stored ||
-      stored.revoked ||
-      stored.expiresAt < new Date() ||
-      stored.tokenHash !== hashToken(refreshToken)
-    ) {
+    if (consumed.count !== 1) {
       throw new UnauthorizedException('Invalid or expired refresh token');
     }
 
-    // Rotate: the old refresh token is single-use.
-    await this.prisma.refreshToken.update({
-      where: { id: stored.id },
-      data: { revoked: true },
-    });
-
-    const user = await this.usersService.findByIdOrThrow(stored.userId);
+    const user = await this.usersService.findByIdOrThrow(payload.sub);
     const authenticatedUser: AuthenticatedUser = {
       id: user.id,
       username: user.username,

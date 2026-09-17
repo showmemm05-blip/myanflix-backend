@@ -9,12 +9,16 @@ import { WalletService } from '../wallet/wallet.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { FinanceSettingsService } from '../finance-settings/finance-settings.service';
 import { PaymentAccountLedgerService } from '../payment-accounts/payment-account-ledger.service';
+import { AuditService } from '../audit/audit.service';
+import { depositSnapshot } from '../audit/audit-snapshots';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import {
   DepositStatus,
   NotificationType,
+  Prisma,
   TransactionType,
 } from '../generated/prisma/client';
+import type { Deposit } from '../generated/prisma/client';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import type { CreateDepositDto } from './dto/create-deposit.dto';
 import type { CreateManualDepositDto } from './dto/create-manual-deposit.dto';
@@ -22,6 +26,55 @@ import type { ApproveDepositDto } from './dto/approve-deposit.dto';
 import type { RejectDepositDto } from './dto/reject-deposit.dto';
 import type { DepositQueryDto } from './dto/deposit-query.dto';
 import type { UpdateReceivingAccountDto } from './dto/update-receiving-account.dto';
+
+/**
+ * Shown verbatim by the admin, website and mobile clients — keep the text
+ * identical at every throw site.
+ */
+const DUPLICATE_REFERENCE_MESSAGE =
+  'A deposit with this transaction reference already exists';
+
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === 'P2002'
+  );
+}
+
+/** Audit-log label: the real-world payment reference plus whose deposit it is. */
+function depositLabel(deposit: {
+  reference: string;
+  user?: { username: string } | null;
+}): string {
+  return deposit.user
+    ? `${deposit.reference} · @${deposit.user.username}`
+    : deposit.reference;
+}
+
+/**
+ * Only the "which of OUR accounts received it" record — the fields
+ * updateReceivingAccount may change — so its audit row diffs exactly that.
+ */
+function receivingAccountSnapshot(deposit: Partial<Deposit>) {
+  const {
+    receivingAccountType,
+    receivingAccountSubname,
+    receivingAccountName,
+    receivingAccountNumber,
+    receivingTransactionCode,
+    receivingTransactionTime,
+    receivingPaymentAccountId,
+  } = depositSnapshot(deposit);
+  return {
+    receivingAccountType,
+    receivingAccountSubname,
+    receivingAccountName,
+    receivingAccountNumber,
+    receivingTransactionCode,
+    receivingTransactionTime,
+    receivingPaymentAccountId,
+  };
+}
 
 @Injectable()
 export class DepositsService {
@@ -31,12 +84,17 @@ export class DepositsService {
     private readonly realtimeGateway: RealtimeGateway,
     private readonly financeSettingsService: FinanceSettingsService,
     private readonly paymentAccountLedgerService: PaymentAccountLedgerService,
+    private readonly audit: AuditService,
   ) {}
 
   /**
    * PENDING/APPROVED deposits block reuse of the same reference; REJECTED
    * ones don't, so a user can resubmit under the same real-world payment
-   * reference after a mistaken rejection. Balance never moves here.
+   * reference after a mistaken rejection. The guarantee is the partial
+   * unique index deposits_reference_active_key (schema.prisma): the
+   * findFirst pre-check below is only the friendly fast path, and a
+   * concurrent duplicate that slips past it surfaces as P2002 on insert,
+   * mapped to the same 409. Balance never moves here.
    */
   async create(userId: string, dto: CreateDepositDto) {
     const { minDepositAmount, maxDepositAmount } =
@@ -54,21 +112,27 @@ export class DepositsService {
       },
     });
     if (duplicate) {
-      throw new ConflictException(
-        'A deposit with this transaction reference already exists',
-      );
+      throw new ConflictException(DUPLICATE_REFERENCE_MESSAGE);
     }
 
-    const deposit = await this.prisma.deposit.create({
-      data: {
-        userId,
-        amount: dto.amount,
-        paymentMethod: dto.paymentMethod,
-        accountName: dto.accountName,
-        reference: dto.reference,
-        declaredPaymentAccountId: dto.paymentAccountId,
-      },
-    });
+    let deposit: Deposit;
+    try {
+      deposit = await this.prisma.deposit.create({
+        data: {
+          userId,
+          amount: dto.amount,
+          paymentMethod: dto.paymentMethod,
+          accountName: dto.accountName,
+          reference: dto.reference,
+          declaredPaymentAccountId: dto.paymentAccountId,
+        },
+      });
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        throw new ConflictException(DUPLICATE_REFERENCE_MESSAGE);
+      }
+      throw error;
+    }
 
     const user = await this.prisma.user.findUniqueOrThrow({
       where: { id: userId },
@@ -274,6 +338,22 @@ export class DepositsService {
         where: { userId: deposit.userId },
       });
 
+      // Inside the transaction, so the audit row commits with the approval
+      // (and rolls back with it).
+      await this.audit.record({
+        action: 'deposit.approve',
+        actor: admin,
+        target: {
+          type: 'deposit',
+          id: depositId,
+          label: depositLabel(updated),
+        },
+        before: depositSnapshot(deposit),
+        after: depositSnapshot(updated),
+        metadata: { creditedPaymentAccountId: accountToCredit },
+        tx,
+      });
+
       return {
         deposit: updated,
         notification,
@@ -319,123 +399,153 @@ export class DepositsService {
    * approve()'s side effects exactly in one transaction: destination-account
    * ledger credit via syncDepositLink, wallet credit, Transaction row and
    * DEPOSIT_APPROVED notification. Sockets are emitted only after the
-   * transaction has actually committed, same as approve().
+   * transaction has actually committed, same as approve(). A concurrent
+   * duplicate reference that slips past the pre-check fails the insert
+   * (partial unique index → P2002), rolling back before any money moves.
    */
   async createManual(dto: CreateManualDepositDto, admin: AuthenticatedUser) {
-    const result = await this.prisma.$transaction(async (tx) => {
-      const user = await tx.user.findUnique({ where: { id: dto.userId } });
-      if (!user) throw new NotFoundException('User not found');
+    const result = await this.prisma
+      .$transaction(async (tx) => {
+        const user = await tx.user.findUnique({ where: { id: dto.userId } });
+        if (!user) throw new NotFoundException('User not found');
 
-      // Same duplicate-reference rule create() enforces — without it, an
-      // admin recording a transfer the user ALSO submitted through the app
-      // would let the same real-world payment credit the wallet twice (once
-      // here, once when the pending copy gets approved).
-      const duplicate = await tx.deposit.findFirst({
-        where: {
-          reference: dto.reference,
-          status: { in: [DepositStatus.PENDING, DepositStatus.APPROVED] },
-        },
-      });
-      if (duplicate) {
-        throw new ConflictException(
-          'A deposit with this transaction reference already exists',
+        // Same duplicate-reference rule create() enforces — without it, an
+        // admin recording a transfer the user ALSO submitted through the app
+        // would let the same real-world payment credit the wallet twice (once
+        // here, once when the pending copy gets approved).
+        const duplicate = await tx.deposit.findFirst({
+          where: {
+            reference: dto.reference,
+            status: { in: [DepositStatus.PENDING, DepositStatus.APPROVED] },
+          },
+        });
+        if (duplicate) {
+          throw new ConflictException(DUPLICATE_REFERENCE_MESSAGE);
+        }
+
+        // Explicit existence check so a bogus destination id surfaces as a
+        // 404 instead of a Prisma P2025 → 500 (the ledger layer would still
+        // roll everything back, but with an opaque error).
+        const destinationAccount = await tx.paymentAccount.findUnique({
+          where: { id: dto.destinationPaymentAccountId },
+        });
+        if (!destinationAccount) {
+          throw new NotFoundException('Payment account not found');
+        }
+
+        // declaredPaymentAccountId and the four receivingAccount* free-text
+        // fields stay null — the admin can fill the FROM record later via the
+        // existing table cell.
+        const deposit = await tx.deposit.create({
+          data: {
+            userId: dto.userId,
+            amount: dto.amount,
+            paymentMethod: dto.paymentMethod,
+            accountName: dto.accountName ?? null,
+            reference: dto.reference,
+            status: DepositStatus.APPROVED,
+            approvedByUserId: admin.id,
+            approvedAt: new Date(),
+            receivingTransactionCode: dto.receivingTransactionCode ?? null,
+            receivingTransactionTime: dto.receivingTransactionTime ?? null,
+          },
+        });
+
+        // Posts DEPOSIT_IN and credits the destination account atomically —
+        // the ONLY correct way to credit it. Throws for a bogus account id,
+        // rolling back the whole transaction.
+        await this.paymentAccountLedgerService.syncDepositLink(
+          tx,
+          deposit,
+          dto.destinationPaymentAccountId,
+          dto.receivingTransactionCode ?? dto.reference,
+          admin.id,
         );
-      }
 
-      // Explicit existence check so a bogus destination id surfaces as a
-      // 404 instead of a Prisma P2025 → 500 (the ledger layer would still
-      // roll everything back, but with an opaque error).
-      const destinationAccount = await tx.paymentAccount.findUnique({
-        where: { id: dto.destinationPaymentAccountId },
-      });
-      if (!destinationAccount) {
-        throw new NotFoundException('Payment account not found');
-      }
+        const creditedWallet = await this.walletService.creditWithinTransaction(
+          tx,
+          dto.userId,
+          dto.amount,
+        );
 
-      // declaredPaymentAccountId and the four receivingAccount* free-text
-      // fields stay null — the admin can fill the FROM record later via the
-      // existing table cell.
-      const deposit = await tx.deposit.create({
-        data: {
-          userId: dto.userId,
-          amount: dto.amount,
-          paymentMethod: dto.paymentMethod,
-          accountName: dto.accountName ?? null,
-          reference: dto.reference,
-          status: DepositStatus.APPROVED,
-          approvedByUserId: admin.id,
-          approvedAt: new Date(),
-          receivingTransactionCode: dto.receivingTransactionCode ?? null,
-          receivingTransactionTime: dto.receivingTransactionTime ?? null,
-        },
-      });
+        // Same wallet-balance snapshot approve() records — see the comment
+        // there; a manual deposit credits the wallet in exactly the same way.
+        await tx.deposit.update({
+          where: { id: deposit.id },
+          data: {
+            walletBalanceBefore: creditedWallet.balance.minus(deposit.amount),
+            walletBalanceAfter: creditedWallet.balance,
+          },
+        });
 
-      // Posts DEPOSIT_IN and credits the destination account atomically —
-      // the ONLY correct way to credit it. Throws for a bogus account id,
-      // rolling back the whole transaction.
-      await this.paymentAccountLedgerService.syncDepositLink(
-        tx,
-        deposit,
-        dto.destinationPaymentAccountId,
-        dto.receivingTransactionCode ?? dto.reference,
-        admin.id,
-      );
+        await tx.transaction.create({
+          data: {
+            userId: deposit.userId,
+            type: TransactionType.DEPOSIT,
+            amount: deposit.amount,
+            status: 'COMPLETED',
+          },
+        });
 
-      const creditedWallet = await this.walletService.creditWithinTransaction(
-        tx,
-        dto.userId,
-        dto.amount,
-      );
-
-      // Same wallet-balance snapshot approve() records — see the comment
-      // there; a manual deposit credits the wallet in exactly the same way.
-      await tx.deposit.update({
-        where: { id: deposit.id },
-        data: {
-          walletBalanceBefore: creditedWallet.balance.minus(deposit.amount),
-          walletBalanceAfter: creditedWallet.balance,
-        },
-      });
-
-      await tx.transaction.create({
-        data: {
-          userId: deposit.userId,
-          type: TransactionType.DEPOSIT,
-          amount: deposit.amount,
-          status: 'COMPLETED',
-        },
-      });
-
-      const notification = await tx.notification.create({
-        data: {
-          userId: deposit.userId,
-          type: NotificationType.DEPOSIT_APPROVED,
-          title: 'Deposit approved',
-          message: `Your deposit of ${deposit.amount.toString()} Ks has been approved and your balance has been updated.`,
-          payload: { depositId: deposit.id, amount: deposit.amount.toNumber() },
-        },
-      });
-
-      const created = await tx.deposit.findUniqueOrThrow({
-        where: { id: deposit.id },
-        include: {
-          user: {
-            select: {
-              id: true,
-              username: true,
-              displayName: true,
-              phone: true,
-              email: true,
+        const notification = await tx.notification.create({
+          data: {
+            userId: deposit.userId,
+            type: NotificationType.DEPOSIT_APPROVED,
+            title: 'Deposit approved',
+            message: `Your deposit of ${deposit.amount.toString()} Ks has been approved and your balance has been updated.`,
+            payload: {
+              depositId: deposit.id,
+              amount: deposit.amount.toNumber(),
             },
           },
-        },
-      });
-      const wallet = await tx.wallet.findUniqueOrThrow({
-        where: { userId: deposit.userId },
-      });
+        });
 
-      return { deposit: created, notification, balance: wallet.balance };
-    });
+        const created = await tx.deposit.findUniqueOrThrow({
+          where: { id: deposit.id },
+          include: {
+            user: {
+              select: {
+                id: true,
+                username: true,
+                displayName: true,
+                phone: true,
+                email: true,
+              },
+            },
+          },
+        });
+        const wallet = await tx.wallet.findUniqueOrThrow({
+          where: { userId: deposit.userId },
+        });
+
+        await this.audit.record({
+          action: 'deposit.manual_create',
+          actor: admin,
+          target: {
+            type: 'deposit',
+            id: created.id,
+            label: depositLabel(created),
+          },
+          after: depositSnapshot(created),
+          metadata: {
+            destinationPaymentAccountId: dto.destinationPaymentAccountId,
+          },
+          tx,
+        });
+
+        return { deposit: created, notification, balance: wallet.balance };
+      })
+      .catch((error: unknown) => {
+        // Postgres aborts the transaction on 23505, so the mapping must live
+        // outside $transaction (same shape as WalletAdjustmentsService.adjust).
+        // The loser fails at tx.deposit.create, before the ledger credit,
+        // wallet credit, Transaction row, notification and audit row — so
+        // nothing is written and the socket emits below never run.
+        if (isUniqueViolation(error)) {
+          throw new ConflictException(DUPLICATE_REFERENCE_MESSAGE);
+        }
+        throw error;
+      });
 
     this.realtimeGateway.notifyAdminsPaymentAccountUpdated({
       paymentAccountId: dto.destinationPaymentAccountId,
@@ -515,6 +625,21 @@ export class DepositsService {
           },
         },
       });
+
+      await this.audit.record({
+        action: 'deposit.reject',
+        actor: admin,
+        target: {
+          type: 'deposit',
+          id: depositId,
+          label: depositLabel(updated),
+        },
+        before: depositSnapshot(deposit),
+        after: depositSnapshot(updated),
+        metadata: { reason: dto.reason },
+        tx,
+      });
+
       return { deposit: updated, notification };
     });
 
@@ -620,6 +745,22 @@ export class DepositsService {
             },
           },
         },
+      });
+
+      // `updatedDeposit` is read after syncDepositLink's claim, so its
+      // receivingPaymentAccountId already reflects the re-link.
+      await this.audit.record({
+        action: 'deposit.receiving_account_update',
+        actor: admin,
+        target: {
+          type: 'deposit',
+          id: depositId,
+          label: depositLabel(updatedDeposit),
+        },
+        before: receivingAccountSnapshot(deposit),
+        after: receivingAccountSnapshot(updatedDeposit),
+        metadata: { oldPaymentAccountId, newPaymentAccountId },
+        tx,
       });
 
       return {

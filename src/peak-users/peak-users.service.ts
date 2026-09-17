@@ -1,10 +1,16 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { AuditService } from '../audit/audit.service';
+import { peakUsersSnapshot } from '../audit/audit-snapshots';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import type { UpdateAdditionalPeakDto } from './dto/update-additional-peak.dto';
 
 @Injectable()
 export class PeakUsersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+  ) {}
 
   /**
    * Lazily creates the single global stats row on first read — mirrors
@@ -39,15 +45,23 @@ export class PeakUsersService {
   }
 
   /** Sets the admin adjustment (0 allowed = reset) and records who set it. */
-  async setAdditional(dto: UpdateAdditionalPeakDto, adminId: string) {
+  async setAdditional(dto: UpdateAdditionalPeakDto, admin: AuthenticatedUser) {
     const current = await this.getOrCreate();
 
     const updated = await this.prisma.peakUserStats.update({
       where: { id: current.id },
       data: {
         additionalPeak: dto.additionalPeak,
-        updatedByUserId: adminId,
+        updatedByUserId: admin.id,
       },
+    });
+
+    await this.audit.record({
+      action: 'peak_users.update',
+      actor: admin,
+      target: { type: 'peak_users', id: current.id, label: 'Peak users' },
+      before: peakUsersSnapshot(current),
+      after: peakUsersSnapshot(updated),
     });
 
     return {

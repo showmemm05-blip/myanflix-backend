@@ -13,6 +13,10 @@
  *
  * THROTTLE_DISABLED: the e2e specs hammer the API from one address; the
  * production rate limits are covered by their own supertest spec instead.
+ *
+ * myanflix_test must be built with `prisma migrate deploy` (DATABASE_URL
+ * pointed at it) and never used as a Prisma shadow database — a shadow run
+ * drops and recreates it, wiping _prisma_migrations (F-106).
  */
 process.env.NODE_ENV = 'test';
 process.env.THROTTLE_DISABLED = 'true';
@@ -24,3 +28,5 @@ process.env.MINIO_ENDPOINT = 'http://localhost:9000';
 process.env.MINIO_ACCESS_KEY = 'test';
 process.env.MINIO_SECRET_KEY = 'test';
 process.env.STREAM_PUBLIC_BASE_URL = 'http://localhost:8080';
+process.env.STREAM_SIGNING_SECRET =
+  'e2e-test-stream-signing-secret-not-for-production';

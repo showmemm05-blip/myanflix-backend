@@ -7,7 +7,15 @@ import type { App } from 'supertest/types';
 import { randomUUID } from 'node:crypto';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
-import { Role, UserStatus } from '../src/generated/prisma/client';
+import {
+  DepositStatus,
+  PaymentAccountTransactionType,
+  Role,
+  UserStatus,
+} from '../src/generated/prisma/client';
+
+const DUPLICATE_REFERENCE_MESSAGE =
+  'A deposit with this transaction reference already exists';
 
 describe('Deposits (e2e)', () => {
   let app: INestApplication<App>;
@@ -17,6 +25,7 @@ describe('Deposits (e2e)', () => {
 
   let userId: string;
   let adminId: string;
+  let paymentAccountId: string;
   let userToken: string;
   let adminToken: string;
 
@@ -39,6 +48,13 @@ describe('Deposits (e2e)', () => {
     // so double-applies them, e.g. double-wrapping every response body).
     app.setGlobalPrefix('api');
     await app.init();
+    // Listen on an ephemeral port before any request is made. supertest only
+    // starts (and then closes) its own listener when the server has no
+    // address, so with the Promise.all bursts below the first request's
+    // server.close() would reset the sockets of its still-connecting
+    // siblings (ECONNRESET). A server that is already listening is never
+    // started or closed by supertest; app.close() in afterAll shuts it down.
+    await app.listen(0);
 
     prisma = app.get(PrismaService);
     jwtService = app.get(JwtService);
@@ -67,14 +83,31 @@ describe('Deposits (e2e)', () => {
     });
     await prisma.wallet.create({ data: { userId: admin.id, balance: 0 } });
 
+    // Destination account for the manual-deposit race cases (ADMIN holds
+    // DEPOSITS.CREATE via the seeded app_roles).
+    const paymentAccount = await prisma.paymentAccount.create({
+      data: {
+        type: 'KBZPay',
+        accountName: `Deposit Test Account ${suffix}`,
+        accountNumber: '09000000000',
+        createdByUserId: admin.id,
+        updatedByUserId: admin.id,
+      },
+    });
+
     userId = user.id;
     adminId = admin.id;
+    paymentAccountId = paymentAccount.id;
     userToken = await signToken(user.id);
     adminToken = await signToken(admin.id);
   });
 
   afterAll(async () => {
     // Isolated test database — safe to hard-delete everything this suite touched.
+    // Ledger rows first: payment_account_transactions.paymentAccountId is
+    // onDelete: Restrict, so the account cannot go before its entries.
+    await prisma.paymentAccountTransaction.deleteMany({ where: { paymentAccountId } });
+    await prisma.paymentAccount.deleteMany({ where: { id: paymentAccountId } });
     await prisma.notification.deleteMany({ where: { userId: { in: [userId, adminId] } } });
     await prisma.transaction.deleteMany({ where: { userId: { in: [userId, adminId] } } });
     await prisma.deposit.deleteMany({ where: { userId: { in: [userId, adminId] } } });
@@ -284,5 +317,148 @@ describe('Deposits (e2e)', () => {
     await prisma.deposit.deleteMany({ where: { userId: otherUser.id } });
     await prisma.wallet.deleteMany({ where: { userId: otherUser.id } });
     await prisma.user.delete({ where: { id: otherUser.id } });
+  });
+
+  // F-006: the duplicate-reference rule is enforced by the partial unique
+  // index deposits_reference_active_key, so concurrent submissions cannot
+  // slip past the service-level pre-check. Every count below is scoped by
+  // userId as well as reference so leftovers from a crashed earlier run
+  // (other users' rows) cannot skew the result.
+  it('eight parallel user submissions with one reference create exactly one PENDING deposit', async () => {
+    const responses = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        request(app.getHttpServer())
+          .post('/api/deposits')
+          .set('Authorization', `Bearer ${userToken}`)
+          .send({ amount: 2500, paymentMethod: 'KBZ Pay', reference: '001101' }),
+      ),
+    );
+
+    const statuses = responses.map((r) => r.status).sort((a, b) => a - b);
+    expect(statuses).toEqual([201, 409, 409, 409, 409, 409, 409, 409]);
+    for (const res of responses.filter((r) => r.status === 409)) {
+      expect(res.body.message).toBe(DUPLICATE_REFERENCE_MESSAGE);
+    }
+
+    expect(
+      await prisma.deposit.count({
+        where: { userId, reference: '001101', status: DepositStatus.PENDING },
+      }),
+    ).toBe(1);
+  });
+
+  it('five parallel manual deposits with one reference credit the wallet and the payment account exactly once', async () => {
+    const before = await request(app.getHttpServer())
+      .get('/api/wallet')
+      .set('Authorization', `Bearer ${userToken}`)
+      .expect(200);
+    const balanceBefore = before.body.data.balance;
+    const depositTxnsBefore = await prisma.transaction.count({
+      where: { userId, type: 'DEPOSIT' },
+    });
+
+    const responses = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        request(app.getHttpServer())
+          .post('/api/deposits/manual')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            userId,
+            amount: 1000,
+            paymentMethod: 'KBZPay',
+            reference: '001102',
+            destinationPaymentAccountId: paymentAccountId,
+          }),
+      ),
+    );
+
+    const statuses = responses.map((r) => r.status).sort((a, b) => a - b);
+    expect(statuses).toEqual([201, 409, 409, 409, 409]);
+    for (const res of responses.filter((r) => r.status === 409)) {
+      expect(res.body.message).toBe(DUPLICATE_REFERENCE_MESSAGE);
+    }
+
+    const after = await request(app.getHttpServer())
+      .get('/api/wallet')
+      .set('Authorization', `Bearer ${userToken}`)
+      .expect(200);
+    expect(after.body.data.balance).toBe(balanceBefore + 1000);
+
+    const winner = await prisma.deposit.findMany({
+      where: { userId, reference: '001102', status: DepositStatus.APPROVED },
+    });
+    expect(winner).toHaveLength(1);
+    expect(
+      await prisma.paymentAccountTransaction.count({
+        where: {
+          paymentAccountId,
+          type: PaymentAccountTransactionType.DEPOSIT_IN,
+        },
+      }),
+    ).toBe(1);
+    expect(
+      await prisma.transaction.count({ where: { userId, type: 'DEPOSIT' } }),
+    ).toBe(depositTxnsBefore + 1);
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          action: 'deposit.manual_create',
+          targetType: 'deposit',
+          targetId: winner[0].id,
+        },
+      }),
+    ).toBe(1);
+  });
+
+  it('a user submission racing an admin manual deposit for one reference leaves exactly one live deposit', async () => {
+    const [userRes, adminRes] = await Promise.all([
+      request(app.getHttpServer())
+        .post('/api/deposits')
+        .set('Authorization', `Bearer ${userToken}`)
+        .send({ amount: 2000, paymentMethod: 'KBZ Pay', reference: '001103' }),
+      request(app.getHttpServer())
+        .post('/api/deposits/manual')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          userId,
+          amount: 2000,
+          paymentMethod: 'KBZPay',
+          reference: '001103',
+          destinationPaymentAccountId: paymentAccountId,
+        }),
+    ]);
+
+    const statuses = [userRes.status, adminRes.status].sort((a, b) => a - b);
+    expect(statuses).toEqual([201, 409]);
+
+    expect(
+      await prisma.deposit.count({
+        where: {
+          userId,
+          reference: '001103',
+          status: { in: [DepositStatus.PENDING, DepositStatus.APPROVED] },
+        },
+      }),
+    ).toBe(1);
+  });
+
+  it("a REJECTED deposit's reference can still be reused", async () => {
+    const createRes = await request(app.getHttpServer())
+      .post('/api/deposits')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ amount: 3000, paymentMethod: 'KBZ Pay', reference: '001104' })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .patch(`/api/deposits/${createRes.body.data.id}/reject`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ reason: 'Wrong amount, please resubmit' })
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .post('/api/deposits')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ amount: 3000, paymentMethod: 'KBZ Pay', reference: '001104' })
+      .expect(201);
   });
 });

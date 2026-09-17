@@ -11,6 +11,8 @@ import {
   Put,
   UseGuards,
 } from '@nestjs/common';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { CategoriesService } from './categories.service';
@@ -34,8 +36,11 @@ export class CategoriesController {
   @Post()
   @UseGuards(PermissionsGuard)
   @RequirePermissions('CATEGORIES.CREATE')
-  create(@Body() dto: CreateCategoryDto) {
-    return this.categoriesService.create(dto);
+  create(
+    @Body() dto: CreateCategoryDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.categoriesService.create(dto, user);
   }
 
   @Put(':id')
@@ -44,15 +49,19 @@ export class CategoriesController {
   update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateCategoryDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.categoriesService.update(id, dto);
+    return this.categoriesService.update(id, dto, user);
   }
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   @UseGuards(PermissionsGuard)
   @RequirePermissions('CATEGORIES.DELETE')
-  async remove(@Param('id', ParseUUIDPipe) id: string) {
-    await this.categoriesService.remove(id);
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    await this.categoriesService.remove(id, user);
   }
 }

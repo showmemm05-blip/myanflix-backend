@@ -12,6 +12,8 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { MinioService } from '../common/storage/minio.service';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
@@ -64,8 +66,11 @@ export class BookAuthorsController {
   @Post()
   @UseGuards(PermissionsGuard)
   @RequirePermissions('BOOKS.CREATE')
-  async create(@Body() dto: CreateBookAuthorDto) {
-    const author = await this.bookAuthorsService.create(dto);
+  async create(
+    @Body() dto: CreateBookAuthorDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    const author = await this.bookAuthorsService.create(dto, user);
     return BookAuthorResponseDto.fromEntity(author, this.resolveImageUrl);
   }
 
@@ -75,8 +80,9 @@ export class BookAuthorsController {
   async update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateBookAuthorDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    const author = await this.bookAuthorsService.update(id, dto);
+    const author = await this.bookAuthorsService.update(id, dto, user);
     return BookAuthorResponseDto.fromEntity(author, this.resolveImageUrl);
   }
 
@@ -84,7 +90,10 @@ export class BookAuthorsController {
   @HttpCode(HttpStatus.NO_CONTENT)
   @UseGuards(PermissionsGuard)
   @RequirePermissions('BOOKS.DELETE')
-  async remove(@Param('id', ParseUUIDPipe) id: string) {
-    await this.bookAuthorsService.remove(id);
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    await this.bookAuthorsService.remove(id, user);
   }
 }

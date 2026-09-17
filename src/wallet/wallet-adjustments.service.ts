@@ -11,6 +11,7 @@ import type {
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { AuditService } from '../audit/audit.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
@@ -54,6 +55,7 @@ export class WalletAdjustmentsService {
     private readonly prisma: PrismaService,
     private readonly walletService: WalletService,
     private readonly realtimeGateway: RealtimeGateway,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -145,6 +147,8 @@ export class WalletAdjustmentsService {
               performedBy: {
                 select: { id: true, username: true, displayName: true },
               },
+              // Only for the audit row's label — never part of the response.
+              user: { select: { username: true } },
             },
           });
 
@@ -166,6 +170,29 @@ export class WalletAdjustmentsService {
                 amount: decimalToNumber(amount),
               },
             },
+          });
+
+          // Inside the transaction, so the audit row commits with the
+          // adjustment (and rolls back with it). A replay writes nothing
+          // and is never audited — the original adjustment already was.
+          await this.audit.record({
+            action: 'user.wallet_adjust',
+            actor: admin,
+            target: {
+              type: 'user',
+              id: userId,
+              label: `@${adjustment.user.username}`,
+            },
+            metadata: {
+              direction: dto.direction,
+              amount: decimalToNumber(amount),
+              reason: dto.reason,
+              balanceBefore: decimalToNumber(balanceBefore),
+              balanceAfter: decimalToNumber(balanceAfter),
+              adjustmentId: adjustment.id,
+              transactionId: transaction.id,
+            },
+            tx,
           });
 
           return {

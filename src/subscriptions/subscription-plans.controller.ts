@@ -28,14 +28,18 @@ export class SubscriptionPlansController {
   @Post()
   @UseGuards(PermissionsGuard)
   @RequirePermissions('SUBSCRIPTIONS.CREATE')
-  create(@Body() dto: CreatePlanDto) {
-    return this.subscriptionsService.createPlan(dto);
+  create(@Body() dto: CreatePlanDto, @CurrentUser() user: AuthenticatedUser) {
+    return this.subscriptionsService.createPlan(dto, user);
   }
 
   @Put(':id')
   @UseGuards(PermissionsGuard)
   @RequirePermissions('SUBSCRIPTIONS.EDIT')
-  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdatePlanDto) {
-    return this.subscriptionsService.updatePlan(id, dto);
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdatePlanDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.subscriptionsService.updatePlan(id, dto, user);
   }
 }

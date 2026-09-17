@@ -4,6 +4,8 @@ import { Type } from 'class-transformer';
 import { MovieStatus } from '../../generated/prisma/client';
 import { CreateMovieDto } from './create-movie.dto';
 
+// CreateMovieDto must stay initializer-free — PartialType copies initializers
+// into every instance; see src/common/dto/update-dtos-have-no-initializers.spec.ts.
 export class UpdateMovieDto extends PartialType(CreateMovieDto) {
   @IsOptional()
   @IsEnum(MovieStatus)

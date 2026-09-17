@@ -59,9 +59,13 @@ describe('MultipartUploadService', () => {
     };
     movieType = {
       assertExists: jest.fn().mockResolvedValue(undefined),
-      buildKey: jest.fn(
-        (resourceId: string, relativePath: string) =>
-          `videos/${resourceId}/${relativePath}`,
+      // Mirrors the real ResourceUploadTypeRegistry routing (asserted for
+      // real in resource-upload-type.registry.spec.ts): a subtitle SOURCE
+      // leaves the video namespace, everything else stays in it.
+      buildKey: jest.fn((resourceId: string, relativePath: string) =>
+        relativePath.startsWith('subtitles/')
+          ? `subtitles/${resourceId}/${relativePath.slice('subtitles/'.length)}`
+          : `videos/${resourceId}/${relativePath}`,
       ),
     };
     resourceTypes = {
@@ -108,7 +112,7 @@ describe('MultipartUploadService', () => {
         'videos/movie-1/hls/master.m3u8',
       );
       expect(minioService.getPresignedPutUrl).toHaveBeenCalledWith(
-        'videos/movie-1/subtitles/english.vtt',
+        'subtitles/movie-1/english.vtt',
       );
       expect(result.files).toEqual([
         {
@@ -118,7 +122,7 @@ describe('MultipartUploadService', () => {
         },
         {
           relativePath: 'subtitles/english.vtt',
-          key: 'videos/movie-1/subtitles/english.vtt',
+          key: 'subtitles/movie-1/english.vtt',
           url: 'https://minio.example/presigned-put',
         },
       ]);

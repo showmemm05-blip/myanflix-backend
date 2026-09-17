@@ -20,7 +20,13 @@ function makeOtp(overrides: Partial<Record<string, unknown>> = {}) {
 describe('OtpService', () => {
   let service: OtpService;
   let prisma: {
-    otpCode: { findFirst: jest.Mock; create: jest.Mock; count: jest.Mock; update: jest.Mock };
+    otpCode: {
+      findFirst: jest.Mock;
+      create: jest.Mock;
+      count: jest.Mock;
+      update: jest.Mock;
+      updateMany: jest.Mock;
+    };
   };
   let smsService: { send: jest.Mock };
 
@@ -33,6 +39,7 @@ describe('OtpService', () => {
         create: jest.fn().mockResolvedValue(makeOtp()),
         count: jest.fn().mockResolvedValue(0),
         update: jest.fn(),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
     };
     smsService = { send: jest.fn().mockResolvedValue(undefined) };
@@ -95,6 +102,7 @@ describe('OtpService', () => {
 
       await expect(service.verifyOtp('+959123456789', '123456')).rejects.toThrow(UnauthorizedException);
       expect(prisma.otpCode.update).not.toHaveBeenCalled();
+      expect(prisma.otpCode.updateMany).not.toHaveBeenCalled();
     });
 
     it('increments attemptCount on a wrong code without consuming it', async () => {
@@ -106,6 +114,7 @@ describe('OtpService', () => {
         where: { id: 'otp-1' },
         data: { attemptCount: { increment: 1 } },
       });
+      expect(prisma.otpCode.updateMany).not.toHaveBeenCalled();
     });
 
     it('locks out further attempts once the attempt cap is reached, even with the right code', async () => {
@@ -113,6 +122,7 @@ describe('OtpService', () => {
 
       await expect(service.verifyOtp('+959123456789', '123456')).rejects.toThrow(UnauthorizedException);
       expect(prisma.otpCode.update).not.toHaveBeenCalled();
+      expect(prisma.otpCode.updateMany).not.toHaveBeenCalled();
     });
 
     it('marks the code consumed on a correct match', async () => {
@@ -120,10 +130,19 @@ describe('OtpService', () => {
 
       await service.verifyOtp('+959123456789', '123456');
 
-      expect(prisma.otpCode.update).toHaveBeenCalledWith({
-        where: { id: 'otp-1' },
+      expect(prisma.otpCode.updateMany).toHaveBeenCalledWith({
+        where: { id: 'otp-1', consumedAt: null },
         data: { consumedAt: expect.any(Date) },
       });
+    });
+
+    it('rejects when a concurrent verify already consumed the code', async () => {
+      prisma.otpCode.findFirst.mockResolvedValue(makeOtp());
+      prisma.otpCode.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(service.verifyOtp('+959123456789', '123456')).rejects.toThrow(
+        new UnauthorizedException('Invalid or expired code'),
+      );
     });
 
     it('ignores an already-consumed code (findFirst filters consumedAt: null, so a stale row falling through means no valid code)', async () => {

@@ -4,13 +4,19 @@ import {
   MovieStatus,
   Prisma,
   Role,
+  SeriesStatus,
   type Actor,
   type Category,
   type Movie,
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
+import { StorageService } from '../common/storage/storage.service';
 import { TrackingService } from '../tracking/tracking.service';
+import { AuditService } from '../audit/audit.service';
+import type { AuditAction } from '../audit/audit-actions';
+import { movieSnapshot } from '../audit/audit-snapshots';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import { computeTwoTierSlice } from '../common/utils/two-tier-page.util';
 import {
@@ -18,6 +24,7 @@ import {
   numberRange,
 } from '../common/utils/facet-filter.util';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
+import type { MovieQualitySource } from './dto/movie-response.dto';
 import type { CreateMovieDto } from './dto/create-movie.dto';
 import type { UpdateMovieDto } from './dto/update-movie.dto';
 import { MovieSort, type MovieQueryDto } from './dto/movie-query.dto';
@@ -32,11 +39,18 @@ import { MovieSort, type MovieQueryDto } from './dto/movie-query.dto';
 export const CATALOG_INCLUDE = {
   categories: true,
   actors: true,
+  // The ONLY honest source for a catalogue card's quality badge: what a
+  // viewer can actually be served lives in the transcode output, not on the
+  // Movie row. Narrowed to two columns with `select` so a 30-row page does
+  // not drag every video's paths and failure text along with it — Prisma
+  // batches this into one extra query per page, not one per title.
+  videos: { select: { status: true, renditions: true } },
 } satisfies Prisma.MovieInclude;
 
 type MovieWithCategories = Movie & {
   categories: Category[];
   actors: Actor[];
+  videos: MovieQualitySource[];
 };
 
 /** One offered value of one facet, with how many PUBLIC movies carry it. */
@@ -55,6 +69,33 @@ export interface MovieFacets {
 }
 
 const FACETS_TTL_MS = 60_000;
+
+type StatusDerivedAuditAction<Prefix extends 'movie' | 'series'> = Extract<
+  AuditAction,
+  | `${Prefix}.update`
+  | `${Prefix}.publish`
+  | `${Prefix}.unpublish`
+  | `${Prefix}.status_change`
+>;
+
+/**
+ * Which audit action a status transition is filed under (audit spec §3):
+ * entering PUBLISHED = `.publish`, leaving it = `.unpublish`, any other
+ * status change = `.status_change`, and no status change at all = the plain
+ * `.update` (which AuditService skips when the diff turns out empty).
+ * Shared with SeriesService so both catalogues follow the one rule.
+ */
+export function statusDerivedAuditAction<Prefix extends 'movie' | 'series'>(
+  prefix: Prefix,
+  before: string | null | undefined,
+  after: string | null | undefined,
+): StatusDerivedAuditAction<Prefix> {
+  type Result = StatusDerivedAuditAction<Prefix>;
+  if (before === after) return `${prefix}.update` as Result;
+  if (after === 'PUBLISHED') return `${prefix}.publish` as Result;
+  if (before === 'PUBLISHED') return `${prefix}.unpublish` as Result;
+  return `${prefix}.status_change` as Result;
+}
 
 /**
  * groupBy rows -> offered facet values: null/empty values dropped (a movie
@@ -212,7 +253,9 @@ export class MoviesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
+    private readonly storageService: StorageService,
     private readonly trackingService: TrackingService,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -512,14 +555,21 @@ export class MoviesService {
     id: string,
     viewerRole: Role,
   ): Promise<MovieWithCategories> {
-    const movie = await this.prisma.movie.findUnique({
+    const found = await this.prisma.movie.findUnique({
       where: { id },
-      include: CATALOG_INCLUDE,
+      include: { ...CATALOG_INCLUDE, series: { select: { status: true } } },
     });
+    if (!found) throw new NotFoundException('Movie not found');
 
+    // The public view (members and guests alike) sees a title only when it
+    // is PUBLISHED — and, for an episode, only when its show is too. An
+    // unpublished series never leaks through one of its episodes, matching
+    // SeriesService.findViewableOrThrow.
+    const { series, ...movie } = found;
     if (
-      !movie ||
-      (viewerRole === Role.USER && movie.status !== MovieStatus.PUBLISHED)
+      viewerRole === Role.USER &&
+      (movie.status !== MovieStatus.PUBLISHED ||
+        (movie.seriesId !== null && series?.status !== SeriesStatus.PUBLISHED))
     ) {
       throw new NotFoundException('Movie not found');
     }
@@ -579,9 +629,9 @@ export class MoviesService {
     };
   }
 
-  async create(dto: CreateMovieDto): Promise<Movie> {
+  async create(dto: CreateMovieDto, actor: AuthenticatedUser): Promise<Movie> {
     const { categoryIds, actorIds, ...data } = dto;
-    return this.prisma.movie.create({
+    const created = await this.prisma.movie.create({
       data: {
         ...this.withNormalizedOptionalMetadata(
           this.withCanonicalImageUrls(data),
@@ -595,6 +645,15 @@ export class MoviesService {
       },
       include: CATALOG_INCLUDE,
     });
+
+    await this.audit.record({
+      action: 'movie.create',
+      actor,
+      target: { type: 'movie', id: created.id, label: created.title },
+      after: movieSnapshot(created),
+    });
+
+    return created;
   }
 
   /**
@@ -616,8 +675,11 @@ export class MoviesService {
    */
   async createUploadPlaceholder(
     title: string,
-    series?: { seriesId: string; seasonNumber: number; episodeNumber: number },
-    options?: { duration?: number },
+    series:
+      | { seriesId: string; seasonNumber: number; episodeNumber: number }
+      | undefined,
+    options: { duration?: number } | undefined,
+    actor: AuthenticatedUser,
   ): Promise<Movie> {
     let inherited: {
       genre: string;
@@ -636,7 +698,7 @@ export class MoviesService {
       };
     }
 
-    return this.prisma.movie.create({
+    const created = await this.prisma.movie.create({
       data: {
         title,
         description: '',
@@ -651,13 +713,36 @@ export class MoviesService {
         episodeNumber: series?.episodeNumber,
       },
     });
+
+    await this.audit.record({
+      action: 'movie.create',
+      actor,
+      target: { type: 'movie', id: created.id, label: created.title },
+      after: movieSnapshot(created),
+      metadata: {
+        flow: 'bulk',
+        ...(series ? { seriesId: series.seriesId } : {}),
+      },
+    });
+
+    return created;
   }
 
-  async update(id: string, dto: UpdateMovieDto): Promise<Movie> {
-    await this.assertExists(id);
+  async update(
+    id: string,
+    dto: UpdateMovieDto,
+    actor: AuthenticatedUser,
+  ): Promise<Movie> {
+    // The pre-read doubles as the existence check: the audit row needs the
+    // row as it was (categories and cast included) to show what changed.
+    const before = await this.prisma.movie.findUnique({
+      where: { id },
+      include: CATALOG_INCLUDE,
+    });
+    if (!before) throw new NotFoundException('Movie not found');
     const { categoryIds, actorIds, ...data } = dto;
 
-    return this.prisma.movie.update({
+    const updated = await this.prisma.movie.update({
       where: { id },
       data: {
         ...this.withNormalizedOptionalMetadata(
@@ -674,6 +759,19 @@ export class MoviesService {
       },
       include: CATALOG_INCLUDE,
     });
+
+    // One row per save: a status flip decides the action, the diff carries
+    // every other field that changed along with it.
+    await this.audit.record({
+      action: statusDerivedAuditAction('movie', before.status, updated.status),
+      actor,
+      target: { type: 'movie', id, label: updated.title },
+      before: movieSnapshot(before),
+      after: movieSnapshot(updated),
+      metadata: updated.seriesId ? { seriesId: updated.seriesId } : null,
+    });
+
+    return updated;
   }
 
   /**
@@ -686,34 +784,50 @@ export class MoviesService {
    * hiccup) and is logged rather than thrown on failure — a partial cleanup
    * just leaves orphaned bytes behind, it's not a functional problem.
    */
-  async remove(id: string): Promise<void> {
+  async remove(id: string, actor: AuthenticatedUser): Promise<void> {
     const movie = await this.prisma.movie.findUnique({
       where: { id },
-      include: { videos: { include: { subtitles: true } } },
+      include: { ...CATALOG_INCLUDE, videos: { include: { subtitles: true } } },
     });
     if (!movie) throw new NotFoundException('Movie not found');
 
     await this.prisma.movie.delete({ where: { id } });
 
+    await this.audit.record({
+      action: 'movie.delete',
+      actor,
+      target: { type: 'movie', id, label: movie.title },
+      before: movieSnapshot(movie),
+      metadata: {
+        videos: movie.videos.length,
+        subtitles: movie.videos.reduce(
+          (sum, video) => sum + video.subtitles.length,
+          0,
+        ),
+        ...(movie.seriesId ? { seriesId: movie.seriesId } : {}),
+      },
+    });
+
     try {
-      await this.minioService.deleteByPrefix(`videos/${id}/`);
+      // Two prefixes own every byte of a title, both keyed by the movie id:
+      // videos/<id>/ is the original plus the whole generated HLS package
+      // (renditions and hls/subs/), and subtitles/<id>/ is every uploaded
+      // subtitle SOURCE, from the single upload and the bulk bundle alike.
+      // No per-subtitle loop and no de-dupe guard: sources used to be split
+      // across two rival namespaces, one of them nested inside videos/<id>/,
+      // and telling them apart by key shape was the only way not to delete
+      // the same object twice.
+      await this.minioService.deleteByPrefix(
+        `${this.storageService.videoKeyPrefix(id)}/`,
+      );
+      await this.minioService.deleteByPrefix(
+        `${this.storageService.subtitleSourcePrefix(id)}/`,
+      );
 
       for (const url of [movie.posterUrl, movie.coverUrl, movie.thumbnailUrl]) {
         if (!url) continue;
         const key = this.minioService.keyFromPublicUrl(url);
         if (key) await this.minioService.deleteObject(key);
-      }
-
-      for (const video of movie.videos) {
-        for (const subtitle of video.subtitles) {
-          // Bundle-detected subtitles already live under videos/<movieId>/...
-          // and were just caught by the prefix delete above; manually
-          // uploaded ones live under the separate global subtitles/<id>/
-          // prefix and need deleting individually.
-          if (!subtitle.objectKey.startsWith(`videos/${id}/`)) {
-            await this.minioService.deleteObject(subtitle.objectKey);
-          }
-        }
       }
     } catch (error) {
       this.logger.warn(
@@ -791,13 +905,5 @@ export class MoviesService {
     });
     if (!movie) throw new NotFoundException('Movie not found');
     return movie.status;
-  }
-
-  private async assertExists(id: string): Promise<void> {
-    const exists = await this.prisma.movie.findUnique({
-      where: { id },
-      select: { id: true },
-    });
-    if (!exists) throw new NotFoundException('Movie not found');
   }
 }

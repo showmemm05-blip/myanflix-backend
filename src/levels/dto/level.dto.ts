@@ -18,6 +18,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { LEVEL_BADGE_ICONS } from '../level-icons';
+import { ToBoolean } from '../../common/decorators/to-boolean.decorator';
 
 export class CreateLevelDto {
   @IsString()
@@ -45,6 +46,7 @@ export class CreateLevelDto {
   order?: number;
 
   @IsOptional()
+  @ToBoolean()
   @IsBoolean()
   enabled?: boolean;
 }

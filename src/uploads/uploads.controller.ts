@@ -15,9 +15,12 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { SkipThrottle } from '@nestjs/throttler';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { InitUploadDto } from './dto/init-upload.dto';
+import { UploadImageDto } from './dto/upload-image.dto';
 import { ValidateExternalBundleDto } from './dto/validate-external-bundle.dto';
 import { UploadsService } from './uploads.service';
 
@@ -38,16 +41,24 @@ export class UploadsController {
   // Serves poster/cover art for movies, series, episodes AND categories, so
   // it rides the class-level MEDIA.UPLOAD rule rather than a movie-specific
   // one (the old MOVIE_CREATE override resolved to the same three roles).
+  //
+  // `purpose` (a required form field alongside `file`) is what decides the
+  // images/<purpose>/ folder the object lands in — see UploadImageDto for
+  // why it has no fallback. The response shape `{ url }` is unchanged.
   @Post('image')
   @UseInterceptors(
     FileInterceptor('file', { limits: { fileSize: MAX_IMAGE_BYTES } }),
   )
-  async uploadImage(@UploadedFile() file: Express.Multer.File | undefined) {
+  async uploadImage(
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @Body() dto: UploadImageDto,
+  ) {
     if (!file)
       throw new BadRequestException(
         'No image file received (expected field "file")',
       );
     const url = await this.uploadsService.saveImage(
+      dto.purpose,
       file.originalname,
       file.buffer,
     );
@@ -89,14 +100,20 @@ export class UploadsController {
   }
 
   @Post(':uploadId/complete')
-  completeUpload(@Param('uploadId', ParseUUIDPipe) uploadId: string) {
-    return this.uploadsService.completeUpload(uploadId);
+  completeUpload(
+    @Param('uploadId', ParseUUIDPipe) uploadId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.uploadsService.completeUpload(uploadId, user);
   }
 
   /** Retries transcoding for a movie whose video failed — no re-upload required. */
   @Post(':movieId/reprocess')
-  reprocess(@Param('movieId', ParseUUIDPipe) movieId: string) {
-    return this.uploadsService.reprocessVideo(movieId);
+  reprocess(
+    @Param('movieId', ParseUUIDPipe) movieId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.uploadsService.reprocessVideo(movieId, user);
   }
 
   /** Cross-checks an externally-pre-transcoded bundle's uploaded files against what's actually in MinIO. */
@@ -112,12 +129,20 @@ export class UploadsController {
    * Runs automatically once the admin's bundle upload finishes — never runs
    * ffmpeg. Moves the movie to READY_TO_PUBLISH (or FAILED if the bundle is
    * incomplete); it never publishes the movie itself.
+   *
+   * Only a movie that is UPLOADING or FAILED is finalized. A movie already
+   * READY_TO_PUBLISH is replayed idempotently (201 with its existing READY
+   * video, nothing created; 409 if it has no READY video). Any other status
+   * — PUBLISHED, ARCHIVED, DRAFT, PROCESSING — is a 409 with nothing
+   * written, so a live title can never be unpublished or failed from here.
+   * Parallel calls for the same movie join a single run.
    */
   @Post(':movieId/finalize')
   finalize(
     @Param('movieId', ParseUUIDPipe) movieId: string,
     @Body() dto: ValidateExternalBundleDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.uploadsService.finalizeExternalUpload(movieId, dto);
+    return this.uploadsService.finalizeExternalUpload(movieId, dto, user);
   }
 }

@@ -3,6 +3,7 @@ import { BadRequestException, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
+import { createHash } from 'node:crypto';
 import { AuthService } from './auth.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
@@ -256,5 +257,110 @@ describe('AuthService — session tracking on sign-in', () => {
     ).resolves.toEqual(expect.objectContaining({ accessToken: 'token' }));
     // Let the rejected promise's .catch handler run.
     await new Promise(process.nextTick);
+  });
+});
+
+describe('AuthService — refresh rotation', () => {
+  const REFRESH_TOKEN = 'refresh-token-1';
+  const sha256 = (value: string) =>
+    createHash('sha256').update(value).digest('hex');
+
+  let service: AuthService;
+  let usersService: { findByIdOrThrow: jest.Mock };
+  let jwtService: { verifyAsync: jest.Mock; signAsync: jest.Mock };
+  let prisma: { refreshToken: { updateMany: jest.Mock; create: jest.Mock } };
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+
+    usersService = { findByIdOrThrow: jest.fn().mockResolvedValue(makeUser()) };
+    jwtService = {
+      verifyAsync: jest.fn().mockResolvedValue({ sub: 'user-1', jti: 'jti-1' }),
+      signAsync: jest.fn().mockResolvedValue('token'),
+    };
+    prisma = {
+      refreshToken: {
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        create: jest.fn().mockResolvedValue({}),
+      },
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        AuthService,
+        { provide: UsersService, useValue: usersService },
+        { provide: PrismaService, useValue: prisma },
+        { provide: JwtService, useValue: jwtService },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) =>
+              key === 'JWT_REFRESH_EXPIRES_IN' ? '7d' : 'secret',
+            ),
+          },
+        },
+        { provide: OtpService, useValue: { verifyOtp: jest.fn() } },
+        {
+          provide: TrackingService,
+          useValue: { startSession: jest.fn(), fireAndForget: jest.fn() },
+        },
+      ],
+    }).compile();
+
+    service = module.get(AuthService);
+  });
+
+  it('consumes the token with one conditional updateMany', async () => {
+    await expect(service.refresh(REFRESH_TOKEN)).resolves.toEqual({
+      accessToken: 'token',
+      refreshToken: 'token',
+    });
+
+    expect(prisma.refreshToken.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'jti-1',
+        userId: 'user-1',
+        tokenHash: sha256(REFRESH_TOKEN),
+        revoked: false,
+        expiresAt: { gt: expect.any(Date) },
+      },
+      data: { revoked: true },
+    });
+    expect(prisma.refreshToken.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects when the row was already consumed', async () => {
+    prisma.refreshToken.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(service.refresh(REFRESH_TOKEN)).rejects.toThrow(
+      new UnauthorizedException('Invalid or expired refresh token'),
+    );
+    expect(usersService.findByIdOrThrow).not.toHaveBeenCalled();
+    expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects a bad signature before touching the database', async () => {
+    jwtService.verifyAsync.mockRejectedValue(new Error('invalid signature'));
+
+    await expect(service.refresh(REFRESH_TOKEN)).rejects.toThrow(
+      UnauthorizedException,
+    );
+    expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('two racing calls yield exactly one token pair', async () => {
+    prisma.refreshToken.updateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+
+    const results = await Promise.allSettled([
+      service.refresh(REFRESH_TOKEN),
+      service.refresh(REFRESH_TOKEN),
+    ]);
+
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1);
+    expect(prisma.refreshToken.create).toHaveBeenCalledTimes(1);
   });
 });

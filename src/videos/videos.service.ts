@@ -36,6 +36,18 @@ export interface SubtitleInfo {
   url: string;
 }
 
+/**
+ * One rung of the ladder as something a player can be pointed at: the
+ * rendition's OWN media playlist rather than the master. That is what
+ * "choose 720p" has to mean on a client whose player cannot be told to hold a
+ * video track — hand it a playlist that only has one. `label` is the stored
+ * resolution verbatim ("720p"), never re-derived and never translated.
+ */
+export interface StreamQualityInfo {
+  label: string;
+  url: string;
+}
+
 @Injectable()
 export class VideosService {
   private readonly logger = new Logger(VideosService.name);
@@ -121,7 +133,11 @@ export class VideosService {
     movieId: string,
     userId: string,
     role: Role,
-  ): Promise<{ playlistUrl: string; subtitles: SubtitleInfo[] }> {
+  ): Promise<{
+    playlistUrl: string;
+    qualities: StreamQualityInfo[];
+    subtitles: SubtitleInfo[];
+  }> {
     const movie = await this.prisma.movie.findUnique({
       where: { id: movieId },
       include: { series: true },
@@ -160,18 +176,86 @@ export class VideosService {
     });
 
     return {
-      // playbackUrl (not publicUrl): follows the host the client called the
-      // API on, so streaming survives the machine changing networks.
-      playlistUrl: this.minioService.playbackUrl(video.hlsMasterPath),
+      // signedPlaybackUrl: follows the host the client called the API on
+      // (so streaming survives the machine changing networks) AND carries
+      // the expiring path token the cache server insists on — the
+      // subscription check above is what earns the token, so it is the
+      // only thing standing between an unsubscribed viewer and the bytes.
+      playlistUrl: this.minioService.signedPlaybackUrl(video.hlsMasterPath),
+      // The same ladder the master adapts between, addressable one rung at a
+      // time — this is what lets a client pin a quality. Every rung lives under
+      // the master's own `videos/<id>/hls` scope, so it is the same token with
+      // one path component swapped; nothing new is signed and the cache server
+      // learns nothing.
+      qualities: this.buildQualities(video.renditions),
       subtitles: subtitles.map((s) => ({
         id: s.id,
         language: s.language,
         label: s.label,
         format: s.format,
         isDefault: s.isDefault,
-        url: this.minioService.playbackUrl(s.objectKey),
+        url: this.minioService.signedPlaybackUrl(s.objectKey),
       })),
     };
+  }
+
+  /**
+   * Turns the stored rendition list into signed, playable rungs.
+   *
+   * `Video.renditions` is a Json column, so what comes back is whatever was
+   * written into it — this mapper is therefore TOTAL: a missing column, a
+   * non-array, a malformed entry or a path that cannot be signed each drop out
+   * quietly instead of failing the whole playback bootstrap. A title with no
+   * usable rungs honestly reports an empty list, and the clients then offer no
+   * quality control at all.
+   *
+   * Sorted best-first HERE because the two producers disagree about order:
+   * the transcode path writes RENDITION_TIERS order (1080p→240p) while the
+   * bulk-upload path writes KNOWN_RENDITIONS order (240p→1080p). Sorting once,
+   * server-side, is what stops every client inventing its own answer.
+   */
+  private buildQualities(renditions: unknown): StreamQualityInfo[] {
+    if (!Array.isArray(renditions)) return [];
+
+    const qualities: StreamQualityInfo[] = [];
+    for (const entry of renditions) {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+        continue;
+      }
+      const { resolution, playlistPath } = entry as {
+        resolution?: unknown;
+        playlistPath?: unknown;
+      };
+      if (typeof resolution !== 'string' || resolution.trim() === '') continue;
+      if (typeof playlistPath !== 'string' || playlistPath.trim() === '') {
+        continue;
+      }
+
+      try {
+        qualities.push({
+          label: resolution,
+          url: this.minioService.signedPlaybackUrl(playlistPath),
+        });
+      } catch (error: unknown) {
+        // A path outside a signable scope throws (StreamKeyNotSignable) — a
+        // legacy row, or the LOCAL ffmpeg output path the transcoder holds
+        // before the upload rewrites it. One unplayable rung must never cost
+        // the viewer the whole stream.
+        this.logger.warn(
+          `Skipping unsignable rendition "${resolution}" (${playlistPath}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
+    // An unparseable label sorts last and, the sort being stable, keeps its
+    // place among its own kind.
+    const height = (label: string): number => {
+      const match = /(\d+)/.exec(label);
+      return match ? Number(match[1]) : -1;
+    };
+    return qualities.sort((a, b) => height(b.label) - height(a.label));
   }
 
   /**
@@ -278,7 +362,7 @@ export class VideosService {
       duration: video.duration,
       resolution: video.resolution,
       hlsMasterPath: video.hlsMasterPath
-        ? this.minioService.playbackUrl(video.hlsMasterPath)
+        ? this.minioService.signedPlaybackUrl(video.hlsMasterPath)
         : null,
       renditions: video.renditions,
       createdAt: video.createdAt,

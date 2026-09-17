@@ -23,12 +23,16 @@ export class InitUploadDto {
   movieId!: string;
 
   /**
-   * Only set for the externally-pre-transcoded upload flow — where this
-   * file lands under `videos/<movieId>/` (e.g. "original.mp4",
-   * "hls/720p/index.m3u8", "hls/720p/segment_000.ts"). No ".." or leading
-   * "/" — this becomes part of a real storage key, not a query the user
-   * types in, but a client bug or a tampered request could still supply a
-   * path that escapes the movie's own folder.
+   * Only set for the externally-pre-transcoded upload flow — the file's
+   * position inside the bundle the operator produced (e.g. "original.mp4",
+   * "hls/720p/index.m3u8", "hls/720p/segment_000.ts",
+   * "subtitles/english.vtt"). Which object key that becomes is
+   * ResourceUploadTypeRegistry's decision, not this field's: most of the
+   * bundle lands under `videos/<movieId>/`, while a subtitle SOURCE is
+   * routed to `subtitles/<movieId>/`. No ".." or leading "/" — this becomes
+   * part of a real storage key, not a query the user types in, but a client
+   * bug or a tampered request could still supply a path that escapes the
+   * movie's own folder.
    */
   @IsOptional()
   @IsString()

@@ -1,7 +1,17 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, PaymentAccountTransactionType } from '../generated/prisma/client';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import {
+  Prisma,
+  PaymentAccountTransactionType,
+} from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { AuditService } from '../audit/audit.service';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import type { CreateManualPaymentAccountTransactionDto } from './dto/create-manual-payment-account-transaction.dto';
+import { paymentAccountLabel } from './payment-account-label';
 
 /** Types that increase a PaymentAccount's balance. Everything else decreases it. */
 const CREDIT_TYPES = new Set<PaymentAccountTransactionType>([
@@ -45,13 +55,16 @@ interface LinkableWithdrawal {
  */
 @Injectable()
 export class PaymentAccountLedgerService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+  ) {}
 
   /** Manual Add/Remove Money — entry point for the admin dialog. Owns its own transaction. */
   async recordManualEntry(
     paymentAccountId: string,
     dto: CreateManualPaymentAccountTransactionDto,
-    actorUserId: string,
+    actor: AuthenticatedUser,
   ) {
     return this.prisma.$transaction(async (tx) => {
       const account = await tx.paymentAccount.findUnique({
@@ -59,15 +72,40 @@ export class PaymentAccountLedgerService {
       });
       if (!account) throw new NotFoundException('Payment account not found');
 
-      return this.applyMovement(tx, paymentAccountId, {
+      const movement = await this.applyMovement(tx, paymentAccountId, {
         type: dto.type,
         amount: dto.amount,
         referenceCode: dto.referenceCode ?? null,
         note: dto.note ?? null,
         relatedDepositId: null,
         relatedWithdrawalId: null,
-        performedByUserId: actorUserId,
+        performedByUserId: actor.id,
       });
+
+      // Inside the ledger transaction, so the audit row commits with the
+      // entry (and rolls back with it). The ledger row itself is the
+      // before/after; the audit row summarises it.
+      await this.audit.record({
+        action: 'payment_account.ledger_entry',
+        actor,
+        target: {
+          type: 'payment_account',
+          id: paymentAccountId,
+          label: paymentAccountLabel(account),
+        },
+        metadata: {
+          entryType: movement.entry.type,
+          amount: movement.entry.amount,
+          balanceBefore: movement.entry.balanceBefore,
+          balanceAfter: movement.entry.balanceAfter,
+          transactionId: movement.entry.id,
+          referenceCode: movement.entry.referenceCode,
+          note: movement.entry.note,
+        },
+        tx,
+      });
+
+      return movement;
     });
   }
 
@@ -94,7 +132,10 @@ export class PaymentAccountLedgerService {
     if (newPaymentAccountId === deposit.receivingPaymentAccountId) return;
 
     const claim = await tx.deposit.updateMany({
-      where: { id: deposit.id, receivingPaymentAccountId: deposit.receivingPaymentAccountId },
+      where: {
+        id: deposit.id,
+        receivingPaymentAccountId: deposit.receivingPaymentAccountId,
+      },
       data: { receivingPaymentAccountId: newPaymentAccountId },
     });
     if (claim.count !== 1) {
@@ -138,7 +179,10 @@ export class PaymentAccountLedgerService {
     if (newPaymentAccountId === withdrawal.transferPaymentAccountId) return;
 
     const claim = await tx.withdrawal.updateMany({
-      where: { id: withdrawal.id, transferPaymentAccountId: withdrawal.transferPaymentAccountId },
+      where: {
+        id: withdrawal.id,
+        transferPaymentAccountId: withdrawal.transferPaymentAccountId,
+      },
       data: { transferPaymentAccountId: newPaymentAccountId },
     });
     if (claim.count !== 1) {
@@ -196,12 +240,16 @@ export class PaymentAccountLedgerService {
       where: { id: paymentAccountId },
       data: {
         balance: { increment: signed },
-        ...(isCredit ? { totalIn: { increment: amount } } : { totalOut: { increment: amount } }),
+        ...(isCredit
+          ? { totalIn: { increment: amount } }
+          : { totalOut: { increment: amount } }),
       },
     });
 
     const balanceAfter = account.balance;
-    const balanceBefore = isCredit ? balanceAfter.minus(amount) : balanceAfter.plus(amount);
+    const balanceBefore = isCredit
+      ? balanceAfter.minus(amount)
+      : balanceAfter.plus(amount);
 
     const entry = await tx.paymentAccountTransaction.create({
       data: {

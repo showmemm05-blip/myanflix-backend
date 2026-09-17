@@ -8,7 +8,11 @@ import { randomUUID } from 'node:crypto';
 import { extname } from 'node:path';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
+import { StorageService } from '../common/storage/storage.service';
 import { SubtitleFormat } from '../generated/prisma/client';
+import { AuditService } from '../audit/audit.service';
+import { subtitleSnapshot } from '../audit/audit-snapshots';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { HlsSubtitlesService } from './hls-subtitles.service';
 import type { SubtitlePublishResult } from './hls-subtitles.service';
 import type { CreateSubtitleDto } from './dto/create-subtitle.dto';
@@ -27,13 +31,16 @@ export class SubtitlesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
+    private readonly storageService: StorageService,
     private readonly hlsSubtitlesService: HlsSubtitlesService,
+    private readonly audit: AuditService,
   ) {}
 
   async create(
     dto: CreateSubtitleDto,
     originalFilename: string,
     buffer: Buffer,
+    actor: AuthenticatedUser,
   ) {
     const video = await this.prisma.video.findUnique({
       where: { id: dto.videoId },
@@ -51,11 +58,21 @@ export class SubtitlesService {
       );
     }
 
-    // Generated up front so the object key (keyed by subtitle id, not
-    // language — a video can have more than one track per language) is
-    // known before the row exists.
+    // Generated up front so the filename (the subtitle id, not the language —
+    // a video can have more than one track per language) is known before the
+    // row exists.
+    //
+    // The key is foldered by the OWNING MOVIE, which is why the movie is
+    // resolved here rather than only for the audit row below: a title's
+    // sources are then one prefix delete, and one `subtitles/<movieId>`
+    // scope signs every track the stream response hands out — exactly like
+    // the bulk bundle flow, which writes its operator-named files into the
+    // same folder.
     const id = randomUUID();
-    const objectKey = `subtitles/${id}/original${extension}`;
+    const objectKey = this.storageService.subtitleSourceKey(
+      video.movieId,
+      `${id}${extension}`,
+    );
     await this.minioService.uploadBuffer(objectKey, buffer);
 
     if (dto.isDefault) {
@@ -76,6 +93,18 @@ export class SubtitlesService {
 
     await this.publishQuietly(dto.videoId);
 
+    await this.audit.record({
+      action: 'subtitle.upload',
+      actor,
+      target: { type: 'subtitle', id: subtitle.id, label: subtitle.label },
+      after: subtitleSnapshot(subtitle),
+      metadata: {
+        movieId: video.movieId,
+        videoId: subtitle.videoId,
+        originalFilename,
+      },
+    });
+
     return subtitle;
   }
 
@@ -85,6 +114,12 @@ export class SubtitlesService {
    * same chunked mechanism as everything else) — just records the row, no
    * upload involved. Always non-default: the admin can promote one via the
    * existing setDefault() once the movie is published.
+   *
+   * The key is whatever that flow built —
+   * `subtitles/<movieId>/<operator's own filename>`, the same folder
+   * create() writes into, so both ingest paths land in one namespace and
+   * remove() below can delete either of them without knowing which flow
+   * produced it.
    */
   async createFromExistingKey(data: {
     videoId: string;
@@ -116,7 +151,7 @@ export class SubtitlesService {
     });
   }
 
-  async update(id: string, dto: UpdateSubtitleDto) {
+  async update(id: string, dto: UpdateSubtitleDto, actor: AuthenticatedUser) {
     const subtitle = await this.assertExists(id);
 
     if (dto.isDefault) {
@@ -136,10 +171,19 @@ export class SubtitlesService {
     // its menu, so a metadata edit has to reach the manifest too.
     await this.publishQuietly(subtitle.videoId);
 
+    await this.audit.record({
+      action: 'subtitle.update',
+      actor,
+      target: { type: 'subtitle', id, label: updated.label },
+      before: subtitleSnapshot(subtitle),
+      after: subtitleSnapshot(updated),
+      metadata: await this.ownerIds(subtitle.videoId),
+    });
+
     return updated;
   }
 
-  async remove(id: string): Promise<void> {
+  async remove(id: string, actor: AuthenticatedUser): Promise<void> {
     const subtitle = await this.assertExists(id);
     const video = await this.prisma.video.findUnique({
       where: { id: subtitle.videoId },
@@ -147,6 +191,17 @@ export class SubtitlesService {
     });
 
     await this.prisma.subtitle.delete({ where: { id } });
+
+    await this.audit.record({
+      action: 'subtitle.delete',
+      actor,
+      target: { type: 'subtitle', id, label: subtitle.label },
+      before: subtitleSnapshot(subtitle),
+      metadata: {
+        movieId: video?.movieId ?? null,
+        videoId: subtitle.videoId,
+      },
+    });
 
     // Manifest FIRST, objects only once it succeeded. The re-publish is
     // best-effort (see publishQuietly), so deleting the objects up front and
@@ -163,10 +218,25 @@ export class SubtitlesService {
     if (video && republished) {
       await this.hlsSubtitlesService.unpublishSubtitle(video.movieId, id);
     }
+
+    // The uploaded SOURCE file — previously left behind on every delete, so
+    // a title that had its tracks replaced a few times kept paying for every
+    // .srt ever uploaded to it, with no row left to find them by. Last, and
+    // best-effort for the same reason as unpublishSubtitle(): nothing serves
+    // it any more once the row is gone, so a failure here is inert storage
+    // rather than a broken manifest.
+    try {
+      await this.minioService.deleteObject(subtitle.objectKey);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        `Could not delete subtitle source ${subtitle.objectKey}: ${reason}`,
+      );
+    }
   }
 
   /** Atomically claims "default" for this subtitle, unsetting any other default for the same video in the same transaction. */
-  async setDefault(id: string) {
+  async setDefault(id: string, actor: AuthenticatedUser) {
     const subtitle = await this.assertExists(id);
 
     await this.prisma.$transaction([
@@ -179,7 +249,31 @@ export class SubtitlesService {
 
     await this.publishQuietly(subtitle.videoId);
 
-    return this.prisma.subtitle.findUniqueOrThrow({ where: { id } });
+    const updated = await this.prisma.subtitle.findUniqueOrThrow({
+      where: { id },
+    });
+
+    await this.audit.record({
+      action: 'subtitle.set_default',
+      actor,
+      target: { type: 'subtitle', id, label: updated.label },
+      before: subtitleSnapshot(subtitle),
+      after: subtitleSnapshot(updated),
+      metadata: await this.ownerIds(subtitle.videoId),
+    });
+
+    return updated;
+  }
+
+  /** `{ movieId, videoId }` for an audit row — the movie a track belongs to is one hop away. */
+  private async ownerIds(
+    videoId: string,
+  ): Promise<{ movieId: string | null; videoId: string }> {
+    const video = await this.prisma.video.findUnique({
+      where: { id: videoId },
+      select: { movieId: true },
+    });
+    return { movieId: video?.movieId ?? null, videoId };
   }
 
   /**

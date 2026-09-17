@@ -9,6 +9,16 @@ import { Prisma, Role } from '../generated/prisma/client';
 import { PermissionResolverService } from '../roles/permission-resolver.service';
 import { createSeededPermissionResolver } from '../../test/seeded-permission-resolver';
 import type { CreateManualPaymentAccountTransactionDto } from './dto/create-manual-payment-account-transaction.dto';
+import { AuditService } from '../audit/audit.service';
+
+/** The staff member performing every mutation below — `id` is what the createdBy/updatedBy stamps check. */
+const actor = {
+  id: 'user-1',
+  username: 'admin.blake',
+  role: Role.SUPER_ADMIN,
+  appRoleId: null,
+};
+const otherActor = { ...actor, id: 'user-2' };
 
 describe('PaymentAccountsService', () => {
   let service: PaymentAccountsService;
@@ -37,6 +47,13 @@ describe('PaymentAccountsService', () => {
   };
   let paymentAccountLedgerService: { recordManualEntry: jest.Mock };
   let realtimeGateway: { notifyAdminsPaymentAccountUpdated: jest.Mock };
+  let minio: {
+    playbackUrl: jest.Mock;
+    imageUrl: jest.Mock;
+    canonicalImageUrl: jest.Mock;
+    keyFromPublicUrl: jest.Mock;
+    deleteObject: jest.Mock;
+  };
 
   const adminRow = {
     id: 'acct-1',
@@ -87,6 +104,33 @@ describe('PaymentAccountsService', () => {
     };
     paymentAccountLedgerService = { recordManualEntry: jest.fn() };
     realtimeGateway = { notifyAdminsPaymentAccountUpdated: jest.fn() };
+    minio = {
+      playbackUrl: jest.fn(
+        (key: string) => `http://cache.test:8080/movies/${key}`,
+      ),
+      // Mirrors the real imageUrl(): re-hosts a URL under our bucket,
+      // passes anything external through untouched.
+      imageUrl: jest.fn((url: string | null | undefined) => {
+        if (!url) return url ?? null;
+        const match = /\/movies\/(.+)$/.exec(url);
+        return match ? `http://cache.test:8080/movies/${match[1]}` : url;
+      }),
+      // Mirrors the real canonicalImageUrl(): the form that gets PERSISTED —
+      // one of our objects re-addressed by the CONFIGURED base rather than by
+      // whichever host the admin was on. An external URL, and an absent one,
+      // pass through untouched (an omitted logoUrl must stay undefined, or
+      // Prisma would write it instead of leaving the column alone).
+      canonicalImageUrl: jest.fn((url: string | null | undefined) => {
+        if (!url) return url;
+        const match = /\/movies\/(images\/.+)$/.exec(url);
+        return match ? `http://configured-base:8080/movies/${match[1]}` : url;
+      }),
+      keyFromPublicUrl: jest.fn((url: string) => {
+        const match = /\/movies\/(.+)$/.exec(url);
+        return match ? match[1] : null;
+      }),
+      deleteObject: jest.fn().mockResolvedValue(undefined),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -97,24 +141,14 @@ describe('PaymentAccountsService', () => {
           useValue: paymentAccountLedgerService,
         },
         { provide: RealtimeGateway, useValue: realtimeGateway },
-        {
-          provide: MinioService,
-          useValue: {
-            playbackUrl: jest.fn(
-              (key: string) => `http://cache.test:8080/movies/${key}`,
-            ),
-            // Mirrors the real imageUrl(): re-hosts a URL under our bucket,
-            // passes anything external through untouched.
-            imageUrl: jest.fn((url: string | null | undefined) => {
-              if (!url) return url ?? null;
-              const match = /\/movies\/(.+)$/.exec(url);
-              return match ? `http://cache.test:8080/movies/${match[1]}` : url;
-            }),
-          },
-        },
+        { provide: MinioService, useValue: minio },
         {
           provide: PermissionResolverService,
           useValue: createSeededPermissionResolver(),
+        },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
         },
       ],
     }).compile();
@@ -275,10 +309,10 @@ describe('PaymentAccountsService', () => {
         logoUrl: null,
       });
 
-      const result = await service.createType({
-        label: 'Wave Pay',
-        requiresBankName: false,
-      });
+      const result = await service.createType(
+        { label: 'Wave Pay', requiresBankName: false },
+        actor,
+      );
 
       expect(prisma.paymentMethodType.create).toHaveBeenCalledWith({
         data: { label: 'Wave Pay', requiresBankName: false },
@@ -302,7 +336,10 @@ describe('PaymentAccountsService', () => {
       });
 
       await expect(
-        service.createType({ label: 'Wave Pay', requiresBankName: false }),
+        service.createType(
+          { label: 'Wave Pay', requiresBankName: false },
+          actor,
+        ),
       ).rejects.toThrow(ConflictException);
       expect(prisma.paymentMethodType.create).not.toHaveBeenCalled();
     });
@@ -316,11 +353,14 @@ describe('PaymentAccountsService', () => {
         logoUrl: 'https://cdn.example.com/wave-pay.png',
       });
 
-      const result = await service.createType({
-        label: 'Wave Pay',
-        requiresBankName: false,
-        logoUrl: 'https://cdn.example.com/wave-pay.png',
-      });
+      const result = await service.createType(
+        {
+          label: 'Wave Pay',
+          requiresBankName: false,
+          logoUrl: 'https://cdn.example.com/wave-pay.png',
+        },
+        actor,
+      );
 
       expect(prisma.paymentMethodType.create).toHaveBeenCalledWith({
         data: {
@@ -331,6 +371,37 @@ describe('PaymentAccountsService', () => {
       });
       expect(result.logoUrl).toBe('https://cdn.example.com/wave-pay.png');
     });
+
+    /**
+     * The admin posts back the logo URL it was just handed, which carries
+     * whichever host that one request came in on. Storing it verbatim is how
+     * the two surviving KBZPay/WavePay rows ended up pinned to a LAN IP that
+     * stopped existing at the next network hop.
+     */
+    it('re-pins a logo of ours to the configured base before storing it, instead of the uploading host', async () => {
+      prisma.paymentMethodType.findUnique.mockResolvedValue(null);
+      prisma.paymentMethodType.create.mockResolvedValue({
+        id: 't3',
+        label: 'KBZPay',
+        requiresBankName: false,
+        logoUrl: 'http://configured-base:8080/movies/images/payment/logo.webp',
+      });
+
+      await service.createType(
+        {
+          label: 'KBZPay',
+          logoUrl: 'http://192.168.10.122:8080/movies/images/payment/logo.webp',
+        },
+        actor,
+      );
+
+      expect(prisma.paymentMethodType.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          logoUrl:
+            'http://configured-base:8080/movies/images/payment/logo.webp',
+        }),
+      });
+    });
   });
 
   describe('updateType', () => {
@@ -338,7 +409,7 @@ describe('PaymentAccountsService', () => {
       prisma.paymentMethodType.findUnique.mockResolvedValue(null);
 
       await expect(
-        service.updateType('nope', { requiresBankName: true }),
+        service.updateType('nope', { requiresBankName: true }, actor),
       ).rejects.toThrow(NotFoundException);
     });
 
@@ -355,7 +426,11 @@ describe('PaymentAccountsService', () => {
         logoUrl: null,
       });
 
-      const result = await service.updateType('t1', { requiresBankName: true });
+      const result = await service.updateType(
+        't1',
+        { requiresBankName: true },
+        actor,
+      );
 
       expect(prisma.paymentAccount.updateMany).not.toHaveBeenCalled();
       expect(prisma.paymentMethodType.update).toHaveBeenCalledWith({
@@ -385,9 +460,11 @@ describe('PaymentAccountsService', () => {
         logoUrl: 'https://cdn.example.com/wave-pay.png',
       });
 
-      const result = await service.updateType('t1', {
-        logoUrl: 'https://cdn.example.com/wave-pay.png',
-      });
+      const result = await service.updateType(
+        't1',
+        { logoUrl: 'https://cdn.example.com/wave-pay.png' },
+        actor,
+      );
 
       expect(prisma.paymentMethodType.update).toHaveBeenCalledWith({
         where: { id: 't1' },
@@ -412,8 +489,14 @@ describe('PaymentAccountsService', () => {
         label: 'Wave Money',
         requiresBankName: false,
       });
+      // The fan-out count feeds the audit row's metadata.affectedAccounts.
+      prisma.paymentAccount.updateMany.mockResolvedValue({ count: 2 });
 
-      const result = await service.updateType('t1', { label: 'Wave Money' });
+      const result = await service.updateType(
+        't1',
+        { label: 'Wave Money' },
+        actor,
+      );
 
       expect(prisma.$transaction).toHaveBeenCalled();
       expect(prisma.paymentAccount.updateMany).toHaveBeenCalledWith({
@@ -433,6 +516,60 @@ describe('PaymentAccountsService', () => {
       });
     });
 
+    it('re-pins a logo of ours on BOTH update branches — the rename one and the plain one', async () => {
+      const stale =
+        'http://192.168.10.122:8080/movies/images/payment/logo.webp';
+      const canonical =
+        'http://configured-base:8080/movies/images/payment/logo.webp';
+
+      // Plain update: no rename, one update call.
+      prisma.paymentMethodType.findUnique.mockResolvedValue({
+        id: 't1',
+        label: 'Wave Pay',
+        requiresBankName: false,
+        logoUrl: null,
+      });
+      prisma.paymentMethodType.update.mockResolvedValue({
+        id: 't1',
+        label: 'Wave Pay',
+        requiresBankName: false,
+        logoUrl: canonical,
+      });
+
+      await service.updateType('t1', { logoUrl: stale }, actor);
+
+      expect(prisma.paymentMethodType.update).toHaveBeenCalledWith({
+        where: { id: 't1' },
+        data: expect.objectContaining({ logoUrl: canonical }),
+      });
+
+      // Rename branch: the label changes, so the write happens inside the
+      // fan-out transaction — a second, separate code path.
+      prisma.paymentMethodType.findUnique
+        .mockResolvedValueOnce({
+          id: 't1',
+          label: 'Wave Pay',
+          requiresBankName: false,
+          logoUrl: null,
+        })
+        .mockResolvedValueOnce(null);
+      prisma.paymentAccount.updateMany.mockResolvedValue({ count: 0 });
+
+      await service.updateType(
+        't1',
+        { label: 'Wave Money', logoUrl: stale },
+        actor,
+      );
+
+      expect(prisma.paymentMethodType.update).toHaveBeenLastCalledWith({
+        where: { id: 't1' },
+        data: expect.objectContaining({
+          label: 'Wave Money',
+          logoUrl: canonical,
+        }),
+      });
+    });
+
     it('rejects renaming into a label another method already uses', async () => {
       prisma.paymentMethodType.findUnique
         .mockResolvedValueOnce({
@@ -443,7 +580,7 @@ describe('PaymentAccountsService', () => {
         .mockResolvedValueOnce({ id: 't2', label: 'AYA Pay' });
 
       await expect(
-        service.updateType('t1', { label: 'AYA Pay' }),
+        service.updateType('t1', { label: 'AYA Pay' }, actor),
       ).rejects.toThrow(ConflictException);
       expect(prisma.paymentAccount.updateMany).not.toHaveBeenCalled();
     });
@@ -453,7 +590,7 @@ describe('PaymentAccountsService', () => {
     it('throws NotFoundException for an unknown method', async () => {
       prisma.paymentMethodType.findUnique.mockResolvedValue(null);
 
-      await expect(service.removeType('nope')).rejects.toThrow(
+      await expect(service.removeType('nope', actor)).rejects.toThrow(
         NotFoundException,
       );
     });
@@ -465,7 +602,9 @@ describe('PaymentAccountsService', () => {
       });
       prisma.paymentAccount.count.mockResolvedValue(2);
 
-      await expect(service.removeType('t1')).rejects.toThrow(ConflictException);
+      await expect(service.removeType('t1', actor)).rejects.toThrow(
+        ConflictException,
+      );
       expect(prisma.paymentMethodType.delete).not.toHaveBeenCalled();
     });
 
@@ -476,12 +615,54 @@ describe('PaymentAccountsService', () => {
       });
       prisma.paymentAccount.count.mockResolvedValue(0);
 
-      const result = await service.removeType('t1');
+      const result = await service.removeType('t1', actor);
 
       expect(prisma.paymentMethodType.delete).toHaveBeenCalledWith({
         where: { id: 't1' },
       });
       expect(result).toEqual({ deleted: true });
+    });
+
+    it("deletes the method's logo object too — nothing else in the system ever would", async () => {
+      prisma.paymentMethodType.findUnique.mockResolvedValue({
+        id: 't1',
+        label: 'Wave Pay',
+        logoUrl: 'http://cache.test:8080/movies/images/payment/logo.webp',
+      });
+      prisma.paymentAccount.count.mockResolvedValue(0);
+
+      await service.removeType('t1', actor);
+
+      expect(minio.deleteObject).toHaveBeenCalledWith(
+        'images/payment/logo.webp',
+      );
+    });
+
+    it('still reports the delete when the logo cleanup fails — the method is already gone', async () => {
+      prisma.paymentMethodType.findUnique.mockResolvedValue({
+        id: 't1',
+        label: 'Wave Pay',
+        logoUrl: 'http://cache.test:8080/movies/images/payment/logo.webp',
+      });
+      prisma.paymentAccount.count.mockResolvedValue(0);
+      minio.deleteObject.mockRejectedValue(new Error('minio down'));
+
+      await expect(service.removeType('t1', actor)).resolves.toEqual({
+        deleted: true,
+      });
+    });
+
+    it('touches storage at all only when a logo was actually set', async () => {
+      prisma.paymentMethodType.findUnique.mockResolvedValue({
+        id: 't1',
+        label: 'Wave Pay',
+        logoUrl: null,
+      });
+      prisma.paymentAccount.count.mockResolvedValue(0);
+
+      await service.removeType('t1', actor);
+
+      expect(minio.deleteObject).not.toHaveBeenCalled();
     });
   });
 
@@ -495,7 +676,7 @@ describe('PaymentAccountsService', () => {
           accountName: 'MyanFlix',
           accountNumber: '09123456789',
         },
-        'user-1',
+        actor,
       );
 
       expect(prisma.paymentAccount.create).toHaveBeenCalledWith(
@@ -518,7 +699,7 @@ describe('PaymentAccountsService', () => {
           accountName: 'MyanFlix',
           accountNumber: '09123456789',
         },
-        'user-1',
+        actor,
       );
 
       expect(prisma.paymentAccount.create).toHaveBeenCalledWith(
@@ -535,7 +716,7 @@ describe('PaymentAccountsService', () => {
       prisma.paymentAccount.findUnique.mockResolvedValue(null);
 
       await expect(
-        service.update('nope', { isActive: false }, 'user-1'),
+        service.update('nope', { isActive: false }, actor),
       ).rejects.toThrow(NotFoundException);
       expect(prisma.paymentAccount.update).not.toHaveBeenCalled();
     });
@@ -550,7 +731,7 @@ describe('PaymentAccountsService', () => {
       const result = await service.update(
         'acct-1',
         { isActive: false },
-        'user-2',
+        otherActor,
       );
 
       expect(prisma.paymentAccount.update).toHaveBeenCalledWith(
@@ -570,7 +751,9 @@ describe('PaymentAccountsService', () => {
     it('throws NotFoundException for an unknown account, without deleting anything', async () => {
       prisma.paymentAccount.findUnique.mockResolvedValue(null);
 
-      await expect(service.remove('nope')).rejects.toThrow(NotFoundException);
+      await expect(service.remove('nope', actor)).rejects.toThrow(
+        NotFoundException,
+      );
       expect(prisma.paymentAccount.delete).not.toHaveBeenCalled();
     });
 
@@ -579,7 +762,7 @@ describe('PaymentAccountsService', () => {
       prisma.paymentAccountTransaction.count.mockResolvedValue(0);
       prisma.paymentAccount.delete.mockResolvedValue(adminRow);
 
-      const result = await service.remove('acct-1');
+      const result = await service.remove('acct-1', actor);
 
       expect(prisma.paymentAccountTransaction.count).toHaveBeenCalledWith({
         where: { paymentAccountId: 'acct-1' },
@@ -594,7 +777,9 @@ describe('PaymentAccountsService', () => {
       prisma.paymentAccount.findUnique.mockResolvedValue({ id: 'acct-1' });
       prisma.paymentAccountTransaction.count.mockResolvedValue(3);
 
-      await expect(service.remove('acct-1')).rejects.toThrow(ConflictException);
+      await expect(service.remove('acct-1', actor)).rejects.toThrow(
+        ConflictException,
+      );
       expect(prisma.paymentAccount.delete).not.toHaveBeenCalled();
     });
   });
@@ -819,7 +1004,7 @@ describe('PaymentAccountsService', () => {
           type: 'MANUAL_CREDIT',
           amount: 1000,
         } as CreateManualPaymentAccountTransactionDto,
-        'user-1',
+        actor,
       );
 
       expect(paymentAccountLedgerService.recordManualEntry).toHaveBeenCalled();

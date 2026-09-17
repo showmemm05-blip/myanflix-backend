@@ -4,11 +4,16 @@ import {
   ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
-import { ClientPlatform, CommentStatus, Role } from '../generated/prisma/client';
+import {
+  ClientPlatform,
+  CommentStatus,
+  Role,
+} from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { requestHostContext } from '../common/storage/request-host.context';
 import { PermissionResolverService } from '../roles/permission-resolver.service';
+import { AuditService } from '../audit/audit.service';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { CommentsService, COMMENT_BODY_MAX } from './comments.service';
 
@@ -17,7 +22,9 @@ const SERIES_ID = '22222222-2222-4222-8222-222222222222';
 const PARENT_ID = '33333333-3333-4333-8333-333333333333';
 const BOOK_ID = '44444444-4444-4444-8444-444444444444';
 
-function makeActor(overrides: Partial<AuthenticatedUser> = {}): AuthenticatedUser {
+function makeActor(
+  overrides: Partial<AuthenticatedUser> = {},
+): AuthenticatedUser {
   return {
     id: 'user-1',
     username: 'blake',
@@ -87,9 +94,15 @@ describe('CommentsService', () => {
         { provide: PrismaService, useValue: prisma },
         {
           provide: MinioService,
-          useValue: { playbackUrl: jest.fn((key: string) => `http://host/${key}`) },
+          useValue: {
+            playbackUrl: jest.fn((key: string) => `http://host/${key}`),
+          },
         },
         { provide: PermissionResolverService, useValue: resolver },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -143,9 +156,9 @@ describe('CommentsService', () => {
     });
 
     it('rejects a comment that names none', async () => {
-      await expect(
-        service.create('user-1', { body: 'Great' }),
-      ).rejects.toThrow(BadRequestException);
+      await expect(service.create('user-1', { body: 'Great' })).rejects.toThrow(
+        BadRequestException,
+      );
       expect(prisma.comment.create).not.toHaveBeenCalled();
     });
 
@@ -550,7 +563,7 @@ describe('CommentsService', () => {
               id: 'user-1',
               username: 'blake',
               displayName: 'Blake',
-              avatar: 'images/avatars/user-1.png',
+              avatar: 'images/user/user-1/1757606400000.png',
             },
           }),
           replies: [createdRow({ id: 'comment-2', body: 'agreed' })],
@@ -559,7 +572,9 @@ describe('CommentsService', () => {
 
       const [comment] = await service.findForTitle({ movieId: MOVIE_ID });
 
-      expect(comment.user.avatarUrl).toBe('http://host/images/avatars/user-1.png');
+      expect(comment.user.avatarUrl).toBe(
+        'http://host/images/user/user-1/1757606400000.png',
+      );
       expect(comment.replies.map((reply) => reply.id)).toEqual(['comment-2']);
       expect(comment.replies[0].replies).toEqual([]);
     });
@@ -625,9 +640,9 @@ describe('CommentsService', () => {
     it('404s for a comment that does not exist', async () => {
       prisma.comment.findUnique.mockResolvedValue(null);
 
-      await expect(
-        service.remove('comment-1', makeActor()),
-      ).rejects.toThrow(NotFoundException);
+      await expect(service.remove('comment-1', makeActor())).rejects.toThrow(
+        NotFoundException,
+      );
     });
   });
 });

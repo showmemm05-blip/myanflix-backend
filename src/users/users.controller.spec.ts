@@ -5,18 +5,21 @@ import {
   INestApplication,
   ValidationPipe,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import { Role, UserStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
+import { StorageService } from '../common/storage/storage.service';
 import { MoviesService } from '../movies/movies.service';
 import { VideosService } from '../videos/videos.service';
 import { WalletAdjustmentsService } from '../wallet/wallet-adjustments.service';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { AuthorityService } from '../roles/authority.service';
 import { PermissionResolverService } from '../roles/permission-resolver.service';
+import { AuditService } from '../audit/audit.service';
 import { createSeededPermissionResolver } from '../../test/seeded-permission-resolver';
 import { UsersController } from './users.controller';
 import { UsersService } from './users.service';
@@ -117,6 +120,15 @@ describe('UsersController — self-service "me" routes (profile, password, avata
         AuthorityService,
         { provide: PrismaService, useValue: prisma },
         { provide: MinioService, useValue: minio },
+        // The REAL key builder: the avatar key shape asserted below is the
+        // one the layout declares, not one this spec invented. It only reads
+        // STORAGE_PATH for local paths, which no avatar route touches.
+        StorageService,
+        { provide: ConfigService, useValue: { get: () => undefined } },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
         { provide: MoviesService, useValue: {} },
         { provide: VideosService, useValue: {} },
         { provide: WalletAdjustmentsService, useValue: {} },
@@ -130,7 +142,12 @@ describe('UsersController — self-service "me" routes (profile, password, avata
         },
         // Constructor dependency of UsersController (the two /level routes);
         // the level math itself is covered by levels.service.spec.ts.
-        { provide: LevelsService, useValue: { getLevelsForUsers: jest.fn().mockResolvedValue(new Map()) } },
+        {
+          provide: LevelsService,
+          useValue: {
+            getLevelsForUsers: jest.fn().mockResolvedValue(new Map()),
+          },
+        },
       ],
     })
       .overrideGuard(PermissionsGuard)
@@ -174,7 +191,7 @@ describe('UsersController — self-service "me" routes (profile, password, avata
   ]);
 
   describe('POST /users/me/avatar', () => {
-    it('uploads the image under a versioned images/avatars/ key and responds with the profile shape (avatarUrl, never the raw key)', async () => {
+    it("uploads the image under a versioned key in the user's OWN images/user/<id>/ folder and responds with the profile shape (avatarUrl, never the raw key)", async () => {
       const response = await request(app.getHttpServer())
         .post('/users/me/avatar')
         .attach('file', PNG_BYTES, {
@@ -189,7 +206,7 @@ describe('UsersController — self-service "me" routes (profile, password, avata
         Buffer,
       ];
       expect(uploadedKey).toMatch(
-        new RegExp(`^images/avatars/${USER_ID}-\\d+\\.png$`),
+        new RegExp(`^images/user/${USER_ID}/\\d+\\.png$`),
       );
       expect(prisma.user.update).toHaveBeenCalledWith({
         where: { id: USER_ID },
@@ -269,7 +286,7 @@ describe('UsersController — self-service "me" routes (profile, password, avata
     });
 
     it('best-effort deletes the previous avatar object when replacing', async () => {
-      const oldKey = `images/avatars/${USER_ID}-1000.jpg`;
+      const oldKey = `images/user/${USER_ID}/1000.jpg`;
       prisma.user.findUnique.mockResolvedValue(makeUserRow({ avatar: oldKey }));
 
       await request(app.getHttpServer())
@@ -283,7 +300,7 @@ describe('UsersController — self-service "me" routes (profile, password, avata
       expect(minio.deleteObject).toHaveBeenCalledWith(oldKey);
     });
 
-    it('never deletes a previous key that is not under images/avatars/', async () => {
+    it("never deletes a previous key that is not under this user's own images/user/<id>/ folder", async () => {
       prisma.user.findUnique.mockResolvedValue(
         makeUserRow({ avatar: 'videos/movie-1/original.mp4' }),
       );
@@ -299,9 +316,27 @@ describe('UsersController — self-service "me" routes (profile, password, avata
       expect(minio.deleteObject).not.toHaveBeenCalled();
     });
 
+    it("never deletes ANOTHER user's avatar, even though it is under images/user/ too — the guard is the folder, not the tree", async () => {
+      prisma.user.findUnique.mockResolvedValue(
+        makeUserRow({
+          avatar: 'images/user/ffffffff-0000-0000-0000-000000000000/1000.png',
+        }),
+      );
+
+      await request(app.getHttpServer())
+        .post('/users/me/avatar')
+        .attach('file', PNG_BYTES, {
+          filename: 'photo.png',
+          contentType: 'image/png',
+        })
+        .expect(201);
+
+      expect(minio.deleteObject).not.toHaveBeenCalled();
+    });
+
     it('still succeeds when deleting the previous object fails (delete is best-effort)', async () => {
       prisma.user.findUnique.mockResolvedValue(
-        makeUserRow({ avatar: `images/avatars/${USER_ID}-1000.png` }),
+        makeUserRow({ avatar: `images/user/${USER_ID}/1000.png` }),
       );
       minio.deleteObject.mockRejectedValue(new Error('minio down'));
 
@@ -319,7 +354,7 @@ describe('UsersController — self-service "me" routes (profile, password, avata
 
   describe('DELETE /users/me/avatar', () => {
     it('clears the avatar, best-effort deletes the old object, and responds with avatarUrl null', async () => {
-      const oldKey = `images/avatars/${USER_ID}-1000.png`;
+      const oldKey = `images/user/${USER_ID}/1000.png`;
       prisma.user.findUnique.mockResolvedValue(makeUserRow({ avatar: oldKey }));
 
       const response = await request(app.getHttpServer())

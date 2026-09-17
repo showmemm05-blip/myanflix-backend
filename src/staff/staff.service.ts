@@ -6,7 +6,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
-import { Role, UserStatus } from '../generated/prisma/client';
+import { Role } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import { AuthorityService } from '../roles/authority.service';
@@ -17,6 +17,8 @@ import type { UpdateStaffDto } from './dto/update-staff.dto';
 import type { ResetStaffPasswordDto } from './dto/reset-staff-password.dto';
 import type { UpdateStaffStatusDto } from './dto/update-staff-status.dto';
 import type { StaffUser } from './dto/staff-response.dto';
+import { AuditService } from '../audit/audit.service';
+import { userSnapshot } from '../audit/audit-snapshots';
 
 const PASSWORD_SALT_ROUNDS = 10;
 
@@ -37,6 +39,7 @@ export class StaffService {
     private readonly prisma: PrismaService,
     private readonly usersService: UsersService,
     private readonly authority: AuthorityService,
+    private readonly audit: AuditService,
   ) {}
 
   async findAll(): Promise<StaffUser[]> {
@@ -77,7 +80,17 @@ export class StaffService {
       role: assignment.role,
       ...(assignment.appRoleId && { appRoleId: assignment.appRoleId }),
     });
-    return this.findStaffOrThrow(created.id);
+    const staff = await this.findStaffOrThrow(created.id);
+
+    // The snapshot picker never reads the password hash — only the account
+    // identity and its assignment reach the log.
+    await this.audit.record({
+      action: 'staff.create',
+      actor,
+      target: { type: 'staff', id: staff.id, label: `@${staff.username}` },
+      after: userSnapshot(staff),
+    });
+    return staff;
   }
 
   async updateStaffFields(
@@ -103,8 +116,12 @@ export class StaffService {
       if (await this.authority.isSuperAdminTier(target)) {
         await this.authority.assertActorIsSuperAdmin(currentUser);
       }
-      // F1/P1 + P2: you cannot hand out a tier or a permission set you lack.
-      await this.authority.assertCanAssignRole(currentUser, assignment);
+      // F1/P1 + P2: you cannot hand out a tier or a permission set you lack —
+      // nor (F-004) take away one you lack by moving the account off it.
+      await this.authority.assertCanAssignRole(currentUser, assignment, {
+        role: target.role,
+        appRoleId: target.appRoleId,
+      });
 
       // F6: on the EFFECTIVE axis — a move onto a custom AppRole takes the
       // protected role away just as surely as a change of the enum does.
@@ -129,7 +146,7 @@ export class StaffService {
       }
     }
 
-    return this.prisma.user.update({
+    const updated = await this.prisma.user.update({
       where: { id },
       data: {
         ...(dto.username !== undefined && { username: dto.username }),
@@ -140,6 +157,21 @@ export class StaffService {
       },
       include: STAFF_INCLUDE,
     });
+
+    // A change on either axis is a role change; anything else (a rename) is
+    // a plain update, which the log skips when nothing actually differs.
+    const roleChanged =
+      updated.role !== target.role || updated.appRoleId !== target.appRoleId;
+    await this.audit.record({
+      action: roleChanged ? 'staff.role_change' : 'staff.update',
+      actor: currentUser,
+      target: { type: 'staff', id, label: `@${updated.username}` },
+      before: userSnapshot(target),
+      after: userSnapshot(updated),
+    });
+    // Their own next audit rows must carry the new role name, not the cached one.
+    this.audit.invalidateActorCache(id);
+    return updated;
   }
 
   /**
@@ -152,7 +184,7 @@ export class StaffService {
     dto: ResetStaffPasswordDto,
     currentUser: AuthenticatedUser,
   ): Promise<void> {
-    const target = await this.usersService.findByIdOrThrow(id);
+    const target = await this.findStaffOrThrow(id);
     if (await this.authority.isSuperAdminTier(target)) {
       await this.authority.assertActorIsSuperAdmin(currentUser);
     }
@@ -164,6 +196,13 @@ export class StaffService {
       where: { id },
       data: { password: passwordHash },
     });
+
+    // Pure event: the fact of the reset is what matters — no values, ever.
+    await this.audit.record({
+      action: 'staff.password_reset',
+      actor: currentUser,
+      target: { type: 'staff', id, label: `@${target.username}` },
+    });
   }
 
   async updateStatus(
@@ -171,34 +210,32 @@ export class StaffService {
     dto: UpdateStaffStatusDto,
     currentUser: AuthenticatedUser,
   ): Promise<StaffUser> {
-    if (id === currentUser.id) {
-      throw new ForbiddenException('You cannot deactivate your own account.');
-    }
+    const target = await this.findStaffOrThrow(id);
 
-    const target = await this.usersService.findByIdOrThrow(id);
+    // F3/F8: self, Super Admin tier (P2) and both lockout guards — the same
+    // gate PATCH /users/:id/status runs, so the two routes cannot drift.
+    await this.authority.assertCanChangeStatus(
+      currentUser,
+      { id, role: target.role, appRoleId: target.appRoleId },
+      dto.status,
+    );
 
-    if (await this.authority.isSuperAdminTier(target)) {
-      // F3: suspending a Super Admin is modifying one.
-      await this.authority.assertActorIsSuperAdmin(currentUser);
-    }
-
-    if (dto.status === UserStatus.SUSPENDED) {
-      if (await this.authority.isEffectiveSuperAdmin(target)) {
-        await this.authority.assertNotLastActiveSuperAdmin(id);
-      }
-      // F8: suspending the last roles manager locks everyone out just as
-      // effectively as stripping the permission would.
-      await this.authority.assertNotLastRoleManagerAccount(
-        { id, role: target.role, appRoleId: target.appRoleId },
-        null,
-      );
-    }
-
-    return this.prisma.user.update({
+    const updated = await this.prisma.user.update({
       where: { id },
       data: { status: dto.status },
       include: STAFF_INCLUDE,
     });
+
+    // A status change never touches the assignment, so the AppRole loaded
+    // with the update names the "before" side too.
+    await this.audit.record({
+      action: 'staff.status_change',
+      actor: currentUser,
+      target: { type: 'staff', id, label: `@${updated.username}` },
+      before: userSnapshot({ ...target, appRole: updated.appRole }),
+      after: userSnapshot(updated),
+    });
+    return updated;
   }
 
   async remove(id: string, currentUser: AuthenticatedUser): Promise<void> {
@@ -206,7 +243,7 @@ export class StaffService {
       throw new ForbiddenException('You cannot delete your own account.');
     }
 
-    const target = await this.usersService.findByIdOrThrow(id);
+    const target = await this.findStaffOrThrow(id);
 
     if (await this.authority.isSuperAdminTier(target)) {
       // P2: deleting a Super Admin is the most complete modification there is.
@@ -223,14 +260,39 @@ export class StaffService {
     );
 
     await this.prisma.user.delete({ where: { id } });
+
+    // Deleting the row leaves the avatar bytes behind, and nothing else will
+    // ever reach them: the key lived only in the column that just went away.
+    // Best-effort by design (it never throws) — the deletion is the
+    // user-facing action, orphaned objects are a storage concern.
+    await this.usersService.deleteAvatarObjects(id);
+
+    // The row was loaded with its AppRole, so the "before" side still names
+    // the assignment the delete just took away.
+    await this.audit.record({
+      action: 'staff.delete',
+      actor: currentUser,
+      target: { type: 'staff', id, label: `@${target.username}` },
+      before: userSnapshot(target),
+    });
   }
 
+  /**
+   * The single gate every /staff/:id mutation loads its target through. A row
+   * outside the staff tier (a subscriber) answers 404 exactly as it does on
+   * the read side (`findAll` filters on the same list) — F-005: STAFF.EDIT used
+   * to be enough to reset any subscriber's password, and STAFF.DELETE to
+   * cascade-delete a subscriber and their ledger. Keyed off the `role` enum
+   * on purpose: assigning a custom AppRole to a subscriber must not widen it.
+   */
   private async findStaffOrThrow(id: string): Promise<StaffUser> {
     const user = await this.prisma.user.findUnique({
       where: { id },
       include: STAFF_INCLUDE,
     });
-    if (!user) throw new NotFoundException('User not found');
+    if (!user || !(STAFF_ROLES as readonly Role[]).includes(user.role)) {
+      throw new NotFoundException('Staff account not found');
+    }
     return user;
   }
 

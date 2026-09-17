@@ -626,6 +626,24 @@ const POST_RBAC_GUARDED_ROUTES: PostRbacRoute[] = [
     granular: ['ACTORS.DELETE'],
     allowed: STAFF_ONLY,
   },
+  // audit log (add_audit_log). Read-only, and the rows show staff IPs and
+  // user agents un-masked, so only the protected SUPER_ADMIN reaches it —
+  // no migration INSERT grants AUDIT.VIEW to ADMIN.
+  {
+    route: 'GET /audit',
+    granular: ['AUDIT.VIEW'],
+    allowed: [Role.SUPER_ADMIN],
+  },
+  {
+    route: 'GET /audit/catalogue',
+    granular: ['AUDIT.VIEW'],
+    allowed: [Role.SUPER_ADMIN],
+  },
+  {
+    route: 'GET /audit/:id',
+    granular: ['AUDIT.VIEW'],
+    allowed: [Role.SUPER_ADMIN],
+  },
 ];
 
 const seedFor = (role: Role) => {
@@ -681,16 +699,19 @@ describe('System role seeds', () => {
    * INSERTing all six for ADMIN (36 -> 42) and five for CONTENT_UPLOADER
    * (16 -> 21) — everything but DELETE, mirroring its movie grants. ACTORS
    * then added four more (71 -> 75), all four to ADMIN (42 -> 46) and three
-   * to CONTENT_UPLOADER (21 -> 24), again everything but DELETE.
+   * to CONTENT_UPLOADER (21 -> 24), again everything but DELETE. AUDIT
+   * (add_audit_log) added AUDIT.VIEW to the catalogue (75 -> 76) and
+   * deliberately to NO seeded role — SUPER_ADMIN is protected and holds it
+   * implicitly; ADMIN and CONTENT_UPLOADER stay unchanged.
    */
-  it('has the expected seed sizes (75 / 46 / 24 / 0, matching the migrations)', () => {
+  it('has the expected seed sizes (76 / 46 / 24 / 0, matching the migrations)', () => {
     expect({
       SUPER_ADMIN: seedFor(Role.SUPER_ADMIN).permissions.length,
       ADMIN: seedFor(Role.ADMIN).permissions.length,
       CONTENT_UPLOADER: seedFor(Role.CONTENT_UPLOADER).permissions.length,
       USER: seedFor(Role.USER).permissions.length,
     }).toEqual({
-      SUPER_ADMIN: 75,
+      SUPER_ADMIN: 76,
       ADMIN: 46,
       CONTENT_UPLOADER: 24,
       USER: 0,
@@ -778,17 +799,18 @@ describe('System role seeds — routes added after the RBAC migration', () => {
    *   by service-side PUBLISHED filtering exactly like GET /movies.
    * +  3 Actors — create/edit/delete. Its three reads are ungated for the
    *   same reason GET /categories is.
+   * +  3 Audit — list, catalogue, one entry, all behind AUDIT.VIEW.
    */
   it('covers every post-migration permission-gated route', () => {
-    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(25);
+    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(28);
     expect(
       POST_RBAC_GUARDED_ROUTES.filter((r) => r.granular.length > 1),
     ).toHaveLength(2);
   });
 
-  it('leaves the backend with 104 permission-gated routes in total', () => {
+  it('leaves the backend with 107 routes in the two tables, 104 permission-gated', () => {
     const gatedLegacy = GUARDED_ROUTES.filter((r) => r.granular !== null);
-    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(101);
-    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(104);
+    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(104);
+    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(107);
   });
 });

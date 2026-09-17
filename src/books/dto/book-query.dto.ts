@@ -1,6 +1,6 @@
-import { Transform } from 'class-transformer';
 import { IsBoolean, IsEnum, IsOptional, IsString } from 'class-validator';
 import { BookStatus, BookType } from '../../generated/prisma/client';
+import { ToBoolean } from '../../common/decorators/to-boolean.decorator';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 
 export class BookQueryDto extends PaginationQueryDto {
@@ -19,7 +19,7 @@ export class BookQueryDto extends PaginationQueryDto {
    * to chapters.
    */
   @IsOptional()
-  @Transform(({ value }) => value === true || value === 'true')
+  @ToBoolean()
   @IsBoolean()
   readyToPublish?: boolean;
 

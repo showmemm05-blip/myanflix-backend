@@ -3,6 +3,8 @@ import { rm, writeFile } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { MovieStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { AuditService } from '../audit/audit.service';
+import { statusDerivedAuditAction } from '../movies/movies.service';
 import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
 import { VideosService } from '../videos/videos.service';
@@ -29,10 +31,31 @@ export class ProcessingService {
     private readonly minioService: MinioService,
     private readonly prisma: PrismaService,
     private readonly hlsSubtitlesService: HlsSubtitlesService,
+    private readonly audit: AuditService,
   ) {}
 
   isActivelyProcessing(videoId: string): boolean {
     return this.activeVideoIds.has(videoId);
+  }
+
+  /**
+   * Claims the video for the caller BEFORE it does any async work —
+   * synchronous on purpose: a check-and-add with no await in between
+   * cannot interleave with another request, so of N simultaneous reprocess
+   * requests exactly one gets `true`. The caller must either hand the video
+   * to processVideo() (whose finally clears the claim once the run owns it)
+   * or release() it on every throw in between. Mirrors
+   * BookProcessingService.reserve().
+   */
+  reserve(videoId: string): boolean {
+    if (this.activeVideoIds.has(videoId)) return false;
+    this.activeVideoIds.add(videoId);
+    return true;
+  }
+
+  /** Gives a reserve() back when the start request fails before the pipeline takes over. */
+  release(videoId: string): void {
+    this.activeVideoIds.delete(videoId);
   }
 
   /**
@@ -44,6 +67,7 @@ export class ProcessingService {
     movieId: string,
     inputPath: string,
   ): Promise<void> {
+    // Idempotent after a reserve(); the finally is what releases it.
     this.activeVideoIds.add(videoId);
     try {
       await this.runPipeline(videoId, movieId, inputPath);
@@ -178,9 +202,25 @@ export class ProcessingService {
         );
       }
 
+      // Auto-publish: nobody is in the request here, so this is a SYSTEM
+      // audit row — the staff member's own upload was recorded as
+      // movie.upload by UploadsService when the file landed.
+      const before = await this.movieForAudit(movieId);
       await this.prisma.movie.update({
         where: { id: movieId },
         data: { status: MovieStatus.PUBLISHED },
+      });
+      await this.audit.record({
+        action: statusDerivedAuditAction(
+          'movie',
+          before?.status,
+          MovieStatus.PUBLISHED,
+        ),
+        actor: null,
+        target: { type: 'movie', id: movieId, label: before?.title ?? null },
+        before: { status: before?.status ?? null },
+        after: { status: MovieStatus.PUBLISHED },
+        metadata: { trigger: 'transcode_complete', videoId },
       });
 
       this.logger.log(
@@ -198,9 +238,22 @@ export class ProcessingService {
       // Nothing in here is allowed to escape.
       try {
         await this.videosService.markFailed(videoId, message);
+        const before = await this.movieForAudit(movieId);
         await this.prisma.movie.update({
           where: { id: movieId },
           data: { status: MovieStatus.DRAFT },
+        });
+        await this.audit.record({
+          action: statusDerivedAuditAction(
+            'movie',
+            before?.status,
+            MovieStatus.DRAFT,
+          ),
+          actor: null,
+          target: { type: 'movie', id: movieId, label: before?.title ?? null },
+          before: { status: before?.status ?? null },
+          after: { status: MovieStatus.DRAFT },
+          metadata: { trigger: 'transcode_failed', videoId, error: message },
         });
       } catch (recordError) {
         const reason =
@@ -218,6 +271,14 @@ export class ProcessingService {
       // check above works off MinIO, not local disk.
       await this.cleanupScratch(movieId, inputPath);
     }
+  }
+
+  /** Title + status as they are right before the pipeline flips the status — the audit `before`. */
+  private movieForAudit(movieId: string) {
+    return this.prisma.movie.findUnique({
+      where: { id: movieId },
+      select: { title: true, status: true },
+    });
   }
 
   /**

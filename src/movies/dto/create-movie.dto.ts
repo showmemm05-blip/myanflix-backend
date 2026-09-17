@@ -59,9 +59,17 @@ export class CreateMovieDto {
   @Min(1)
   duration!: number;
 
+  /**
+   * Create-time default is Prisma `@default(SUBSCRIPTION)` (prisma/schema.prisma
+   * Movie.accessType). No class initializer on purpose: UpdateMovieDto =
+   * PartialType(CreateMovieDto) inherits initializers (@nestjs/mapped-types
+   * type-helpers.utils inheritPropertyInitializers) and the global transform
+   * pipe (src/app.module.ts) would inject the value into every PUT that omits
+   * the field — see the precedent in src/subscriptions/dto/create-plan.dto.ts.
+   */
   @IsOptional()
   @IsEnum(AccessType)
-  accessType?: AccessType = AccessType.SUBSCRIPTION;
+  accessType?: AccessType;
 
   /**
    * Optional filter metadata (2026-09). The service maps an empty string to

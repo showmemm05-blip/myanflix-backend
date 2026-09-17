@@ -1,8 +1,17 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException } from '@nestjs/common';
-import { Prisma } from '../generated/prisma/client';
+import { Prisma, Role } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { AuditService } from '../audit/audit.service';
 import { FinanceSettingsService } from './finance-settings.service';
+
+/** The staff member saving the settings — `id` is what the updatedByUserId stamp checks. */
+const admin = {
+  id: 'admin-1',
+  username: 'admin.blake',
+  role: Role.SUPER_ADMIN,
+  appRoleId: null,
+};
 
 function makeSettings(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -41,6 +50,10 @@ describe('FinanceSettingsService', () => {
       providers: [
         FinanceSettingsService,
         { provide: PrismaService, useValue: prisma },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -100,7 +113,7 @@ describe('FinanceSettingsService', () => {
             minWithdrawalAmount: 1000,
             maxWithdrawalAmount: 100000,
           },
-          'admin-1',
+          admin,
         ),
       ).rejects.toThrow(BadRequestException);
       expect(prisma.financeSettings.update).not.toHaveBeenCalled();
@@ -115,7 +128,7 @@ describe('FinanceSettingsService', () => {
             minWithdrawalAmount: 60000,
             maxWithdrawalAmount: 50000,
           },
-          'admin-1',
+          admin,
         ),
       ).rejects.toThrow(BadRequestException);
       expect(prisma.financeSettings.update).not.toHaveBeenCalled();
@@ -133,7 +146,7 @@ describe('FinanceSettingsService', () => {
         minWithdrawalAmount: 2000,
         maxWithdrawalAmount: 200000,
       };
-      const result = await service.update(dto, 'admin-1');
+      const result = await service.update(dto, admin);
 
       expect(prisma.financeSettings.update).toHaveBeenCalledWith({
         where: { id: 'settings-1' },
@@ -167,7 +180,7 @@ describe('FinanceSettingsService', () => {
           minWithdrawalAmount: 2000,
           maxWithdrawalAmount: 200000,
         },
-        'admin-1',
+        admin,
       );
 
       expect(result.updatedBy).toEqual({

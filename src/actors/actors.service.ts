@@ -7,7 +7,14 @@ import {
 import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
-import type { ActorQueryDto, CreateActorDto, UpdateActorDto } from './dto/actor.dto';
+import { AuditService } from '../audit/audit.service';
+import { actorSnapshot } from '../audit/audit-snapshots';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
+import type {
+  ActorQueryDto,
+  CreateActorDto,
+  UpdateActorDto,
+} from './dto/actor.dto';
 
 const WITH_MOVIE_COUNT = {
   _count: { select: { movies: true } },
@@ -20,6 +27,7 @@ export class ActorsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -67,18 +75,27 @@ export class ActorsService {
     });
   }
 
-  async create(dto: CreateActorDto) {
+  async create(dto: CreateActorDto, actor: AuthenticatedUser) {
     await this.assertNameAvailable(dto.name);
-    return this.prisma.actor.create({
+    const created = await this.prisma.actor.create({
       data: {
         name: dto.name,
         imageUrl: this.minioService.canonicalImageUrl(dto.imageUrl),
       },
       include: WITH_MOVIE_COUNT,
     });
+
+    await this.audit.record({
+      action: 'actor.create',
+      actor,
+      target: { type: 'actor', id: created.id, label: created.name },
+      after: actorSnapshot(created),
+    });
+
+    return created;
   }
 
-  async update(id: string, dto: UpdateActorDto) {
+  async update(id: string, dto: UpdateActorDto, actor: AuthenticatedUser) {
     const current = await this.prisma.actor.findUnique({ where: { id } });
     if (!current) throw new NotFoundException('Actor not found');
     if (dto.name) await this.assertNameAvailable(dto.name, id);
@@ -105,6 +122,14 @@ export class ActorsService {
       await this.deleteImage(current.imageUrl, id);
     }
 
+    await this.audit.record({
+      action: 'actor.update',
+      actor,
+      target: { type: 'actor', id, label: updated.name },
+      before: actorSnapshot(current),
+      after: actorSnapshot(updated),
+    });
+
     return updated;
   }
 
@@ -113,12 +138,24 @@ export class ActorsService {
    * join cascades) but touches no movie itself. DB row first, then the
    * headshot — the same order and reasoning as MoviesService.remove.
    */
-  async remove(id: string): Promise<void> {
-    const actor = await this.prisma.actor.findUnique({ where: { id } });
-    if (!actor) throw new NotFoundException('Actor not found');
+  async remove(id: string, actor: AuthenticatedUser): Promise<void> {
+    const person = await this.prisma.actor.findUnique({
+      where: { id },
+      include: WITH_MOVIE_COUNT,
+    });
+    if (!person) throw new NotFoundException('Actor not found');
 
     await this.prisma.actor.delete({ where: { id } });
-    if (actor.imageUrl) await this.deleteImage(actor.imageUrl, id);
+
+    await this.audit.record({
+      action: 'actor.delete',
+      actor,
+      target: { type: 'actor', id, label: person.name },
+      before: actorSnapshot(person),
+      metadata: { unlinkedMovies: person._count?.movies ?? 0 },
+    });
+
+    if (person.imageUrl) await this.deleteImage(person.imageUrl, id);
   }
 
   private async deleteImage(url: string, actorId: string): Promise<void> {

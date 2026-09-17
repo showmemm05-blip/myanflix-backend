@@ -28,9 +28,12 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
    * than waiting for the access token to expire.
    */
   async validate(payload: JwtPayload): Promise<AuthenticatedUser> {
-    const user = await this.usersService.findByIdOrThrow(payload.sub);
+    // A well-formed token for an account that no longer exists is just an
+    // invalid token — 401 like every other failure here, so clients take
+    // their normal refresh/sign-out path instead of seeing a stray 404.
+    const user = await this.usersService.findById(payload.sub);
 
-    if (user.status !== UserStatus.ACTIVE) {
+    if (!user || user.status !== UserStatus.ACTIVE) {
       throw new UnauthorizedException('This account is no longer active');
     }
 

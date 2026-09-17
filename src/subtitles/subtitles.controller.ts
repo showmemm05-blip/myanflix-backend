@@ -16,6 +16,8 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { CreateSubtitleDto } from './dto/create-subtitle.dto';
@@ -44,12 +46,18 @@ export class SubtitlesController {
   create(
     @Body() dto: CreateSubtitleDto,
     @UploadedFile() file: Express.Multer.File | undefined,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
     if (!file)
       throw new BadRequestException(
         'No subtitle file received (expected field "file")',
       );
-    return this.subtitlesService.create(dto, file.originalname, file.buffer);
+    return this.subtitlesService.create(
+      dto,
+      file.originalname,
+      file.buffer,
+      user,
+    );
   }
 
   @Get()
@@ -63,8 +71,9 @@ export class SubtitlesController {
   update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateSubtitleDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.subtitlesService.update(id, dto);
+    return this.subtitlesService.update(id, dto, user);
   }
 
   /**
@@ -91,14 +100,20 @@ export class SubtitlesController {
 
   @Patch(':id/set-default')
   @RequirePermissions('MEDIA.UPLOAD')
-  setDefault(@Param('id', ParseUUIDPipe) id: string) {
-    return this.subtitlesService.setDefault(id);
+  setDefault(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.subtitlesService.setDefault(id, user);
   }
 
   @Delete(':id')
   @RequirePermissions('MEDIA.DELETE')
   @HttpCode(HttpStatus.NO_CONTENT)
-  async remove(@Param('id', ParseUUIDPipe) id: string) {
-    await this.subtitlesService.remove(id);
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    await this.subtitlesService.remove(id, user);
   }
 }

@@ -3,13 +3,13 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import {
-  TransactionStatus,
-  TransactionType,
-} from '../generated/prisma/client';
+import { TransactionStatus, TransactionType } from '../generated/prisma/client';
 import type { UserLevel } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
+import { AuditService } from '../audit/audit.service';
+import { levelSnapshot } from '../audit/audit-snapshots';
 import type {
   CreateLevelDto,
   ReorderLevelsDto,
@@ -88,7 +88,14 @@ export function resolveLevelStatus(
     (a, b) => a.order - b.order || a.threshold - b.threshold,
   );
 
-  return { qualifyingTotal, level, nextLevel, remaining, progressPercent, ladder };
+  return {
+    qualifyingTotal,
+    level,
+    nextLevel,
+    remaining,
+    progressPercent,
+    ladder,
+  };
 }
 
 /**
@@ -113,7 +120,10 @@ export function resolveLevelStatus(
  */
 @Injectable()
 export class LevelsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+  ) {}
 
   /** The public ladder: enabled levels only, display order. */
   async findEnabled(): Promise<LevelDto[]> {
@@ -132,18 +142,31 @@ export class LevelsService {
     return levels.map((l) => this.toResponse(l));
   }
 
-  async create(dto: CreateLevelDto): Promise<LevelDto> {
+  async create(
+    dto: CreateLevelDto,
+    actor: AuthenticatedUser,
+  ): Promise<LevelDto> {
     await this.assertNameAvailable(dto.name);
     await this.assertThresholdAvailable(dto.threshold);
     const order = dto.order ?? (await this.nextOrder());
     const level = await this.prisma.userLevel.create({
       data: { ...dto, order },
     });
+    await this.audit.record({
+      action: 'level.create',
+      actor,
+      target: { type: 'level', id: level.id, label: level.name },
+      after: levelSnapshot(level),
+    });
     return this.toResponse(level);
   }
 
-  async update(id: string, dto: UpdateLevelDto): Promise<LevelDto> {
-    await this.assertExists(id);
+  async update(
+    id: string,
+    dto: UpdateLevelDto,
+    actor: AuthenticatedUser,
+  ): Promise<LevelDto> {
+    const before = await this.findByIdOrThrow(id);
     if (dto.name !== undefined) await this.assertNameAvailable(dto.name, id);
     if (dto.threshold !== undefined) {
       await this.assertThresholdAvailable(dto.threshold, id);
@@ -152,6 +175,13 @@ export class LevelsService {
       where: { id },
       data: dto,
     });
+    await this.audit.record({
+      action: 'level.update',
+      actor,
+      target: { type: 'level', id, label: level.name },
+      before: levelSnapshot(before),
+      after: levelSnapshot(level),
+    });
     return this.toResponse(level);
   }
 
@@ -159,17 +189,28 @@ export class LevelsService {
    * Hard delete — no relations exist, and users at this level simply resolve
    * to the next qualifying rung on their next read.
    */
-  async remove(id: string): Promise<void> {
-    await this.assertExists(id);
+  async remove(id: string, actor: AuthenticatedUser): Promise<void> {
+    const before = await this.findByIdOrThrow(id);
     await this.prisma.userLevel.delete({ where: { id } });
+    await this.audit.record({
+      action: 'level.delete',
+      actor,
+      target: { type: 'level', id, label: before.name },
+      before: levelSnapshot(before),
+    });
   }
 
   /** Applies the whole new ordering atomically; 404 if any id is unknown. */
-  async reorder(dto: ReorderLevelsDto): Promise<LevelDto[]> {
+  async reorder(
+    dto: ReorderLevelsDto,
+    actor: AuthenticatedUser,
+  ): Promise<LevelDto[]> {
     const ids = dto.items.map((item) => item.id);
+    // Ordered so the audit row can show the old sequence next to the new one.
     const existing = await this.prisma.userLevel.findMany({
       where: { id: { in: ids } },
-      select: { id: true },
+      select: { id: true, order: true },
+      orderBy: [{ order: 'asc' }, { threshold: 'asc' }],
     });
     if (existing.length !== new Set(ids).size) {
       throw new NotFoundException('Level not found');
@@ -182,6 +223,18 @@ export class LevelsService {
         }),
       ),
     );
+    // One row for the whole bulk move: ids in old order → ids in new order.
+    await this.audit.record({
+      action: 'level.reorder',
+      actor,
+      target: { type: 'level', id: null, label: `${ids.length} levels` },
+      metadata: {
+        before: existing.map((level) => level.id),
+        after: [...dto.items]
+          .sort((a, b) => a.order - b.order)
+          .map((item) => item.id),
+      },
+    });
     return this.findAll();
   }
 
@@ -263,12 +316,11 @@ export class LevelsService {
     return (agg._max.order ?? 0) + 1;
   }
 
-  private async assertExists(id: string): Promise<void> {
-    const exists = await this.prisma.userLevel.findUnique({
-      where: { id },
-      select: { id: true },
-    });
-    if (!exists) throw new NotFoundException('Level not found');
+  /** The row as it stands — the audit "before" for an update or delete. */
+  private async findByIdOrThrow(id: string): Promise<UserLevel> {
+    const level = await this.prisma.userLevel.findUnique({ where: { id } });
+    if (!level) throw new NotFoundException('Level not found');
+    return level;
   }
 
   private async assertNameAvailable(

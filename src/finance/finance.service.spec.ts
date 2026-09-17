@@ -58,7 +58,7 @@ describe('FinanceService', () => {
           id: 'user-1',
           username: 'user_95950495369',
           displayName: 'Blake',
-          avatar: 'images/avatars/user-1.png',
+          avatar: 'images/user/user-1/1757606400000.png',
         },
       ]);
 
@@ -76,7 +76,7 @@ describe('FinanceService', () => {
           id: 'user-1',
           username: 'user_95950495369',
           displayName: 'Blake',
-          avatarUrl: 'https://cdn.test/images/avatars/user-1.png',
+          avatarUrl: 'https://cdn.test/images/user/user-1/1757606400000.png',
         },
         totalSpent: 50000,
         purchaseCount: 4,

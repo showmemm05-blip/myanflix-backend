@@ -39,6 +39,6 @@ export class PeakUsersController {
     @Body() dto: UpdateAdditionalPeakDto,
     @CurrentUser() admin: AuthenticatedUser,
   ) {
-    return this.peakUsersService.setAdditional(dto, admin.id);
+    return this.peakUsersService.setAdditional(dto, admin);
   }
 }

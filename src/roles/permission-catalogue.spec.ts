@@ -6,9 +6,9 @@ import {
 } from './permission-catalogue';
 
 describe('permission catalogue', () => {
-  it('declares 19 modules and 75 MODULE.ACTION permissions', () => {
-    expect(PERMISSION_CATALOGUE).toHaveLength(19);
-    expect(ALL_PERMISSIONS).toHaveLength(75);
+  it('declares 20 modules and 76 MODULE.ACTION permissions', () => {
+    expect(PERMISSION_CATALOGUE).toHaveLength(20);
+    expect(ALL_PERMISSIONS).toHaveLength(76);
   });
 
   it('generates every permission as MODULE.ACTION with no duplicates', () => {

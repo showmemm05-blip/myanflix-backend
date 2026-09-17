@@ -1,6 +1,9 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { AuditService } from '../audit/audit.service';
+import { financeSettingsSnapshot } from '../audit/audit-snapshots';
 import { decimalToNumber } from '../common/utils/decimal.util';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import type { UpdateFinanceSettingsDto } from './dto/update-finance-settings.dto';
 
 const DEFAULT_MIN_DEPOSIT = 1000;
@@ -10,7 +13,10 @@ const DEFAULT_MAX_WITHDRAWAL = 5_000_000;
 
 @Injectable()
 export class FinanceSettingsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+  ) {}
 
   /**
    * Lazily creates the single global settings row with sensible defaults on
@@ -31,7 +37,7 @@ export class FinanceSettingsService {
     });
   }
 
-  async update(dto: UpdateFinanceSettingsDto, adminId: string) {
+  async update(dto: UpdateFinanceSettingsDto, admin: AuthenticatedUser) {
     if (dto.minDepositAmount > dto.maxDepositAmount) {
       throw new BadRequestException(
         'Minimum deposit amount cannot be greater than maximum deposit amount',
@@ -45,19 +51,33 @@ export class FinanceSettingsService {
 
     const current = await this.getOrCreate();
 
-    return this.prisma.financeSettings.update({
+    const updated = await this.prisma.financeSettings.update({
       where: { id: current.id },
       data: {
         minDepositAmount: dto.minDepositAmount,
         maxDepositAmount: dto.maxDepositAmount,
         minWithdrawalAmount: dto.minWithdrawalAmount,
         maxWithdrawalAmount: dto.maxWithdrawalAmount,
-        updatedByUserId: adminId,
+        updatedByUserId: admin.id,
       },
       include: {
         updatedBy: { select: { id: true, username: true, displayName: true } },
       },
     });
+
+    await this.audit.record({
+      action: 'finance_settings.update',
+      actor: admin,
+      target: {
+        type: 'finance_settings',
+        id: current.id,
+        label: 'Finance settings',
+      },
+      before: financeSettingsSnapshot(current),
+      after: financeSettingsSnapshot(updated),
+    });
+
+    return updated;
   }
 
   /** Convenience helper for deposits/withdrawals `create()` — plain numbers, not Decimal. */

@@ -83,9 +83,14 @@ export class OtpService {
       throw new UnauthorizedException('Invalid or expired code');
     }
 
-    await this.prisma.otpCode.update({
-      where: { id: otp.id },
+    // Consume in one conditional statement so concurrent verifies of the same
+    // code can succeed at most once (the losers match 0 rows and get a 401).
+    const consumed = await this.prisma.otpCode.updateMany({
+      where: { id: otp.id, consumedAt: null },
       data: { consumedAt: new Date() },
     });
+    if (consumed.count !== 1) {
+      throw new UnauthorizedException('Invalid or expired code');
+    }
   }
 }

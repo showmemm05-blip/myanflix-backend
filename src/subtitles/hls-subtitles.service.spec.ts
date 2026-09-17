@@ -10,6 +10,8 @@ const MOVIE_ID = 'ebfce557-db9f-4515-8329-f28fc10dd28f';
 const VIDEO_ID = '0b94b5e5-7224-4dfd-99a3-4112bb09501c';
 const SUBTITLE_ID = 'cc0ce210-d64a-4a83-ab24-33369b711e43';
 const MASTER_KEY = `videos/${MOVIE_ID}/hls/master.m3u8`;
+/** The uploaded SOURCE — under subtitles/<movieId>/, unlike the renditions this service writes under videos/<movieId>/hls/subs/. */
+const SOURCE_KEY = `subtitles/${MOVIE_ID}/${SUBTITLE_ID}.srt`;
 
 const MASTER =
   [
@@ -55,7 +57,7 @@ const englishRow = (overrides: Record<string, unknown> = {}) => ({
   language: 'en',
   label: 'English',
   format: 'SRT',
-  objectKey: `subtitles/${SUBTITLE_ID}/original.srt`,
+  objectKey: SOURCE_KEY,
   isDefault: true,
   ...overrides,
 });
@@ -87,7 +89,7 @@ describe('HlsSubtitlesService', () => {
     written = new Map();
     stored = new Map([
       [MASTER_KEY, MASTER],
-      [`subtitles/${SUBTITLE_ID}/original.srt`, SRT],
+      [SOURCE_KEY, SRT],
       [
         `videos/${MOVIE_ID}/hls/720p/index.m3u8`,
         '#EXTM3U\n#EXTINF:6.000,\nsegment_000.ts\n#EXTINF:4.000,\nsegment_001.ts\n#EXT-X-ENDLIST\n',
@@ -272,7 +274,7 @@ describe('HlsSubtitlesService', () => {
       prisma.subtitle.findMany.mockResolvedValue([
         englishRow({
           format: 'ASS',
-          objectKey: `subtitles/${SUBTITLE_ID}/original.ass`,
+          objectKey: `subtitles/${MOVIE_ID}/${SUBTITLE_ID}.ass`,
         }),
       ]);
 
@@ -297,7 +299,7 @@ describe('HlsSubtitlesService', () => {
           format: 'ASS',
           label: 'Styled',
           isDefault: false,
-          objectKey: 'subtitles/styled/original.ass',
+          objectKey: `subtitles/${MOVIE_ID}/styled.ass`,
         }),
       ]);
 
@@ -311,7 +313,7 @@ describe('HlsSubtitlesService', () => {
 
   describe('robustness', () => {
     it('never advertises a track whose source file cannot be read', async () => {
-      stored.delete(`subtitles/${SUBTITLE_ID}/original.srt`);
+      stored.delete(SOURCE_KEY);
 
       const result = await service.publishForVideo(VIDEO_ID);
 

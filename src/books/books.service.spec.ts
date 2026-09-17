@@ -10,6 +10,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
 import { BookAuthorsService } from '../book-authors/book-authors.service';
+import { AuditService } from '../audit/audit.service';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import {
   BookStatus,
   BookType,
@@ -18,6 +20,13 @@ import {
 } from '../generated/prisma/client';
 
 const BOOK_ID = 'book-1';
+/** The staff member every mutation below is attributed to in the audit log. */
+const ACTOR: AuthenticatedUser = {
+  id: 'staff-1',
+  username: 'editor',
+  role: Role.ADMIN,
+  appRoleId: null,
+};
 const EDITION_ID = 'edition-my';
 const CHAPTER_UUID = '11111111-1111-4111-8111-111111111111';
 
@@ -64,6 +73,7 @@ describe('BooksService', () => {
       findMany: jest.Mock;
       findUnique: jest.Mock;
       findFirst: jest.Mock;
+      count: jest.Mock;
     };
     bookReadingProgress: { upsert: jest.Mock; findUnique: jest.Mock };
     $transaction: jest.Mock;
@@ -78,7 +88,10 @@ describe('BooksService', () => {
   let bookProcessing: {
     processChapter: jest.Mock;
     isActivelyProcessing: jest.Mock;
+    reserve: jest.Mock;
+    release: jest.Mock;
   };
+  let audit: { record: jest.Mock };
   let bookAuthors: {
     findByIdOrThrow: jest.Mock;
     findOrCreateByName: jest.Mock;
@@ -107,7 +120,7 @@ describe('BooksService', () => {
   const pdfEdition = (overrides: Record<string, unknown> = {}) =>
     edition({
       status: BookStatus.READY,
-      pdfKey: `books/${BOOK_ID}/${EDITION_ID}/original.pdf`,
+      pdfKey: `documents/books/${BOOK_ID}/${EDITION_ID}/original.pdf`,
       pageCount: 12,
       processedPages: 12,
       book: { type: BookType.PDF },
@@ -162,6 +175,7 @@ describe('BooksService', () => {
         findMany: jest.fn().mockResolvedValue([]),
         findUnique: jest.fn(),
         findFirst: jest.fn(),
+        count: jest.fn().mockResolvedValue(0),
       },
       bookReadingProgress: { upsert: jest.fn(), findUnique: jest.fn() },
       $transaction: jest.fn((ops: unknown[]) => Promise.all(ops)),
@@ -170,13 +184,18 @@ describe('BooksService', () => {
       canonicalImageUrl: jest.fn((url: string | null) => url),
       deleteByPrefix: jest.fn().mockResolvedValue(undefined),
       deleteObject: jest.fn().mockResolvedValue(undefined),
-      keyFromPublicUrl: jest.fn(() => 'images/cover.webp'),
+      keyFromPublicUrl: jest.fn(() => 'images/book/cover.webp'),
       objectSize: jest.fn().mockResolvedValue(1024),
     };
     bookProcessing = {
       processChapter: jest.fn().mockResolvedValue(undefined),
       isActivelyProcessing: jest.fn().mockReturnValue(false),
+      // The synchronous claim wins by default; a case that wants a refused
+      // duplicate press returns false.
+      reserve: jest.fn().mockReturnValue(true),
+      release: jest.fn(),
     };
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
     bookAuthors = {
       findByIdOrThrow: jest.fn().mockResolvedValue(AUTHOR_ROW),
       findOrCreateByName: jest.fn().mockResolvedValue(AUTHOR_ROW),
@@ -189,16 +208,26 @@ describe('BooksService', () => {
         { provide: MinioService, useValue: minioService },
         {
           provide: StorageService,
+          // Both halves of the split layout, spelled out so a change to
+          // either one shows up here: generated pages under books/, uploaded
+          // source PDFs under the mirrored documents/books/ tree.
           useValue: {
             bookPdfKey: (b: string, e: string, c: string) =>
-              `books/${b}/${e}/${c}/original.pdf`,
+              `documents/books/${b}/${e}/${c}/original.pdf`,
+            bookPrefix: (b: string) => `books/${b}`,
             bookEditionPrefix: (b: string, e: string) => `books/${b}/${e}`,
             bookChapterPrefix: (b: string, e: string, c: string) =>
               `books/${b}/${e}/${c}`,
+            bookDocumentPrefix: (b: string) => `documents/books/${b}`,
+            bookDocumentEditionPrefix: (b: string, e: string) =>
+              `documents/books/${b}/${e}`,
+            bookDocumentChapterPrefix: (b: string, e: string, c: string) =>
+              `documents/books/${b}/${e}/${c}`,
           },
         },
         { provide: BookProcessingService, useValue: bookProcessing },
         { provide: BookAuthorsService, useValue: bookAuthors },
+        { provide: AuditService, useValue: audit },
       ],
     }).compile();
 
@@ -216,7 +245,7 @@ describe('BooksService', () => {
     it('creates the first language edition alongside the book', async () => {
       prisma.book.create.mockResolvedValue({ id: BOOK_ID });
 
-      await service.create({ ...base, type: BookType.EDITOR });
+      await service.create({ ...base, type: BookType.EDITOR }, ACTOR);
 
       const data = prisma.book.create.mock.calls[0][0].data as {
         editions: { create: { language: string; status: BookStatus }[] };
@@ -232,7 +261,7 @@ describe('BooksService', () => {
       async () => {
         prisma.book.create.mockResolvedValue({ id: BOOK_ID });
 
-        await service.create({ ...base, type: BookType.PDF });
+        await service.create({ ...base, type: BookType.PDF }, ACTOR);
 
         const data = prisma.book.create.mock.calls[0][0].data as {
           editions: { create: { status: BookStatus }[] };
@@ -258,13 +287,16 @@ describe('BooksService', () => {
           name: 'Blake',
         });
 
-        await service.create({
-          title: 'A Book',
-          authorId: 'author-9',
-          description: '',
-          language: 'my',
-          type: BookType.EDITOR,
-        });
+        await service.create(
+          {
+            title: 'A Book',
+            authorId: 'author-9',
+            description: '',
+            language: 'my',
+            type: BookType.EDITOR,
+          },
+          ACTOR,
+        );
 
         expect(bookAuthors.findByIdOrThrow).toHaveBeenCalledWith('author-9');
         expect(bookAuthors.findOrCreateByName).not.toHaveBeenCalled();
@@ -280,9 +312,12 @@ describe('BooksService', () => {
     it('find-or-creates the author from a bare string and links it', async () => {
       prisma.book.create.mockResolvedValue({ id: BOOK_ID });
 
-      await service.create({ ...base, type: BookType.EDITOR });
+      await service.create({ ...base, type: BookType.EDITOR }, ACTOR);
 
-      expect(bookAuthors.findOrCreateByName).toHaveBeenCalledWith('An Author');
+      expect(bookAuthors.findOrCreateByName).toHaveBeenCalledWith(
+        'An Author',
+        ACTOR,
+      );
       expect(authorDataOf()).toMatchObject({
         author: 'An Author',
         authorRef: { connect: { id: 'author-1' } },
@@ -296,12 +331,15 @@ describe('BooksService', () => {
         name: 'Blake',
       });
 
-      await service.create({
-        ...base,
-        author: 'Ignored Name',
-        authorId: 'author-9',
-        type: BookType.EDITOR,
-      });
+      await service.create(
+        {
+          ...base,
+          author: 'Ignored Name',
+          authorId: 'author-9',
+          type: BookType.EDITOR,
+        },
+        ACTOR,
+      );
 
       expect(bookAuthors.findOrCreateByName).not.toHaveBeenCalled();
       expect(authorDataOf().author).toBe('Blake');
@@ -313,13 +351,16 @@ describe('BooksService', () => {
       );
 
       await expect(
-        service.create({
-          title: 'A Book',
-          authorId: 'missing',
-          description: '',
-          language: 'my',
-          type: BookType.EDITOR,
-        }),
+        service.create(
+          {
+            title: 'A Book',
+            authorId: 'missing',
+            description: '',
+            language: 'my',
+            type: BookType.EDITOR,
+          },
+          ACTOR,
+        ),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(prisma.book.create).not.toHaveBeenCalled();
     });
@@ -335,7 +376,7 @@ describe('BooksService', () => {
       prisma.book.update.mock.calls[0][0].data as Record<string, unknown>;
 
     it('leaves the author untouched when the edit does not mention it', async () => {
-      await service.update(BOOK_ID, { title: 'Renamed' });
+      await service.update(BOOK_ID, { title: 'Renamed' }, ACTOR);
 
       expect(bookAuthors.findByIdOrThrow).not.toHaveBeenCalled();
       expect(bookAuthors.findOrCreateByName).not.toHaveBeenCalled();
@@ -350,7 +391,7 @@ describe('BooksService', () => {
         name: 'Blake',
       });
 
-      await service.update(BOOK_ID, { authorId: 'author-9' });
+      await service.update(BOOK_ID, { authorId: 'author-9' }, ACTOR);
 
       expect(dataOf()).toMatchObject({
         author: 'Blake',
@@ -360,9 +401,12 @@ describe('BooksService', () => {
     });
 
     it('still accepts the legacy bare string on update', async () => {
-      await service.update(BOOK_ID, { author: 'An Author' });
+      await service.update(BOOK_ID, { author: 'An Author' }, ACTOR);
 
-      expect(bookAuthors.findOrCreateByName).toHaveBeenCalledWith('An Author');
+      expect(bookAuthors.findOrCreateByName).toHaveBeenCalledWith(
+        'An Author',
+        ACTOR,
+      );
       expect(dataOf()).toMatchObject({
         author: 'An Author',
         authorRef: { connect: { id: 'author-1' } },
@@ -372,9 +416,11 @@ describe('BooksService', () => {
 
   describe('findAll — visibility', () => {
     const whereOf = () =>
-      (prisma.book.findMany.mock.calls[0][0] as {
-        where: Record<string, unknown>;
-      }).where;
+      (
+        prisma.book.findMany.mock.calls[0][0] as {
+          where: Record<string, unknown>;
+        }
+      ).where;
     const includeOf = () =>
       prisma.book.findMany.mock.calls[0][0] as {
         include: { editions: { where?: unknown } };
@@ -462,7 +508,7 @@ describe('BooksService', () => {
       prisma.bookEdition.findUnique.mockResolvedValue({ id: EDITION_ID });
 
       await expect(
-        service.addEdition(BOOK_ID, { language: 'my' }),
+        service.addEdition(BOOK_ID, { language: 'my' }, ACTOR),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(prisma.bookEdition.create).not.toHaveBeenCalled();
     });
@@ -472,7 +518,7 @@ describe('BooksService', () => {
       prisma.bookEdition.findUnique.mockResolvedValue(null);
       prisma.bookEdition.create.mockResolvedValue(pdfEdition());
 
-      await service.addEdition(BOOK_ID, { language: 'en' });
+      await service.addEdition(BOOK_ID, { language: 'en' }, ACTOR);
 
       expect(prisma.bookEdition.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -486,15 +532,87 @@ describe('BooksService', () => {
     });
   });
 
+  describe('update — cover', () => {
+    const OLD = 'http://cache/movies/images/book/old.webp';
+    const NEW = 'http://cache/movies/images/book/new.webp';
+
+    beforeEach(() => {
+      prisma.book.findUnique.mockResolvedValue({ id: BOOK_ID, coverUrl: OLD });
+      prisma.book.update.mockResolvedValue({ id: BOOK_ID, coverUrl: NEW });
+      prisma.book.count.mockResolvedValue(0);
+      minioService.keyFromPublicUrl.mockImplementation((url: string) =>
+        url.replace('http://cache/movies/', ''),
+      );
+    });
+
+    it('deletes the previous cover object when the cover is replaced', async () => {
+      await service.update(BOOK_ID, { coverUrl: NEW }, ACTOR);
+
+      // Every replaced cover used to be leaked: nothing pointed at the old
+      // object again and remove() only clears the cover current at delete
+      // time. The row already holds NEW, so OLD is now unreferenced.
+      expect(minioService.deleteObject).toHaveBeenCalledWith(
+        'images/book/old.webp',
+      );
+    });
+
+    it('does not delete anything when the same cover is echoed back', async () => {
+      // The admin saves a fetched record without touching artwork; the
+      // canonical form must read as "unchanged", never as a replacement.
+      prisma.book.update.mockResolvedValue({ id: BOOK_ID, coverUrl: OLD });
+
+      await service.update(BOOK_ID, { coverUrl: OLD, title: 'Renamed' }, ACTOR);
+
+      expect(minioService.deleteObject).not.toHaveBeenCalled();
+    });
+
+    it('does not delete anything when the edit does not mention the cover', async () => {
+      await service.update(BOOK_ID, { title: 'Renamed' }, ACTOR);
+
+      expect(minioService.deleteObject).not.toHaveBeenCalled();
+    });
+
+    it('deletes the old object when the cover is cleared', async () => {
+      prisma.book.update.mockResolvedValue({ id: BOOK_ID, coverUrl: null });
+
+      await service.update(BOOK_ID, { coverUrl: null }, ACTOR);
+
+      expect(minioService.deleteObject).toHaveBeenCalledWith(
+        'images/book/old.webp',
+      );
+    });
+
+    it('keeps the old object when another book still uses it', async () => {
+      prisma.book.count.mockResolvedValue(1);
+
+      await service.update(BOOK_ID, { coverUrl: NEW }, ACTOR);
+
+      expect(minioService.deleteObject).not.toHaveBeenCalled();
+    });
+
+    it('never fails the update because storage cleanup failed', async () => {
+      minioService.deleteObject.mockRejectedValue(new Error('storage down'));
+
+      await expect(
+        service.update(BOOK_ID, { coverUrl: NEW }, ACTOR),
+      ).resolves.toMatchObject({ id: BOOK_ID });
+    });
+  });
+
   describe('updateEdition — status transitions', () => {
     it('refuses to publish a language with nothing readable in it', async () => {
       prisma.bookEdition.findUnique.mockResolvedValue(edition());
       prisma.bookChapter.count.mockResolvedValue(0);
 
       await expect(
-        service.updateEdition(BOOK_ID, EDITION_ID, {
-          status: BookStatus.PUBLISHED,
-        }),
+        service.updateEdition(
+          BOOK_ID,
+          EDITION_ID,
+          {
+            status: BookStatus.PUBLISHED,
+          },
+          ACTOR,
+        ),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(prisma.bookEdition.update).not.toHaveBeenCalled();
     });
@@ -507,9 +625,14 @@ describe('BooksService', () => {
         prisma.bookChapter.count.mockResolvedValue(0);
 
         await expect(
-          service.updateEdition(BOOK_ID, EDITION_ID, {
-            status: BookStatus.PUBLISHED,
-          }),
+          service.updateEdition(
+            BOOK_ID,
+            EDITION_ID,
+            {
+              status: BookStatus.PUBLISHED,
+            },
+            ACTOR,
+          ),
         ).rejects.toBeInstanceOf(BadRequestException);
       },
     );
@@ -522,9 +645,14 @@ describe('BooksService', () => {
         prisma.bookChapter.count.mockResolvedValue(1);
         prisma.bookEdition.update.mockResolvedValue(pdfEdition());
 
-        await service.updateEdition(BOOK_ID, EDITION_ID, {
-          status: BookStatus.PUBLISHED,
-        });
+        await service.updateEdition(
+          BOOK_ID,
+          EDITION_ID,
+          {
+            status: BookStatus.PUBLISHED,
+          },
+          ACTOR,
+        );
 
         expect(prisma.bookEdition.update).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -538,9 +666,14 @@ describe('BooksService', () => {
       prisma.bookEdition.findUnique.mockResolvedValue(pdfEdition());
 
       await expect(
-        service.updateEdition(BOOK_ID, EDITION_ID, {
-          status: BookStatus.PROCESSING,
-        }),
+        service.updateEdition(
+          BOOK_ID,
+          EDITION_ID,
+          {
+            status: BookStatus.PROCESSING,
+          },
+          ACTOR,
+        ),
       ).rejects.toBeInstanceOf(BadRequestException);
     });
 
@@ -549,9 +682,14 @@ describe('BooksService', () => {
       prisma.bookChapter.count.mockResolvedValue(1);
       prisma.bookEdition.update.mockResolvedValue(edition());
 
-      await service.updateEdition(BOOK_ID, EDITION_ID, {
-        status: BookStatus.PUBLISHED,
-      });
+      await service.updateEdition(
+        BOOK_ID,
+        EDITION_ID,
+        {
+          status: BookStatus.PUBLISHED,
+        },
+        ACTOR,
+      );
 
       expect(prisma.bookEdition.update).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -571,9 +709,14 @@ describe('BooksService', () => {
       prisma.bookChapter.count.mockResolvedValue(1);
       prisma.bookEdition.update.mockResolvedValue(edition());
 
-      await service.updateEdition(BOOK_ID, EDITION_ID, {
-        status: BookStatus.PUBLISHED,
-      });
+      await service.updateEdition(
+        BOOK_ID,
+        EDITION_ID,
+        {
+          status: BookStatus.PUBLISHED,
+        },
+        ACTOR,
+      );
 
       const data = prisma.bookEdition.update.mock.calls[0][0].data as Record<
         string,
@@ -588,7 +731,7 @@ describe('BooksService', () => {
         .mockResolvedValueOnce({ id: 'edition-en' });
 
       await expect(
-        service.updateEdition(BOOK_ID, EDITION_ID, { language: 'en' }),
+        service.updateEdition(BOOK_ID, EDITION_ID, { language: 'en' }, ACTOR),
       ).rejects.toBeInstanceOf(ConflictException);
     });
 
@@ -598,7 +741,7 @@ describe('BooksService', () => {
       );
 
       await expect(
-        service.updateEdition(BOOK_ID, EDITION_ID, { language: 'en' }),
+        service.updateEdition(BOOK_ID, EDITION_ID, { language: 'en' }, ACTOR),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
@@ -609,22 +752,26 @@ describe('BooksService', () => {
       prisma.bookEdition.count.mockResolvedValue(1);
 
       await expect(
-        service.removeEdition(BOOK_ID, EDITION_ID),
+        service.removeEdition(BOOK_ID, EDITION_ID, ACTOR),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(prisma.bookEdition.delete).not.toHaveBeenCalled();
     });
 
-    it('deletes the row and that language\'s objects only', async () => {
+    it("deletes the row and that language's objects only", async () => {
       prisma.bookEdition.findUnique.mockResolvedValue(edition());
       prisma.bookEdition.count.mockResolvedValue(2);
 
-      await service.removeEdition(BOOK_ID, EDITION_ID);
+      await service.removeEdition(BOOK_ID, EDITION_ID, ACTOR);
 
       expect(prisma.bookEdition.delete).toHaveBeenCalledWith({
         where: { id: EDITION_ID },
       });
+      // BOTH halves of the edition's bytes: generated pages and source PDFs.
       expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
         `books/${BOOK_ID}/${EDITION_ID}/`,
+      );
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+        `documents/books/${BOOK_ID}/${EDITION_ID}/`,
       );
     });
   });
@@ -636,32 +783,101 @@ describe('BooksService', () => {
       async () => {
         prisma.book.findUnique.mockResolvedValue({
           id: BOOK_ID,
-          coverUrl: 'http://cache/movies/images/cover.webp',
+          coverUrl: 'http://cache/movies/images/book/cover.webp',
         });
-        minioService.deleteByPrefix.mockRejectedValue(new Error('storage down'));
+        prisma.book.count.mockResolvedValue(0);
+        minioService.deleteByPrefix.mockRejectedValue(
+          new Error('storage down'),
+        );
 
-        await expect(service.remove(BOOK_ID)).resolves.toBeUndefined();
+        await expect(service.remove(BOOK_ID, ACTOR)).resolves.toBeUndefined();
 
         expect(prisma.book.delete).toHaveBeenCalledWith({
           where: { id: BOOK_ID },
         });
+        // The regression that was reported: the cover delete used to be the
+        // last statement inside the same try as the prefix deletes, so a
+        // prefix failure threw past it and the cover outlived its book. It
+        // must still be attempted when the prefixes fail.
+        expect(minioService.deleteObject).toHaveBeenCalledWith(
+          'images/book/cover.webp',
+        );
       },
     );
 
-    it('reaches every language with one prefix delete', async () => {
+    it('keeps a cover that another book still references', async () => {
+      prisma.book.findUnique.mockResolvedValue({
+        id: BOOK_ID,
+        coverUrl: 'http://cache/movies/images/book/cover.webp',
+      });
+      // Covers are uploaded before any row exists, so two books can point
+      // at one object; the deleted row is gone, so a count > 0 means a
+      // survivor still needs it.
+      prisma.book.count.mockResolvedValue(1);
+
+      await service.remove(BOOK_ID, ACTOR);
+
+      expect(minioService.deleteObject).not.toHaveBeenCalled();
+    });
+
+    it('reports, rather than hides, a cover URL it cannot map to a key', async () => {
+      prisma.book.findUnique.mockResolvedValue({
+        id: BOOK_ID,
+        coverUrl: 'https://external.example/not-ours.png',
+      });
+      minioService.keyFromPublicUrl.mockReturnValueOnce(null);
+
+      await service.remove(BOOK_ID, ACTOR);
+
+      // The old `if (key) delete` skipped this silently; nothing may be
+      // deleted, but nothing may be swallowed either.
+      expect(minioService.deleteObject).not.toHaveBeenCalled();
+    });
+
+    it('reaches every language with one prefix delete per tree', async () => {
       prisma.book.findUnique.mockResolvedValue({ id: BOOK_ID, coverUrl: null });
 
-      await service.remove(BOOK_ID);
+      await service.remove(BOOK_ID, ACTOR);
 
+      // The source PDFs moved to documents/, so a book is now two prefix
+      // deletes; missing the second one would leave the PDFs behind forever,
+      // with no row left pointing at them.
       expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
         `books/${BOOK_ID}/`,
+      );
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+        `documents/books/${BOOK_ID}/`,
       );
     });
 
     it('404s an unknown book instead of silently succeeding', async () => {
       prisma.book.findUnique.mockResolvedValue(null);
-      await expect(service.remove('nope')).rejects.toBeInstanceOf(
+      await expect(service.remove('nope', ACTOR)).rejects.toBeInstanceOf(
         NotFoundException,
+      );
+    });
+  });
+
+  describe('deleteChapter', () => {
+    it('sweeps the chapter out of both trees — pages and source PDF', async () => {
+      prisma.bookEdition.findUnique.mockResolvedValue(pdfEdition());
+      prisma.bookChapter.findUnique.mockResolvedValue({
+        id: CHAPTER_UUID,
+        editionId: EDITION_ID,
+        title: 'Ch. 1',
+        pageCount: 12,
+      });
+
+      await service.deleteChapter(BOOK_ID, EDITION_ID, CHAPTER_UUID, ACTOR);
+
+      expect(prisma.bookChapter.delete).toHaveBeenCalledWith({
+        where: { id: CHAPTER_UUID },
+      });
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+        `books/${BOOK_ID}/${EDITION_ID}/${CHAPTER_UUID}/`,
+      );
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+        `documents/books/${BOOK_ID}/${EDITION_ID}/${CHAPTER_UUID}/`,
       );
     });
   });
@@ -672,7 +888,7 @@ describe('BooksService', () => {
       id: CHAPTER_UUID,
       editionId: EDITION_ID,
       status: ChapterStatus.DRAFT,
-      pdfKey: `books/${BOOK_ID}/${EDITION_ID}/${CHAPTER_UUID}/original.pdf`,
+      pdfKey: `documents/books/${BOOK_ID}/${EDITION_ID}/${CHAPTER_UUID}/original.pdf`,
       pdfFileSize: null,
       pageCount: 0,
       processedPages: 0,
@@ -692,21 +908,104 @@ describe('BooksService', () => {
       minioService.objectSize.mockResolvedValue(null);
 
       await expect(
-        service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID),
+        service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID, ACTOR),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(bookProcessing.processChapter).not.toHaveBeenCalled();
     });
 
-    it('refuses a second run while this process is genuinely converting', async () => {
+    it('refuses a second run while this process is genuinely converting — nothing read, written or logged', async () => {
       prisma.bookChapter.findUnique.mockResolvedValue(
         chapter({ status: ChapterStatus.PROCESSING }),
       );
-      bookProcessing.isActivelyProcessing.mockReturnValue(true);
+      bookProcessing.reserve.mockReturnValue(false);
 
       await expect(
-        service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID),
+        service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID, ACTOR),
       ).rejects.toBeInstanceOf(ConflictException);
+      expect(minioService.objectSize).not.toHaveBeenCalled();
+      expect(prisma.bookChapter.update).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+      expect(bookProcessing.processChapter).not.toHaveBeenCalled();
     });
+
+    it('gives the reservation back when no PDF is found, so the next press is not refused', async () => {
+      prisma.bookChapter.findUnique.mockResolvedValue(
+        chapter({ pdfKey: null }),
+      );
+      minioService.objectSize.mockResolvedValue(null);
+
+      await expect(
+        service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID, ACTOR),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(bookProcessing.reserve).toHaveBeenCalledWith(CHAPTER_UUID);
+      expect(bookProcessing.release).toHaveBeenCalledWith(CHAPTER_UUID);
+      expect(bookProcessing.processChapter).not.toHaveBeenCalled();
+    });
+
+    it('gives the reservation back and rethrows when the audit write fails', async () => {
+      prisma.bookChapter.findUnique.mockResolvedValue(chapter());
+      audit.record.mockRejectedValue(new Error('audit down'));
+
+      await expect(
+        service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID, ACTOR),
+      ).rejects.toThrow('audit down');
+      expect(bookProcessing.release).toHaveBeenCalledWith(CHAPTER_UUID);
+      expect(bookProcessing.processChapter).not.toHaveBeenCalled();
+    });
+
+    it('keeps the reservation once the pipeline owns it — a successful start never releases', async () => {
+      prisma.bookChapter.findUnique.mockResolvedValue(chapter());
+
+      await service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID, ACTOR);
+
+      expect(bookProcessing.reserve).toHaveBeenCalledWith(CHAPTER_UUID);
+      expect(bookProcessing.release).not.toHaveBeenCalled();
+      expect(bookProcessing.processChapter).toHaveBeenCalledWith(CHAPTER_UUID);
+    });
+
+    it(
+      'five simultaneous presses start exactly one conversion — the reservation is taken before ' +
+        'the first await, so the row read alone can no longer let every request through',
+      async () => {
+        prisma.bookChapter.findUnique.mockResolvedValue(chapter());
+        // A real Set behind the mock, exactly like BookProcessingService.
+        const active = new Set<string>();
+        bookProcessing.reserve.mockImplementation((id: string) => {
+          if (active.has(id)) return false;
+          active.add(id);
+          return true;
+        });
+        bookProcessing.release.mockImplementation((id: string) => {
+          active.delete(id);
+        });
+        bookProcessing.isActivelyProcessing.mockImplementation((id: string) =>
+          active.has(id),
+        );
+        // The pipeline keeps the id in the set for the life of the run.
+        bookProcessing.processChapter.mockImplementation(
+          () => new Promise<void>(() => {}),
+        );
+
+        const outcomes = await Promise.allSettled(
+          Array.from({ length: 5 }, () =>
+            service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID, ACTOR),
+          ),
+        );
+
+        expect(outcomes.filter((o) => o.status === 'fulfilled')).toHaveLength(
+          1,
+        );
+        const refused = outcomes.filter(
+          (o): o is PromiseRejectedResult => o.status === 'rejected',
+        );
+        expect(refused).toHaveLength(4);
+        for (const o of refused) {
+          expect(o.reason).toBeInstanceOf(ConflictException);
+        }
+        expect(bookProcessing.processChapter).toHaveBeenCalledTimes(1);
+        expect(audit.record).toHaveBeenCalledTimes(1);
+      },
+    );
 
     it(
       'allows a retry of a chapter stuck at PROCESSING that nothing is ' +
@@ -717,9 +1016,11 @@ describe('BooksService', () => {
         );
         bookProcessing.isActivelyProcessing.mockReturnValue(false);
 
-        await service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID);
+        await service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID, ACTOR);
 
-        expect(bookProcessing.processChapter).toHaveBeenCalledWith(CHAPTER_UUID);
+        expect(bookProcessing.processChapter).toHaveBeenCalledWith(
+          CHAPTER_UUID,
+        );
       },
     );
 
@@ -727,7 +1028,7 @@ describe('BooksService', () => {
       prisma.bookChapter.findUnique.mockResolvedValue(chapter());
       minioService.objectSize.mockResolvedValue(4096);
 
-      await service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID);
+      await service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID, ACTOR);
 
       expect(prisma.bookChapter.update).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -746,9 +1047,11 @@ describe('BooksService', () => {
         );
         prisma.bookChapter.findUnique.mockResolvedValue(chapter());
 
-        await service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID);
+        await service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID, ACTOR);
 
-        expect(bookProcessing.processChapter).toHaveBeenCalledWith(CHAPTER_UUID);
+        expect(bookProcessing.processChapter).toHaveBeenCalledWith(
+          CHAPTER_UUID,
+        );
       },
     );
 
@@ -756,7 +1059,7 @@ describe('BooksService', () => {
       prisma.bookEdition.findUnique.mockResolvedValue(edition());
 
       await expect(
-        service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID),
+        service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID, ACTOR),
       ).rejects.toBeInstanceOf(BadRequestException);
     });
 
@@ -766,7 +1069,7 @@ describe('BooksService', () => {
       );
 
       await expect(
-        service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID),
+        service.startProcessing(BOOK_ID, EDITION_ID, CHAPTER_UUID, ACTOR),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
@@ -837,9 +1140,14 @@ describe('BooksService', () => {
     });
 
     it('renumbers every chapter sequentially from the submitted order', async () => {
-      await service.reorderChapters(BOOK_ID, EDITION_ID, {
-        chapterIds: ['c3', 'c1', 'c2'],
-      });
+      await service.reorderChapters(
+        BOOK_ID,
+        EDITION_ID,
+        {
+          chapterIds: ['c3', 'c1', 'c2'],
+        },
+        ACTOR,
+      );
 
       expect(prisma.bookChapter.update.mock.calls.map((c) => c[0])).toEqual([
         { where: { id: 'c3' }, data: { order: 1 } },
@@ -852,9 +1160,14 @@ describe('BooksService', () => {
       'issues exactly the index+1 writes and nothing else for a part-less ' +
         'edition — the byte-for-byte guard for every existing book',
       async () => {
-        await service.reorderChapters(BOOK_ID, EDITION_ID, {
-          chapterIds: ['c1', 'c2', 'c3'],
-        });
+        await service.reorderChapters(
+          BOOK_ID,
+          EDITION_ID,
+          {
+            chapterIds: ['c1', 'c2', 'c3'],
+          },
+          ACTOR,
+        );
 
         expect(prisma.bookChapter.update).toHaveBeenCalledTimes(3);
         expect(prisma.$transaction).toHaveBeenCalledTimes(1);
@@ -864,9 +1177,14 @@ describe('BooksService', () => {
 
     it('rejects a partial list — a full-set renumber is what keeps this idempotent', async () => {
       await expect(
-        service.reorderChapters(BOOK_ID, EDITION_ID, {
-          chapterIds: ['c1', 'c2'],
-        }),
+        service.reorderChapters(
+          BOOK_ID,
+          EDITION_ID,
+          {
+            chapterIds: ['c1', 'c2'],
+          },
+          ACTOR,
+        ),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(prisma.bookChapter.update).not.toHaveBeenCalled();
     });
@@ -881,7 +1199,12 @@ describe('BooksService', () => {
         prisma.bookChapter.findFirst.mockResolvedValue(null);
         prisma.bookChapter.create.mockResolvedValue({ id: 'c1' });
 
-        await service.createChapter(BOOK_ID, EDITION_ID, { title: 'Ch. 1' });
+        await service.createChapter(
+          BOOK_ID,
+          EDITION_ID,
+          { title: 'Ch. 1' },
+          ACTOR,
+        );
 
         expect(prisma.bookChapter.create).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -900,10 +1223,15 @@ describe('BooksService', () => {
       prisma.bookChapter.findFirst.mockResolvedValue(null);
       prisma.bookChapter.create.mockResolvedValue({ id: 'c1' });
 
-      await service.createChapter(BOOK_ID, EDITION_ID, {
-        title: 'One',
-        content: {},
-      });
+      await service.createChapter(
+        BOOK_ID,
+        EDITION_ID,
+        {
+          title: 'One',
+          content: {},
+        },
+        ACTOR,
+      );
 
       expect(prisma.bookChapter.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -917,15 +1245,20 @@ describe('BooksService', () => {
       prisma.bookChapter.findFirst.mockResolvedValue(null);
       prisma.bookChapter.create.mockResolvedValue({ id: 'c1' });
 
-      await service.createChapter(BOOK_ID, EDITION_ID, {
-        title: 'Ch. 1',
-        imageUrl: 'http://cache/movies/images/ch1.webp',
-      });
+      await service.createChapter(
+        BOOK_ID,
+        EDITION_ID,
+        {
+          title: 'Ch. 1',
+          imageUrl: 'http://cache/movies/images/book/ch1.webp',
+        },
+        ACTOR,
+      );
 
       expect(prisma.bookChapter.create).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
-            imageUrl: 'http://cache/movies/images/ch1.webp',
+            imageUrl: 'http://cache/movies/images/book/ch1.webp',
           }),
         }),
       );
@@ -936,10 +1269,15 @@ describe('BooksService', () => {
       prisma.bookChapter.findFirst.mockResolvedValue({ order: 7 });
       prisma.bookChapter.create.mockResolvedValue({ id: 'c8' });
 
-      await service.createChapter(BOOK_ID, EDITION_ID, {
-        title: 'Eight',
-        content: {},
-      });
+      await service.createChapter(
+        BOOK_ID,
+        EDITION_ID,
+        {
+          title: 'Eight',
+          content: {},
+        },
+        ACTOR,
+      );
 
       expect(prisma.bookChapter.findFirst).toHaveBeenCalledWith(
         expect.objectContaining({ where: { editionId: EDITION_ID } }),
@@ -1073,11 +1411,16 @@ describe('BooksService', () => {
       prisma.bookPart.findUnique.mockResolvedValue({ editionId: 'edition-en' });
 
       await expect(
-        service.createChapter(BOOK_ID, EDITION_ID, {
-          title: 'One',
-          content: {},
-          partId: PART_UUID,
-        }),
+        service.createChapter(
+          BOOK_ID,
+          EDITION_ID,
+          {
+            title: 'One',
+            content: {},
+            partId: PART_UUID,
+          },
+          ACTOR,
+        ),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(prisma.bookChapter.create).not.toHaveBeenCalled();
     });
@@ -1087,14 +1430,19 @@ describe('BooksService', () => {
       prisma.bookChapter.findFirst.mockResolvedValue(null);
       prisma.bookChapter.create.mockResolvedValue({ id: 'c1', order: 1 });
 
-      const created = await service.createChapter(BOOK_ID, EDITION_ID, {
-        title: 'One',
-        content: {},
-      });
-
-      expect(prisma.bookChapter.create.mock.calls[0][0].data).not.toHaveProperty(
-        'partId',
+      const created = await service.createChapter(
+        BOOK_ID,
+        EDITION_ID,
+        {
+          title: 'One',
+          content: {},
+        },
+        ACTOR,
       );
+
+      expect(
+        prisma.bookChapter.create.mock.calls[0][0].data,
+      ).not.toHaveProperty('partId');
       expect(created.number).toBe('1');
       expect(created.sections).toEqual([]);
     });
@@ -1124,9 +1472,15 @@ describe('BooksService', () => {
         { id: 'c3', partId: PART_UUID, order: 3, createdAt: t, pageCount: 0 },
       ]);
 
-      await service.updateChapter(BOOK_ID, EDITION_ID, 'c3', {
-        partId: PART_UUID,
-      });
+      await service.updateChapter(
+        BOOK_ID,
+        EDITION_ID,
+        'c3',
+        {
+          partId: PART_UUID,
+        },
+        ACTOR,
+      );
 
       // Canonical: c2 (unparted) first, then c1, c3 — c3 keeps 3.
       const orderWrites = prisma.bookChapter.update.mock.calls
@@ -1150,7 +1504,7 @@ describe('BooksService', () => {
         { id: 'c2', partId: null, order: 1, createdAt: t },
       ]);
 
-      await service.deletePart(BOOK_ID, EDITION_ID, PART_UUID);
+      await service.deletePart(BOOK_ID, EDITION_ID, PART_UUID, ACTOR);
 
       expect(prisma.bookPart.delete).toHaveBeenCalledWith({
         where: { id: PART_UUID },
@@ -1178,16 +1532,28 @@ describe('BooksService', () => {
       prisma.bookChapter.findUnique.mockResolvedValue(pdfChapter());
 
       await expect(
-        service.createSection(BOOK_ID, EDITION_ID, CHAPTER_UUID, {
-          title: 'S',
-          startPage: 0,
-        }),
+        service.createSection(
+          BOOK_ID,
+          EDITION_ID,
+          CHAPTER_UUID,
+          {
+            title: 'S',
+            startPage: 0,
+          },
+          ACTOR,
+        ),
       ).rejects.toBeInstanceOf(BadRequestException);
       await expect(
-        service.createSection(BOOK_ID, EDITION_ID, CHAPTER_UUID, {
-          title: 'S',
-          startPage: 13,
-        }),
+        service.createSection(
+          BOOK_ID,
+          EDITION_ID,
+          CHAPTER_UUID,
+          {
+            title: 'S',
+            startPage: 13,
+          },
+          ACTOR,
+        ),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(prisma.bookSection.create).not.toHaveBeenCalled();
     });
@@ -1198,11 +1564,19 @@ describe('BooksService', () => {
       prisma.bookSection.findFirst.mockImplementation(
         ({ where }: { where: { startPage?: number } }) =>
           Promise.resolve(
-            where?.startPage !== undefined ? { id: 's-old', title: 'Late' } : { order: 1 },
+            where?.startPage !== undefined
+              ? { id: 's-old', title: 'Late' }
+              : { order: 1 },
           ),
       );
       await expect(
-        service.createSection(BOOK_ID, EDITION_ID, CHAPTER_UUID, { title: 'Dup', startPage: 9 }),
+        service.createSection(
+          BOOK_ID,
+          EDITION_ID,
+          CHAPTER_UUID,
+          { title: 'Dup', startPage: 9 },
+          ACTOR,
+        ),
       ).rejects.toThrow(/already starts on page 9/);
       expect(prisma.bookSection.create).not.toHaveBeenCalled();
     });
@@ -1218,8 +1592,26 @@ describe('BooksService', () => {
       );
       prisma.bookSection.create.mockResolvedValue({ id: 's-new', order: 2 });
       const rows = [
-        { id: 's-old', chapterId: CHAPTER_UUID, title: 'Late', order: 1, startPage: 9, content: null, createdAt: t, updatedAt: t },
-        { id: 's-new', chapterId: CHAPTER_UUID, title: 'Early', order: 2, startPage: 3, content: null, createdAt: t, updatedAt: t },
+        {
+          id: 's-old',
+          chapterId: CHAPTER_UUID,
+          title: 'Late',
+          order: 1,
+          startPage: 9,
+          content: null,
+          createdAt: t,
+          updatedAt: t,
+        },
+        {
+          id: 's-new',
+          chapterId: CHAPTER_UUID,
+          title: 'Early',
+          order: 2,
+          startPage: 3,
+          content: null,
+          createdAt: t,
+          updatedAt: t,
+        },
       ];
       prisma.bookSection.findMany.mockResolvedValue(rows);
 
@@ -1228,6 +1620,7 @@ describe('BooksService', () => {
         EDITION_ID,
         CHAPTER_UUID,
         { title: 'Early', startPage: 3 },
+        ACTOR,
       );
 
       expect(prisma.bookSection.create).toHaveBeenCalledWith(
@@ -1246,19 +1639,36 @@ describe('BooksService', () => {
 
     it('refuses a start page on a written chapter, and defaults its content to {}', async () => {
       prisma.bookEdition.findUnique.mockResolvedValue(edition());
-      prisma.bookChapter.findUnique.mockResolvedValue(pdfChapter({ pageCount: 0 }));
+      prisma.bookChapter.findUnique.mockResolvedValue(
+        pdfChapter({ pageCount: 0 }),
+      );
 
       await expect(
-        service.createSection(BOOK_ID, EDITION_ID, CHAPTER_UUID, {
-          title: 'S',
-          startPage: 1,
-        }),
+        service.createSection(
+          BOOK_ID,
+          EDITION_ID,
+          CHAPTER_UUID,
+          {
+            title: 'S',
+            startPage: 1,
+          },
+          ACTOR,
+        ),
       ).rejects.toBeInstanceOf(BadRequestException);
 
       prisma.bookSection.findFirst.mockResolvedValue(null);
       prisma.bookSection.create.mockResolvedValue({ id: 's1' });
       prisma.bookSection.findMany.mockResolvedValue([
-        { id: 's1', chapterId: CHAPTER_UUID, title: 'S', order: 1, startPage: null, content: {}, createdAt: t, updatedAt: t },
+        {
+          id: 's1',
+          chapterId: CHAPTER_UUID,
+          title: 'S',
+          order: 1,
+          startPage: null,
+          content: {},
+          createdAt: t,
+          updatedAt: t,
+        },
       ]);
 
       const created = await service.createSection(
@@ -1266,11 +1676,16 @@ describe('BooksService', () => {
         EDITION_ID,
         CHAPTER_UUID,
         { title: 'S' },
+        ACTOR,
       );
 
       expect(prisma.bookSection.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({ content: {}, startPage: undefined, order: 1 }),
+          data: expect.objectContaining({
+            content: {},
+            startPage: undefined,
+            order: 1,
+          }),
         }),
       );
       expect(created.number).toBe('1.1');
@@ -1282,9 +1697,15 @@ describe('BooksService', () => {
       prisma.bookChapter.findUnique.mockResolvedValue(pdfChapter());
 
       await expect(
-        service.reorderSections(BOOK_ID, EDITION_ID, CHAPTER_UUID, {
-          sectionIds: ['s1'],
-        }),
+        service.reorderSections(
+          BOOK_ID,
+          EDITION_ID,
+          CHAPTER_UUID,
+          {
+            sectionIds: ['s1'],
+          },
+          ACTOR,
+        ),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(prisma.bookSection.update).not.toHaveBeenCalled();
     });
@@ -1297,7 +1718,9 @@ describe('BooksService', () => {
 
     it('rejects a section that belongs to a different chapter than the one sent', async () => {
       prisma.bookEdition.findUnique.mockResolvedValue(published());
-      prisma.bookChapter.findUnique.mockResolvedValue({ editionId: EDITION_ID });
+      prisma.bookChapter.findUnique.mockResolvedValue({
+        editionId: EDITION_ID,
+      });
       prisma.bookSection.findUnique.mockResolvedValue({
         chapterId: OTHER_CHAPTER,
         chapter: { editionId: EDITION_ID },
@@ -1317,7 +1740,9 @@ describe('BooksService', () => {
 
     it('writes the section alongside the chapter when it fits', async () => {
       prisma.bookEdition.findUnique.mockResolvedValue(published());
-      prisma.bookChapter.findUnique.mockResolvedValue({ editionId: EDITION_ID });
+      prisma.bookChapter.findUnique.mockResolvedValue({
+        editionId: EDITION_ID,
+      });
       prisma.bookSection.findUnique.mockResolvedValue({
         chapterId: CHAPTER_UUID,
         chapter: { editionId: EDITION_ID },

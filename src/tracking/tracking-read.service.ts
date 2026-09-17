@@ -11,6 +11,12 @@ import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { normalizeSearchTerm } from './tracking.service';
 import { presentIp, presentPhone } from './pii.util';
+import { AuditService } from '../audit/audit.service';
+import {
+  commentSnapshot,
+  feedbackSnapshot,
+  textPreview,
+} from '../audit/audit-snapshots';
 import type { TrackingCommentQueryDto } from './dto/tracking-comment-query.dto';
 import type { ModerateCommentDto } from './dto/moderate-comment.dto';
 import type { TrackingFeedbackQueryDto } from './dto/tracking-feedback-query.dto';
@@ -258,6 +264,7 @@ export class TrackingReadService {
     private readonly prisma: PrismaService,
     private readonly resolver: PermissionResolverService,
     private readonly realtimeGateway: RealtimeGateway,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -370,10 +377,21 @@ export class TrackingReadService {
   async moderateComment(
     id: string,
     dto: ModerateCommentDto,
+    actor: AuthenticatedUser,
   ): Promise<{ id: string; status: CommentStatus }> {
+    // The audit "before": status plus enough of the comment to recognise it.
     const existing = await this.prisma.comment.findUnique({
       where: { id },
-      select: { id: true },
+      select: {
+        id: true,
+        status: true,
+        body: true,
+        userId: true,
+        movieId: true,
+        seriesId: true,
+        bookId: true,
+        parentId: true,
+      },
     });
     if (!existing) throw new NotFoundException('Comment not found');
 
@@ -381,6 +399,14 @@ export class TrackingReadService {
       where: { id },
       data: { status: dto.status },
       select: { id: true, status: true },
+    });
+
+    await this.audit.record({
+      action: 'comment.moderate',
+      actor,
+      target: { type: 'comment', id, label: textPreview(existing.body, 60) },
+      before: commentSnapshot(existing),
+      after: commentSnapshot({ ...existing, status: updated.status }),
     });
     return updated;
   }
@@ -466,9 +492,19 @@ export class TrackingReadService {
     dto: UpdateFeedbackStatusDto,
     actor: AuthenticatedUser,
   ): Promise<TrackedFeedbackView> {
+    // The audit "before" — `handledBy` in the same shape the update returns,
+    // so an unchanged handler never shows up as a change.
     const existing = await this.prisma.feedback.findUnique({
       where: { id },
-      select: { id: true },
+      select: {
+        id: true,
+        status: true,
+        category: true,
+        message: true,
+        adminNote: true,
+        handledAt: true,
+        handledBy: { select: { id: true, username: true } },
+      },
     });
     if (!existing) throw new NotFoundException('Feedback not found');
 
@@ -497,6 +533,18 @@ export class TrackingReadService {
         user: { select: TRACKED_USER_SELECT },
         handledBy: { select: { id: true, username: true, displayName: true } },
       },
+    });
+
+    await this.audit.record({
+      action: 'feedback.status_change',
+      actor,
+      target: {
+        type: 'feedback',
+        id,
+        label: textPreview(existing.message, 60),
+      },
+      before: feedbackSnapshot(existing),
+      after: feedbackSnapshot(row),
     });
 
     return {

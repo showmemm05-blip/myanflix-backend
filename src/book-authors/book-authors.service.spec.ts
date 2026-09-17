@@ -3,8 +3,18 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import { BookAuthorsService } from './book-authors.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
+import { AuditService } from '../audit/audit.service';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
+import { Role } from '../generated/prisma/client';
 
 const AUTHOR_ID = 'author-1';
+/** The staff member every mutation below is attributed to in the audit log. */
+const ACTOR: AuthenticatedUser = {
+  id: 'staff-1',
+  username: 'editor',
+  role: Role.ADMIN,
+  appRoleId: null,
+};
 
 describe('BookAuthorsService', () => {
   let service: BookAuthorsService;
@@ -61,7 +71,7 @@ describe('BookAuthorsService', () => {
     };
     minioService = {
       canonicalImageUrl: jest.fn((url: string | null) => url),
-      keyFromPublicUrl: jest.fn(() => 'images/portrait.jpg'),
+      keyFromPublicUrl: jest.fn(() => 'images/bookauthor/portrait.jpg'),
       deleteObject: jest.fn().mockResolvedValue(undefined),
     };
 
@@ -70,6 +80,10 @@ describe('BookAuthorsService', () => {
         BookAuthorsService,
         { provide: PrismaService, useValue: prisma },
         { provide: MinioService, useValue: minioService },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -109,7 +123,7 @@ describe('BookAuthorsService', () => {
       prisma.bookAuthor.findFirst.mockResolvedValue(author());
 
       await expect(
-        service.create({ name: '  blake ' }),
+        service.create({ name: '  blake ' }, ACTOR),
       ).rejects.toBeInstanceOf(ConflictException);
 
       expect(prisma.bookAuthor.findFirst).toHaveBeenCalledWith({
@@ -122,7 +136,10 @@ describe('BookAuthorsService', () => {
       prisma.bookAuthor.findFirst.mockResolvedValue(null);
       prisma.bookAuthor.create.mockResolvedValue(author());
 
-      await service.create({ name: ' New Person ', imageUrl: 'http://x/p.jpg' });
+      await service.create(
+        { name: ' New Person ', imageUrl: 'http://x/p.jpg' },
+        ACTOR,
+      );
 
       expect(minioService.canonicalImageUrl).toHaveBeenCalledWith(
         'http://x/p.jpg',
@@ -140,16 +157,18 @@ describe('BookAuthorsService', () => {
       prisma.bookAuthor.findUnique.mockResolvedValue(null);
 
       await expect(
-        service.update('nope', { name: 'X' }),
+        service.update('nope', { name: 'X' }, ACTOR),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
 
-    it('fans a rename out to every credited book\'s display string', async () => {
+    it("fans a rename out to every credited book's display string", async () => {
       prisma.bookAuthor.findUnique.mockResolvedValue(author());
       prisma.bookAuthor.findFirst.mockResolvedValue(null);
-      prisma.bookAuthor.update.mockResolvedValue(author({ name: 'Blake Crouch' }));
+      prisma.bookAuthor.update.mockResolvedValue(
+        author({ name: 'Blake Crouch' }),
+      );
 
-      await service.update(AUTHOR_ID, { name: ' Blake Crouch ' });
+      await service.update(AUTHOR_ID, { name: ' Blake Crouch ' }, ACTOR);
 
       expect(prisma.book.updateMany).toHaveBeenCalledWith({
         where: { authorId: AUTHOR_ID },
@@ -162,7 +181,7 @@ describe('BookAuthorsService', () => {
       prisma.bookAuthor.findFirst.mockResolvedValue(author());
       prisma.bookAuthor.update.mockResolvedValue(author());
 
-      await service.update(AUTHOR_ID, { name: 'Blake', bio: 'Writes.' });
+      await service.update(AUTHOR_ID, { name: 'Blake', bio: 'Writes.' }, ACTOR);
 
       expect(prisma.book.updateMany).not.toHaveBeenCalled();
     });
@@ -173,7 +192,7 @@ describe('BookAuthorsService', () => {
       prisma.bookAuthor.update.mockResolvedValue(author());
 
       await expect(
-        service.update(AUTHOR_ID, { name: 'blake' }),
+        service.update(AUTHOR_ID, { name: 'blake' }, ACTOR),
       ).resolves.toBeDefined();
     });
 
@@ -184,7 +203,7 @@ describe('BookAuthorsService', () => {
       );
 
       await expect(
-        service.update(AUTHOR_ID, { name: 'taken' }),
+        service.update(AUTHOR_ID, { name: 'taken' }, ACTOR),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(prisma.bookAuthor.update).not.toHaveBeenCalled();
     });
@@ -197,10 +216,10 @@ describe('BookAuthorsService', () => {
         author({ imageUrl: 'http://x/new.jpg' }),
       );
 
-      await service.update(AUTHOR_ID, { imageUrl: 'http://x/new.jpg' });
+      await service.update(AUTHOR_ID, { imageUrl: 'http://x/new.jpg' }, ACTOR);
 
       expect(minioService.deleteObject).toHaveBeenCalledWith(
-        'images/portrait.jpg',
+        'images/bookauthor/portrait.jpg',
       );
     });
 
@@ -212,7 +231,7 @@ describe('BookAuthorsService', () => {
         author({ imageUrl: 'http://x/same.jpg' }),
       );
 
-      await service.update(AUTHOR_ID, { imageUrl: 'http://x/same.jpg' });
+      await service.update(AUTHOR_ID, { imageUrl: 'http://x/same.jpg' }, ACTOR);
 
       expect(minioService.deleteObject).not.toHaveBeenCalled();
     });
@@ -226,7 +245,7 @@ describe('BookAuthorsService', () => {
         author({ name: 'Renamed', imageUrl: 'http://x/kept.jpg' }),
       );
 
-      await service.update(AUTHOR_ID, { name: 'Renamed' });
+      await service.update(AUTHOR_ID, { name: 'Renamed' }, ACTOR);
 
       expect(minioService.deleteObject).not.toHaveBeenCalled();
     });
@@ -238,7 +257,7 @@ describe('BookAuthorsService', () => {
         author({ _count: { books: 3 } }),
       );
 
-      await expect(service.remove(AUTHOR_ID)).rejects.toMatchObject({
+      await expect(service.remove(AUTHOR_ID, ACTOR)).rejects.toMatchObject({
         constructor: ConflictException,
         message: expect.stringContaining('3 books'),
       });
@@ -250,7 +269,7 @@ describe('BookAuthorsService', () => {
         author({ _count: { books: 1 } }),
       );
 
-      await expect(service.remove(AUTHOR_ID)).rejects.toMatchObject({
+      await expect(service.remove(AUTHOR_ID, ACTOR)).rejects.toMatchObject({
         message: expect.stringContaining('on 1 book.'),
       });
     });
@@ -260,7 +279,7 @@ describe('BookAuthorsService', () => {
         author({ imageUrl: 'http://x/p.jpg' }),
       );
 
-      await service.remove(AUTHOR_ID);
+      await service.remove(AUTHOR_ID, ACTOR);
 
       expect(prisma.bookAuthor.delete).toHaveBeenCalledWith({
         where: { id: AUTHOR_ID },
@@ -274,13 +293,13 @@ describe('BookAuthorsService', () => {
       );
       minioService.deleteObject.mockRejectedValue(new Error('storage down'));
 
-      await expect(service.remove(AUTHOR_ID)).resolves.toBeUndefined();
+      await expect(service.remove(AUTHOR_ID, ACTOR)).resolves.toBeUndefined();
       expect(prisma.bookAuthor.delete).toHaveBeenCalled();
     });
 
     it('404s an unknown author instead of silently succeeding', async () => {
       prisma.bookAuthor.findUnique.mockResolvedValue(null);
-      await expect(service.remove('nope')).rejects.toBeInstanceOf(
+      await expect(service.remove('nope', ACTOR)).rejects.toBeInstanceOf(
         NotFoundException,
       );
     });

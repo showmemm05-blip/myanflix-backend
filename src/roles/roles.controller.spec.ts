@@ -225,9 +225,11 @@ describe('RolesController', () => {
           .send({ name: 'Film Manager' }),
       ).expect(200);
 
-      expect(service.update).toHaveBeenCalledWith(ROLE_ID, {
-        name: 'Film Manager',
-      });
+      expect(service.update).toHaveBeenCalledWith(
+        ROLE_ID,
+        { name: 'Film Manager' },
+        SUPER_ADMIN_ACTOR,
+      );
     });
 
     it('PUT /roles/:id/permissions replaces the whole set', async () => {
@@ -264,7 +266,7 @@ describe('RolesController', () => {
       ).expect(204);
 
       expect(response.body).toEqual({});
-      expect(service.remove).toHaveBeenCalledWith(ROLE_ID);
+      expect(service.remove).toHaveBeenCalledWith(ROLE_ID, SUPER_ADMIN_ACTOR);
     });
 
     it('rejects a non-UUID role id', async () => {

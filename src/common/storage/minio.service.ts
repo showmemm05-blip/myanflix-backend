@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { OWN_KEY_PREFIXES } from './media-taxonomy';
 import { requestHostContext } from './request-host.context';
+import { quantizedExpiry, scopeForKey, signScope } from './stream-signature';
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
@@ -16,7 +18,6 @@ import {
   ListPartsCommand,
   NotFound,
   PutBucketLifecycleConfigurationCommand,
-  PutBucketPolicyCommand,
   PutObjectCommand,
   S3Client,
   UploadPartCommand,
@@ -40,6 +41,11 @@ const UPLOAD_QUEUE_SIZE = 4; // parts uploaded concurrently within one file
 // rendition can be ~900 segments for a feature-length movie; uploading them
 // all concurrently is what previously spiked memory on the backend VPS.
 const DIRECTORY_UPLOAD_CONCURRENCY = 4;
+
+// Lifetime of a signed playback link when STREAM_URL_TTL_SECONDS is unset:
+// 12 hours — longer than any sitting, short enough that a shared link is
+// dead by the next day. Mirrors the default in config/env.validation.ts.
+const DEFAULT_STREAM_URL_TTL_SECONDS = 43_200;
 
 // Without these, the AWS SDK's default HTTP handler has no timeout at all —
 // a stalled connection to MinIO (a dropped packet, a brief network blip)
@@ -82,17 +88,10 @@ const CONTENT_TYPES: Record<string, string> = {
   '.srt': 'application/x-subrip',
   '.vtt': 'text/vtt',
   '.ass': 'text/x-ssa',
-  // Book originals — archived under books/<bookId>/, converted page-by-page
+  // Book originals — archived under documents/books/, converted page-by-page
   // to the WebPs that are actually served.
   '.pdf': 'application/pdf',
 };
-
-/**
- * The key namespaces this service writes (see StorageService.imageObjectKey /
- * videoObjectKey). A URL only counts as "ours" if its key starts with one of
- * them — see MinioService.ownImageKey.
- */
-const OWN_KEY_PREFIXES = ['images/', 'videos/', 'subtitles/', 'books/'] as const;
 
 /**
  * Talks to the storage server (MinIO, or any S3-compatible endpoint) —
@@ -127,6 +126,15 @@ export class MinioService {
    * Setting this to true makes the configured base authoritative.
    */
   private readonly streamBaseIsPublic: boolean;
+  /**
+   * Shared with the cache server's nginx (STREAM_SIGNING_SECRET on both
+   * sides) — signedPlaybackUrl() mints the path token secure_link verifies.
+   * Env validation refuses to boot without one; the `?? ''` only keeps unit
+   * specs that mock ConfigService constructing the service.
+   */
+  private readonly streamSigningSecret: string;
+  /** How long a signed playback link stays valid (STREAM_URL_TTL_SECONDS). */
+  private readonly streamUrlTtlSeconds: number;
   private bucketReady: Promise<void> | null = null;
 
   constructor(private readonly configService: ConfigService) {
@@ -136,6 +144,11 @@ export class MinioService {
         this.configService.get<string>('STREAM_PUBLIC_BASE_URL_IS_PUBLIC') ??
           '',
       ).toLowerCase() === 'true';
+    this.streamSigningSecret =
+      this.configService.get<string>('STREAM_SIGNING_SECRET') ?? '';
+    const ttl = Number(this.configService.get('STREAM_URL_TTL_SECONDS'));
+    this.streamUrlTtlSeconds =
+      Number.isFinite(ttl) && ttl > 0 ? ttl : DEFAULT_STREAM_URL_TTL_SECONDS;
     const credentials = {
       accessKeyId: this.configService.get<string>('MINIO_ACCESS_KEY') ?? '',
       secretAccessKey: this.configService.get<string>('MINIO_SECRET_KEY') ?? '',
@@ -208,17 +221,56 @@ export class MinioService {
    * request-specific host would be baked into the database.
    */
   playbackUrl(objectKey: string): string {
+    return `${this.playbackBase()}/${this.bucket}/${objectKey}`;
+  }
+
+  /**
+   * Playback URL carrying the cache server's access token in its PATH:
+   *
+   *   <base>/s/<expires>/<signature>/<bucket>/<objectKey>
+   *
+   * Same host rules as playbackUrl(); what differs is that the cache server
+   * refuses the request unless the token checks out (nginx secure_link, see
+   * cacheserver/nginx/templates/default.conf.template) or has expired. The
+   * token signs the key's SCOPE — `videos/<id>/hls`, a chapter's `pages`,
+   * a subtitle's folder — not the object, so the relative URIs inside a
+   * playlist (`720p/index.m3u8`, `segment_007.ts`) resolve to URLs the same
+   * token covers and the player needs nothing beyond the master URL. The
+   * expiry is hour-quantised (see quantizedExpiry) so a client refetching
+   * the stream mid-session gets the identical URL back. Throws
+   * StreamKeyNotSignable for a key outside every scope — images stay on
+   * playbackUrl()/imageUrl(), originals and PDFs are never handed out.
+   */
+  signedPlaybackUrl(objectKey: string): string {
+    const scope = scopeForKey(objectKey);
+    const expires = quantizedExpiry(
+      Math.floor(Date.now() / 1000),
+      this.streamUrlTtlSeconds,
+    );
+    const signature = signScope(scope, expires, this.streamSigningSecret);
+    return `${this.playbackBase()}/s/${expires}/${signature}/${this.bucket}/${objectKey}`;
+  }
+
+  /**
+   * `<protocol>://<host>:<port>` every playback URL hangs off — no trailing
+   * slash. Host resolution, in order: the configured base verbatim when it
+   * is marked public, else the current request's hostname with the base's
+   * protocol/port, else the configured base (outside any request).
+   */
+  private playbackBase(): string {
+    const base = (
+      this.configService.get<string>('STREAM_PUBLIC_BASE_URL') ?? ''
+    ).replace(/\/$/, '');
     // A deployment whose cache server has an address of its own — a separate
     // VPS, a CDN hostname — sets STREAM_PUBLIC_BASE_URL_IS_PUBLIC=true, and
     // the configured base is then used verbatim. Deriving the host would
     // point every stream at whichever host serves the API, which on a split
     // deployment is the one machine with no cache server on it.
-    if (this.streamBaseIsPublic) return this.publicUrl(objectKey);
+    if (this.streamBaseIsPublic) return base;
 
     const ctx = requestHostContext.getStore();
-    if (!ctx?.hostname) return this.publicUrl(objectKey);
+    if (!ctx?.hostname) return base;
 
-    const base = this.configService.get<string>('STREAM_PUBLIC_BASE_URL') ?? '';
     let protocol = 'http';
     let port = '8080';
     try {
@@ -228,7 +280,7 @@ export class MinioService {
     } catch {
       // Malformed/absent env base — keep the defaults above.
     }
-    return `${protocol}://${ctx.hostname}:${port}/${this.bucket}/${objectKey}`;
+    return `${protocol}://${ctx.hostname}:${port}`;
   }
 
   /**
@@ -565,7 +617,20 @@ export class MinioService {
     );
   }
 
-  /** Deletes every object under `prefix` — e.g. a movie's whole `videos/<movieId>/` tree (original + every rendition + bundle subtitles) when the movie itself is deleted. */
+  /**
+   * Deletes every object under `prefix` — e.g. a movie's whole
+   * `videos/<movieId>/` tree (the archived original plus every generated
+   * rendition, playlist and published subtitle) when the movie is deleted.
+   *
+   * ONE call is not a whole entity: the taxonomy splits sources from
+   * generated output, so an entity's storage spans a FIXED, deterministic
+   * set of prefixes and the caller must sweep all of them. A movie is
+   * `videos/<movieId>/` AND `subtitles/<movieId>/` (its uploaded subtitle
+   * source files, which no longer live under the video prefix); a book is
+   * `books/<bookId>/` AND `documents/books/<bookId>/`. MoviesService,
+   * SeriesService and BooksService each issue the matching pair — dropping
+   * one of them is a silent storage leak, not a failure.
+   */
   async deleteByPrefix(prefix: string): Promise<void> {
     let continuationToken: string | undefined;
     do {
@@ -730,29 +795,17 @@ export class MinioService {
 
     await this.client.send(new CreateBucketCommand({ Bucket: this.bucket }));
 
-    // HLS content is only ever handed out via the /videos/:movieId/stream
-    // endpoint, which already checks purchase ownership before returning a
-    // URL — public-read on the bucket is what lets the cache server (and
-    // MinIO) serve every segment without per-object signing, which HLS's
-    // many-small-files structure doesn't support cleanly. See
-    // cacheserver/README.md for the full tradeoff.
-    const policy = {
-      Version: '2012-10-17',
-      Statement: [
-        {
-          Effect: 'Allow',
-          Principal: '*',
-          Action: ['s3:GetObject'],
-          Resource: [`arn:aws:s3:::${this.bucket}/*`],
-        },
-      ],
-    };
-    await this.client.send(
-      new PutBucketPolicyCommand({
-        Bucket: this.bucket,
-        Policy: JSON.stringify(policy),
-      }),
+    // No bucket policy is set here any more. The bucket used to be made
+    // world-readable at creation, which meant every object — HLS, archived
+    // originals, subtitle sources, book pages and PDFs — was fetchable by
+    // key from MinIO's own port and through the cache server, no matter
+    // what the /stream endpoint had decided. Reads are now gated by the
+    // cache server's signed path token (signedPlaybackUrl), and the only
+    // anonymous read MinIO should allow is the one FROM the cache server's
+    // address: that policy is ops state, applied with `mc anonymous
+    // set-json` from storage-server/policies/ — see storage-server/README.md.
+    this.logger.log(
+      `Created bucket "${this.bucket}" (no anonymous policy — see storage-server/policies/)`,
     );
-    this.logger.log(`Created bucket "${this.bucket}" with public-read policy`);
   }
 }

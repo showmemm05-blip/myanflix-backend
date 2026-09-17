@@ -4,6 +4,9 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
+import { bookCategorySnapshot } from '../audit/audit-snapshots';
+import { AuditService } from '../audit/audit.service';
 import type {
   CreateBookCategoryDto,
   UpdateBookCategoryDto,
@@ -20,7 +23,10 @@ import type {
  */
 @Injectable()
 export class BookCategoriesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+  ) {}
 
   async findAll() {
     const categories = await this.prisma.bookCategory.findMany({
@@ -49,32 +55,63 @@ export class BookCategoriesService {
     };
   }
 
-  async create(dto: CreateBookCategoryDto) {
+  async create(dto: CreateBookCategoryDto, actor: AuthenticatedUser) {
     await this.assertNameAvailable(dto.name);
-    return this.prisma.bookCategory.create({ data: dto });
+    const created = await this.prisma.bookCategory.create({ data: dto });
+    await this.audit.record({
+      action: 'book_category.create',
+      actor,
+      target: { type: 'book_category', id: created.id, label: created.name },
+      after: bookCategorySnapshot(created),
+    });
+    return created;
   }
 
-  async update(id: string, dto: UpdateBookCategoryDto) {
-    await this.assertExists(id);
+  async update(
+    id: string,
+    dto: UpdateBookCategoryDto,
+    actor: AuthenticatedUser,
+  ) {
+    const before = await this.rowOrThrow(id);
     if (dto.name) await this.assertNameAvailable(dto.name, id);
-    return this.prisma.bookCategory.update({ where: { id }, data: dto });
+    const after = await this.prisma.bookCategory.update({
+      where: { id },
+      data: dto,
+    });
+    await this.audit.record({
+      action: 'book_category.update',
+      actor,
+      target: { type: 'book_category', id, label: after.name },
+      before: bookCategorySnapshot(before),
+      after: bookCategorySnapshot(after),
+    });
+    return after;
   }
 
   /**
    * The join rows go with it (schema cascade), so the books survive and
    * simply lose that shelf — the same semantics as deleting a movie category.
    */
-  async remove(id: string): Promise<void> {
-    await this.assertExists(id);
+  async remove(id: string, actor: AuthenticatedUser): Promise<void> {
+    const category = await this.rowOrThrow(id);
     await this.prisma.bookCategory.delete({ where: { id } });
+    await this.audit.record({
+      action: 'book_category.delete',
+      actor,
+      target: { type: 'book_category', id, label: category.name },
+      before: bookCategorySnapshot(category),
+      metadata: { unlinkedBooks: category._count.books },
+    });
   }
 
-  private async assertExists(id: string): Promise<void> {
-    const exists = await this.prisma.bookCategory.findUnique({
+  /** The row itself (not just its id): the audit snapshot wants the old values. */
+  private async rowOrThrow(id: string) {
+    const category = await this.prisma.bookCategory.findUnique({
       where: { id },
-      select: { id: true },
+      include: { _count: { select: { books: true } } },
     });
-    if (!exists) throw new NotFoundException('Book category not found');
+    if (!category) throw new NotFoundException('Book category not found');
+    return category;
   }
 
   private async assertNameAvailable(

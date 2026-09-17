@@ -18,13 +18,13 @@ function makeUser(overrides: Record<string, unknown> = {}) {
 
 describe('JwtStrategy — presence touch', () => {
   let strategy: JwtStrategy;
-  let usersService: { findByIdOrThrow: jest.Mock };
+  let usersService: { findById: jest.Mock };
   let trackingService: { touchLastSeen: jest.Mock; fireAndForget: jest.Mock };
 
   beforeEach(() => {
     jest.clearAllMocks();
 
-    usersService = { findByIdOrThrow: jest.fn().mockResolvedValue(makeUser()) };
+    usersService = { findById: jest.fn().mockResolvedValue(makeUser()) };
     trackingService = {
       touchLastSeen: jest.fn().mockResolvedValue(undefined),
       // Matches the real helper: run it, swallow failures into a log.
@@ -34,7 +34,9 @@ describe('JwtStrategy — presence touch', () => {
     };
 
     strategy = new JwtStrategy(
-      { get: jest.fn().mockReturnValue('test-secret') } as unknown as ConfigService,
+      {
+        get: jest.fn().mockReturnValue('test-secret'),
+      } as unknown as ConfigService,
       usersService as unknown as UsersService,
       trackingService as unknown as TrackingService,
     );
@@ -82,11 +84,20 @@ describe('JwtStrategy — presence touch', () => {
   });
 
   it('rejects a suspended account without recording it as present', async () => {
-    usersService.findByIdOrThrow.mockResolvedValue(
+    usersService.findById.mockResolvedValue(
       makeUser({ status: UserStatus.SUSPENDED }),
     );
 
     await expect(strategy.validate({ sub: 'user-1' })).rejects.toThrow(
+      UnauthorizedException,
+    );
+    expect(trackingService.touchLastSeen).not.toHaveBeenCalled();
+  });
+
+  it('rejects a token for an account that no longer exists with 401, not 404', async () => {
+    usersService.findById.mockResolvedValue(null);
+
+    await expect(strategy.validate({ sub: 'gone' })).rejects.toThrow(
       UnauthorizedException,
     );
     expect(trackingService.touchLastSeen).not.toHaveBeenCalled();

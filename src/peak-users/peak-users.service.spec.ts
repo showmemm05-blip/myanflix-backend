@@ -1,6 +1,16 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { Role } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { AuditService } from '../audit/audit.service';
 import { PeakUsersService } from './peak-users.service';
+
+/** The staff member setting the adjustment — `id` is what the updatedByUserId stamp checks. */
+const admin = {
+  id: 'admin-1',
+  username: 'boss',
+  role: Role.SUPER_ADMIN,
+  appRoleId: null,
+};
 
 function makeStats(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -38,6 +48,10 @@ describe('PeakUsersService', () => {
       providers: [
         PeakUsersService,
         { provide: PrismaService, useValue: prisma },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -122,7 +136,7 @@ describe('PeakUsersService', () => {
 
       const result = await service.setAdditional(
         { additionalPeak: 900 },
-        'admin-1',
+        admin,
       );
 
       expect(prisma.peakUserStats.update).toHaveBeenCalledWith({
@@ -149,10 +163,7 @@ describe('PeakUsersService', () => {
         }),
       );
 
-      const result = await service.setAdditional(
-        { additionalPeak: 0 },
-        'admin-1',
-      );
+      const result = await service.setAdditional({ additionalPeak: 0 }, admin);
 
       expect(prisma.peakUserStats.update).toHaveBeenCalledWith({
         where: { id: 'stats-1' },

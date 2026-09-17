@@ -11,6 +11,7 @@ import { WalletService } from '../wallet/wallet.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { FinanceSettingsService } from '../finance-settings/finance-settings.service';
 import { PaymentAccountLedgerService } from '../payment-accounts/payment-account-ledger.service';
+import { AuditService } from '../audit/audit.service';
 import { WithdrawalsService } from './withdrawals.service';
 
 function makeWithdrawal(overrides: Partial<Record<string, unknown>> = {}) {
@@ -91,7 +92,10 @@ describe('WithdrawalsService', () => {
           : Promise.all(arg as Promise<unknown>[]),
       ),
     };
-    walletService = { getByUserId: jest.fn(), debitWithinTransaction: jest.fn() };
+    walletService = {
+      getByUserId: jest.fn(),
+      debitWithinTransaction: jest.fn(),
+    };
     gateway = {
       notifyAdminsWithdrawalCreated: jest.fn(),
       notifyUserWithdrawalUpdated: jest.fn(),
@@ -110,7 +114,9 @@ describe('WithdrawalsService', () => {
     // Real linking/reversal behavior is covered by
     // payment-account-ledger.service.spec.ts — here it's a no-op so these
     // tests stay focused on WithdrawalsService's own orchestration.
-    paymentAccountLedgerService = { syncWithdrawalLink: jest.fn().mockResolvedValue(undefined) };
+    paymentAccountLedgerService = {
+      syncWithdrawalLink: jest.fn().mockResolvedValue(undefined),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -119,7 +125,14 @@ describe('WithdrawalsService', () => {
         { provide: WalletService, useValue: walletService },
         { provide: RealtimeGateway, useValue: gateway },
         { provide: FinanceSettingsService, useValue: financeSettingsService },
-        { provide: PaymentAccountLedgerService, useValue: paymentAccountLedgerService },
+        {
+          provide: PaymentAccountLedgerService,
+          useValue: paymentAccountLedgerService,
+        },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -128,7 +141,9 @@ describe('WithdrawalsService', () => {
 
   describe('create', () => {
     it('creates a PENDING withdrawal without touching the wallet, when balance is sufficient', async () => {
-      walletService.getByUserId.mockResolvedValue({ balance: new Prisma.Decimal(10000) });
+      walletService.getByUserId.mockResolvedValue({
+        balance: new Prisma.Decimal(10000),
+      });
       const withdrawal = makeWithdrawal();
       prisma.withdrawal.create.mockResolvedValue(withdrawal);
       prisma.user.findUniqueOrThrow.mockResolvedValue({ username: 'john' });
@@ -154,8 +169,10 @@ describe('WithdrawalsService', () => {
       });
     });
 
-    it('stores the payout details from the request itself, never from the requester\'s profile', async () => {
-      walletService.getByUserId.mockResolvedValue({ balance: new Prisma.Decimal(100000) });
+    it("stores the payout details from the request itself, never from the requester's profile", async () => {
+      walletService.getByUserId.mockResolvedValue({
+        balance: new Prisma.Decimal(100000),
+      });
       prisma.withdrawal.create.mockResolvedValue(makeWithdrawal());
       prisma.user.findUniqueOrThrow.mockResolvedValue({ username: 'john' });
 
@@ -190,7 +207,9 @@ describe('WithdrawalsService', () => {
     });
 
     it('announces the withdrawal to admins with the display name next to the raw username', async () => {
-      walletService.getByUserId.mockResolvedValue({ balance: new Prisma.Decimal(100000) });
+      walletService.getByUserId.mockResolvedValue({
+        balance: new Prisma.Decimal(100000),
+      });
       prisma.withdrawal.create.mockResolvedValue(makeWithdrawal());
       prisma.user.findUniqueOrThrow.mockResolvedValue({
         username: 'user_95950495369',
@@ -215,7 +234,9 @@ describe('WithdrawalsService', () => {
     });
 
     it('emits displayName as null on the realtime event when the user never set a name', async () => {
-      walletService.getByUserId.mockResolvedValue({ balance: new Prisma.Decimal(100000) });
+      walletService.getByUserId.mockResolvedValue({
+        balance: new Prisma.Decimal(100000),
+      });
       prisma.withdrawal.create.mockResolvedValue(makeWithdrawal());
       prisma.user.findUniqueOrThrow.mockResolvedValue({
         username: 'john',
@@ -235,7 +256,9 @@ describe('WithdrawalsService', () => {
     });
 
     it('rejects a request for more than the available wallet balance, without creating anything', async () => {
-      walletService.getByUserId.mockResolvedValue({ balance: new Prisma.Decimal(1000) });
+      walletService.getByUserId.mockResolvedValue({
+        balance: new Prisma.Decimal(1000),
+      });
 
       await expect(
         service.create('user-1', {
@@ -294,7 +317,9 @@ describe('WithdrawalsService', () => {
         minWithdrawalAmount: 1000,
         maxWithdrawalAmount: 100000,
       });
-      walletService.getByUserId.mockResolvedValue({ balance: new Prisma.Decimal(10000) });
+      walletService.getByUserId.mockResolvedValue({
+        balance: new Prisma.Decimal(10000),
+      });
       prisma.withdrawal.create.mockResolvedValue(makeWithdrawal());
       prisma.user.findUniqueOrThrow.mockResolvedValue({ username: 'john' });
 
@@ -333,7 +358,9 @@ describe('WithdrawalsService', () => {
       expect(prisma.withdrawal.findMany).toHaveBeenCalledWith(
         expect.objectContaining({ where: expectedWhere }),
       );
-      expect(prisma.withdrawal.count).toHaveBeenCalledWith({ where: expectedWhere });
+      expect(prisma.withdrawal.count).toHaveBeenCalledWith({
+        where: expectedWhere,
+      });
     });
 
     it('projects the requesting user with their display name next to the raw username', async () => {
@@ -466,7 +493,9 @@ describe('WithdrawalsService', () => {
     it('atomically claims, debits the wallet, and records a WITHDRAWAL transaction', async () => {
       prisma.withdrawal.findUnique.mockResolvedValue(makeWithdrawal());
       prisma.withdrawal.updateMany.mockResolvedValue({ count: 1 });
-      walletService.debitWithinTransaction.mockResolvedValue({ balance: new Prisma.Decimal(5000) });
+      walletService.debitWithinTransaction.mockResolvedValue({
+        balance: new Prisma.Decimal(5000),
+      });
       prisma.transaction.create.mockResolvedValue({});
       prisma.notification.create.mockResolvedValue({
         id: 'notif-1',
@@ -481,9 +510,13 @@ describe('WithdrawalsService', () => {
         ...makeWithdrawal({ status: WithdrawalStatus.APPROVED }),
         user: { id: 'user-1', username: 'john' },
       });
-      prisma.wallet.findUniqueOrThrow.mockResolvedValue({ balance: new Prisma.Decimal(5000) });
+      prisma.wallet.findUniqueOrThrow.mockResolvedValue({
+        balance: new Prisma.Decimal(5000),
+      });
 
-      const result = await service.approve('withdrawal-1', { id: 'admin-1' } as never);
+      const result = await service.approve('withdrawal-1', {
+        id: 'admin-1',
+      } as never);
 
       expect(walletService.debitWithinTransaction).toHaveBeenCalledWith(
         prisma,
@@ -491,9 +524,16 @@ describe('WithdrawalsService', () => {
         5000,
       );
       expect(prisma.transaction.create).toHaveBeenCalledWith({
-        data: expect.objectContaining({ userId: 'user-1', type: 'WITHDRAWAL', status: 'COMPLETED' }),
+        data: expect.objectContaining({
+          userId: 'user-1',
+          type: 'WITHDRAWAL',
+          status: 'COMPLETED',
+        }),
       });
-      expect(gateway.notifyUserBalanceUpdated).toHaveBeenCalledWith('user-1', 5000);
+      expect(gateway.notifyUserBalanceUpdated).toHaveBeenCalledWith(
+        'user-1',
+        5000,
+      );
       expect(result.status).toBe(WithdrawalStatus.APPROVED);
     });
 
@@ -527,7 +567,9 @@ describe('WithdrawalsService', () => {
       prisma.withdrawal.updateMany.mockResolvedValue({ count: 0 });
 
       await expect(
-        service.reject('withdrawal-1', { id: 'admin-1' } as never, { reason: 'bad' }),
+        service.reject('withdrawal-1', { id: 'admin-1' } as never, {
+          reason: 'bad',
+        }),
       ).rejects.toThrow(ConflictException);
     });
 
@@ -544,13 +586,20 @@ describe('WithdrawalsService', () => {
         createdAt: new Date(),
       });
       prisma.withdrawal.findUniqueOrThrow.mockResolvedValue({
-        ...makeWithdrawal({ status: WithdrawalStatus.REJECTED, rejectionReason: 'bad' }),
+        ...makeWithdrawal({
+          status: WithdrawalStatus.REJECTED,
+          rejectionReason: 'bad',
+        }),
         user: { id: 'user-1', username: 'john' },
       });
 
-      const result = await service.reject('withdrawal-1', { id: 'admin-1' } as never, {
-        reason: 'bad',
-      });
+      const result = await service.reject(
+        'withdrawal-1',
+        { id: 'admin-1' } as never,
+        {
+          reason: 'bad',
+        },
+      );
 
       expect(walletService.debitWithinTransaction).not.toHaveBeenCalled();
       expect(prisma.transaction.create).not.toHaveBeenCalled();
@@ -602,7 +651,7 @@ describe('WithdrawalsService', () => {
       expect(prisma.withdrawal.update).not.toHaveBeenCalled();
     });
 
-    it('records our transfer account (incl. subname), transaction code, and transaction time without touching the user\'s own withdrawal account fields, status, wallet, or ledger', async () => {
+    it("records our transfer account (incl. subname), transaction code, and transaction time without touching the user's own withdrawal account fields, status, wallet, or ledger", async () => {
       prisma.withdrawal.findUnique.mockResolvedValue(
         makeWithdrawal({ status: WithdrawalStatus.APPROVED }),
       );
@@ -657,21 +706,24 @@ describe('WithdrawalsService', () => {
       expect(walletService.debitWithinTransaction).not.toHaveBeenCalled();
       expect(prisma.transaction.create).not.toHaveBeenCalled();
       expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
-      expect(gateway.notifyUserWithdrawalUpdated).toHaveBeenCalledWith('user-1', {
-        id: 'withdrawal-1',
-        status: WithdrawalStatus.APPROVED,
-        amount: 5000,
-        accountType: 'KBZPay',
-        accountName: 'Ko Ko',
-        accountNumber: '09123456789',
-        approvedAt: null,
-        transferAccountType: 'KBZPay',
-        transferAccountSubname: 'K1',
-        transferAccountName: 'MyanFlix',
-        transferAccountNumber: '09999999999',
-        transferTransactionCode: '123456',
-        transferTransactionTime: 'Jan 1, 2026 10:00 AM',
-      });
+      expect(gateway.notifyUserWithdrawalUpdated).toHaveBeenCalledWith(
+        'user-1',
+        {
+          id: 'withdrawal-1',
+          status: WithdrawalStatus.APPROVED,
+          amount: 5000,
+          accountType: 'KBZPay',
+          accountName: 'Ko Ko',
+          accountNumber: '09123456789',
+          approvedAt: null,
+          transferAccountType: 'KBZPay',
+          transferAccountSubname: 'K1',
+          transferAccountName: 'MyanFlix',
+          transferAccountNumber: '09999999999',
+          transferTransactionCode: '123456',
+          transferTransactionTime: 'Jan 1, 2026 10:00 AM',
+        },
+      );
       // The user's own withdrawal account (what they submitted) is untouched.
       expect(result.accountName).toBe('Ko Ko');
       expect(result.transferAccountName).toBe('MyanFlix');

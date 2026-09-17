@@ -11,6 +11,7 @@ import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard';
 import { UsersModule } from './users/users.module';
 import { RolesModule } from './roles/roles.module';
+import { AuditModule } from './audit/audit.module';
 import { StaffModule } from './staff/staff.module';
 import { CategoriesModule } from './categories/categories.module';
 import { ActorsModule } from './actors/actors.module';
@@ -63,6 +64,7 @@ import { AppService } from './app.service';
     AuthModule,
     UsersModule,
     RolesModule,
+    AuditModule,
     StaffModule,
     CategoriesModule,
     ActorsModule,

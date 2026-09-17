@@ -84,6 +84,7 @@ export class MovieQueryDto extends PaginationQueryDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(200)
   search?: string;
 
   /** OR within the facet — values come from GET /movies/facets. */

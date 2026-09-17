@@ -10,10 +10,15 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import {
   CATALOG_INCLUDE,
+  statusDerivedAuditAction,
   toFacetValues,
   type FacetValue,
 } from '../movies/movies.service';
+import { AuditService } from '../audit/audit.service';
+import { seriesSnapshot } from '../audit/audit-snapshots';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { MinioService } from '../common/storage/minio.service';
+import { StorageService } from '../common/storage/storage.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import { computeTwoTierSlice } from '../common/utils/two-tier-page.util';
 import {
@@ -134,6 +139,8 @@ export class SeriesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
+    private readonly storageService: StorageService,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -343,7 +350,7 @@ export class SeriesService {
   }
 
   /** Detail shape for a viewer — access is a global per-user subscription flag, not per-item, so it isn't computed here. */
-  async getForViewer(id: string, _userId: string, role: Role) {
+  async getForViewer(id: string, _userId: string | undefined, role: Role) {
     return this.findViewableOrThrow(id, role);
   }
 
@@ -367,7 +374,7 @@ export class SeriesService {
     };
   }
 
-  async create(dto: CreateSeriesDto) {
+  async create(dto: CreateSeriesDto, actor: AuthenticatedUser) {
     const { categoryIds, ...data } = dto;
     const created = await this.prisma.series.create({
       data: {
@@ -378,11 +385,20 @@ export class SeriesService {
       },
       include: { categories: true },
     });
+
+    await this.audit.record({
+      action: 'series.create',
+      actor,
+      target: { type: 'series', id: created.id, label: created.title },
+      after: seriesSnapshot(created),
+    });
+
     return this.withImageUrls(created);
   }
 
-  async update(id: string, dto: UpdateSeriesDto) {
-    await this.findByIdOrThrow(id);
+  async update(id: string, dto: UpdateSeriesDto, actor: AuthenticatedUser) {
+    // The stored row, not the re-hosted view: image URLs must diff as saved.
+    const before = await this.findStoredOrThrow(id);
     const { categoryIds, ...data } = dto;
     const updated = await this.prisma.series.update({
       where: { id },
@@ -394,6 +410,15 @@ export class SeriesService {
       },
       include: { categories: true },
     });
+
+    await this.audit.record({
+      action: 'series.update',
+      actor,
+      target: { type: 'series', id, label: updated.title },
+      before: seriesSnapshot(before),
+      after: seriesSnapshot(updated),
+    });
+
     return this.withImageUrls(updated);
   }
 
@@ -402,14 +427,40 @@ export class SeriesService {
    * separate from update() so SERIES_MANAGE metadata edits can never flip
    * visibility as a side effect of echoing a stale form back.
    */
-  async updateStatus(id: string, status: SeriesStatus) {
-    await this.findByIdOrThrow(id);
+  async updateStatus(
+    id: string,
+    status: SeriesStatus,
+    actor: AuthenticatedUser,
+  ) {
+    const before = await this.findStoredOrThrow(id);
     const updated = await this.prisma.series.update({
       where: { id },
       data: { status },
       include: { categories: true },
     });
+
+    // → PUBLISHED = publish, PUBLISHED → other = unpublish, DRAFT ↔
+    // UNPUBLISHED = status_change; a no-op re-save of the same status is
+    // filed as series.update and dropped by AuditService (empty diff).
+    await this.audit.record({
+      action: statusDerivedAuditAction('series', before.status, updated.status),
+      actor,
+      target: { type: 'series', id, label: updated.title },
+      before: seriesSnapshot(before),
+      after: seriesSnapshot(updated),
+    });
+
     return this.withImageUrls(updated);
+  }
+
+  /** The row exactly as stored (no image re-hosting) — what an audit `before` must be. */
+  private async findStoredOrThrow(id: string) {
+    const series = await this.prisma.series.findUnique({
+      where: { id },
+      include: { categories: true },
+    });
+    if (!series) throw new NotFoundException('Series not found');
+    return series;
   }
 
   /**
@@ -426,10 +477,14 @@ export class SeriesService {
    * level, so a MinIO hiccup is visible to the admin but never rolls back
    * the catalog delete.
    */
-  async remove(id: string): Promise<SeriesRemovalResult> {
+  async remove(
+    id: string,
+    actor: AuthenticatedUser,
+  ): Promise<SeriesRemovalResult> {
     const series = await this.prisma.series.findUnique({
       where: { id },
       include: {
+        categories: true,
         episodes: { include: { videos: { include: { subtitles: true } } } },
       },
     });
@@ -437,39 +492,54 @@ export class SeriesService {
 
     await this.prisma.series.delete({ where: { id } });
 
+    let videoCount = 0;
+    let subtitleCount = 0;
+    for (const episode of series.episodes) {
+      videoCount += episode.videos.length;
+      for (const video of episode.videos)
+        subtitleCount += video.subtitles.length;
+    }
+    await this.audit.record({
+      action: 'series.delete',
+      actor,
+      target: { type: 'series', id, label: series.title },
+      before: seriesSnapshot(series),
+      metadata: {
+        deletedEpisodes: series.episodes.length,
+        videos: videoCount,
+        subtitles: subtitleCount,
+      },
+    });
+
     const failedObjects: string[] = [];
 
     for (const episode of series.episodes) {
-      // The whole HLS tree (original + renditions + bundle subtitles) lives
-      // under this id-keyed prefix — unshareable by construction, no guard.
-      const prefix = `videos/${episode.id}/`;
-      try {
-        await this.minioService.deleteByPrefix(prefix);
-      } catch {
-        failedObjects.push(prefix);
-      }
-
-      // Manually-uploaded subtitles live under the separate global
-      // subtitles/<id>/ prefix and need deleting individually; bundle ones
-      // were already caught by the prefix delete above. Same rule as
-      // MoviesService.remove.
-      for (const video of episode.videos) {
-        for (const subtitle of video.subtitles) {
-          if (subtitle.objectKey.startsWith(prefix)) continue;
-          try {
-            await this.minioService.deleteObject(subtitle.objectKey);
-          } catch {
-            failedObjects.push(subtitle.objectKey);
-          }
+      // An episode IS a Movie row, so its bytes sit under its OWN id in the
+      // same two prefixes MoviesService.remove sweeps: videos/<episodeId>/
+      // for the original and the whole generated HLS package, and
+      // subtitles/<episodeId>/ for every uploaded subtitle source. Both are
+      // id-keyed and unshareable by construction, so neither needs a guard —
+      // and there is no per-subtitle loop any more, because sources are no
+      // longer split across two namespaces that could overlap.
+      for (const prefix of [
+        `${this.storageService.videoKeyPrefix(episode.id)}/`,
+        `${this.storageService.subtitleSourcePrefix(episode.id)}/`,
+      ]) {
+        try {
+          await this.minioService.deleteByPrefix(prefix);
+        } catch {
+          failedObjects.push(prefix);
         }
       }
     }
 
     // Image keys (episode poster/cover/thumbnail + series poster/cover) are
-    // uuid-named under images/ and CAN be referenced by several rows, so
-    // each key is deleted only after confirming no surviving movie or
-    // series row still points at it (the rows being deleted are already
-    // gone from the DB at this point and can't count as references).
+    // uuid-named under images/<purpose>/ and CAN be referenced by several
+    // rows — the purpose folder does not change that, since the same uuid is
+    // still shareable within one purpose — so each key is deleted only after
+    // confirming no surviving movie or series row still points at it (the
+    // rows being deleted are already gone from the DB at this point and
+    // can't count as references).
     const imageKeys = new Set<string>();
     const collectImageKey = (url: string | null) => {
       if (!url) return;

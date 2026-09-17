@@ -2,6 +2,8 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Prisma, VideoStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
+import { AuditService } from '../audit/audit.service';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import {
   firstVariantUri,
   resolveRelativeKey,
@@ -60,6 +62,7 @@ export class VideoDurationService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -125,8 +128,15 @@ export class VideoDurationService {
    * movie still at duration 0 with a READY HLS video, oldest first, capped at
    * 100 per call. Idempotent by construction (see the class doc) — clicking
    * it again is safe, and `remaining` tells the admin whether to.
+   *
+   * Audited as ONE `movie.durations_backfill` row whose metadata carries the
+   * request (limit) and the result (ids touched, counts) — no per-row
+   * before/after, exactly like the other bulk actions.
    */
-  async backfill(limit: number): Promise<BackfillResult> {
+  async backfill(
+    limit: number,
+    actor: AuthenticatedUser,
+  ): Promise<BackfillResult> {
     const take = Math.min(
       Math.max(1, Math.floor(Number.isFinite(limit) ? limit : 0)),
       BACKFILL_MAX_LIMIT,
@@ -148,6 +158,7 @@ export class VideoDurationService {
     });
 
     let updated = 0;
+    const updatedMovieIds: string[] = [];
     const failed: BackfillFailure[] = [];
 
     for (const movie of movies) {
@@ -171,13 +182,37 @@ export class VideoDurationService {
       }
 
       await this.fillVideoDurationIfUnknown(video.id, seconds);
-      if (await this.fillMovieDurationIfUnknown(movie.id, seconds)) updated++;
+      if (await this.fillMovieDurationIfUnknown(movie.id, seconds)) {
+        updated++;
+        updatedMovieIds.push(movie.id);
+      }
     }
 
     const remaining = await this.prisma.movie.count({
       where: UNKNOWN_RUNTIME_WITH_READY_HLS,
     });
 
-    return { scanned: movies.length, updated, failed, remaining };
+    const result: BackfillResult = {
+      scanned: movies.length,
+      updated,
+      failed,
+      remaining,
+    };
+
+    await this.audit.record({
+      action: 'movie.durations_backfill',
+      actor,
+      target: { type: 'movie', id: null, label: 'Runtime backfill' },
+      metadata: {
+        limit: take,
+        scanned: result.scanned,
+        updated: result.updated,
+        updatedMovieIds,
+        failed: result.failed,
+        remaining: result.remaining,
+      },
+    });
+
+    return result;
   }
 }

@@ -7,6 +7,9 @@ import {
 import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
+import { bookAuthorSnapshot } from '../audit/audit-snapshots';
+import { AuditService } from '../audit/audit.service';
 import type {
   BookAuthorQueryDto,
   CreateBookAuthorDto,
@@ -32,6 +35,7 @@ export class BookAuthorsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
+    private readonly audit: AuditService,
   ) {}
 
   /** Browsed and searched, so alphabetical is the useful order. */
@@ -67,10 +71,10 @@ export class BookAuthorsService {
     return author;
   }
 
-  async create(dto: CreateBookAuthorDto) {
+  async create(dto: CreateBookAuthorDto, actor: AuthenticatedUser) {
     const name = dto.name.trim();
     await this.assertNameAvailable(name);
-    return this.prisma.bookAuthor.create({
+    const created = await this.prisma.bookAuthor.create({
       data: {
         name,
         imageUrl: this.minioService.canonicalImageUrl(dto.imageUrl),
@@ -78,6 +82,13 @@ export class BookAuthorsService {
       },
       include: WITH_BOOK_COUNT,
     });
+    await this.audit.record({
+      action: 'book_author.create',
+      actor,
+      target: { type: 'book_author', id: created.id, label: created.name },
+      after: bookAuthorSnapshot(created),
+    });
+    return created;
   }
 
   /**
@@ -85,7 +96,7 @@ export class BookAuthorsService {
    * display string, in one transaction — the invariant `book.author ===
    * authorRef.name` must never be observable as broken.
    */
-  async update(id: string, dto: UpdateBookAuthorDto) {
+  async update(id: string, dto: UpdateBookAuthorDto, actor: AuthenticatedUser) {
     const current = await this.prisma.bookAuthor.findUnique({ where: { id } });
     if (!current) throw new NotFoundException('Book author not found');
 
@@ -104,12 +115,26 @@ export class BookAuthorsService {
         },
         include: WITH_BOOK_COUNT,
       });
+      // How many books the rename reached — only a rename fans out at all.
+      let affectedBooks = 0;
       if (name !== undefined && name !== current.name) {
-        await tx.book.updateMany({
+        const fanOut = await tx.book.updateMany({
           where: { authorId: id },
           data: { author: name },
         });
+        affectedBooks = fanOut.count;
       }
+      // Inside the transaction, so the audit row commits — or rolls back —
+      // together with the rename and its fan-out.
+      await this.audit.record({
+        action: 'book_author.update',
+        actor,
+        target: { type: 'book_author', id, label: row.name },
+        before: bookAuthorSnapshot(current),
+        after: bookAuthorSnapshot(row),
+        metadata: { affectedBooks },
+        tx,
+      });
       return row;
     });
 
@@ -133,7 +158,7 @@ export class BookAuthorsService {
    * would fail at the database too. DB row first, then the portrait, the
    * same order and reasoning as ActorsService.remove.
    */
-  async remove(id: string): Promise<void> {
+  async remove(id: string, actor: AuthenticatedUser): Promise<void> {
     const author = await this.prisma.bookAuthor.findUnique({
       where: { id },
       include: WITH_BOOK_COUNT,
@@ -148,6 +173,12 @@ export class BookAuthorsService {
     }
 
     await this.prisma.bookAuthor.delete({ where: { id } });
+    await this.audit.record({
+      action: 'book_author.delete',
+      actor,
+      target: { type: 'book_author', id, label: author.name },
+      before: bookAuthorSnapshot(author),
+    });
     if (author.imageUrl) await this.deleteImage(author.imageUrl, id);
   }
 
@@ -156,14 +187,27 @@ export class BookAuthorsService {
    * case-insensitively on the trimmed name so 'blake' never becomes a second
    * row beside 'Blake'; created when nothing matches. A concurrent create of
    * the same name loses the unique race and simply re-reads the winner.
+   *
+   * `actor` is the staff member whose book form typed the name: a row born
+   * here is still an author they created, and is audited as such.
    */
-  async findOrCreateByName(rawName: string) {
+  async findOrCreateByName(rawName: string, actor?: AuthenticatedUser) {
     const name = rawName.trim();
     const existing = await this.findByNameInsensitive(name);
     if (existing) return existing;
 
     try {
-      return await this.prisma.bookAuthor.create({ data: { name } });
+      const created = await this.prisma.bookAuthor.create({ data: { name } });
+      if (actor) {
+        await this.audit.record({
+          action: 'book_author.create',
+          actor,
+          target: { type: 'book_author', id: created.id, label: created.name },
+          after: bookAuthorSnapshot(created),
+          metadata: { via: 'book_form' },
+        });
+      }
+      return created;
     } catch (error) {
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&

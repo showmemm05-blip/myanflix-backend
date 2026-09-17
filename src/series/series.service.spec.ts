@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   SeriesService,
   buildSeriesWhere,
@@ -9,6 +10,8 @@ import {
 import { SeriesSort } from './dto/series-query.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
+import { StorageService } from '../common/storage/storage.service';
+import { AuditService } from '../audit/audit.service';
 import {
   AccessType,
   MovieStatus,
@@ -16,10 +19,27 @@ import {
   SeriesStatus,
 } from '../generated/prisma/client';
 
+/** A staff actor for the audit calls — the mocked AuditService records nothing. */
+const ACTOR = {
+  id: 'admin-1',
+  username: 'boss',
+  role: Role.ADMIN,
+  appRoleId: null,
+} as const;
+
 describe('SeriesService', () => {
   let service: SeriesService;
   let prisma: {
-    series: { findUnique: jest.Mock; create: jest.Mock; update: jest.Mock; delete: jest.Mock; findMany: jest.Mock; count: jest.Mock; groupBy: jest.Mock; aggregate: jest.Mock };
+    series: {
+      findUnique: jest.Mock;
+      create: jest.Mock;
+      update: jest.Mock;
+      delete: jest.Mock;
+      findMany: jest.Mock;
+      count: jest.Mock;
+      groupBy: jest.Mock;
+      aggregate: jest.Mock;
+    };
     movie: { groupBy: jest.Mock; findMany: jest.Mock; count: jest.Mock };
     seriesPurchase: { findMany: jest.Mock };
     watchHistory: { findMany: jest.Mock };
@@ -72,7 +92,9 @@ describe('SeriesService', () => {
       seriesPurchase: { findMany: jest.fn() },
       watchHistory: { findMany: jest.fn() },
       $transaction: jest.fn(async (arg: unknown) =>
-        typeof arg === 'function' ? (arg as (t: unknown) => Promise<unknown>)(undefined) : Promise.all(arg as Promise<unknown>[]),
+        typeof arg === 'function'
+          ? (arg as (t: unknown) => Promise<unknown>)(undefined)
+          : Promise.all(arg as Promise<unknown>[]),
       ),
     };
 
@@ -81,6 +103,15 @@ describe('SeriesService', () => {
         SeriesService,
         { provide: PrismaService, useValue: prisma },
         { provide: MinioService, useValue: minioService },
+        // The REAL key builder, so the delete assertions below pin the
+        // actual storage layout rather than a mock's idea of it. It only
+        // reads STORAGE_PATH for LOCAL paths, which deletion never touches.
+        StorageService,
+        { provide: ConfigService, useValue: { get: () => undefined } },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -90,7 +121,9 @@ describe('SeriesService', () => {
   describe('getSeasons', () => {
     it('throws NotFoundException for an unknown series', async () => {
       prisma.series.findUnique.mockResolvedValue(null);
-      await expect(service.getSeasons('nope', Role.ADMIN)).rejects.toThrow(NotFoundException);
+      await expect(service.getSeasons('nope', Role.ADMIN)).rejects.toThrow(
+        NotFoundException,
+      );
     });
 
     it('reports distinct season numbers with per-season episode counts, in order', async () => {
@@ -111,14 +144,20 @@ describe('SeriesService', () => {
 
   describe('getEpisodes', () => {
     it('regular users only ever see PUBLISHED episodes — same rule as the movies catalog', async () => {
-      prisma.series.findUnique.mockResolvedValue({ id: 'series-1', status: SeriesStatus.PUBLISHED });
+      prisma.series.findUnique.mockResolvedValue({
+        id: 'series-1',
+        status: SeriesStatus.PUBLISHED,
+      });
       prisma.movie.findMany.mockResolvedValue([]);
 
       await service.getEpisodes('series-1', Role.USER);
 
       expect(prisma.movie.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: expect.objectContaining({ seriesId: 'series-1', status: MovieStatus.PUBLISHED }),
+          where: expect.objectContaining({
+            seriesId: 'series-1',
+            status: MovieStatus.PUBLISHED,
+          }),
         }),
       );
     });
@@ -202,18 +241,47 @@ describe('SeriesService', () => {
 
   describe('getPlayerEpisodes', () => {
     const episodes = [
-      { id: 'ep-1', title: 'Pilot', seasonNumber: 1, episodeNumber: 1, duration: 42, thumbnailUrl: 't1', posterUrl: 'p1' },
-      { id: 'ep-2', title: 'Episode 2', seasonNumber: 1, episodeNumber: 2, duration: 40, thumbnailUrl: 't2', posterUrl: 'p2' },
-      { id: 'ep-3', title: 'Season Finale', seasonNumber: 2, episodeNumber: 1, duration: 45, thumbnailUrl: 't3', posterUrl: 'p3' },
+      {
+        id: 'ep-1',
+        title: 'Pilot',
+        seasonNumber: 1,
+        episodeNumber: 1,
+        duration: 42,
+        thumbnailUrl: 't1',
+        posterUrl: 'p1',
+      },
+      {
+        id: 'ep-2',
+        title: 'Episode 2',
+        seasonNumber: 1,
+        episodeNumber: 2,
+        duration: 40,
+        thumbnailUrl: 't2',
+        posterUrl: 'p2',
+      },
+      {
+        id: 'ep-3',
+        title: 'Season Finale',
+        seasonNumber: 2,
+        episodeNumber: 1,
+        duration: 45,
+        thumbnailUrl: 't3',
+        posterUrl: 'p3',
+      },
     ];
 
     it('throws NotFoundException for an unknown series', async () => {
       prisma.series.findUnique.mockResolvedValue(null);
-      await expect(service.getPlayerEpisodes('nope', 'user-1', Role.USER)).rejects.toThrow(NotFoundException);
+      await expect(
+        service.getPlayerEpisodes('nope', 'user-1', Role.USER),
+      ).rejects.toThrow(NotFoundException);
     });
 
     it('regular users only ever see PUBLISHED episodes — same rule as getEpisodes', async () => {
-      prisma.series.findUnique.mockResolvedValue({ id: 'series-1', status: SeriesStatus.PUBLISHED });
+      prisma.series.findUnique.mockResolvedValue({
+        id: 'series-1',
+        status: SeriesStatus.PUBLISHED,
+      });
       prisma.movie.findMany.mockResolvedValue([]);
       prisma.watchHistory.findMany.mockResolvedValue([]);
 
@@ -221,7 +289,10 @@ describe('SeriesService', () => {
 
       expect(prisma.movie.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: expect.objectContaining({ seriesId: 'series-1', status: MovieStatus.PUBLISHED }),
+          where: expect.objectContaining({
+            seriesId: 'series-1',
+            status: MovieStatus.PUBLISHED,
+          }),
         }),
       );
     });
@@ -231,53 +302,104 @@ describe('SeriesService', () => {
       prisma.movie.findMany.mockResolvedValue(episodes);
       prisma.watchHistory.findMany.mockResolvedValue([]);
 
-      const result = await service.getPlayerEpisodes('series-1', 'user-1', Role.ADMIN);
+      const result = await service.getPlayerEpisodes(
+        'series-1',
+        'user-1',
+        Role.ADMIN,
+      );
 
       expect(result.seasons).toEqual([
         {
           seasonNumber: 1,
           episodes: [
-            { id: 'ep-1', title: 'Pilot', episodeNumber: 1, duration: 42, thumbnailUrl: 't1', posterUrl: 'p1', watchProgress: null },
-            { id: 'ep-2', title: 'Episode 2', episodeNumber: 2, duration: 40, thumbnailUrl: 't2', posterUrl: 'p2', watchProgress: null },
+            {
+              id: 'ep-1',
+              title: 'Pilot',
+              episodeNumber: 1,
+              duration: 42,
+              thumbnailUrl: 't1',
+              posterUrl: 'p1',
+              watchProgress: null,
+            },
+            {
+              id: 'ep-2',
+              title: 'Episode 2',
+              episodeNumber: 2,
+              duration: 40,
+              thumbnailUrl: 't2',
+              posterUrl: 'p2',
+              watchProgress: null,
+            },
           ],
         },
         {
           seasonNumber: 2,
           episodes: [
-            { id: 'ep-3', title: 'Season Finale', episodeNumber: 1, duration: 45, thumbnailUrl: 't3', posterUrl: 'p3', watchProgress: null },
+            {
+              id: 'ep-3',
+              title: 'Season Finale',
+              episodeNumber: 1,
+              duration: 45,
+              thumbnailUrl: 't3',
+              posterUrl: 'p3',
+              watchProgress: null,
+            },
           ],
         },
       ]);
     });
 
     it("attaches the caller's own watch progress per episode via one batched query, not one per episode", async () => {
-      prisma.series.findUnique.mockResolvedValue({ id: 'series-1', status: SeriesStatus.PUBLISHED });
+      prisma.series.findUnique.mockResolvedValue({
+        id: 'series-1',
+        status: SeriesStatus.PUBLISHED,
+      });
       prisma.movie.findMany.mockResolvedValue(episodes);
       prisma.watchHistory.findMany.mockResolvedValue([
         { movieId: 'ep-1', progress: 100, lastPosition: 2520 },
         { movieId: 'ep-2', progress: 35, lastPosition: 840 },
       ]);
 
-      const result = await service.getPlayerEpisodes('series-1', 'user-1', Role.USER);
+      const result = await service.getPlayerEpisodes(
+        'series-1',
+        'user-1',
+        Role.USER,
+      );
 
       expect(prisma.watchHistory.findMany).toHaveBeenCalledTimes(1);
       expect(prisma.watchHistory.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { userId: 'user-1', movieId: { in: ['ep-1', 'ep-2', 'ep-3'] } },
+          where: {
+            userId: 'user-1',
+            movieId: { in: ['ep-1', 'ep-2', 'ep-3'] },
+          },
         }),
       );
 
       const [season1] = result.seasons;
-      expect(season1.episodes[0].watchProgress).toEqual({ progressPercent: 100, lastPositionSeconds: 2520 });
-      expect(season1.episodes[1].watchProgress).toEqual({ progressPercent: 35, lastPositionSeconds: 840 });
+      expect(season1.episodes[0].watchProgress).toEqual({
+        progressPercent: 100,
+        lastPositionSeconds: 2520,
+      });
+      expect(season1.episodes[1].watchProgress).toEqual({
+        progressPercent: 35,
+        lastPositionSeconds: 840,
+      });
       expect(result.seasons[1].episodes[0].watchProgress).toBeNull();
     });
 
     it('skips the watch-history query entirely when the series has no episodes', async () => {
-      prisma.series.findUnique.mockResolvedValue({ id: 'series-1', status: SeriesStatus.PUBLISHED });
+      prisma.series.findUnique.mockResolvedValue({
+        id: 'series-1',
+        status: SeriesStatus.PUBLISHED,
+      });
       prisma.movie.findMany.mockResolvedValue([]);
 
-      const result = await service.getPlayerEpisodes('series-1', 'user-1', Role.USER);
+      const result = await service.getPlayerEpisodes(
+        'series-1',
+        'user-1',
+        Role.USER,
+      );
 
       expect(prisma.watchHistory.findMany).not.toHaveBeenCalled();
       expect(result.seasons).toEqual([]);
@@ -286,12 +408,24 @@ describe('SeriesService', () => {
     it('skips any episode with no seasonNumber — it cannot be grouped', async () => {
       prisma.series.findUnique.mockResolvedValue({ id: 'series-1' });
       prisma.movie.findMany.mockResolvedValue([
-        { id: 'ep-orphan', title: 'Orphan', seasonNumber: null, episodeNumber: null, duration: 10, thumbnailUrl: null, posterUrl: null },
+        {
+          id: 'ep-orphan',
+          title: 'Orphan',
+          seasonNumber: null,
+          episodeNumber: null,
+          duration: 10,
+          thumbnailUrl: null,
+          posterUrl: null,
+        },
         ...episodes,
       ]);
       prisma.watchHistory.findMany.mockResolvedValue([]);
 
-      const result = await service.getPlayerEpisodes('series-1', 'user-1', Role.ADMIN);
+      const result = await service.getPlayerEpisodes(
+        'series-1',
+        'user-1',
+        Role.ADMIN,
+      );
 
       const allIds = result.seasons.flatMap((s) => s.episodes.map((e) => e.id));
       expect(allIds).not.toContain('ep-orphan');
@@ -343,7 +477,11 @@ describe('SeriesService', () => {
         categories: [],
       });
 
-      const result = await service.getForViewer('series-1', 'user-1', Role.USER);
+      const result = await service.getForViewer(
+        'series-1',
+        'user-1',
+        Role.USER,
+      );
 
       expect(result.posterUrl).toBe(fresh('poster'));
       expect(result.coverUrl).toBe(
@@ -366,7 +504,11 @@ describe('SeriesService', () => {
       ]);
       prisma.watchHistory.findMany.mockResolvedValue([]);
 
-      const result = await service.getPlayerEpisodes('series-1', 'user-1', Role.ADMIN);
+      const result = await service.getPlayerEpisodes(
+        'series-1',
+        'user-1',
+        Role.ADMIN,
+      );
 
       expect(result.seasons[0].episodes[0]).toMatchObject({
         thumbnailUrl: fresh('thumb'),
@@ -381,7 +523,11 @@ describe('SeriesService', () => {
           seriesId: 'series-1',
           amount: 5000,
           createdAt: new Date('2026-01-01T00:00:00.000Z'),
-          series: { id: 'series-1', title: 'A Show', posterUrl: stale('poster') },
+          series: {
+            id: 'series-1',
+            title: 'A Show',
+            posterUrl: stale('poster'),
+          },
         },
       ]);
 
@@ -392,17 +538,30 @@ describe('SeriesService', () => {
   });
 
   describe('getForViewer', () => {
-    const series = { id: 'series-1', accessType: AccessType.SUBSCRIPTION, status: SeriesStatus.PUBLISHED, categories: [], posterUrl: null, coverUrl: null };
+    const series = {
+      id: 'series-1',
+      accessType: AccessType.SUBSCRIPTION,
+      status: SeriesStatus.PUBLISHED,
+      categories: [],
+      posterUrl: null,
+      coverUrl: null,
+    };
 
     it('throws NotFoundException for an unknown series', async () => {
       prisma.series.findUnique.mockResolvedValue(null);
-      await expect(service.getForViewer('nope', 'user-1', Role.USER)).rejects.toThrow(NotFoundException);
+      await expect(
+        service.getForViewer('nope', 'user-1', Role.USER),
+      ).rejects.toThrow(NotFoundException);
     });
 
     it('returns the series as-is — access is a global per-user subscription flag, not computed per item', async () => {
       prisma.series.findUnique.mockResolvedValue(series);
 
-      const result = await service.getForViewer('series-1', 'user-1', Role.USER);
+      const result = await service.getForViewer(
+        'series-1',
+        'user-1',
+        Role.USER,
+      );
 
       expect(result).toEqual(series);
       expect(prisma.seriesPurchase.findMany).not.toHaveBeenCalled();
@@ -423,7 +582,11 @@ describe('SeriesService', () => {
       const draft = { ...series, status: SeriesStatus.DRAFT };
       prisma.series.findUnique.mockResolvedValue(draft);
 
-      const result = await service.getForViewer('series-1', 'admin-1', Role.SUPER_ADMIN);
+      const result = await service.getForViewer(
+        'series-1',
+        'admin-1',
+        Role.SUPER_ADMIN,
+      );
 
       expect(result).toEqual(draft);
     });
@@ -454,7 +617,10 @@ describe('SeriesService', () => {
     });
 
     it('staff can narrow to one status', async () => {
-      await service.findAll({ status: SeriesStatus.UNPUBLISHED }, Role.SUPER_ADMIN);
+      await service.findAll(
+        { status: SeriesStatus.UNPUBLISHED },
+        Role.SUPER_ADMIN,
+      );
       expect(whereUsed().status).toBe(SeriesStatus.UNPUBLISHED);
     });
   });
@@ -477,8 +643,14 @@ describe('SeriesService', () => {
     });
 
     it.each([
-      [SeriesSort.NEWEST, [{ releaseYear: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }]],
-      [SeriesSort.OLDEST, [{ releaseYear: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }]],
+      [
+        SeriesSort.NEWEST,
+        [{ releaseYear: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+      ],
+      [
+        SeriesSort.OLDEST,
+        [{ releaseYear: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
+      ],
       [SeriesSort.TITLE, [{ title: 'asc' }, { id: 'asc' }]],
     ] as const)('maps sort %s', async (sort, expected) => {
       await service.findAll({ sort }, Role.USER);
@@ -503,9 +675,7 @@ describe('SeriesService', () => {
     });
 
     it('relevance with a term takes the two-tier path: total = count1 + count2, tiers disjoint', async () => {
-      prisma.series.count
-        .mockResolvedValueOnce(2)
-        .mockResolvedValueOnce(1);
+      prisma.series.count.mockResolvedValueOnce(2).mockResolvedValueOnce(1);
       prisma.series.findMany.mockResolvedValue([]);
 
       const result = await service.findAll(
@@ -585,16 +755,33 @@ describe('SeriesService', () => {
     it('throws NotFoundException for an unknown series', async () => {
       prisma.series.findUnique.mockResolvedValue(null);
       await expect(
-        service.updateStatus('nope', SeriesStatus.PUBLISHED),
+        service.updateStatus('nope', SeriesStatus.PUBLISHED, ACTOR),
       ).rejects.toThrow(NotFoundException);
       expect(prisma.series.update).not.toHaveBeenCalled();
     });
 
     it('updates only the status and returns the admin shape (categories included)', async () => {
-      prisma.series.findUnique.mockResolvedValue({ id: 'series-1', status: SeriesStatus.DRAFT, posterUrl: null, coverUrl: null, categories: [] });
-      prisma.series.update.mockResolvedValue({ id: 'series-1', title: 'A Show', status: SeriesStatus.PUBLISHED, posterUrl: null, coverUrl: null, categories: [] });
+      prisma.series.findUnique.mockResolvedValue({
+        id: 'series-1',
+        status: SeriesStatus.DRAFT,
+        posterUrl: null,
+        coverUrl: null,
+        categories: [],
+      });
+      prisma.series.update.mockResolvedValue({
+        id: 'series-1',
+        title: 'A Show',
+        status: SeriesStatus.PUBLISHED,
+        posterUrl: null,
+        coverUrl: null,
+        categories: [],
+      });
 
-      const result = await service.updateStatus('series-1', SeriesStatus.PUBLISHED);
+      const result = await service.updateStatus(
+        'series-1',
+        SeriesStatus.PUBLISHED,
+        ACTOR,
+      );
 
       expect(prisma.series.update).toHaveBeenCalledWith({
         where: { id: 'series-1' },
@@ -606,8 +793,10 @@ describe('SeriesService', () => {
   });
 
   describe('remove', () => {
-    const img = (name: string) =>
-      `http://192.168.10.122:8080/movies/images/${name}.jpeg`;
+    // Episode artwork is uploaded with purpose=movie (an episode IS a Movie
+    // row); the series' own poster/cover go to images/series/.
+    const img = (name: string, purpose = 'series') =>
+      `http://192.168.10.122:8080/movies/images/${purpose}/${name}.jpeg`;
 
     const makeSeries = (episodes: unknown[]) => ({
       id: 'series-1',
@@ -636,7 +825,9 @@ describe('SeriesService', () => {
     it('throws NotFoundException for an unknown series and deletes nothing', async () => {
       prisma.series.findUnique.mockResolvedValue(null);
 
-      await expect(service.remove('nope')).rejects.toThrow(NotFoundException);
+      await expect(service.remove('nope', ACTOR)).rejects.toThrow(
+        NotFoundException,
+      );
       expect(prisma.series.delete).not.toHaveBeenCalled();
       expect(minioService.deleteByPrefix).not.toHaveBeenCalled();
       expect(minioService.deleteObject).not.toHaveBeenCalled();
@@ -647,9 +838,11 @@ describe('SeriesService', () => {
         makeSeries([episode('ep-1'), episode('ep-2')]),
       );
 
-      const result = await service.remove('series-1');
+      const result = await service.remove('series-1', ACTOR);
 
-      expect(prisma.series.delete).toHaveBeenCalledWith({ where: { id: 'series-1' } });
+      expect(prisma.series.delete).toHaveBeenCalledWith({
+        where: { id: 'series-1' },
+      });
       expect(result).toEqual({
         deletedEpisodes: 2,
         storageCleanup: 'complete',
@@ -657,38 +850,47 @@ describe('SeriesService', () => {
       });
     });
 
-    it('cleans MinIO per episode video prefix plus every episode and series image key', async () => {
+    it("cleans MinIO per episode's TWO id-keyed prefixes plus every episode and series image key", async () => {
       prisma.series.findUnique.mockResolvedValue(
         makeSeries([
-          episode('ep-1', { posterUrl: img('ep1-poster'), thumbnailUrl: img('ep1-thumb') }),
+          episode('ep-1', {
+            posterUrl: img('ep1-poster', 'movie'),
+            thumbnailUrl: img('ep1-thumb', 'movie'),
+          }),
           episode('ep-2'),
         ]),
       );
 
-      await service.remove('series-1');
+      await service.remove('series-1', ACTOR);
 
       expect(minioService.deleteByPrefix).toHaveBeenCalledWith('videos/ep-1/');
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+        'subtitles/ep-1/',
+      );
       expect(minioService.deleteByPrefix).toHaveBeenCalledWith('videos/ep-2/');
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+        'subtitles/ep-2/',
+      );
       const deletedKeys = minioService.deleteObject.mock.calls.map((c) => c[0]);
       expect(deletedKeys).toEqual(
         expect.arrayContaining([
-          'images/ep1-poster.jpeg',
-          'images/ep1-thumb.jpeg',
-          'images/series-poster.jpeg',
-          'images/series-cover.jpeg',
+          'images/movie/ep1-poster.jpeg',
+          'images/movie/ep1-thumb.jpeg',
+          'images/series/series-poster.jpeg',
+          'images/series/series-cover.jpeg',
         ]),
       );
     });
 
-    it('deletes a manually-uploaded subtitle individually, but not one already under the video prefix', async () => {
+    it('sweeps every subtitle source through the episode prefix, never object by object', async () => {
       prisma.series.findUnique.mockResolvedValue(
         makeSeries([
           episode('ep-1', {
             videos: [
               {
                 subtitles: [
-                  { objectKey: 'subtitles/sub-1/my.vtt' },
-                  { objectKey: 'videos/ep-1/bundle/en.vtt' },
+                  { objectKey: 'subtitles/ep-1/sub-1.vtt' }, // single upload
+                  { objectKey: 'subtitles/ep-1/en.srt' }, // bulk bundle
                 ],
               },
             ],
@@ -696,28 +898,41 @@ describe('SeriesService', () => {
         ]),
       );
 
-      await service.remove('series-1');
+      await service.remove('series-1', ACTOR);
 
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+        'subtitles/ep-1/',
+      );
+      // Both flows write under the same movie-keyed prefix now, so no
+      // subtitle is ever deleted individually and there is nothing to
+      // de-duplicate against the videos/ prefix.
       const deletedKeys = minioService.deleteObject.mock.calls.map((c) => c[0]);
-      expect(deletedKeys).toContain('subtitles/sub-1/my.vtt');
-      expect(deletedKeys).not.toContain('videos/ep-1/bundle/en.vtt');
+      expect(deletedKeys).not.toContain('subtitles/ep-1/sub-1.vtt');
+      expect(deletedKeys).not.toContain('subtitles/ep-1/en.srt');
     });
 
     it('skips an image key another surviving row still references — the shared-asset guard', async () => {
       prisma.series.findUnique.mockResolvedValue(makeSeries([episode('ep-1')]));
       // Another movie still references the series poster key.
       prisma.movie.count.mockImplementation(
-        ({ where }: { where: { OR: { posterUrl?: { contains: string } }[] } }) =>
+        ({
+          where,
+        }: {
+          where: { OR: { posterUrl?: { contains: string } }[] };
+        }) =>
           Promise.resolve(
-            where.OR[0].posterUrl?.contains === 'images/series-poster.jpeg' ? 1 : 0,
+            where.OR[0].posterUrl?.contains ===
+              'images/series/series-poster.jpeg'
+              ? 1
+              : 0,
           ),
       );
 
-      const result = await service.remove('series-1');
+      const result = await service.remove('series-1', ACTOR);
 
       const deletedKeys = minioService.deleteObject.mock.calls.map((c) => c[0]);
-      expect(deletedKeys).not.toContain('images/series-poster.jpeg');
-      expect(deletedKeys).toContain('images/series-cover.jpeg');
+      expect(deletedKeys).not.toContain('images/series/series-poster.jpeg');
+      expect(deletedKeys).toContain('images/series/series-cover.jpeg');
       // A skipped shared key is not a failure.
       expect(result.storageCleanup).toBe('complete');
     });
@@ -732,7 +947,7 @@ describe('SeriesService', () => {
           : Promise.resolve(),
       );
       minioService.deleteObject.mockImplementation((key: string) =>
-        key === 'images/series-cover.jpeg'
+        key === 'images/series/series-cover.jpeg'
           ? Promise.reject(new Error('minio down'))
           : Promise.resolve(),
       );
@@ -740,13 +955,18 @@ describe('SeriesService', () => {
         .spyOn(service['logger'], 'error')
         .mockImplementation(() => undefined);
 
-      const result = await service.remove('series-1');
+      const result = await service.remove('series-1', ACTOR);
 
-      expect(prisma.series.delete).toHaveBeenCalledWith({ where: { id: 'series-1' } });
+      expect(prisma.series.delete).toHaveBeenCalledWith({
+        where: { id: 'series-1' },
+      });
       expect(result.deletedEpisodes).toBe(2);
       expect(result.storageCleanup).toBe('partial');
       expect(result.failedObjects).toEqual(
-        expect.arrayContaining(['videos/ep-1/', 'images/series-cover.jpeg']),
+        expect.arrayContaining([
+          'videos/ep-1/',
+          'images/series/series-cover.jpeg',
+        ]),
       );
       expect(result.failedObjects).toHaveLength(2);
       expect(errorSpy).toHaveBeenCalledWith(
@@ -761,30 +981,50 @@ describe('SeriesService', () => {
    * a nonexistent series) while staff keep full access for management.
    */
   describe('series-level gating of seasons/episodes', () => {
-    const draft = { id: 'series-1', status: SeriesStatus.DRAFT, posterUrl: null, coverUrl: null, categories: [] };
+    const draft = {
+      id: 'series-1',
+      status: SeriesStatus.DRAFT,
+      posterUrl: null,
+      coverUrl: null,
+      categories: [],
+    };
 
     it('getSeasons: 404 for USER on a non-PUBLISHED series', async () => {
       prisma.series.findUnique.mockResolvedValue(draft);
-      await expect(service.getSeasons('series-1', Role.USER)).rejects.toThrow(NotFoundException);
+      await expect(service.getSeasons('series-1', Role.USER)).rejects.toThrow(
+        NotFoundException,
+      );
       expect(prisma.movie.groupBy).not.toHaveBeenCalled();
     });
 
     it('getSeasons: staff still list seasons of a DRAFT series', async () => {
       prisma.series.findUnique.mockResolvedValue(draft);
       prisma.movie.groupBy.mockResolvedValue([]);
-      await expect(service.getSeasons('series-1', Role.ADMIN)).resolves.toEqual([]);
+      await expect(service.getSeasons('series-1', Role.ADMIN)).resolves.toEqual(
+        [],
+      );
     });
 
     it('getEpisodes: 404 for USER on a non-PUBLISHED series', async () => {
-      prisma.series.findUnique.mockResolvedValue({ ...draft, status: SeriesStatus.UNPUBLISHED });
-      await expect(service.getEpisodes('series-1', Role.USER)).rejects.toThrow(NotFoundException);
+      prisma.series.findUnique.mockResolvedValue({
+        ...draft,
+        status: SeriesStatus.UNPUBLISHED,
+      });
+      await expect(service.getEpisodes('series-1', Role.USER)).rejects.toThrow(
+        NotFoundException,
+      );
       expect(prisma.movie.findMany).not.toHaveBeenCalled();
     });
 
     it('getEpisodes: staff still list episodes of an UNPUBLISHED series', async () => {
-      prisma.series.findUnique.mockResolvedValue({ ...draft, status: SeriesStatus.UNPUBLISHED });
+      prisma.series.findUnique.mockResolvedValue({
+        ...draft,
+        status: SeriesStatus.UNPUBLISHED,
+      });
       prisma.movie.findMany.mockResolvedValue([]);
-      await expect(service.getEpisodes('series-1', Role.ADMIN)).resolves.toEqual([]);
+      await expect(
+        service.getEpisodes('series-1', Role.ADMIN),
+      ).resolves.toEqual([]);
     });
 
     it('getPlayerEpisodes: 404 for USER on a non-PUBLISHED series', async () => {
@@ -798,7 +1038,11 @@ describe('SeriesService', () => {
     it('getPlayerEpisodes: staff still get the grouped list for a DRAFT series', async () => {
       prisma.series.findUnique.mockResolvedValue(draft);
       prisma.movie.findMany.mockResolvedValue([]);
-      const result = await service.getPlayerEpisodes('series-1', 'admin-1', Role.SUPER_ADMIN);
+      const result = await service.getPlayerEpisodes(
+        'series-1',
+        'admin-1',
+        Role.SUPER_ADMIN,
+      );
       expect(result.seasons).toEqual([]);
     });
   });

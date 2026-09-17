@@ -5,8 +5,17 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { Prisma, Role } from '../generated/prisma/client';
+import { AuditService } from '../audit/audit.service';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** The staff member managing plans below. */
+const actor = {
+  id: 'admin-1',
+  username: 'admin.blake',
+  role: Role.SUPER_ADMIN,
+  appRoleId: null,
+};
 
 describe('SubscriptionsService', () => {
   let service: SubscriptionsService;
@@ -71,6 +80,10 @@ describe('SubscriptionsService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: WalletService, useValue: walletService },
         { provide: RealtimeGateway, useValue: realtimeGateway },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -126,7 +139,10 @@ describe('SubscriptionsService', () => {
         isActive: true,
       });
 
-      const result = await service.createPlan({ name: 'Basic', price: 5000 });
+      const result = await service.createPlan(
+        { name: 'Basic', price: 5000 },
+        actor,
+      );
 
       expect(prisma.subscriptionPlan.create).toHaveBeenCalledWith({
         data: expect.objectContaining({
@@ -148,11 +164,10 @@ describe('SubscriptionsService', () => {
         isActive: true,
       });
 
-      const result = await service.createPlan({
-        name: 'Week',
-        price: 3000,
-        durationDays: 7,
-      });
+      const result = await service.createPlan(
+        { name: 'Week', price: 3000, durationDays: 7 },
+        actor,
+      );
 
       expect(prisma.subscriptionPlan.create).toHaveBeenCalledWith({
         data: expect.objectContaining({ durationDays: 7 }),
@@ -165,9 +180,9 @@ describe('SubscriptionsService', () => {
     it('throws NotFoundException for an unknown plan, without writing anything', async () => {
       prisma.subscriptionPlan.findUnique.mockResolvedValue(null);
 
-      await expect(service.updatePlan('nope', { name: 'X' })).rejects.toThrow(
-        NotFoundException,
-      );
+      await expect(
+        service.updatePlan('nope', { name: 'X' }, actor),
+      ).rejects.toThrow(NotFoundException);
       expect(prisma.subscriptionPlan.update).not.toHaveBeenCalled();
     });
 
@@ -181,7 +196,11 @@ describe('SubscriptionsService', () => {
         isActive: false,
       });
 
-      const result = await service.updatePlan('plan-1', { isActive: false });
+      const result = await service.updatePlan(
+        'plan-1',
+        { isActive: false },
+        actor,
+      );
 
       // Only the sent field is written — a toggle must never reset durationDays.
       expect(prisma.subscriptionPlan.update).toHaveBeenCalledWith({
@@ -201,7 +220,11 @@ describe('SubscriptionsService', () => {
         isActive: true,
       });
 
-      const result = await service.updatePlan('plan-1', { durationDays: 90 });
+      const result = await service.updatePlan(
+        'plan-1',
+        { durationDays: 90 },
+        actor,
+      );
 
       expect(prisma.subscriptionPlan.update).toHaveBeenCalledWith({
         where: { id: 'plan-1' },

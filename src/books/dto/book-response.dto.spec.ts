@@ -19,7 +19,7 @@ describe('chapter response mappers', () => {
       content: null,
       order: 1,
       status: 'READY',
-      pdfKey: 'books/b/e/c/original.pdf',
+      pdfKey: 'documents/books/b/e/c/original.pdf',
       pdfFileSize: BigInt(4096),
       pageCount: 12,
       processedPages: 12,
@@ -103,10 +103,12 @@ describe('chapter response mappers', () => {
 
   it('re-hosts the chapter image through the resolver it is given', () => {
     const summary = toChapterSummary(
-      chapter({ imageUrl: 'http://stale-host/movies/images/c.webp' }),
-      () => 'http://current-host/movies/images/c.webp',
+      chapter({ imageUrl: 'http://stale-host/movies/images/book/c.webp' }),
+      () => 'http://current-host/movies/images/book/c.webp',
     );
 
-    expect(summary.imageUrl).toBe('http://current-host/movies/images/c.webp');
+    expect(summary.imageUrl).toBe(
+      'http://current-host/movies/images/book/c.webp',
+    );
   });
 });

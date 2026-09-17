@@ -157,6 +157,102 @@ describe('Auth rate limiting', () => {
         .send({ phone: '+959111111111', extra: 'x' })
         .expect(429);
     });
+
+    it('buckets a numeric phone with its string spelling', async () => {
+      // The pipe's enableImplicitConversion turns 9111111111 into the
+      // string "9111111111" — the tracker must key it the same way, or a
+      // JSON number buys a fresh allowance (F-007).
+      for (let i = 0; i < 3; i += 1) {
+        await otp('09111111111').expect(200);
+      }
+      await request(app.getHttpServer())
+        .post('/auth/otp/request')
+        .send({ phone: 9111111111 })
+        .expect(429);
+      await request(app.getHttpServer())
+        .post('/auth/otp/request')
+        .send({ phone: 959111111111 })
+        .expect(429);
+      expect(service.requestPhoneOtp).toHaveBeenCalledTimes(3);
+    });
+
+    it('non-primitive credentials fall back to the per-IP bucket', async () => {
+      // Objects, arrays and null are rejected by the pipe (400) and count
+      // against the IP, not the phone — the phone keeps its full allowance.
+      await request(app.getHttpServer())
+        .post('/auth/otp/request')
+        .send({ phone: { a: 1 } })
+        .expect(400);
+      await request(app.getHttpServer())
+        .post('/auth/otp/request')
+        .send({ phone: null })
+        .expect(400);
+      await request(app.getHttpServer())
+        .post('/auth/otp/request')
+        .send({ phone: ['09111111111'] })
+        .expect(400);
+      for (let i = 0; i < 3; i += 1) {
+        await otp('09111111111').expect(200);
+      }
+      await otp('09111111111').expect(429);
+      expect(service.requestPhoneOtp).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe('POST /auth/otp/verify (10 per phone / min)', () => {
+    beforeEach(() => boot());
+
+    const verify = (phone: unknown, ip?: string) => {
+      const req = request(app.getHttpServer())
+        .post('/auth/otp/verify')
+        .send({ phone, code: '111111' });
+      return ip ? req.set('x-forwarded-for', ip) : req;
+    };
+
+    it('blocks a numeric phone once its string spelling is exhausted', async () => {
+      for (let i = 0; i < 10; i += 1) {
+        await verify('09777000777').expect(200);
+      }
+      // From a different address, so the 429 can only come from the
+      // per-phone bucket, never the per-IP one.
+      const blocked = await verify(9777000777, '203.0.113.9').expect(429);
+      expect(blocked.body.success).toBe(false);
+      expect(blocked.body.message).toMatch(TOO_MANY);
+      expect(blocked.headers['retry-after']).toBeDefined();
+      expect(service.verifyPhoneOtp).toHaveBeenCalledTimes(10);
+    });
+  });
+
+  describe('POST /auth/phone/check and /auth/phone/verify-password (10 per phone / min)', () => {
+    beforeEach(() => boot());
+
+    it('blocks a numeric phone on /auth/phone/check once its string spelling is exhausted', async () => {
+      for (let i = 0; i < 10; i += 1) {
+        await request(app.getHttpServer())
+          .post('/auth/phone/check')
+          .send({ phone: '09777000777' })
+          .expect(200);
+      }
+      await request(app.getHttpServer())
+        .post('/auth/phone/check')
+        .send({ phone: 9777000777 })
+        .expect(429);
+      expect(service.checkPhoneExists).toHaveBeenCalledTimes(10);
+    });
+
+    it('blocks a numeric phone on /auth/phone/verify-password once its string spelling is exhausted', async () => {
+      for (let i = 0; i < 10; i += 1) {
+        await request(app.getHttpServer())
+          .post('/auth/phone/verify-password')
+          .send({ phone: '09777000777', password: 'guess' })
+          .expect(200);
+      }
+      await request(app.getHttpServer())
+        .post('/auth/phone/verify-password')
+        .send({ phone: 9777000777, password: 'guess' })
+        .expect(429);
+      expect(service.verifyPhonePassword).toHaveBeenCalledTimes(10);
+    });
   });
 
   describe('POST /auth/login (10 per username / min, 60 per IP / min)', () => {
@@ -182,6 +278,39 @@ describe('Auth rate limiting', () => {
         .send({ username: 'bob', password: 'pw' })
         .expect(200);
       expect(service.login).toHaveBeenCalledTimes(11);
+    });
+
+    it('a numeric username shares the bucket of its digit string', async () => {
+      for (let i = 0; i < 10; i += 1) {
+        await request(app.getHttpServer())
+          .post('/auth/login')
+          .send({ username: '12345', password: 'x' })
+          .expect(200);
+      }
+      // From a different address, so the 429 can only come from the
+      // per-username bucket, never the per-IP one.
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .set('x-forwarded-for', '203.0.113.9')
+        .send({ username: 12345, password: 'x' })
+        .expect(429);
+      expect(service.login).toHaveBeenCalledTimes(10);
+    });
+
+    it('a boolean username is bucketed as the pipe will read it', async () => {
+      // class-transformer stringifies EVERY primitive, so `true` reaches
+      // the service as username "true" — the tracker must agree.
+      for (let i = 0; i < 10; i += 1) {
+        await request(app.getHttpServer())
+          .post('/auth/login')
+          .send({ username: 'true', password: 'x' })
+          .expect(200);
+      }
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ username: true, password: 'x' })
+        .expect(429);
+      expect(service.login).toHaveBeenCalledTimes(10);
     });
   });
 

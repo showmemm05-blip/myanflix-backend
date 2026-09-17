@@ -1,21 +1,34 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
+  CATALOG_INCLUDE,
   MoviesService,
   buildMovieWhere,
   movieOrderBy,
   movieSearchOr,
+  statusDerivedAuditAction,
 } from './movies.service';
 import { MovieSort } from './dto/movie-query.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
+import { StorageService } from '../common/storage/storage.service';
 import { TrackingService } from '../tracking/tracking.service';
+import { AuditService } from '../audit/audit.service';
 import {
   AccessType,
   AgeRating,
   MovieStatus,
   Role,
 } from '../generated/prisma/client';
+
+/** A staff actor for the audit calls — the mocked AuditService records nothing. */
+const ACTOR = {
+  id: 'admin-1',
+  username: 'boss',
+  role: Role.ADMIN,
+  appRoleId: null,
+} as const;
 
 describe('MoviesService', () => {
   let service: MoviesService;
@@ -39,14 +52,29 @@ describe('MoviesService', () => {
     minioService = {
       deleteByPrefix: jest.fn().mockResolvedValue(undefined),
       deleteObject: jest.fn().mockResolvedValue(undefined),
-      keyFromPublicUrl: jest.fn((url: string) => `images/${url.split('/').pop()}`),
+      // Mirrors the real keyFromPublicUrl(): everything after the bucket
+      // segment is the key, so the purpose folder survives the round trip.
+      keyFromPublicUrl: jest.fn((url: string) => {
+        const match = /\/movies\/(.+)$/.exec(url);
+        return match ? match[1] : null;
+      }),
     };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         MoviesService,
         { provide: PrismaService, useValue: prisma },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
         { provide: MinioService, useValue: minioService },
+        // The REAL key builder, not a mock: the point of the delete
+        // assertions below is that they pin the actual storage layout.
+        // StorageService only reads STORAGE_PATH for LOCAL paths, which no
+        // deletion path touches, so an empty config is enough.
+        StorageService,
+        { provide: ConfigService, useValue: { get: () => undefined } },
         // findAll fire-and-forgets a search row; nothing else in this suite
         // touches tracking.
         {
@@ -67,9 +95,18 @@ describe('MoviesService', () => {
       'creates a movie with only the given title populated and every other ' +
         'field defaulted, starting at UPLOADING — the bulk upload flow only knows the title at this point',
       async () => {
-        prisma.movie.create.mockResolvedValue({ id: 'movie-1', title: 'My Cool Movie', status: MovieStatus.UPLOADING });
+        prisma.movie.create.mockResolvedValue({
+          id: 'movie-1',
+          title: 'My Cool Movie',
+          status: MovieStatus.UPLOADING,
+        });
 
-        const result = await service.createUploadPlaceholder('My Cool Movie');
+        const result = await service.createUploadPlaceholder(
+          'My Cool Movie',
+          undefined,
+          undefined,
+          ACTOR,
+        );
 
         expect(prisma.movie.create).toHaveBeenCalledWith({
           data: expect.objectContaining({
@@ -82,16 +119,25 @@ describe('MoviesService', () => {
             status: MovieStatus.UPLOADING,
           }),
         });
-        expect(result).toEqual({ id: 'movie-1', title: 'My Cool Movie', status: MovieStatus.UPLOADING });
+        expect(result).toEqual({
+          id: 'movie-1',
+          title: 'My Cool Movie',
+          status: MovieStatus.UPLOADING,
+        });
       },
     );
 
     it('stores the runtime the uploader probed from the bundle when one is given', async () => {
       prisma.movie.create.mockResolvedValue({ id: 'movie-1' });
 
-      await service.createUploadPlaceholder('Probed Movie', undefined, {
-        duration: 91,
-      });
+      await service.createUploadPlaceholder(
+        'Probed Movie',
+        undefined,
+        {
+          duration: 91,
+        },
+        ACTOR,
+      );
 
       expect(prisma.movie.create).toHaveBeenCalledWith({
         data: expect.objectContaining({ title: 'Probed Movie', duration: 91 }),
@@ -101,7 +147,12 @@ describe('MoviesService', () => {
     it('is born with the 0 unknown sentinel when the probe produced nothing — never a guess', async () => {
       prisma.movie.create.mockResolvedValue({ id: 'movie-1' });
 
-      await service.createUploadPlaceholder('Unprobed Movie', undefined, {});
+      await service.createUploadPlaceholder(
+        'Unprobed Movie',
+        undefined,
+        {},
+        ACTOR,
+      );
 
       expect(prisma.movie.create.mock.calls[0][0].data.duration).toBe(0);
     });
@@ -109,7 +160,12 @@ describe('MoviesService', () => {
     it('never sets status to PUBLISHED — that only ever happens via an explicit admin action', async () => {
       prisma.movie.create.mockResolvedValue({ id: 'movie-1' });
 
-      await service.createUploadPlaceholder('Anything');
+      await service.createUploadPlaceholder(
+        'Anything',
+        undefined,
+        undefined,
+        ACTOR,
+      );
 
       const callData = prisma.movie.create.mock.calls[0][0].data;
       expect(callData.status).toBe(MovieStatus.UPLOADING);
@@ -120,7 +176,12 @@ describe('MoviesService', () => {
       prisma.series.findUnique.mockResolvedValue(null);
 
       await expect(
-        service.createUploadPlaceholder('Episode 1', { seriesId: 'series-1', seasonNumber: 1, episodeNumber: 1 }),
+        service.createUploadPlaceholder(
+          'Episode 1',
+          { seriesId: 'series-1', seasonNumber: 1, episodeNumber: 1 },
+          undefined,
+          ACTOR,
+        ),
       ).rejects.toThrow(NotFoundException);
       expect(prisma.movie.create).not.toHaveBeenCalled();
     });
@@ -134,7 +195,12 @@ describe('MoviesService', () => {
       });
       prisma.movie.create.mockResolvedValue({ id: 'movie-1' });
 
-      await service.createUploadPlaceholder('Episode 3', { seriesId: 'series-1', seasonNumber: 2, episodeNumber: 3 });
+      await service.createUploadPlaceholder(
+        'Episode 3',
+        { seriesId: 'series-1', seasonNumber: 2, episodeNumber: 3 },
+        undefined,
+        ACTOR,
+      );
 
       expect(prisma.movie.create).toHaveBeenCalledWith({
         data: expect.objectContaining({
@@ -153,7 +219,12 @@ describe('MoviesService', () => {
     it('as a standalone movie: leaves every series field unset', async () => {
       prisma.movie.create.mockResolvedValue({ id: 'movie-1' });
 
-      await service.createUploadPlaceholder('Just A Movie');
+      await service.createUploadPlaceholder(
+        'Just A Movie',
+        undefined,
+        undefined,
+        ACTOR,
+      );
 
       const callData = prisma.movie.create.mock.calls[0][0].data;
       expect(callData.seriesId).toBeUndefined();
@@ -167,26 +238,41 @@ describe('MoviesService', () => {
     it('throws NotFoundException when the movie does not exist', async () => {
       prisma.movie.findUnique.mockResolvedValue(null);
 
-      await expect(service.remove('movie-1')).rejects.toThrow(NotFoundException);
+      await expect(service.remove('movie-1', ACTOR)).rejects.toThrow(
+        NotFoundException,
+      );
       expect(prisma.movie.delete).not.toHaveBeenCalled();
     });
 
-    it('deletes the DB row, then cleans up its whole videos/<id>/ tree and its three images in storage', async () => {
+    it('deletes the DB row, then cleans up both of its id-keyed prefixes and its three images in storage', async () => {
       prisma.movie.findUnique.mockResolvedValue({
         id: 'movie-1',
-        posterUrl: 'http://cache/movies/images/poster.jpg',
-        coverUrl: 'http://cache/movies/images/cover.jpg',
-        thumbnailUrl: 'http://cache/movies/images/thumb.jpg',
+        posterUrl: 'http://cache/movies/images/movie/poster.jpg',
+        coverUrl: 'http://cache/movies/images/movie/cover.jpg',
+        thumbnailUrl: 'http://cache/movies/images/movie/thumb.jpg',
         videos: [],
       });
 
-      await service.remove('movie-1');
+      await service.remove('movie-1', ACTOR);
 
-      expect(prisma.movie.delete).toHaveBeenCalledWith({ where: { id: 'movie-1' } });
-      expect(minioService.deleteByPrefix).toHaveBeenCalledWith('videos/movie-1/');
-      expect(minioService.deleteObject).toHaveBeenCalledWith('images/poster.jpg');
-      expect(minioService.deleteObject).toHaveBeenCalledWith('images/cover.jpg');
-      expect(minioService.deleteObject).toHaveBeenCalledWith('images/thumb.jpg');
+      expect(prisma.movie.delete).toHaveBeenCalledWith({
+        where: { id: 'movie-1' },
+      });
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+        'videos/movie-1/',
+      );
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+        'subtitles/movie-1/',
+      );
+      expect(minioService.deleteObject).toHaveBeenCalledWith(
+        'images/movie/poster.jpg',
+      );
+      expect(minioService.deleteObject).toHaveBeenCalledWith(
+        'images/movie/cover.jpg',
+      );
+      expect(minioService.deleteObject).toHaveBeenCalledWith(
+        'images/movie/thumb.jpg',
+      );
     });
 
     it('skips any image field that was never set, instead of trying to delete a null URL', async () => {
@@ -198,14 +284,14 @@ describe('MoviesService', () => {
         videos: [],
       });
 
-      await service.remove('movie-1');
+      await service.remove('movie-1', ACTOR);
 
       expect(minioService.deleteObject).not.toHaveBeenCalled();
     });
 
     it(
-      'deletes a manually-uploaded subtitle (global subtitles/<id>/ prefix) individually, but does not ' +
-        'double-delete a bundle-detected one that the videos/<movieId>/ prefix delete already caught',
+      'sweeps every subtitle source with one prefix keyed by the MOVIE, never object by object — ' +
+        'both upload flows now land in subtitles/<movieId>/, so there is nothing left to tell apart',
       async () => {
         prisma.movie.findUnique.mockResolvedValue({
           id: 'movie-1',
@@ -216,26 +302,41 @@ describe('MoviesService', () => {
             {
               id: 'video-1',
               subtitles: [
-                { objectKey: 'subtitles/sub-1/original.vtt' }, // manually uploaded — separate global prefix
-                { objectKey: 'videos/movie-1/subtitles/english.vtt' }, // bundle-detected — already under the deleted prefix
+                { objectKey: 'subtitles/movie-1/sub-1.vtt' }, // single upload
+                { objectKey: 'subtitles/movie-1/english.srt' }, // bulk bundle
               ],
             },
           ],
         });
 
-        await service.remove('movie-1');
+        await service.remove('movie-1', ACTOR);
 
-        expect(minioService.deleteObject).toHaveBeenCalledWith('subtitles/sub-1/original.vtt');
-        expect(minioService.deleteObject).not.toHaveBeenCalledWith('videos/movie-1/subtitles/english.vtt');
+        expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+          'subtitles/movie-1/',
+        );
+        // No individual subtitle delete survives — the only deleteObject
+        // calls this path may make are the three artwork keys, and this
+        // movie has none.
+        expect(minioService.deleteObject).not.toHaveBeenCalled();
       },
     );
 
     it('still deletes the movie even if storage cleanup fails — a storage hiccup must not block removing it from the catalog', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1', posterUrl: null, coverUrl: null, thumbnailUrl: null, videos: [] });
-      minioService.deleteByPrefix.mockRejectedValue(new Error('storage server unreachable'));
+      prisma.movie.findUnique.mockResolvedValue({
+        id: 'movie-1',
+        posterUrl: null,
+        coverUrl: null,
+        thumbnailUrl: null,
+        videos: [],
+      });
+      minioService.deleteByPrefix.mockRejectedValue(
+        new Error('storage server unreachable'),
+      );
 
-      await expect(service.remove('movie-1')).resolves.toBeUndefined();
-      expect(prisma.movie.delete).toHaveBeenCalledWith({ where: { id: 'movie-1' } });
+      await expect(service.remove('movie-1', ACTOR)).resolves.toBeUndefined();
+      expect(prisma.movie.delete).toHaveBeenCalledWith({
+        where: { id: 'movie-1' },
+      });
     });
   });
 });
@@ -272,7 +373,13 @@ describe('MoviesService — search logging', () => {
       providers: [
         MoviesService,
         { provide: PrismaService, useValue: prisma },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
         { provide: MinioService, useValue: {} },
+        StorageService,
+        { provide: ConfigService, useValue: { get: () => undefined } },
         { provide: TrackingService, useValue: trackingService },
       ],
     }).compile();
@@ -284,7 +391,11 @@ describe('MoviesService — search logging', () => {
     prisma.movie.findMany.mockResolvedValue([{ id: 'movie-1' }]);
     prisma.movie.count.mockResolvedValue(42);
 
-    await service.findAll({ search: 'avengers', limit: 1 }, Role.USER, 'user-1');
+    await service.findAll(
+      { search: 'avengers', limit: 1 },
+      Role.USER,
+      'user-1',
+    );
 
     expect(trackingService.recordSearch).toHaveBeenCalledWith({
       term: 'avengers',
@@ -452,7 +563,14 @@ describe('buildMovieWhere', () => {
 
   it('swapped bounds are normalized, not turned into an empty set', () => {
     const where = buildMovieWhere(
-      { yearFrom: 2020, yearTo: 2000, ratingMin: 9, ratingMax: 2, durationMin: 120, durationMax: 90 },
+      {
+        yearFrom: 2020,
+        yearTo: 2000,
+        ratingMin: 9,
+        ratingMax: 2,
+        durationMin: 120,
+        durationMax: 90,
+      },
       Role.USER,
     );
     expect(where.releaseYear).toEqual({ gte: 2000, lte: 2020 });
@@ -495,9 +613,18 @@ describe('buildMovieWhere', () => {
 describe('movieOrderBy — the sort mapping table', () => {
   it.each([
     [MovieSort.RECENTLY_ADDED, [{ createdAt: 'desc' }, { id: 'desc' }]],
-    [MovieSort.NEWEST, [{ releaseYear: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }]],
-    [MovieSort.OLDEST, [{ releaseYear: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }]],
-    [MovieSort.RATING, [{ rating: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }]],
+    [
+      MovieSort.NEWEST,
+      [{ releaseYear: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+    ],
+    [
+      MovieSort.OLDEST,
+      [{ releaseYear: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
+    ],
+    [
+      MovieSort.RATING,
+      [{ rating: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+    ],
     [MovieSort.TITLE, [{ title: 'asc' }, { id: 'asc' }]],
   ] as const)('%s', (sort, expected) => {
     expect(movieOrderBy(sort)).toEqual(expected);
@@ -549,9 +676,15 @@ describe('MoviesService — catalog sort paths, facets, and metadata normalizati
         MoviesService,
         { provide: PrismaService, useValue: prisma },
         {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
+        {
           provide: MinioService,
           useValue: { canonicalImageUrl: (u: string | null) => u },
         },
+        StorageService,
+        { provide: ConfigService, useValue: { get: () => undefined } },
         {
           provide: TrackingService,
           useValue: {
@@ -667,8 +800,14 @@ describe('MoviesService — catalog sort paths, facets, and metadata normalizati
       const [firstCall, secondCall] = prisma.movie.findMany.mock.calls;
       expect(firstCall[0]).toMatchObject({ skip: 10, take: 5 });
       expect(secondCall[0]).toMatchObject({ skip: 0, take: 5 });
-      expect(firstCall[0].include).toMatchObject({ categories: true, actors: true });
-      expect(secondCall[0].include).toMatchObject({ categories: true, actors: true });
+      expect(firstCall[0].include).toMatchObject({
+        categories: true,
+        actors: true,
+      });
+      expect(secondCall[0].include).toMatchObject({
+        categories: true,
+        actors: true,
+      });
       expect(result.items).toEqual([{ id: 't1' }, { id: 't2' }]);
       expect(result.total).toBe(45);
     });
@@ -870,7 +1009,7 @@ describe('MoviesService — catalog sort paths, facets, and metadata normalizati
     });
 
     it('update: a blanked director/country persists as NULL, so it cannot become a fake facet value', async () => {
-      await service.update('movie-1', { director: '', country: '  ' });
+      await service.update('movie-1', { director: '', country: '  ' }, ACTOR);
 
       expect(prisma.movie.update.mock.calls[0][0].data).toMatchObject({
         director: null,
@@ -879,7 +1018,7 @@ describe('MoviesService — catalog sort paths, facets, and metadata normalizati
     });
 
     it('update: absent fields stay absent — a partial edit never touches them', async () => {
-      await service.update('movie-1', { title: 'New title' });
+      await service.update('movie-1', { title: 'New title' }, ACTOR);
 
       const data = prisma.movie.update.mock.calls[0][0].data;
       expect('director' in data).toBe(false);
@@ -887,11 +1026,15 @@ describe('MoviesService — catalog sort paths, facets, and metadata normalizati
     });
 
     it('update: real values pass through, and ageRating null clears to Unrated', async () => {
-      await service.update('movie-1', {
-        director: 'Some Director',
-        country: 'Myanmar',
-        ageRating: null,
-      });
+      await service.update(
+        'movie-1',
+        {
+          director: 'Some Director',
+          country: 'Myanmar',
+          ageRating: null,
+        },
+        ACTOR,
+      );
 
       expect(prisma.movie.update.mock.calls[0][0].data).toMatchObject({
         director: 'Some Director',
@@ -901,21 +1044,287 @@ describe('MoviesService — catalog sort paths, facets, and metadata normalizati
     });
 
     it('create: same normalization', async () => {
-      await service.create({
-        title: 'T',
-        description: 'D',
-        genre: 'Action',
-        language: 'Burmese',
-        releaseYear: 2026,
-        duration: 100,
-        director: '',
-        country: 'Myanmar',
-      });
+      await service.create(
+        {
+          title: 'T',
+          description: 'D',
+          genre: 'Action',
+          language: 'Burmese',
+          releaseYear: 2026,
+          duration: 100,
+          director: '',
+          country: 'Myanmar',
+        },
+        ACTOR,
+      );
 
       expect(prisma.movie.create.mock.calls[0][0].data).toMatchObject({
         director: null,
         country: 'Myanmar',
       });
     });
+  });
+});
+
+describe('statusDerivedAuditAction — one rule for movies and series', () => {
+  it.each([
+    ['DRAFT', 'DRAFT', 'movie.update'],
+    ['DRAFT', 'PUBLISHED', 'movie.publish'],
+    ['READY_TO_PUBLISH', 'PUBLISHED', 'movie.publish'],
+    ['PUBLISHED', 'ARCHIVED', 'movie.unpublish'],
+    ['PUBLISHED', 'DRAFT', 'movie.unpublish'],
+    ['DRAFT', 'ARCHIVED', 'movie.status_change'],
+    ['UPLOADING', 'READY_TO_PUBLISH', 'movie.status_change'],
+  ])('%s → %s is %s', (before, after, expected) => {
+    expect(statusDerivedAuditAction('movie', before, after)).toBe(expected);
+  });
+
+  it('files series transitions under the series keys', () => {
+    expect(statusDerivedAuditAction('series', 'DRAFT', 'PUBLISHED')).toBe(
+      'series.publish',
+    );
+    expect(statusDerivedAuditAction('series', 'PUBLISHED', 'UNPUBLISHED')).toBe(
+      'series.unpublish',
+    );
+    expect(statusDerivedAuditAction('series', 'DRAFT', 'UNPUBLISHED')).toBe(
+      'series.status_change',
+    );
+  });
+});
+
+describe('MoviesService — audit rows', () => {
+  let service: MoviesService;
+  let audit: { record: jest.Mock };
+  let prisma: {
+    movie: {
+      create: jest.Mock;
+      findUnique: jest.Mock;
+      update: jest.Mock;
+      delete: jest.Mock;
+    };
+    series: { findUnique: jest.Mock };
+  };
+
+  const stored = {
+    id: 'movie-1',
+    title: 'Old Title',
+    description: '',
+    genre: 'Drama',
+    language: 'en',
+    releaseYear: 2024,
+    duration: 100,
+    rating: null,
+    director: null,
+    country: null,
+    ageRating: null,
+    accessType: AccessType.FREE,
+    status: MovieStatus.DRAFT,
+    seriesId: null,
+    seasonNumber: null,
+    episodeNumber: null,
+    posterUrl: null,
+    coverUrl: null,
+    thumbnailUrl: null,
+    categories: [{ id: 'cat-1', name: 'Action', description: null }],
+    actors: [],
+  };
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
+    prisma = {
+      movie: {
+        create: jest.fn(),
+        findUnique: jest.fn(),
+        update: jest.fn(),
+        delete: jest.fn().mockResolvedValue(undefined),
+      },
+      series: { findUnique: jest.fn() },
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        MoviesService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: AuditService, useValue: audit },
+        {
+          provide: MinioService,
+          useValue: {
+            canonicalImageUrl: (u: string | null) => u,
+            deleteByPrefix: jest.fn().mockResolvedValue(undefined),
+            deleteObject: jest.fn().mockResolvedValue(undefined),
+            keyFromPublicUrl: jest.fn(() => null),
+          },
+        },
+        StorageService,
+        { provide: ConfigService, useValue: { get: () => undefined } },
+        {
+          provide: TrackingService,
+          useValue: { recordSearch: jest.fn(), fireAndForget: jest.fn() },
+        },
+      ],
+    }).compile();
+
+    service = module.get(MoviesService);
+  });
+
+  it('create records movie.create with the created snapshot only', async () => {
+    prisma.movie.create.mockResolvedValue({ ...stored, title: 'New' });
+
+    await service.create(
+      {
+        title: 'New',
+        description: '',
+        genre: 'Drama',
+        language: 'en',
+        releaseYear: 2024,
+        duration: 100,
+      },
+      ACTOR,
+    );
+
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'movie.create',
+        actor: ACTOR,
+        target: { type: 'movie', id: 'movie-1', label: 'New' },
+        after: expect.objectContaining({
+          title: 'New',
+          categories: [{ id: 'cat-1', name: 'Action' }],
+        }),
+      }),
+    );
+    expect(audit.record.mock.calls[0][0].before).toBeUndefined();
+  });
+
+  it('the bulk placeholder is movie.create tagged flow=bulk (+ seriesId for an episode)', async () => {
+    prisma.series.findUnique.mockResolvedValue({
+      genre: 'Drama',
+      language: 'en',
+      releaseYear: 2020,
+    });
+    prisma.movie.create.mockResolvedValue({
+      ...stored,
+      title: 'Ep 1',
+      seriesId: 'series-1',
+    });
+
+    await service.createUploadPlaceholder(
+      'Ep 1',
+      { seriesId: 'series-1', seasonNumber: 1, episodeNumber: 1 },
+      undefined,
+      ACTOR,
+    );
+
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'movie.create',
+        metadata: { flow: 'bulk', seriesId: 'series-1' },
+      }),
+    );
+  });
+
+  it('update pre-reads the row with its relations and records the plain update with before/after', async () => {
+    prisma.movie.findUnique.mockResolvedValue(stored);
+    prisma.movie.update.mockResolvedValue({ ...stored, title: 'New Title' });
+
+    await service.update('movie-1', { title: 'New Title' }, ACTOR);
+
+    // CATALOG_INCLUDE rather than a literal: the pre-read has to carry
+    // whatever a response row carries, so this assertion must not be a second
+    // copy of the include that can drift away from the real one.
+    expect(prisma.movie.findUnique).toHaveBeenCalledWith({
+      where: { id: 'movie-1' },
+      include: CATALOG_INCLUDE,
+    });
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'movie.update',
+        actor: ACTOR,
+        target: { type: 'movie', id: 'movie-1', label: 'New Title' },
+        before: expect.objectContaining({ title: 'Old Title' }),
+        after: expect.objectContaining({ title: 'New Title' }),
+        metadata: null,
+      }),
+    );
+  });
+
+  it.each([
+    [MovieStatus.DRAFT, MovieStatus.PUBLISHED, 'movie.publish'],
+    [MovieStatus.PUBLISHED, MovieStatus.ARCHIVED, 'movie.unpublish'],
+    [MovieStatus.DRAFT, MovieStatus.ARCHIVED, 'movie.status_change'],
+  ])(
+    'update %s → %s is filed as %s, in ONE row that also carries the other edits',
+    async (before, after, action) => {
+      prisma.movie.findUnique.mockResolvedValue({ ...stored, status: before });
+      prisma.movie.update.mockResolvedValue({
+        ...stored,
+        status: after,
+        title: 'Renamed',
+        seriesId: 'series-1',
+      });
+
+      await service.update(
+        'movie-1',
+        { status: after, title: 'Renamed' },
+        ACTOR,
+      );
+
+      expect(audit.record).toHaveBeenCalledTimes(1);
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action,
+          before: expect.objectContaining({
+            status: before,
+            title: 'Old Title',
+          }),
+          after: expect.objectContaining({ status: after, title: 'Renamed' }),
+          metadata: { seriesId: 'series-1' },
+        }),
+      );
+    },
+  );
+
+  it('update 404s before touching the audit log', async () => {
+    prisma.movie.findUnique.mockResolvedValue(null);
+
+    await expect(
+      service.update('movie-1', { title: 'x' }, ACTOR),
+    ).rejects.toThrow(NotFoundException);
+    expect(prisma.movie.update).not.toHaveBeenCalled();
+    expect(audit.record).not.toHaveBeenCalled();
+  });
+
+  it('remove records movie.delete with the before snapshot and what cascaded', async () => {
+    prisma.movie.findUnique.mockResolvedValue({
+      ...stored,
+      seriesId: 'series-1',
+      videos: [
+        { id: 'v1', subtitles: [{ objectKey: 'videos/movie-1/a.vtt' }] },
+        {
+          id: 'v2',
+          subtitles: [
+            { objectKey: 'videos/movie-1/b.vtt' },
+            { objectKey: 'videos/movie-1/c.vtt' },
+          ],
+        },
+      ],
+    });
+
+    await service.remove('movie-1', ACTOR);
+
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'movie.delete',
+        target: { type: 'movie', id: 'movie-1', label: 'Old Title' },
+        before: expect.objectContaining({ title: 'Old Title' }),
+        metadata: { videos: 2, subtitles: 3, seriesId: 'series-1' },
+      }),
+    );
+    expect(audit.record.mock.calls[0][0].after).toBeUndefined();
+    // The delete happened before the row was written.
+    expect(prisma.movie.delete.mock.invocationCallOrder[0]).toBeLessThan(
+      audit.record.mock.invocationCallOrder[0],
+    );
   });
 });

@@ -10,6 +10,8 @@ import { MinioService } from '../common/storage/minio.service';
 import { requestClientContext } from '../common/storage/request-host.context';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { PermissionResolverService } from '../roles/permission-resolver.service';
+import { AuditService } from '../audit/audit.service';
+import { commentSnapshot, textPreview } from '../audit/audit-snapshots';
 import type { CreateCommentDto } from './dto/create-comment.dto';
 import type { CommentQueryDto } from './dto/comment-query.dto';
 
@@ -75,6 +77,7 @@ export class CommentsService {
     private readonly prisma: PrismaService,
     private readonly minioService: MinioService,
     private readonly resolver: PermissionResolverService,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -251,13 +254,24 @@ export class CommentsService {
    * must never need a staff permission.
    */
   async remove(id: string, actor: AuthenticatedUser): Promise<void> {
+    // Selects the audit snapshot fields too — the row is gone after this.
     const comment = await this.prisma.comment.findUnique({
       where: { id },
-      select: { id: true, userId: true },
+      select: {
+        id: true,
+        userId: true,
+        status: true,
+        body: true,
+        movieId: true,
+        seriesId: true,
+        bookId: true,
+        parentId: true,
+      },
     });
     if (!comment) throw new NotFoundException('Comment not found');
 
-    if (comment.userId !== actor.id) {
+    const isOwner = comment.userId === actor.id;
+    if (!isOwner) {
       const canModerate = await this.resolver.can(
         actor,
         'TRACKING.COMMENTS_MODERATE',
@@ -269,6 +283,22 @@ export class CommentsService {
 
     // Replies cascade with the parent (Comment.parent is onDelete: Cascade).
     await this.prisma.comment.delete({ where: { id } });
+
+    // Only moderation is audited — an author deleting their own comment is
+    // self-service, whatever role they happen to hold.
+    if (!isOwner) {
+      await this.audit.record({
+        action: 'comment.delete',
+        actor,
+        target: {
+          type: 'comment',
+          id,
+          label: textPreview(comment.body, 60),
+        },
+        before: commentSnapshot(comment),
+        metadata: { authorId: comment.userId },
+      });
+    }
   }
 
   private toView(row: CommentRow, replies: CommentView[]): CommentView {

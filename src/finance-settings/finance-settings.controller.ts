@@ -29,6 +29,6 @@ export class FinanceSettingsController {
     @Body() dto: UpdateFinanceSettingsDto,
     @CurrentUser() admin: AuthenticatedUser,
   ) {
-    return this.financeSettingsService.update(dto, admin.id);
+    return this.financeSettingsService.update(dto, admin);
   }
 }

@@ -51,8 +51,11 @@ export class PaymentAccountsController {
   @Post('types')
   @UseGuards(PermissionsGuard)
   @RequirePermissions('PAYMENT_METHODS.CREATE')
-  createType(@Body() dto: CreatePaymentMethodTypeDto) {
-    return this.paymentAccountsService.createType(dto);
+  createType(
+    @Body() dto: CreatePaymentMethodTypeDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.paymentAccountsService.createType(dto, user);
   }
 
   @Patch('types/:id')
@@ -61,15 +64,19 @@ export class PaymentAccountsController {
   updateType(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdatePaymentMethodTypeDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.paymentAccountsService.updateType(id, dto);
+    return this.paymentAccountsService.updateType(id, dto, user);
   }
 
   @Delete('types/:id')
   @UseGuards(PermissionsGuard)
   @RequirePermissions('PAYMENT_METHODS.DELETE')
-  removeType(@Param('id', ParseUUIDPipe) id: string) {
-    return this.paymentAccountsService.removeType(id);
+  removeType(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.paymentAccountsService.removeType(id, user);
   }
 
   /** Central cross-account transaction view — must be registered before `:id` so "transactions" isn't captured as an id. */
@@ -107,7 +114,7 @@ export class PaymentAccountsController {
     @Body() dto: CreateManualPaymentAccountTransactionDto,
     @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.paymentAccountsService.recordTransaction(id, dto, user.id);
+    return this.paymentAccountsService.recordTransaction(id, dto, user);
   }
 
   @Post()
@@ -117,7 +124,7 @@ export class PaymentAccountsController {
     @Body() dto: CreatePaymentAccountDto,
     @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.paymentAccountsService.create(dto, user.id);
+    return this.paymentAccountsService.create(dto, user);
   }
 
   @Patch(':id')
@@ -128,13 +135,16 @@ export class PaymentAccountsController {
     @Body() dto: UpdatePaymentAccountDto,
     @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.paymentAccountsService.update(id, dto, user.id);
+    return this.paymentAccountsService.update(id, dto, user);
   }
 
   @Delete(':id')
   @UseGuards(PermissionsGuard)
   @RequirePermissions('PAYMENT_ACCOUNTS.DELETE')
-  remove(@Param('id', ParseUUIDPipe) id: string) {
-    return this.paymentAccountsService.remove(id);
+  remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.paymentAccountsService.remove(id, user);
   }
 }

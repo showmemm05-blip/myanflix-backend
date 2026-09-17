@@ -10,6 +10,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { PermissionResolverService } from '../roles/permission-resolver.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { AuditService } from '../audit/audit.service';
 import type { ActiveSocketUser } from '../realtime/realtime.gateway';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { createRoleAwarePermissionResolver } from '../../test/seeded-permission-resolver';
@@ -135,7 +136,11 @@ describe('TrackingReadService', () => {
     gateway = { getActiveUsers: jest.fn().mockReturnValue([]) };
 
     const resolver = createRoleAwarePermissionResolver([
-      { id: 'role-view-only', key: 'TRACKING_ANALYST', permissions: ['TRACKING.VIEW'] },
+      {
+        id: 'role-view-only',
+        key: 'TRACKING_ANALYST',
+        permissions: ['TRACKING.VIEW'],
+      },
       {
         id: 'role-with-pii',
         key: 'TRACKING_INVESTIGATOR',
@@ -155,6 +160,10 @@ describe('TrackingReadService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: PermissionResolverService, useValue: resolver },
         { provide: RealtimeGateway, useValue: gateway },
+        {
+          provide: AuditService,
+          useValue: { record: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 
@@ -414,9 +423,11 @@ describe('TrackingReadService', () => {
 
   describe('moderateComment', () => {
     it('hides a comment without deleting it', async () => {
-      const result = await service.moderateComment('comment-1', {
-        status: CommentStatus.HIDDEN,
-      });
+      const result = await service.moderateComment(
+        'comment-1',
+        { status: CommentStatus.HIDDEN },
+        analyst,
+      );
 
       expect(prisma.comment.update).toHaveBeenCalledWith({
         where: { id: 'comment-1' },
@@ -430,7 +441,11 @@ describe('TrackingReadService', () => {
       prisma.comment.findUnique.mockResolvedValue(null);
 
       await expect(
-        service.moderateComment('missing', { status: CommentStatus.HIDDEN }),
+        service.moderateComment(
+          'missing',
+          { status: CommentStatus.HIDDEN },
+          analyst,
+        ),
       ).rejects.toThrow(NotFoundException);
       expect(prisma.comment.update).not.toHaveBeenCalled();
     });

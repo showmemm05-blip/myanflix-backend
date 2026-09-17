@@ -8,7 +8,9 @@
  */
 import 'dotenv/config';
 import * as bcrypt from 'bcrypt';
+import { ConfigService } from '@nestjs/config';
 import { PrismaPg } from '@prisma/adapter-pg';
+import { StorageService } from '../common/storage/storage.service';
 import {
   PrismaClient,
   Prisma,
@@ -22,6 +24,18 @@ import {
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
+
+/**
+ * Seeded media paths go through the ONE key builder, exactly like the real
+ * write paths do. Hand-typed keys here drifted from it before — a seeded
+ * Video carried `/storage/videos/<id>/original.mp4`, a LOCAL disk path
+ * stored in the column the reprocess flow reads as an OBJECT KEY, so
+ * reprocessing a seeded title tried to fetch an object literally named
+ * "/storage/...". Only STORAGE_PATH is read from the environment, and none
+ * of the object keys below depend on it, so a bare ConfigService over
+ * process.env is all this needs.
+ */
+const storage = new StorageService(new ConfigService());
 
 const PASSWORD_SALT_ROUNDS = 10;
 const DEFAULT_PASSWORD = 'Password123!';
@@ -336,6 +350,14 @@ const MOVIE_SEEDS: MovieSeed[] = [
   },
 ];
 
+/**
+ * Rendition names for the seeded 1080p masters. Nothing is actually
+ * transcoded here, so only the names matter — but their playlist keys are
+ * still built by StorageService, so a seeded row holds the same shape a real
+ * transcode would have written.
+ */
+const SEEDED_RENDITIONS = ['1080p', '720p', '480p'];
+
 async function seedMovies(categoriesByName: Map<string, { id: string }>) {
   const movies = await Promise.all(
     MOVIE_SEEDS.map((seed) =>
@@ -373,28 +395,23 @@ async function seedMovies(categoriesByName: Map<string, { id: string }>) {
           data: {
             movieId: movie.id,
             originalFilename: `${movie.title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.mp4`,
-            originalPath: `/storage/videos/${movie.id}/original.mp4`,
+            // The archived original's OBJECT KEY, which is what this column
+            // holds for every video the pipeline has finished with — the
+            // local scratch path it starts out as is replaced by
+            // updateOriginalPath() the moment the original is archived.
+            originalPath: storage.originalObjectKey(movie.id, '.mp4'),
             status: ready ? VideoStatus.READY : VideoStatus.PROCESSING,
             duration: ready ? movie.duration * 60 : null,
             resolution: ready ? '1920x1080' : null,
-            hlsMasterPath: ready
-              ? `/storage/videos/${movie.id}/hls/master.m3u8`
-              : null,
+            // Also an object key — the only shape
+            // MinioService.signedPlaybackUrl() will sign, and the reason a
+            // seeded title is streamable at all.
+            hlsMasterPath: ready ? storage.hlsMasterKey(movie.id) : null,
             renditions: ready
-              ? [
-                  {
-                    resolution: '1080p',
-                    playlistPath: `videos/${movie.id}/hls/1080p/index.m3u8`,
-                  },
-                  {
-                    resolution: '720p',
-                    playlistPath: `videos/${movie.id}/hls/720p/index.m3u8`,
-                  },
-                  {
-                    resolution: '480p',
-                    playlistPath: `videos/${movie.id}/hls/480p/index.m3u8`,
-                  },
-                ]
+              ? SEEDED_RENDITIONS.map((resolution) => ({
+                  resolution,
+                  playlistPath: `${storage.hlsRenditionKeyPrefix(movie.id, resolution)}/index.m3u8`,
+                }))
               : undefined,
           },
         });

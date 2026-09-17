@@ -42,8 +42,9 @@ const MAX_AVATAR_BYTES = 5 * 1024 * 1024;
  * The old single USER_MANAGE bundle is split per route: reads need
  * USERS.VIEW, the role change needs USERS.EDIT, activate/suspend needs
  * USERS.SUSPEND and balance corrections keep their own USERS.WALLET_ADJUST.
- * The class-level rule stays as the fail-safe floor for any route that
- * forgets to state its own.
+ * Activate/suspend also runs the Super Admin tier and lockout guards the
+ * staff route runs (F-001). The class-level rule stays as the fail-safe
+ * floor for any route that forgets to state its own.
  */
 @Controller('users')
 @UseGuards(PermissionsGuard)
@@ -268,8 +269,9 @@ export class UsersController {
   async updateStatus(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateStatusDto,
+    @CurrentUser() actor: AuthenticatedUser,
   ) {
-    const user = await this.usersService.updateStatus(id, dto.status);
+    const user = await this.usersService.updateStatus(id, dto.status, actor);
     return this.toResponse(user);
   }
 

@@ -11,8 +11,10 @@ import {
   Put,
   UseGuards,
 } from '@nestjs/common';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
+import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { LevelsService } from './levels.service';
 import {
   CreateLevelDto,
@@ -49,15 +51,18 @@ export class LevelsController {
   @Put('reorder')
   @UseGuards(PermissionsGuard)
   @RequirePermissions('USERS.EDIT')
-  reorder(@Body() dto: ReorderLevelsDto) {
-    return this.service.reorder(dto);
+  reorder(
+    @Body() dto: ReorderLevelsDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.service.reorder(dto, actor);
   }
 
   @Post()
   @UseGuards(PermissionsGuard)
   @RequirePermissions('USERS.EDIT')
-  create(@Body() dto: CreateLevelDto) {
-    return this.service.create(dto);
+  create(@Body() dto: CreateLevelDto, @CurrentUser() actor: AuthenticatedUser) {
+    return this.service.create(dto, actor);
   }
 
   @Put(':id')
@@ -66,15 +71,19 @@ export class LevelsController {
   update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateLevelDto,
+    @CurrentUser() actor: AuthenticatedUser,
   ) {
-    return this.service.update(id, dto);
+    return this.service.update(id, dto, actor);
   }
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   @UseGuards(PermissionsGuard)
   @RequirePermissions('USERS.EDIT')
-  async remove(@Param('id', ParseUUIDPipe) id: string) {
-    await this.service.remove(id);
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    await this.service.remove(id, actor);
   }
 }
