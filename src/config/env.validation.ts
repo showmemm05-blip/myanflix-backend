@@ -1,4 +1,4 @@
-import { Type, plainToInstance } from 'class-transformer';
+import { Transform, Type, plainToInstance } from 'class-transformer';
 import {
   IsIn,
   IsInt,
@@ -133,6 +133,26 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   TRUSTED_PROXIES?: string;
+
+  /**
+   * Shared secret the phone-monitor desktop app presents as a bearer token
+   * on POST /bank-events/* and in its socket handshake (MachineTokenGuard,
+   * RealtimeGateway). Never a user login, never a JWT. Unset/empty = bank
+   * event ingestion disabled: those routes answer 503 and machine socket
+   * handshakes are refused; nothing else in the app changes. The compose
+   * default is the empty string, which @IsOptional alone would NOT skip —
+   * the transform folds '' into undefined so an unset token never fails the
+   * MinLength check.
+   */
+  @Transform(({ value }: { value: unknown }) =>
+    value === '' ? undefined : value,
+  )
+  @IsOptional()
+  @IsString()
+  @MinLength(32, {
+    message: 'BANK_EVENTS_TOKEN must be at least 32 characters',
+  })
+  BANK_EVENTS_TOKEN?: string;
 }
 
 export function validateEnv(

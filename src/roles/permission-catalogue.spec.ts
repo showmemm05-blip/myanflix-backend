@@ -6,9 +6,11 @@ import {
 } from './permission-catalogue';
 
 describe('permission catalogue', () => {
-  it('declares 20 modules and 76 MODULE.ACTION permissions', () => {
+  it('declares 20 modules and 78 MODULE.ACTION permissions', () => {
+    // 76 + DEPOSITS.BANK_EVIDENCE + WITHDRAWALS.BANK_EVIDENCE (bank
+    // verification: the balance-revealing screenshot streams).
     expect(PERMISSION_CATALOGUE).toHaveLength(20);
-    expect(ALL_PERMISSIONS).toHaveLength(76);
+    expect(ALL_PERMISSIONS).toHaveLength(78);
   });
 
   it('generates every permission as MODULE.ACTION with no duplicates', () => {

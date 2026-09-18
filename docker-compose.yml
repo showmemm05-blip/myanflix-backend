@@ -77,6 +77,11 @@ services:
       THROTTLE_DISABLED: ${THROTTLE_DISABLED:-false}
       # Only these peers may set X-Forwarded-For for rate limiting (empty = API reached directly).
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      # Bearer token the phone-monitor desktop app presents on
+      # POST /bank-events/* and its socket handshake. Same value as the
+      # phone-monitor's config.json (myanflix.token). Empty = bank-event
+      # ingestion disabled (those routes answer 503). Never a user login.
+      BANK_EVENTS_TOKEN: ${BANK_EVENTS_TOKEN:-}
     extra_hosts:
       # host.docker.internal is automatic on Docker Desktop (macOS/Windows);
       # this makes it also resolve on Linux Docker engines.

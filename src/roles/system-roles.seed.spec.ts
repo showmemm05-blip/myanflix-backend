@@ -644,6 +644,31 @@ const POST_RBAC_GUARDED_ROUTES: PostRbacRoute[] = [
     granular: ['AUDIT.VIEW'],
     allowed: [Role.SUPER_ADMIN],
   },
+  // bank verification (bank_verification). The review actions reuse EDIT;
+  // the screenshot streams show the business account balance and sit
+  // behind their own BANK_EVIDENCE permission, granted to no seeded role
+  // but the implicit SUPER_ADMIN. The phone-monitor's /bank-events routes
+  // are NOT here: they take a machine token, never a staff JWT.
+  {
+    route: 'PATCH /deposits/:id/verification',
+    granular: ['DEPOSITS.EDIT'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /deposits/:id/bank-screenshot',
+    granular: ['DEPOSITS.BANK_EVIDENCE'],
+    allowed: [Role.SUPER_ADMIN],
+  },
+  {
+    route: 'PATCH /withdrawals/:id/verification',
+    granular: ['WITHDRAWALS.EDIT'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /withdrawals/:id/bank-screenshot',
+    granular: ['WITHDRAWALS.BANK_EVIDENCE'],
+    allowed: [Role.SUPER_ADMIN],
+  },
 ];
 
 const seedFor = (role: Role) => {
@@ -702,16 +727,20 @@ describe('System role seeds', () => {
    * to CONTENT_UPLOADER (21 -> 24), again everything but DELETE. AUDIT
    * (add_audit_log) added AUDIT.VIEW to the catalogue (75 -> 76) and
    * deliberately to NO seeded role — SUPER_ADMIN is protected and holds it
-   * implicitly; ADMIN and CONTENT_UPLOADER stay unchanged.
+   * implicitly; ADMIN and CONTENT_UPLOADER stay unchanged. Bank verification
+   * (bank_verification) added DEPOSITS.BANK_EVIDENCE and
+   * WITHDRAWALS.BANK_EVIDENCE (76 -> 78), again to NO seeded role: a bank
+   * screenshot shows the business account balance, so a super admin grants
+   * it explicitly in the roles matrix.
    */
-  it('has the expected seed sizes (76 / 46 / 24 / 0, matching the migrations)', () => {
+  it('has the expected seed sizes (78 / 46 / 24 / 0, matching the migrations)', () => {
     expect({
       SUPER_ADMIN: seedFor(Role.SUPER_ADMIN).permissions.length,
       ADMIN: seedFor(Role.ADMIN).permissions.length,
       CONTENT_UPLOADER: seedFor(Role.CONTENT_UPLOADER).permissions.length,
       USER: seedFor(Role.USER).permissions.length,
     }).toEqual({
-      SUPER_ADMIN: 76,
+      SUPER_ADMIN: 78,
       ADMIN: 46,
       CONTENT_UPLOADER: 24,
       USER: 0,
@@ -800,17 +829,19 @@ describe('System role seeds — routes added after the RBAC migration', () => {
    * +  3 Actors — create/edit/delete. Its three reads are ungated for the
    *   same reason GET /categories is.
    * +  3 Audit — list, catalogue, one entry, all behind AUDIT.VIEW.
+   * +  4 Bank verification — the two review PATCHes (EDIT) and the two
+   *   screenshot streams (BANK_EVIDENCE).
    */
   it('covers every post-migration permission-gated route', () => {
-    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(28);
+    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(32);
     expect(
       POST_RBAC_GUARDED_ROUTES.filter((r) => r.granular.length > 1),
     ).toHaveLength(2);
   });
 
-  it('leaves the backend with 107 routes in the two tables, 104 permission-gated', () => {
+  it('leaves the backend with 111 routes in the two tables, 108 permission-gated', () => {
     const gatedLegacy = GUARDED_ROUTES.filter((r) => r.granular !== null);
-    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(104);
-    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(107);
+    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(108);
+    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(111);
   });
 });

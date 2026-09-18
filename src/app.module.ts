@@ -41,6 +41,7 @@ import { TrackingReadModule } from './tracking/tracking-read.module';
 import { CommentsModule } from './comments/comments.module';
 import { FeedbackModule } from './feedback/feedback.module';
 import { LevelsModule } from './levels/levels.module';
+import { BankEventsModule } from './bank-events/bank-events.module';
 
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { AppThrottlerGuard } from './common/throttling/app-throttler.guard';
@@ -94,6 +95,7 @@ import { AppService } from './app.service';
     CommentsModule,
     FeedbackModule,
     LevelsModule,
+    BankEventsModule,
   ],
   controllers: [AppController],
   providers: [

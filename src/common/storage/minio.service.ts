@@ -16,6 +16,7 @@ import {
   ListMultipartUploadsCommand,
   ListObjectsV2Command,
   ListPartsCommand,
+  NoSuchKey,
   NotFound,
   PutBucketLifecycleConfigurationCommand,
   PutObjectCommand,
@@ -394,6 +395,34 @@ export class MinioService {
     );
     if (!response.Body) throw new Error(`Object "${key}" has no body`);
     return response.Body.transformToString('utf-8');
+  }
+
+  /**
+   * A private object as a Node stream, for the API to pipe to an authorised
+   * caller (bank screenshots — a class the cache server must never serve).
+   * Streams rather than buffers so a multi-megabyte PNG never sits whole in
+   * memory per request. `null` when the key does not exist, so the route
+   * can answer 404 instead of leaking an S3 error shape.
+   */
+  async getObjectStream(key: string): Promise<{
+    stream: Readable;
+    contentType: string;
+    contentLength: number | null;
+  } | null> {
+    try {
+      const response = await this.client.send(
+        new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+      );
+      if (!response.Body) return null;
+      return {
+        stream: response.Body as Readable,
+        contentType: response.ContentType ?? this.contentTypeForKey(key),
+        contentLength: response.ContentLength ?? null,
+      };
+    } catch (error) {
+      if (error instanceof NoSuchKey || error instanceof NotFound) return null;
+      throw error;
+    }
   }
 
   /**

@@ -287,6 +287,33 @@ export class StorageService {
   }
 
   /**
+   * MinIO key prefix for one deposit's / withdrawal's bank-notification
+   * screenshots (the `bankScreenshot` class). Under documents/ because the
+   * image shows the business account balance: denied at the cache,
+   * unsignable, streamed only by the API behind BANK_EVIDENCE. One folder
+   * per row so an unlink or a row delete is one prefix delete.
+   */
+  bankScreenshotPrefix(
+    kind: 'deposits' | 'withdrawals',
+    rowId: string,
+  ): string {
+    return `documents/bank-screenshots/${kind}/${rowId}`;
+  }
+
+  /**
+   * MinIO object key of the screenshot for one matched bank event. The
+   * filename is the event's idempotency key, so a retried upload of the same
+   * notification lands on the same key instead of piling up copies.
+   */
+  bankScreenshotKey(
+    kind: 'deposits' | 'withdrawals',
+    rowId: string,
+    eventKey: string,
+  ): string {
+    return `${this.bankScreenshotPrefix(kind, rowId)}/${eventKey}.png`;
+  }
+
+  /**
    * MinIO object key of one converted page, numbered WITHIN ITS CHAPTER. The
    * page number is zero-padded to at least three digits (widening for very
    * long chapters) so both key listings and filenames sort in reading order.

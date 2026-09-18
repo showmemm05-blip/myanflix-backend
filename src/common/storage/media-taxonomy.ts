@@ -305,6 +305,25 @@ export const MEDIA_CLASSES: readonly MediaClass[] = [
       'rather than a loosening of the namespace.',
   },
   {
+    id: 'bankScreenshot',
+    prefix: 'documents/bank-screenshots/<kind>/<id>/',
+    status: 'active',
+    visibility: 'private',
+    scopePattern: null,
+    retention: PERMANENT,
+    archivable: false,
+    localScratchRoot: null,
+    holds:
+      'The phone-monitor screenshot of the bank notification that was matched ' +
+      'to one deposit or withdrawal (<kind> = deposits | withdrawals, <id> = ' +
+      'that row, filename = the bank event idempotency key + .png). It shows ' +
+      'the business account BALANCE, so it lives under documents/ — denied ' +
+      'unconditionally at the cache, unsignable, readable only server-side ' +
+      'over credentialed S3 and streamed to staff who hold BANK_EVIDENCE. ' +
+      'Permanent: it is the evidence behind a credit. One folder per row so ' +
+      'an unlink or a row delete is one prefix delete.',
+  },
+  {
     id: 'temp',
     prefix: 'temp/<sessionId>/',
     status: 'reserved',

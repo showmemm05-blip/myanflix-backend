@@ -1,6 +1,16 @@
-import { IsDateString, IsEnum, IsOptional, IsUUID } from 'class-validator';
+import {
+  IsDateString,
+  IsEnum,
+  IsIn,
+  IsOptional,
+  IsUUID,
+} from 'class-validator';
 import { WithdrawalStatus } from '../../generated/prisma/client';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
+import {
+  VERIFICATION_FILTERS,
+  type VerificationFilter,
+} from '../../common/dto/verification-filter';
 
 export class WithdrawalQueryDto extends PaginationQueryDto {
   @IsOptional()
@@ -11,6 +21,11 @@ export class WithdrawalQueryDto extends PaginationQueryDto {
   @IsOptional()
   @IsUUID('4')
   userId?: string;
+
+  /** Admin-only bank-verification tab — ignored on /withdrawals/me. */
+  @IsOptional()
+  @IsIn(VERIFICATION_FILTERS)
+  verification?: VerificationFilter;
 
   @IsOptional()
   @IsDateString()

@@ -169,10 +169,24 @@ export const AUDIT_ACTIONS = [
   define('deposit.approve', FINANCE, 'deposit'),
   define('deposit.reject', FINANCE, 'deposit'),
   define('deposit.receiving_account_update', FINANCE, 'deposit'),
+  /**
+   * Bank-side events (bank-events module). The phone-monitor's writes are
+   * system rows (actor null, metadata.source = 'phone-monitor', plus the
+   * device serial and event idempotency key); verification_review is the
+   * staff member's decision on a flagged row.
+   */
+  define('deposit.bank_match', FINANCE, 'deposit'),
+  define('deposit.bank_screenshot_attach', FINANCE, 'deposit'),
+  define('deposit.risk_update', FINANCE, 'deposit'),
+  define('deposit.verification_review', FINANCE, 'deposit'),
 
   define('withdrawal.approve', FINANCE, 'withdrawal'),
   define('withdrawal.reject', FINANCE, 'withdrawal'),
   define('withdrawal.transfer_account_update', FINANCE, 'withdrawal'),
+  define('withdrawal.bank_match', FINANCE, 'withdrawal'),
+  define('withdrawal.bank_screenshot_attach', FINANCE, 'withdrawal'),
+  define('withdrawal.risk_update', FINANCE, 'withdrawal'),
+  define('withdrawal.verification_review', FINANCE, 'withdrawal'),
 
   define('payment_account.create', FINANCE, 'payment_account'),
   define('payment_account.update', FINANCE, 'payment_account'),

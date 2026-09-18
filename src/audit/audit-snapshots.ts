@@ -330,6 +330,20 @@ export function depositSnapshot(deposit: Partial<Deposit>): Snapshot {
     ),
     walletBalanceBefore: money(deposit.walletBalanceBefore),
     walletBalanceAfter: money(deposit.walletBalanceAfter),
+    // The bank side (bank-events matcher). The screenshot KEY is deliberately
+    // absent: the log records that evidence exists, never where it lives.
+    receivingAmount: money(deposit.receivingAmount),
+    receivingTransactionAt: nullIfUndefined(deposit.receivingTransactionAt),
+    receivingEventKey: nullIfUndefined(deposit.receivingEventKey),
+    hasBankScreenshot:
+      deposit.receivingScreenshotKey === undefined
+        ? null
+        : deposit.receivingScreenshotKey !== null,
+    bankCheckedAt: nullIfUndefined(deposit.bankCheckedAt),
+    matchStatus: nullIfUndefined(deposit.matchStatus),
+    riskLevel: nullIfUndefined(deposit.riskLevel),
+    riskReasons: nullIfUndefined(deposit.riskReasons),
+    declaredTransferAt: nullIfUndefined(deposit.declaredTransferAt),
   };
 }
 
@@ -358,6 +372,18 @@ export function withdrawalSnapshot(withdrawal: Partial<Withdrawal>): Snapshot {
     transferPaymentAccountId: nullIfUndefined(
       withdrawal.transferPaymentAccountId,
     ),
+    // The bank side — same shape as depositSnapshot, transfer* voice.
+    transferAmount: money(withdrawal.transferAmount),
+    transferTransactionAt: nullIfUndefined(withdrawal.transferTransactionAt),
+    transferEventKey: nullIfUndefined(withdrawal.transferEventKey),
+    hasBankScreenshot:
+      withdrawal.transferScreenshotKey === undefined
+        ? null
+        : withdrawal.transferScreenshotKey !== null,
+    bankCheckedAt: nullIfUndefined(withdrawal.bankCheckedAt),
+    matchStatus: nullIfUndefined(withdrawal.matchStatus),
+    riskLevel: nullIfUndefined(withdrawal.riskLevel),
+    riskReasons: nullIfUndefined(withdrawal.riskReasons),
   };
 }
 

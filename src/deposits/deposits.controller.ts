@@ -7,8 +7,10 @@ import {
   Patch,
   Post,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
@@ -19,6 +21,7 @@ import { ApproveDepositDto } from './dto/approve-deposit.dto';
 import { RejectDepositDto } from './dto/reject-deposit.dto';
 import { DepositQueryDto } from './dto/deposit-query.dto';
 import { UpdateReceivingAccountDto } from './dto/update-receiving-account.dto';
+import { VerificationReviewDto } from './dto/verification-review.dto';
 import { DepositsService } from './deposits.service';
 
 /**
@@ -96,5 +99,34 @@ export class DepositsController {
     @CurrentUser() admin: AuthenticatedUser,
   ) {
     return this.depositsService.updateReceivingAccount(id, dto, admin);
+  }
+
+  /** Staff review of the bank-verification flags — reuses DEPOSITS.EDIT. */
+  @Patch(':id/verification')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('DEPOSITS.EDIT')
+  reviewVerification(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: VerificationReviewDto,
+    @CurrentUser() admin: AuthenticatedUser,
+  ) {
+    return this.depositsService.reviewVerification(id, dto, admin);
+  }
+
+  /**
+   * The bank-notification screenshot (shows the business account balance)
+   * — its own permission, streamed inline, and marked no-store so no proxy
+   * or browser cache ever keeps a copy. `passthrough` keeps Nest in charge
+   * of sending the StreamableFile; we only add a header.
+   */
+  @Get(':id/bank-screenshot')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('DEPOSITS.BANK_EVIDENCE')
+  async bankScreenshot(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    res.setHeader('Cache-Control', 'private, no-store');
+    return this.depositsService.getBankScreenshot(id);
   }
 }

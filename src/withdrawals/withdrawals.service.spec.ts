@@ -12,6 +12,7 @@ import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { FinanceSettingsService } from '../finance-settings/finance-settings.service';
 import { PaymentAccountLedgerService } from '../payment-accounts/payment-account-ledger.service';
 import { AuditService } from '../audit/audit.service';
+import { MinioService } from '../common/storage/minio.service';
 import { WithdrawalsService } from './withdrawals.service';
 
 function makeWithdrawal(overrides: Partial<Record<string, unknown>> = {}) {
@@ -29,6 +30,16 @@ function makeWithdrawal(overrides: Partial<Record<string, unknown>> = {}) {
     transferAccountType: null,
     transferAccountName: null,
     transferAccountNumber: null,
+    transferTransactionCode: null,
+    // The bank side, as a fresh row has it (bank_verification migration).
+    transferAmount: null,
+    transferTransactionAt: null,
+    transferScreenshotKey: null,
+    transferEventKey: null,
+    bankCheckedAt: null,
+    matchStatus: 'UNVERIFIED',
+    riskLevel: null,
+    riskReasons: [],
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,
@@ -52,7 +63,9 @@ describe('WithdrawalsService', () => {
     notification: { create: jest.Mock };
     user: { findUniqueOrThrow: jest.Mock };
     $transaction: jest.Mock;
+    $queryRaw: jest.Mock;
   };
+  let minio: { deleteObject: jest.Mock; getObjectStream: jest.Mock };
   let walletService: {
     getByUserId: jest.Mock;
     debitWithinTransaction: jest.Mock;
@@ -63,9 +76,12 @@ describe('WithdrawalsService', () => {
     notifyUserNotificationCreated: jest.Mock;
     notifyUserBalanceUpdated: jest.Mock;
     notifyAdminsPaymentAccountUpdated: jest.Mock;
+    notifyAdminsWithdrawalVerificationUpdated: jest.Mock;
+    notifyBankMonitorsNudge: jest.Mock;
   };
   let financeSettingsService: { getLimits: jest.Mock };
   let paymentAccountLedgerService: { syncWithdrawalLink: jest.Mock };
+  let audit: { record: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
@@ -91,6 +107,14 @@ describe('WithdrawalsService', () => {
           ? (arg as (tx: unknown) => unknown)(prisma)
           : Promise.all(arg as Promise<unknown>[]),
       ),
+      $queryRaw: jest.fn().mockResolvedValue([]),
+    };
+    // updateTransferAccount() runs the payout-code twin lookup (Q8) through
+    // findMany inside its transaction; no twins is the default.
+    prisma.withdrawal.findMany.mockResolvedValue([]);
+    minio = {
+      deleteObject: jest.fn().mockResolvedValue(undefined),
+      getObjectStream: jest.fn(),
     };
     walletService = {
       getByUserId: jest.fn(),
@@ -102,6 +126,8 @@ describe('WithdrawalsService', () => {
       notifyUserNotificationCreated: jest.fn(),
       notifyUserBalanceUpdated: jest.fn(),
       notifyAdminsPaymentAccountUpdated: jest.fn(),
+      notifyAdminsWithdrawalVerificationUpdated: jest.fn(),
+      notifyBankMonitorsNudge: jest.fn(),
     };
     financeSettingsService = {
       getLimits: jest.fn().mockResolvedValue({
@@ -117,6 +143,7 @@ describe('WithdrawalsService', () => {
     paymentAccountLedgerService = {
       syncWithdrawalLink: jest.fn().mockResolvedValue(undefined),
     };
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -129,10 +156,8 @@ describe('WithdrawalsService', () => {
           provide: PaymentAccountLedgerService,
           useValue: paymentAccountLedgerService,
         },
-        {
-          provide: AuditService,
-          useValue: { record: jest.fn().mockResolvedValue(undefined) },
-        },
+        { provide: AuditService, useValue: audit },
+        { provide: MinioService, useValue: minio },
       ],
     }).compile();
 
@@ -757,6 +782,381 @@ describe('WithdrawalsService', () => {
           data: expect.objectContaining({ transferAccountSubname: null }),
         }),
       );
+    });
+  });
+});
+
+/** Bank transfer verification — the withdrawal half (see deposits.service.spec.ts). */
+describe('WithdrawalsService — bank verification', () => {
+  let service: WithdrawalsService;
+  let prisma: {
+    withdrawal: {
+      create: jest.Mock;
+      findMany: jest.Mock;
+      count: jest.Mock;
+      findUnique: jest.Mock;
+      findUniqueOrThrow: jest.Mock;
+      updateMany: jest.Mock;
+      update: jest.Mock;
+    };
+    wallet: { findUniqueOrThrow: jest.Mock };
+    transaction: { create: jest.Mock };
+    notification: { create: jest.Mock };
+    user: { findUniqueOrThrow: jest.Mock };
+    $transaction: jest.Mock;
+    $queryRaw: jest.Mock;
+  };
+  let gateway: Record<string, jest.Mock>;
+  let audit: { record: jest.Mock };
+  let minio: { deleteObject: jest.Mock; getObjectStream: jest.Mock };
+  const admin = { id: 'admin-1', username: 'admin', role: 'ADMIN' } as never;
+
+  beforeEach(async () => {
+    prisma = {
+      withdrawal: {
+        create: jest.fn(),
+        findMany: jest.fn().mockResolvedValue([]),
+        count: jest.fn().mockResolvedValue(0),
+        findUnique: jest.fn(),
+        findUniqueOrThrow: jest.fn(),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        update: jest.fn(),
+      },
+      wallet: {
+        findUniqueOrThrow: jest
+          .fn()
+          .mockResolvedValue({ balance: new Prisma.Decimal(1000) }),
+      },
+      transaction: { create: jest.fn() },
+      notification: {
+        create: jest.fn().mockResolvedValue({
+          id: 'n1',
+          type: 'WITHDRAWAL_APPROVED',
+          title: 't',
+          message: 'm',
+          payload: {},
+          isRead: false,
+          createdAt: new Date(),
+        }),
+      },
+      user: { findUniqueOrThrow: jest.fn() },
+      $transaction: jest.fn((arg: unknown) =>
+        typeof arg === 'function'
+          ? (arg as (tx: unknown) => unknown)(prisma)
+          : Promise.all(arg as Promise<unknown>[]),
+      ),
+      $queryRaw: jest.fn().mockResolvedValue([]),
+    };
+    gateway = {
+      notifyAdminsWithdrawalCreated: jest.fn(),
+      notifyUserWithdrawalUpdated: jest.fn(),
+      notifyUserNotificationCreated: jest.fn(),
+      notifyUserBalanceUpdated: jest.fn(),
+      notifyAdminsPaymentAccountUpdated: jest.fn(),
+      notifyAdminsWithdrawalVerificationUpdated: jest.fn(),
+      notifyBankMonitorsNudge: jest.fn(),
+    };
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
+    minio = {
+      deleteObject: jest.fn().mockResolvedValue(undefined),
+      getObjectStream: jest.fn(),
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        WithdrawalsService,
+        { provide: PrismaService, useValue: prisma },
+        {
+          provide: WalletService,
+          useValue: {
+            getByUserId: jest.fn(),
+            debitWithinTransaction: jest.fn().mockResolvedValue(undefined),
+          },
+        },
+        { provide: RealtimeGateway, useValue: gateway },
+        {
+          provide: FinanceSettingsService,
+          useValue: { getLimits: jest.fn().mockResolvedValue({}) },
+        },
+        {
+          provide: PaymentAccountLedgerService,
+          useValue: {
+            syncWithdrawalLink: jest.fn().mockResolvedValue(undefined),
+          },
+        },
+        { provide: AuditService, useValue: audit },
+        { provide: MinioService, useValue: minio },
+      ],
+    }).compile();
+    service = module.get(WithdrawalsService);
+  });
+
+  it('approve nudges the phone-monitor (no account known yet) after commit', async () => {
+    prisma.withdrawal.findUnique.mockResolvedValue(makeWithdrawal());
+    prisma.withdrawal.findUniqueOrThrow.mockResolvedValue({
+      ...makeWithdrawal({
+        status: WithdrawalStatus.APPROVED,
+        approvedAt: new Date(),
+      }),
+      user: { id: 'user-1', username: 'john' },
+    });
+
+    const result = await service.approve('withdrawal-1', admin);
+
+    expect(gateway.notifyBankMonitorsNudge).toHaveBeenCalledWith({
+      kind: 'withdrawal',
+      paymentAccountId: null,
+    });
+    expect(result).toMatchObject({
+      matchStatus: 'UNVERIFIED',
+      hasBankScreenshot: false,
+    });
+  });
+
+  describe('updateTransferAccount — DUPLICATE_PAYOUT_CODE', () => {
+    const dto = {
+      transferAccountType: 'KBZPay',
+      transferAccountName: 'MyanFlix',
+      transferAccountNumber: '09999999999',
+      transferTransactionCode: 'AB12CD',
+      transferTransactionTime: '06:56:28',
+    };
+
+    it('flags this row and the other withdrawal already carrying the same code — flagged, never blocked', async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue(
+        makeWithdrawal({ status: WithdrawalStatus.APPROVED }),
+      );
+      const updated = {
+        ...makeWithdrawal({
+          status: WithdrawalStatus.APPROVED,
+          transferTransactionCode: 'AB12CD',
+        }),
+        user: { id: 'user-1', username: 'john' },
+      };
+      prisma.withdrawal.update.mockResolvedValue(updated);
+      prisma.withdrawal.findMany.mockImplementation(
+        (args: { where: { transferTransactionCode?: string } }) =>
+          Promise.resolve(
+            args.where.transferTransactionCode === 'AB12CD'
+              ? [
+                  {
+                    id: 'withdrawal-0',
+                    userId: 'user-9',
+                    amount: new Prisma.Decimal(5000),
+                    status: WithdrawalStatus.APPROVED,
+                    bankCheckedAt: null,
+                    matchStatus: 'UNVERIFIED',
+                    riskLevel: null,
+                    riskReasons: [],
+                  },
+                ]
+              : [],
+          ),
+      );
+
+      const result = await service.updateTransferAccount(
+        'withdrawal-1',
+        dto,
+        admin,
+      );
+
+      expect(result.status).toBe(WithdrawalStatus.APPROVED);
+      expect(prisma.withdrawal.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'withdrawal-1' },
+          data: {
+            matchStatus: 'SUSPICIOUS',
+            riskLevel: 'MEDIUM',
+            riskReasons: ['DUPLICATE_PAYOUT_CODE'],
+          },
+        }),
+      );
+      expect(prisma.withdrawal.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'withdrawal-0' },
+          data: {
+            matchStatus: 'SUSPICIOUS',
+            riskLevel: 'MEDIUM',
+            riskReasons: ['DUPLICATE_PAYOUT_CODE'],
+          },
+        }),
+      );
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'withdrawal.risk_update',
+          actor: null,
+          metadata: {
+            trigger: 'transfer_account_update',
+            anchorWithdrawalId: 'withdrawal-1',
+          },
+        }),
+      );
+    });
+
+    it('writes no risk update when the code is unique', async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue(
+        makeWithdrawal({ status: WithdrawalStatus.APPROVED }),
+      );
+      prisma.withdrawal.update.mockResolvedValue({
+        ...makeWithdrawal({
+          status: WithdrawalStatus.APPROVED,
+          transferTransactionCode: 'AB12CD',
+        }),
+        user: { id: 'user-1', username: 'john' },
+      });
+
+      await service.updateTransferAccount('withdrawal-1', dto, admin);
+
+      // Exactly one update: the transfer-account save itself.
+      expect(prisma.withdrawal.update).toHaveBeenCalledTimes(1);
+      expect(audit.record).toHaveBeenCalledTimes(1);
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'withdrawal.transfer_account_update',
+        }),
+      );
+    });
+  });
+
+  describe('findAllAdmin — verification tabs', () => {
+    it('awaiting_bank spells the open payout set as literal SQL and pages by primary key', async () => {
+      prisma.$queryRaw
+        .mockResolvedValueOnce([{ id: 'w1' }])
+        .mockResolvedValueOnce([{ n: 1 }]);
+      prisma.withdrawal.findMany.mockResolvedValue([
+        {
+          ...makeWithdrawal({
+            id: 'w1',
+            status: WithdrawalStatus.APPROVED,
+            approvedAt: new Date(),
+          }),
+          user: { id: 'user-1' },
+        },
+      ]);
+
+      const page = await service.findAllAdmin({
+        verification: 'awaiting_bank',
+      });
+
+      const text = (
+        prisma.$queryRaw.mock.calls[0][0] as Prisma.Sql
+      ).strings.join('?');
+      expect(text).toContain(`status = 'APPROVED'::"WithdrawalStatus"`);
+      expect(text).toContain(`"bankCheckedAt" IS NULL`);
+      expect(text).toContain(`"transferTransactionCode" IS NULL`);
+      expect(text).toContain(`"approvedAt" >= ?`);
+      expect(page.items[0]).toMatchObject({
+        id: 'w1',
+        matchStatus: 'UNVERIFIED',
+      });
+      expect(page.total).toBe(1);
+    });
+
+    it('derives NO_BANK_TRANSACTION for an approved payout older than the window with no bank confirmation', async () => {
+      prisma.withdrawal.findMany.mockResolvedValue([
+        {
+          ...makeWithdrawal({
+            status: WithdrawalStatus.APPROVED,
+            approvedAt: new Date(Date.now() - 30 * 3_600_000),
+          }),
+          user: { id: 'user-1' },
+        },
+      ]);
+      const { items } = await service.findAllAdmin({});
+      expect(items[0].matchStatus).toBe('NO_BANK_TRANSACTION');
+      expect(items[0].riskLevel).toBe('MEDIUM');
+    });
+
+    it('verified filters on matchStatus with the ordinary index', async () => {
+      await service.findAllAdmin({ verification: 'verified' });
+      expect(prisma.withdrawal.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ matchStatus: 'MATCHED' }),
+        }),
+      );
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    });
+  });
+
+  it('findAllForUser strips the bank-verification columns', async () => {
+    prisma.withdrawal.findMany.mockResolvedValue([
+      makeWithdrawal({
+        matchStatus: 'SUSPICIOUS',
+        riskReasons: ['DUPLICATE_PAYOUT_CODE'],
+        transferScreenshotKey: 'x',
+      }),
+    ]);
+    const { items } = await service.findAllForUser('user-1', {});
+    for (const key of [
+      'matchStatus',
+      'riskLevel',
+      'riskReasons',
+      'transferScreenshotKey',
+      'transferEventKey',
+      'bankCheckedAt',
+      'transferAmount',
+    ]) {
+      expect(items[0]).not.toHaveProperty(key);
+    }
+  });
+
+  describe('reviewVerification', () => {
+    it('unlink wipes the transfer* bank values and deletes the screenshot; a row without a bank event is refused', async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue(
+        makeWithdrawal({
+          status: WithdrawalStatus.APPROVED,
+          bankCheckedAt: new Date(),
+          transferEventKey: 'k'.repeat(64),
+          transferScreenshotKey:
+            'documents/bank-screenshots/withdrawals/withdrawal-1/k.png',
+          matchStatus: 'PENDING_REVIEW',
+          riskReasons: ['AMBIGUOUS_MATCH', 'DUPLICATE_PAYOUT_CODE'],
+        }),
+      );
+      prisma.withdrawal.update.mockResolvedValue({
+        ...makeWithdrawal({ status: WithdrawalStatus.APPROVED }),
+        user: { id: 'user-1', username: 'john' },
+      });
+
+      await service.reviewVerification(
+        'withdrawal-1',
+        { action: 'unlink' },
+        admin,
+      );
+
+      expect(prisma.withdrawal.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: {
+            transferAmount: null,
+            transferTransactionCode: null,
+            transferTransactionTime: null,
+            transferTransactionAt: null,
+            transferEventKey: null,
+            transferScreenshotKey: null,
+            bankCheckedAt: null,
+            matchStatus: 'SUSPICIOUS',
+            riskLevel: 'MEDIUM',
+            riskReasons: ['DUPLICATE_PAYOUT_CODE'],
+          },
+        }),
+      );
+      expect(minio.deleteObject).toHaveBeenCalledWith(
+        'documents/bank-screenshots/withdrawals/withdrawal-1/k.png',
+      );
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'withdrawal.verification_review',
+          actor: admin,
+        }),
+      );
+      expect(
+        gateway.notifyAdminsWithdrawalVerificationUpdated,
+      ).toHaveBeenCalled();
+
+      prisma.withdrawal.findUnique.mockResolvedValue(makeWithdrawal());
+      await expect(
+        service.reviewVerification('withdrawal-1', { action: 'unlink' }, admin),
+      ).rejects.toThrow(BadRequestException);
     });
   });
 });

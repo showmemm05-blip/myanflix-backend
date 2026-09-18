@@ -8,6 +8,7 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import type { Server, Socket } from 'socket.io';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { ClientPlatform, UserStatus } from '../generated/prisma/client';
 import {
   resolveClientIp,
@@ -25,6 +26,16 @@ function userRoom(userId: string): string {
   return `user:${userId}`;
 }
 
+/**
+ * The phone-monitor desktop app's sockets. A hint channel only: the backend
+ * nudges it when a deposit is created / a withdrawal approved so the common
+ * case matches in seconds instead of waiting for its next poll. Never a
+ * user room, never counted as audience.
+ */
+function bankMonitorRoom(): string {
+  return 'bank-monitors';
+}
+
 export interface DepositCreatedPayload {
   id: string;
   userId: string;
@@ -40,6 +51,44 @@ export interface DepositCreatedPayload {
   reference: string;
   status: string;
   createdAt: Date;
+  /** Pre-bank flags computed at create time (twins, velocity) — admins-only event, so safe here. */
+  matchStatus: string;
+  riskLevel: string | null;
+  riskReasons: string[];
+}
+
+/**
+ * Bank-verification state of one deposit, for the admins room ONLY — the
+ * user-facing `deposit.updated` must never carry a fraud score.
+ */
+export interface DepositVerificationPayload {
+  id: string;
+  matchStatus: string;
+  riskLevel: string | null;
+  riskReasons: string[];
+  receivingAmount: number | null;
+  receivingTransactionCode: string | null;
+  receivingTransactionAt: Date | null;
+  bankCheckedAt: Date | null;
+  hasBankScreenshot: boolean;
+}
+
+export interface WithdrawalVerificationPayload {
+  id: string;
+  matchStatus: string;
+  riskLevel: string | null;
+  riskReasons: string[];
+  transferAmount: number | null;
+  transferTransactionCode: string | null;
+  transferTransactionAt: Date | null;
+  bankCheckedAt: Date | null;
+  hasBankScreenshot: boolean;
+}
+
+/** "Something to match just appeared" — the phone-monitor flushes its outbox on receipt. */
+export interface BankEventsNudgePayload {
+  kind: 'deposit' | 'withdrawal';
+  paymentAccountId: string | null;
 }
 
 export interface DepositUpdatedPayload {
@@ -183,6 +232,22 @@ export class RealtimeGateway
 
   async handleConnection(client: Socket): Promise<void> {
     try {
+      // Machine handshake FIRST: the phone-monitor presents the shared
+      // BANK_EVENTS_TOKEN (never a JWT) and only ever joins its own room —
+      // it is neither a user nor an admin, so it must not fall through to
+      // the user path below, enter connectedUserSockets, or count as
+      // audience. An unset token means ingestion is disabled: refuse.
+      const machineToken: unknown = client.handshake.auth?.['machineToken'];
+      if (typeof machineToken === 'string' && machineToken.length > 0) {
+        const expected = this.configService.get<string>('BANK_EVENTS_TOKEN');
+        if (!expected || !tokensMatch(machineToken, expected)) {
+          throw new Error('Machine token rejected');
+        }
+        client.data.machine = 'phone-monitor';
+        await client.join(bankMonitorRoom());
+        return;
+      }
+
       const token = this.extractToken(client);
       if (!token) throw new Error('No token provided');
 
@@ -376,4 +441,47 @@ export class RealtimeGateway
   ): void {
     this.server.to(adminRoom()).emit('payment-account.updated', payload);
   }
+
+  /**
+   * Bank-verification change on a deposit (a phone-monitor match, a risk
+   * recompute, a staff review) — admins room ONLY. The depositing user's
+   * room deliberately never receives it: a user must not see their own
+   * fraud score, and `deposit.updated` (which does reach them) never gains
+   * these fields.
+   */
+  notifyAdminsDepositVerificationUpdated(
+    payload: DepositVerificationPayload,
+  ): void {
+    this.server.to(adminRoom()).emit('deposit.verification', payload);
+  }
+
+  /** Mirrors notifyAdminsDepositVerificationUpdated — admins only. */
+  notifyAdminsWithdrawalVerificationUpdated(
+    payload: WithdrawalVerificationPayload,
+  ): void {
+    this.server.to(adminRoom()).emit('withdrawal.verification', payload);
+  }
+
+  /**
+   * Tells every connected phone-monitor "a row worth matching just
+   * appeared" so it posts its outbox now instead of at its next tick. A
+   * hint, not a delivery mechanism: the phone-monitor's own retry schedule
+   * delivers every event even if no socket is ever connected. Carries no
+   * money data — just which kind and which business account.
+   */
+  notifyBankMonitorsNudge(payload: BankEventsNudgePayload): void {
+    this.server.to(bankMonitorRoom()).emit('bank-events.nudge', payload);
+  }
+}
+
+/**
+ * Constant-time equality for the machine token. Both sides are hashed
+ * first so the buffers compared are always the same length — a raw
+ * timingSafeEqual would throw (and leak the expected length) on a
+ * presented token of a different size. Shared with MachineTokenGuard.
+ */
+export function tokensMatch(presented: string, expected: string): boolean {
+  const a = createHash('sha256').update(presented).digest();
+  const b = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(a, b);
 }

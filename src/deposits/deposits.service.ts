@@ -2,7 +2,9 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
+  StreamableFile,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
@@ -11,8 +13,28 @@ import { FinanceSettingsService } from '../finance-settings/finance-settings.ser
 import { PaymentAccountLedgerService } from '../payment-accounts/payment-account-ledger.service';
 import { AuditService } from '../audit/audit.service';
 import { depositSnapshot } from '../audit/audit-snapshots';
+import { MinioService } from '../common/storage/minio.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
+import type { VerificationFilter } from '../common/dto/verification-filter';
 import {
+  countRecentDepositsByUser,
+  depositVerificationPayload,
+  findDepositTwins,
+  recomputeDepositTwins,
+  updateDepositRisk,
+} from '../bank-events/deposit-risk';
+import {
+  NO_BANK_TRANSACTION_AFTER_MS,
+  type RiskReason,
+  normalizeReasons,
+  referenceTwinReasons,
+  scoreVerification,
+  velocityReasons,
+  verificationView,
+} from '../bank-events/risk-rules';
+import {
+  BankMatchStatus,
+  BankRiskLevel,
   DepositStatus,
   NotificationType,
   Prisma,
@@ -26,6 +48,7 @@ import type { ApproveDepositDto } from './dto/approve-deposit.dto';
 import type { RejectDepositDto } from './dto/reject-deposit.dto';
 import type { DepositQueryDto } from './dto/deposit-query.dto';
 import type { UpdateReceivingAccountDto } from './dto/update-receiving-account.dto';
+import type { VerificationReviewDto } from './dto/verification-review.dto';
 
 /**
  * Shown verbatim by the admin, website and mobile clients — keep the text
@@ -76,8 +99,58 @@ function receivingAccountSnapshot(deposit: Partial<Deposit>) {
   };
 }
 
+/**
+ * The reasons that only exist because a bank event was applied to the row.
+ * `unlink` strips exactly these; the reference/velocity reasons describe
+ * the submission itself and survive an unlink.
+ */
+const BANK_EVENT_REASONS: readonly RiskReason[] = [
+  'AMOUNT_MISMATCH',
+  'CODE_MISMATCH',
+  'SUBMITTED_BEFORE_TRANSFER',
+  'TIME_GAP_TOO_LARGE',
+  'AMBIGUOUS_MATCH',
+];
+
+const ADMIN_USER_SELECT = {
+  id: true,
+  username: true,
+  displayName: true,
+  phone: true,
+  email: true,
+} satisfies Prisma.UserSelect;
+
+/**
+ * The columns a depositor must never see about their own row: the bank's
+ * values, the fraud score, whether evidence exists. Stripped by toResponse,
+ * re-added (derived, key-less) only by toAdminResponse.
+ */
+const USER_HIDDEN_DEPOSIT_KEYS = [
+  'receivingAmount',
+  'receivingTransactionAt',
+  'receivingScreenshotKey',
+  'receivingEventKey',
+  'bankCheckedAt',
+  'matchStatus',
+  'riskLevel',
+  'riskReasons',
+  'declaredTransferAt',
+] as const satisfies readonly (keyof Deposit)[];
+
+/** A shallow copy without the given keys (typed so the result still has the rest). */
+function omitKeys<T extends object, K extends string>(
+  value: T,
+  keys: readonly K[],
+): Omit<T, K> {
+  const copy = { ...value } as Record<string, unknown>;
+  for (const key of keys) delete copy[key];
+  return copy as Omit<T, K>;
+}
+
 @Injectable()
 export class DepositsService {
+  private readonly logger = new Logger(DepositsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly walletService: WalletService,
@@ -85,6 +158,7 @@ export class DepositsService {
     private readonly financeSettingsService: FinanceSettingsService,
     private readonly paymentAccountLedgerService: PaymentAccountLedgerService,
     private readonly audit: AuditService,
+    private readonly minioService: MinioService,
   ) {}
 
   /**
@@ -115,17 +189,24 @@ export class DepositsService {
       throw new ConflictException(DUPLICATE_REFERENCE_MESSAGE);
     }
 
-    let deposit: Deposit;
+    // The insert and the create-time risk flags commit together (Q13): the
+    // new row's own DUPLICATE_REFERENCE / SHARED / VELOCITY reasons, and
+    // the twin recompute on every other row carrying this reference. Both
+    // are indexed lookups (reference, (userId, createdAt)) — never a scan.
+    let created: { deposit: Deposit; changedTwinIds: string[] };
     try {
-      deposit = await this.prisma.deposit.create({
-        data: {
-          userId,
-          amount: dto.amount,
-          paymentMethod: dto.paymentMethod,
-          accountName: dto.accountName,
-          reference: dto.reference,
-          declaredPaymentAccountId: dto.paymentAccountId,
-        },
+      created = await this.prisma.$transaction(async (tx) => {
+        const deposit = await tx.deposit.create({
+          data: {
+            userId,
+            amount: dto.amount,
+            paymentMethod: dto.paymentMethod,
+            accountName: dto.accountName,
+            reference: dto.reference,
+            declaredPaymentAccountId: dto.paymentAccountId,
+          },
+        });
+        return this.applyCreateTimeRules(tx, deposit, 'deposit_create');
       });
     } catch (error) {
       if (isUniqueViolation(error)) {
@@ -133,6 +214,7 @@ export class DepositsService {
       }
       throw error;
     }
+    const { deposit } = created;
 
     const user = await this.prisma.user.findUniqueOrThrow({
       where: { id: userId },
@@ -152,19 +234,104 @@ export class DepositsService {
       reference: deposit.reference,
       status: deposit.status,
       createdAt: deposit.createdAt,
+      matchStatus: deposit.matchStatus,
+      riskLevel: deposit.riskLevel,
+      riskReasons: deposit.riskReasons,
+    });
+    await this.pushVerificationUpdates(created.changedTwinIds);
+
+    // The seconds-fast path: the phone-monitor flushes its outbox now
+    // instead of at its next tick. A hint only — its own schedule delivers
+    // the event even if no monitor is connected.
+    this.realtimeGateway.notifyBankMonitorsNudge({
+      kind: 'deposit',
+      paymentAccountId: deposit.declaredPaymentAccountId,
     });
 
     return this.toResponse(deposit);
+  }
+
+  /**
+   * Q13/Q14's shared half: the reference-twin and velocity reasons for a
+   * freshly inserted row, written onto it (audited as a system
+   * risk_update — the create itself is user self-service, which the audit
+   * log deliberately does not record), plus the twin recompute. Bank
+   * values stay null; the row can be PENDING_REVIEW/SUSPICIOUS before any
+   * bank event arrives.
+   */
+  private async applyCreateTimeRules(
+    tx: Prisma.TransactionClient,
+    deposit: Deposit,
+    trigger: 'deposit_create' | 'deposit_manual_create',
+  ): Promise<{ deposit: Deposit; changedTwinIds: string[] }> {
+    const twins = await findDepositTwins(tx, deposit.reference, deposit.id);
+    const recent = await countRecentDepositsByUser(
+      tx,
+      deposit.userId,
+      deposit.createdAt,
+    );
+    const reasons = [
+      ...referenceTwinReasons(deposit, twins),
+      ...velocityReasons(recent),
+    ];
+    const metadata = { trigger, anchorDepositId: deposit.id };
+    const changedTwins = await recomputeDepositTwins(
+      tx,
+      this.audit,
+      deposit,
+      twins,
+      metadata,
+    );
+    if (reasons.length === 0) {
+      return { deposit, changedTwinIds: changedTwins.map((t) => t.id) };
+    }
+    const score = scoreVerification(reasons, false);
+    await updateDepositRisk(tx, this.audit, deposit, score, metadata);
+    return {
+      deposit: { ...deposit, ...score },
+      changedTwinIds: changedTwins.map((t) => t.id),
+    };
+  }
+
+  /** Admins-room realtime push for rows whose verification state changed — after commit only. */
+  private async pushVerificationUpdates(ids: readonly string[]): Promise<void> {
+    if (ids.length === 0) return;
+    const rows = await this.prisma.deposit.findMany({
+      where: { id: { in: [...ids] } },
+    });
+    for (const row of rows) {
+      this.realtimeGateway.notifyAdminsDepositVerificationUpdated(
+        depositVerificationPayload(row),
+      );
+    }
   }
 
   async findAllForUser(userId: string, query: DepositQueryDto) {
     return this.findAll({ ...query, userId });
   }
 
+  /**
+   * Q11 — the admin list with the five verification tabs. `all`,
+   * `verified` and `needs_review` are ordinary Prisma filters (matchStatus
+   * equality lands on the full deposits_matchStatus_createdAt_idx, which a
+   * bound parameter can use). The two OPEN-SET tabs go through
+   * findOpenAdmin: their predicate must be literal SQL for the partial
+   * deposits_open_createdAt_idx to be chosen.
+   */
   async findAllAdmin(query: DepositQueryDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
-    const where = {
+    const verification: VerificationFilter = query.verification ?? 'all';
+    const now = new Date();
+
+    if (
+      verification === 'awaiting_bank' ||
+      verification === 'no_bank_transaction'
+    ) {
+      return this.findOpenAdmin(query, verification, page, limit, now);
+    }
+
+    const where: Prisma.DepositWhereInput = {
       status: query.status,
       userId: query.userId,
       createdAt:
@@ -174,6 +341,14 @@ export class DepositsService {
               lte: query.dateTo ? new Date(query.dateTo) : undefined,
             }
           : undefined,
+      ...(verification === 'verified' && {
+        matchStatus: BankMatchStatus.MATCHED,
+      }),
+      ...(verification === 'needs_review' && {
+        matchStatus: {
+          in: [BankMatchStatus.PENDING_REVIEW, BankMatchStatus.SUSPICIOUS],
+        },
+      }),
     };
 
     const [items, total] = await this.prisma.$transaction([
@@ -182,27 +357,76 @@ export class DepositsService {
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
-        include: {
-          user: {
-            select: {
-              id: true,
-              username: true,
-              displayName: true,
-              phone: true,
-              email: true,
-            },
-          },
-        },
+        include: { user: { select: ADMIN_USER_SELECT } },
       }),
       this.prisma.deposit.count({ where }),
     ]);
 
     return {
-      items: items.map((d) => ({ ...this.toResponse(d), user: d.user })),
+      items: items.map((d) => ({
+        ...this.toAdminResponse(d, now),
+        user: d.user,
+      })),
       total,
       page,
       limit,
     };
+  }
+
+  /**
+   * The "awaiting bank" (open set, younger than the window) and "no bank
+   * transaction" (open set, older than it — the computed-never-swept rule
+   * as a WHERE clause) tabs. Page of ids from the partial index in
+   * createdAt order, then a primary-key fetch of exactly those rows with
+   * their user. A non-PENDING status filter can match nothing here and
+   * short-circuits without a query.
+   */
+  private async findOpenAdmin(
+    query: DepositQueryDto,
+    verification: 'awaiting_bank' | 'no_bank_transaction',
+    page: number,
+    limit: number,
+    now: Date,
+  ) {
+    if (query.status && query.status !== DepositStatus.PENDING) {
+      return { items: [], total: 0, page, limit };
+    }
+    const cutoff = new Date(now.getTime() - NO_BANK_TRANSACTION_AFTER_MS);
+    const predicate = Prisma.sql`status = 'PENDING'::"DepositStatus"
+      AND "bankCheckedAt" IS NULL
+      AND ${
+        verification === 'awaiting_bank'
+          ? Prisma.sql`"createdAt" >= ${cutoff}`
+          : Prisma.sql`"createdAt" < ${cutoff}`
+      }
+      ${query.dateFrom ? Prisma.sql`AND "createdAt" >= ${new Date(query.dateFrom)}` : Prisma.empty}
+      ${query.dateTo ? Prisma.sql`AND "createdAt" <= ${new Date(query.dateTo)}` : Prisma.empty}
+      ${query.userId ? Prisma.sql`AND "userId" = ${query.userId}` : Prisma.empty}`;
+
+    const [idRows, countRows] = await this.prisma.$transaction([
+      this.prisma.$queryRaw<{ id: string }[]>(
+        Prisma.sql`SELECT id FROM deposits WHERE ${predicate}
+          ORDER BY "createdAt" DESC
+          LIMIT ${limit} OFFSET ${(page - 1) * limit}`,
+      ),
+      this.prisma.$queryRaw<{ n: number }[]>(
+        Prisma.sql`SELECT count(*)::int AS n FROM deposits WHERE ${predicate}`,
+      ),
+    ]);
+    const ids = idRows.map((row) => row.id);
+    const total = Number(countRows[0]?.n ?? 0);
+    if (ids.length === 0) return { items: [], total, page, limit };
+
+    const rows = await this.prisma.deposit.findMany({
+      where: { id: { in: ids } },
+      include: { user: { select: ADMIN_USER_SELECT } },
+    });
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const items = ids
+      .map((id) => byId.get(id))
+      .filter((row): row is NonNullable<typeof row> => row !== undefined)
+      .map((d) => ({ ...this.toAdminResponse(d, now), user: d.user }));
+    return { items, total, page, limit };
   }
 
   private async findAll(query: DepositQueryDto & { userId: string }) {
@@ -322,24 +546,16 @@ export class DepositsService {
 
       const updated = await tx.deposit.findUniqueOrThrow({
         where: { id: depositId },
-        include: {
-          user: {
-            select: {
-              id: true,
-              username: true,
-              displayName: true,
-              phone: true,
-              email: true,
-            },
-          },
-        },
+        include: { user: { select: ADMIN_USER_SELECT } },
       });
       const wallet = await tx.wallet.findUniqueOrThrow({
         where: { userId: deposit.userId },
       });
 
       // Inside the transaction, so the audit row commits with the approval
-      // (and rolls back with it).
+      // (and rolls back with it). The verification state at the moment of
+      // approval travels in the metadata — "the admin approved a SUSPICIOUS
+      // row" must be readable from the log without a join.
       await this.audit.record({
         action: 'deposit.approve',
         actor: admin,
@@ -350,15 +566,32 @@ export class DepositsService {
         },
         before: depositSnapshot(deposit),
         after: depositSnapshot(updated),
-        metadata: { creditedPaymentAccountId: accountToCredit },
+        metadata: {
+          creditedPaymentAccountId: accountToCredit,
+          matchStatus: updated.matchStatus,
+          riskLevel: updated.riskLevel,
+          riskReasons: updated.riskReasons,
+        },
         tx,
       });
+
+      // Q14 — the approved row's twins learn that this reference now sits
+      // on an APPROVED row; its own stored reasons are untouched.
+      const twins = await findDepositTwins(tx, deposit.reference, deposit.id);
+      const changedTwins = await recomputeDepositTwins(
+        tx,
+        this.audit,
+        deposit,
+        twins,
+        { trigger: 'deposit_approve', anchorDepositId: deposit.id },
+      );
 
       return {
         deposit: updated,
         notification,
         balance: wallet.balance,
         accountToCredit,
+        changedTwinIds: changedTwins.map((twin) => twin.id),
       };
     });
 
@@ -367,6 +600,7 @@ export class DepositsService {
         paymentAccountId: result.accountToCredit,
       });
     }
+    await this.pushVerificationUpdates(result.changedTwinIds);
 
     this.realtimeGateway.notifyUserDepositUpdated(result.deposit.userId, {
       id: result.deposit.id,
@@ -390,7 +624,10 @@ export class DepositsService {
       decimalToNumber(result.balance),
     );
 
-    return { ...this.toResponse(result.deposit), user: result.deposit.user };
+    return {
+      ...this.toAdminResponse(result.deposit),
+      user: result.deposit.user,
+    };
   }
 
   /**
@@ -500,19 +737,17 @@ export class DepositsService {
           },
         });
 
+        // An admin-recorded deposit is a row with a reference: it and its
+        // twins learn about each other exactly as a user-submitted one does.
+        const flagged = await this.applyCreateTimeRules(
+          tx,
+          deposit,
+          'deposit_manual_create',
+        );
+
         const created = await tx.deposit.findUniqueOrThrow({
           where: { id: deposit.id },
-          include: {
-            user: {
-              select: {
-                id: true,
-                username: true,
-                displayName: true,
-                phone: true,
-                email: true,
-              },
-            },
-          },
+          include: { user: { select: ADMIN_USER_SELECT } },
         });
         const wallet = await tx.wallet.findUniqueOrThrow({
           where: { userId: deposit.userId },
@@ -533,7 +768,12 @@ export class DepositsService {
           tx,
         });
 
-        return { deposit: created, notification, balance: wallet.balance };
+        return {
+          deposit: created,
+          notification,
+          balance: wallet.balance,
+          changedTwinIds: flagged.changedTwinIds,
+        };
       })
       .catch((error: unknown) => {
         // Postgres aborts the transaction on 23505, so the mapping must live
@@ -550,6 +790,7 @@ export class DepositsService {
     this.realtimeGateway.notifyAdminsPaymentAccountUpdated({
       paymentAccountId: dto.destinationPaymentAccountId,
     });
+    await this.pushVerificationUpdates(result.changedTwinIds);
 
     this.realtimeGateway.notifyUserDepositUpdated(result.deposit.userId, {
       id: result.deposit.id,
@@ -573,7 +814,10 @@ export class DepositsService {
       decimalToNumber(result.balance),
     );
 
-    return { ...this.toResponse(result.deposit), user: result.deposit.user };
+    return {
+      ...this.toAdminResponse(result.deposit),
+      user: result.deposit.user,
+    };
   }
 
   /** Same atomic claim pattern as approve() — never touches the wallet or ledger. */
@@ -613,17 +857,7 @@ export class DepositsService {
 
       const updated = await tx.deposit.findUniqueOrThrow({
         where: { id: depositId },
-        include: {
-          user: {
-            select: {
-              id: true,
-              username: true,
-              displayName: true,
-              phone: true,
-              email: true,
-            },
-          },
-        },
+        include: { user: { select: ADMIN_USER_SELECT } },
       });
 
       await this.audit.record({
@@ -661,7 +895,10 @@ export class DepositsService {
       createdAt: result.notification.createdAt,
     });
 
-    return { ...this.toResponse(result.deposit), user: result.deposit.user };
+    return {
+      ...this.toAdminResponse(result.deposit),
+      user: result.deposit.user,
+    };
   }
 
   /**
@@ -734,17 +971,7 @@ export class DepositsService {
             receivingTransactionTime: dto.receivingTransactionTime,
           }),
         },
-        include: {
-          user: {
-            select: {
-              id: true,
-              username: true,
-              displayName: true,
-              phone: true,
-              email: true,
-            },
-          },
-        },
+        include: { user: { select: ADMIN_USER_SELECT } },
       });
 
       // `updatedDeposit` is read after syncDepositLink's claim, so its
@@ -801,9 +1028,162 @@ export class DepositsService {
       receivingTransactionTime: updated.receivingTransactionTime,
     });
 
-    return { ...this.toResponse(updated), user: updated.user };
+    return { ...this.toAdminResponse(updated), user: updated.user };
   }
 
+  /**
+   * A staff decision on a flagged row (PATCH /deposits/:id/verification).
+   *   clear  — reviewed, no issue: reasons emptied, level unscored; the
+   *            status becomes MATCHED only when bank values are present
+   *            and none of them actually disagree with the user (a hard
+   *            mismatch cleared by hand still is not "every check passed").
+   *   confirm_suspicious — the admin agrees: SUSPICIOUS / HIGH, reasons kept.
+   *   unlink — the bank values were attached to the wrong row (the amount
+   *            fallback path can do that): wipe every bank column and the
+   *            screenshot so the row re-enters the open set; the reasons
+   *            that describe the submission itself (twins, velocity) stay.
+   *            PENDING only — an approved deposit keeps its evidence.
+   * A later twin recompute re-derives status from the stored reasons, so a
+   * `confirm_suspicious` on a row with no reasons can be undone by its
+   * twins changing; the audit trail keeps the admin's decision either way.
+   */
+  async reviewVerification(
+    depositId: string,
+    dto: VerificationReviewDto,
+    admin: AuthenticatedUser,
+  ) {
+    const result = await this.prisma.$transaction(async (tx) => {
+      const deposit = await tx.deposit.findUnique({ where: { id: depositId } });
+      if (!deposit) throw new NotFoundException('Deposit not found');
+
+      let data: Prisma.DepositUpdateInput;
+      if (dto.action === 'clear') {
+        const hasBankValues = deposit.bankCheckedAt !== null;
+        const hardMismatch = deposit.riskReasons.some(
+          (reason) =>
+            reason === 'AMOUNT_MISMATCH' || reason === 'CODE_MISMATCH',
+        );
+        data = {
+          matchStatus:
+            hasBankValues && !hardMismatch
+              ? BankMatchStatus.MATCHED
+              : BankMatchStatus.UNVERIFIED,
+          riskLevel: null,
+          riskReasons: [],
+        };
+      } else if (dto.action === 'confirm_suspicious') {
+        data = {
+          matchStatus: BankMatchStatus.SUSPICIOUS,
+          riskLevel: BankRiskLevel.HIGH,
+        };
+      } else {
+        if (deposit.bankCheckedAt === null) {
+          throw new BadRequestException(
+            'This deposit has no bank event to unlink',
+          );
+        }
+        if (deposit.status !== DepositStatus.PENDING) {
+          throw new BadRequestException(
+            'Only a pending deposit can have its bank event unlinked',
+          );
+        }
+        const kept = normalizeReasons(deposit.riskReasons).filter(
+          (reason) => !BANK_EVENT_REASONS.includes(reason),
+        );
+        data = {
+          receivingAmount: null,
+          receivingTransactionCode: null,
+          receivingTransactionTime: null,
+          receivingTransactionAt: null,
+          receivingEventKey: null,
+          receivingScreenshotKey: null,
+          bankCheckedAt: null,
+          ...scoreVerification(kept, false),
+        };
+      }
+
+      const updated = await tx.deposit.update({
+        where: { id: depositId },
+        data,
+        include: { user: { select: ADMIN_USER_SELECT } },
+      });
+
+      await this.audit.record({
+        action: 'deposit.verification_review',
+        actor: admin,
+        target: {
+          type: 'deposit',
+          id: depositId,
+          label: depositLabel(updated),
+        },
+        before: depositSnapshot(deposit),
+        after: depositSnapshot(updated),
+        metadata: { action: dto.action, note: dto.note ?? null },
+        tx,
+      });
+
+      return {
+        deposit: updated,
+        screenshotToDelete:
+          dto.action === 'unlink' ? deposit.receivingScreenshotKey : null,
+      };
+    });
+
+    // After commit: the object is evidence only while the row points at it.
+    // A failed delete is logged, never surfaced — the row is already clean.
+    if (result.screenshotToDelete) {
+      await this.minioService
+        .deleteObject(result.screenshotToDelete)
+        .catch((error: Error) =>
+          this.logger.warn(
+            `Could not delete bank screenshot ${result.screenshotToDelete}: ${error.message}`,
+          ),
+        );
+    }
+    this.realtimeGateway.notifyAdminsDepositVerificationUpdated(
+      depositVerificationPayload(result.deposit),
+    );
+
+    return {
+      ...this.toAdminResponse(result.deposit),
+      user: result.deposit.user,
+    };
+  }
+
+  /**
+   * GET /deposits/:id/bank-screenshot — the bank-notification screenshot,
+   * streamed from private storage to a staff member holding
+   * DEPOSITS.BANK_EVIDENCE. Never a URL: the object lives under documents/,
+   * which the cache server denies and nothing can sign.
+   */
+  async getBankScreenshot(depositId: string): Promise<StreamableFile> {
+    const deposit = await this.prisma.deposit.findUnique({
+      where: { id: depositId },
+      select: { receivingScreenshotKey: true },
+    });
+    if (!deposit) throw new NotFoundException('Deposit not found');
+    if (!deposit.receivingScreenshotKey) {
+      throw new NotFoundException('This deposit has no bank screenshot');
+    }
+    const object = await this.minioService.getObjectStream(
+      deposit.receivingScreenshotKey,
+    );
+    if (!object) {
+      throw new NotFoundException('This deposit has no bank screenshot');
+    }
+    return new StreamableFile(object.stream, {
+      type: 'image/png',
+      disposition: `inline; filename="bank-${depositId}.png"`,
+      ...(object.contentLength !== null && { length: object.contentLength }),
+    });
+  }
+
+  /**
+   * The USER-SAFE shape (/deposits, /deposits/me): what the depositor may
+   * see about their own row. Every bank-verification column is stripped
+   * here — a user must never see their own fraud score, the bank's values,
+   * or that a screenshot exists.
+   */
   private toResponse(deposit: {
     id: string;
     userId: string;
@@ -827,8 +1207,9 @@ export class DepositsService {
     createdAt: Date;
     updatedAt: Date;
   }) {
+    const visible = omitKeys(deposit, USER_HIDDEN_DEPOSIT_KEYS);
     return {
-      ...deposit,
+      ...visible,
       amount: decimalToNumber(deposit.amount as never),
       // Numbers-or-null, unlike amount: null means "never captured" (legacy
       // rows, PENDING/REJECTED) and must stay distinguishable from a real 0.
@@ -840,6 +1221,53 @@ export class DepositsService {
         deposit.walletBalanceAfter == null
           ? null
           : decimalToNumber(deposit.walletBalanceAfter as never),
+    };
+  }
+
+  /**
+   * The STAFF shape: the user-safe shape plus the bank side, with the
+   * read-time NO_BANK_TRANSACTION derivation (Q12) applied — `matchStatus`
+   * is the VIEW value, `riskReasons` stored ∪ derived, `riskLevel` raised
+   * to at least MEDIUM when derived. The screenshot key itself never leaves
+   * the server; only `hasBankScreenshot` does.
+   */
+  private toAdminResponse(
+    deposit: Parameters<DepositsService['toResponse']>[0] & {
+      receivingAmount?: unknown;
+      receivingTransactionAt?: Date | null;
+      receivingScreenshotKey?: string | null;
+      bankCheckedAt?: Date | null;
+      matchStatus?: BankMatchStatus;
+      riskLevel?: BankRiskLevel | null;
+      riskReasons?: string[];
+      declaredTransferAt?: Date | null;
+    },
+    now: Date = new Date(),
+  ) {
+    const view = verificationView(
+      {
+        status: deposit.status,
+        bankCheckedAt: deposit.bankCheckedAt ?? null,
+        createdAt: deposit.createdAt,
+        matchStatus: deposit.matchStatus ?? BankMatchStatus.UNVERIFIED,
+        riskLevel: deposit.riskLevel ?? null,
+        riskReasons: deposit.riskReasons ?? [],
+      },
+      now,
+    );
+    return {
+      ...this.toResponse(deposit),
+      receivingAmount:
+        deposit.receivingAmount == null
+          ? null
+          : decimalToNumber(deposit.receivingAmount as never),
+      receivingTransactionAt: deposit.receivingTransactionAt ?? null,
+      bankCheckedAt: deposit.bankCheckedAt ?? null,
+      matchStatus: view.matchStatus,
+      riskLevel: view.riskLevel,
+      riskReasons: view.riskReasons,
+      hasBankScreenshot: Boolean(deposit.receivingScreenshotKey),
+      declaredTransferAt: deposit.declaredTransferAt ?? null,
     };
   }
 }

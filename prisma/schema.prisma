@@ -176,6 +176,29 @@ enum WithdrawalStatus {
   REJECTED
 }
 
+/// The BANK side of a deposit/withdrawal — orthogonal to DepositStatus /
+/// WithdrawalStatus, which stay the MONEY state. UNVERIFIED = no bank
+/// notification applied yet; MATCHED = every exact check passed and no
+/// reason; PENDING_REVIEW = a soft reason (twin reference, ambiguity, gap,
+/// velocity); SUSPICIOUS = a hard mismatch (amount/code/impossible timing/
+/// shared across users). "No bank transaction after 24 h" is deliberately
+/// NOT a member: it is derived at read time from status + bankCheckedAt +
+/// createdAt, so nothing ever has to sweep the table to set it.
+enum BankMatchStatus {
+  UNVERIFIED
+  MATCHED
+  PENDING_REVIEW
+  SUSPICIOUS
+}
+
+/// Deterministic bucket of the summed reason weights (see
+/// bank-events/risk-rules.ts). Null = not scored yet.
+enum BankRiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
 enum NotificationType {
   DEPOSIT_APPROVED
   DEPOSIT_REJECTED
@@ -1022,9 +1045,9 @@ model WalletAdjustment {
 /// itself never touches the ledger directly, so a rejected request leaves no
 /// trace on the Wallet/Transaction tables at all.
 model Deposit {
-  id                        String        @id @default(uuid())
+  id                        String          @id @default(uuid())
   userId                    String
-  amount                    Decimal       @db.Decimal(12, 2)
+  amount                    Decimal         @db.Decimal(12, 2)
   paymentMethod             String
   /// The PaymentAccount.accountName the depositor says they sent to, as a
   /// plain snapshot string (same free-text convention as paymentMethod) —
@@ -1043,7 +1066,7 @@ model Deposit {
   /// distinguishable from "nothing changed" once it's already set. Null for
   /// deposits from a client that hasn't been updated to send it.
   declaredPaymentAccountId  String?
-  status                    DepositStatus @default(PENDING)
+  status                    DepositStatus   @default(PENDING)
   rejectionReason           String?
   approvedByUserId          String?
   approvedAt                DateTime?
@@ -1077,10 +1100,40 @@ model Deposit {
   /// Customer wallet balance immediately before/after this deposit's credit —
   /// captured at approve/manual-create time; null for deposits credited
   /// before these columns existed and for PENDING/REJECTED deposits.
-  walletBalanceBefore       Decimal?      @db.Decimal(12, 2)
-  walletBalanceAfter        Decimal?      @db.Decimal(12, 2)
-  createdAt                 DateTime      @default(now())
-  updatedAt                 DateTime      @updatedAt
+  walletBalanceBefore       Decimal?        @db.Decimal(12, 2)
+  walletBalanceAfter        Decimal?        @db.Decimal(12, 2)
+  /// What the BANK said, written by the matcher only (bank-events module)
+  /// — never by an admin form. Null until a phone-monitor event matched
+  /// this row.
+  receivingAmount           Decimal?        @db.Decimal(12, 2)
+  /// Full timestamp of the bank notification. The old time-of-day column
+  /// receivingTransactionTime stays and is filled from this in Asia/Yangon,
+  /// as an admin would have typed it.
+  receivingTransactionAt    DateTime?
+  /// Private object key (documents/bank-screenshots/deposits/<id>/…) — never
+  /// a URL; the admin only ever learns `hasBankScreenshot`, and the bytes
+  /// are streamed through GET /deposits/:id/bank-screenshot behind
+  /// DEPOSITS.BANK_EVIDENCE.
+  receivingScreenshotKey    String?
+  /// The phone event's idempotency key. UNIQUE: one bank notification can
+  /// credit at most one deposit, and a retried event is recognised as
+  /// already applied instead of being applied twice.
+  receivingEventKey         String?         @unique(map: "deposits_receivingEventKey_key")
+  /// Set once, when a bank event was applied. IS NULL = still in the open
+  /// set the matcher searches; that predicate is what keeps every partial
+  /// index below tiny (work scales with transfers that happen, never rows
+  /// that exist).
+  bankCheckedAt             DateTime?
+  matchStatus               BankMatchStatus @default(UNVERIFIED)
+  riskLevel                 BankRiskLevel?
+  /// Sorted, de-duplicated reason codes (bank-events/risk-rules.ts) — a set,
+  /// so recomputation is idempotent. NO_BANK_TRANSACTION is never stored.
+  riskReasons               String[]        @default([])
+  /// When the user says they transferred (the mobile form does not send it
+  /// yet; rules treat null as "use createdAt").
+  declaredTransferAt        DateTime?
+  createdAt                 DateTime        @default(now())
+  updatedAt                 DateTime        @updatedAt
 
   user                    User                        @relation(fields: [userId], references: [id], onDelete: Cascade)
   approvedBy              User?                       @relation("DepositApprovals", fields: [approvedByUserId], references: [id], onDelete: SetNull)
@@ -1105,6 +1158,27 @@ model Deposit {
   @@index([createdAt])
   @@index([declaredPaymentAccountId])
   @@index([receivingPaymentAccountId])
+  /// The OPEN SET — deposits still waiting for their bank notification. A
+  /// row enters it at create and leaves it for good the moment it is
+  /// matched, approved or rejected, so these three partial indexes hold
+  /// "today's unmatched deposits", never history. The bank-events matcher
+  /// and the two open-set admin filters query them with the predicate
+  /// spelled out as literal SQL ($queryRaw) — a parameterised
+  /// `status = $n` cannot prove it implies the index predicate.
+  ///   open_match   — Q1: the user's own last-6 on the declared account.
+  ///   open_amount  — Q2: the amount fallback inside the time window.
+  ///   open_created — the "awaiting bank" / "no bank transaction" filters.
+  @@index([declaredPaymentAccountId, reference], map: "deposits_open_match_idx", where: raw("status = 'PENDING'::\"DepositStatus\" AND \"bankCheckedAt\" IS NULL"))
+  @@index([declaredPaymentAccountId, amount, createdAt], map: "deposits_open_amount_idx", where: raw("status = 'PENDING'::\"DepositStatus\" AND \"bankCheckedAt\" IS NULL"))
+  @@index([createdAt], map: "deposits_open_createdAt_idx", where: raw("status = 'PENDING'::\"DepositStatus\" AND \"bankCheckedAt\" IS NULL"))
+  /// VELOCITY = "rows by this user inside the last few minutes" — reads
+  /// only the rows inside the window, where deposits_userId_idx would read
+  /// a heavy user's whole history and filter createdAt per row.
+  @@index([userId, createdAt])
+  /// The "verified" / "needs review" admin filters ordered by createdAt
+  /// DESC — a paginated scan reads `limit` entries and stops. Not partial:
+  /// a needs-review row must stay findable across any date range.
+  @@index([matchStatus, createdAt])
   @@map("deposits")
 }
 
@@ -1164,6 +1238,25 @@ model Withdrawal {
   /// never picked from the catalog, in which case no ledger entry is ever
   /// created for this withdrawal.
   transferPaymentAccountId String?
+  /// What the BANK said ("You sent …"), written by the matcher only —
+  /// mirrors Deposit.receivingAmount and friends with transfer* naming.
+  transferAmount           Decimal?         @db.Decimal(12, 2)
+  /// Full timestamp of the bank notification; transferTransactionTime (the
+  /// legacy time-of-day text) is filled from this in Asia/Yangon.
+  transferTransactionAt    DateTime?
+  /// Private object key (documents/bank-screenshots/withdrawals/<id>/…) —
+  /// never a URL, streamed only behind WITHDRAWALS.BANK_EVIDENCE.
+  transferScreenshotKey    String?
+  /// The phone event's idempotency key — UNIQUE, so one "sent" notification
+  /// confirms at most one payout and a retry is recognised, not re-applied.
+  transferEventKey         String?          @unique(map: "withdrawals_transferEventKey_key")
+  /// Set once, when a bank event was applied. IS NULL = still in the open
+  /// payout set the matcher searches.
+  bankCheckedAt            DateTime?
+  matchStatus              BankMatchStatus  @default(UNVERIFIED)
+  riskLevel                BankRiskLevel?
+  /// Sorted, de-duplicated reason codes — see bank-events/risk-rules.ts.
+  riskReasons              String[]         @default([])
   createdAt                DateTime         @default(now())
   updatedAt                DateTime         @updatedAt
 
@@ -1176,6 +1269,24 @@ model Withdrawal {
   @@index([status])
   @@index([createdAt])
   @@index([transferPaymentAccountId])
+  /// DUPLICATE_PAYOUT_CODE = "this payout code already sits on another
+  /// withdrawal". Without an index that check is a sequential scan. Plain,
+  /// not unique: the decision is flag-not-block.
+  @@index([transferTransactionCode])
+  /// The OPEN PAYOUT SET — approved, not yet bank-checked, no code keyed in
+  /// by hand. The withdrawal matcher ("You sent …") searches it by amount +
+  /// approvedAt window with the predicate as literal SQL; a row leaves it
+  /// when matched or when an admin records the code manually.
+  @@index([amount, approvedAt], map: "withdrawals_open_payout_idx", where: raw("status = 'APPROVED'::\"WithdrawalStatus\" AND \"bankCheckedAt\" IS NULL AND \"transferTransactionCode\" IS NULL"))
+  /// Same open payout set, keyed by createdAt: the "awaiting bank" / "no bank
+  /// transaction" admin filters page the open set ORDER BY createdAt DESC,
+  /// and the payout index above cannot serve that order (amount comes
+  /// first). Without this, EXPLAIN on 50k rows walked withdrawals_createdAt_idx
+  /// and threw away thousands of finished rows to fill one page — work that
+  /// grows with rows that exist. Mirrors deposits_open_createdAt_idx.
+  @@index([createdAt], map: "withdrawals_open_createdAt_idx", where: raw("status = 'APPROVED'::\"WithdrawalStatus\" AND \"bankCheckedAt\" IS NULL AND \"transferTransactionCode\" IS NULL"))
+  /// Same role as deposits_matchStatus_createdAt_idx.
+  @@index([matchStatus, createdAt])
   @@map("withdrawals")
 }
 

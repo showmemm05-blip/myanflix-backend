@@ -7,9 +7,12 @@ import {
   Patch,
   Post,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { VerificationReviewDto } from '../deposits/dto/verification-review.dto';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
@@ -82,5 +85,29 @@ export class WithdrawalsController {
     @CurrentUser() admin: AuthenticatedUser,
   ) {
     return this.withdrawalsService.updateTransferAccount(id, dto, admin);
+  }
+
+  /** Staff review of the bank-verification flags — reuses WITHDRAWALS.EDIT. */
+  @Patch(':id/verification')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('WITHDRAWALS.EDIT')
+  reviewVerification(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: VerificationReviewDto,
+    @CurrentUser() admin: AuthenticatedUser,
+  ) {
+    return this.withdrawalsService.reviewVerification(id, dto, admin);
+  }
+
+  /** Mirrors DepositsController.bankScreenshot — see its doc comment. */
+  @Get(':id/bank-screenshot')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('WITHDRAWALS.BANK_EVIDENCE')
+  async bankScreenshot(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    res.setHeader('Cache-Control', 'private, no-store');
+    return this.withdrawalsService.getBankScreenshot(id);
   }
 }

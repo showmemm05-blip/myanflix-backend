@@ -55,14 +55,19 @@ export const PERMISSION_CATALOGUE = [
     actions: ['VIEW', 'CREATE', 'EDIT', 'DELETE'],
   },
   {
+    // BANK_EVIDENCE gates the bank-notification screenshot stream
+    // (GET /deposits/:id/bank-screenshot): that image shows the business
+    // account BALANCE, so it is separately grantable and — like AUDIT.VIEW —
+    // seeded to no role but the implicit SUPER_ADMIN. Verification review
+    // actions reuse EDIT.
     key: 'DEPOSITS',
     label: 'Deposits',
-    actions: ['VIEW', 'APPROVE', 'REJECT', 'CREATE', 'EDIT'],
+    actions: ['VIEW', 'APPROVE', 'REJECT', 'CREATE', 'EDIT', 'BANK_EVIDENCE'],
   },
   {
     key: 'WITHDRAWALS',
     label: 'Withdrawals',
-    actions: ['VIEW', 'APPROVE', 'REJECT', 'EDIT'],
+    actions: ['VIEW', 'APPROVE', 'REJECT', 'EDIT', 'BANK_EVIDENCE'],
   },
   {
     key: 'PAYMENT_METHODS',

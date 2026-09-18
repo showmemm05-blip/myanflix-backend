@@ -2,7 +2,9 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
+  StreamableFile,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
@@ -11,9 +13,31 @@ import { FinanceSettingsService } from '../finance-settings/finance-settings.ser
 import { PaymentAccountLedgerService } from '../payment-accounts/payment-account-ledger.service';
 import { AuditService } from '../audit/audit.service';
 import { withdrawalSnapshot } from '../audit/audit-snapshots';
+import { MinioService } from '../common/storage/minio.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
+import type { VerificationFilter } from '../common/dto/verification-filter';
+import type { VerificationReviewDto } from '../deposits/dto/verification-review.dto';
 import {
+  findWithdrawalCodeTwins,
+  flagWithdrawalCodeTwins,
+  updateWithdrawalRisk,
+  withdrawalVerificationPayload,
+} from '../bank-events/withdrawal-risk';
+import {
+  PAYOUT_CODE_TWIN_REASONS,
+  WITHDRAWAL_PAYOUT_WINDOW_MS,
+  type RiskReason,
+  normalizeReasons,
+  reasonsEqual,
+  replaceReasonClass,
+  scoreVerification,
+  withdrawalVerificationView,
+} from '../bank-events/risk-rules';
+import {
+  BankMatchStatus,
+  BankRiskLevel,
   NotificationType,
+  Prisma,
   TransactionType,
   WithdrawalStatus,
 } from '../generated/prisma/client';
@@ -23,6 +47,38 @@ import type { CreateWithdrawalDto } from './dto/create-withdrawal.dto';
 import type { RejectWithdrawalDto } from './dto/reject-withdrawal.dto';
 import type { UpdateTransferAccountDto } from './dto/update-transfer-account.dto';
 import type { WithdrawalQueryDto } from './dto/withdrawal-query.dto';
+
+/** The reasons a bank event puts on a withdrawal — what `unlink` strips. */
+const BANK_EVENT_REASONS: readonly RiskReason[] = ['AMBIGUOUS_MATCH'];
+
+const ADMIN_USER_SELECT = {
+  id: true,
+  username: true,
+  displayName: true,
+  phone: true,
+  email: true,
+} satisfies Prisma.UserSelect;
+
+/** The columns a user must never see about their own payout — see DepositsService. */
+const USER_HIDDEN_WITHDRAWAL_KEYS = [
+  'transferAmount',
+  'transferTransactionAt',
+  'transferScreenshotKey',
+  'transferEventKey',
+  'bankCheckedAt',
+  'matchStatus',
+  'riskLevel',
+  'riskReasons',
+] as const satisfies readonly (keyof Withdrawal)[];
+
+function omitKeys<T extends object, K extends string>(
+  value: T,
+  keys: readonly K[],
+): Omit<T, K> {
+  const copy = { ...value } as Record<string, unknown>;
+  for (const key of keys) delete copy[key];
+  return copy as Omit<T, K>;
+}
 
 /** Audit-log label: a withdrawal has no reference, so amount plus whose it is. */
 function withdrawalLabel(withdrawal: {
@@ -60,6 +116,8 @@ function transferAccountSnapshot(withdrawal: Partial<Withdrawal>) {
 
 @Injectable()
 export class WithdrawalsService {
+  private readonly logger = new Logger(WithdrawalsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly walletService: WalletService,
@@ -67,7 +125,21 @@ export class WithdrawalsService {
     private readonly financeSettingsService: FinanceSettingsService,
     private readonly paymentAccountLedgerService: PaymentAccountLedgerService,
     private readonly audit: AuditService,
+    private readonly minioService: MinioService,
   ) {}
+
+  /** Admins-room realtime push for rows whose verification state changed — after commit only. */
+  private async pushVerificationUpdates(ids: readonly string[]): Promise<void> {
+    if (ids.length === 0) return;
+    const rows = await this.prisma.withdrawal.findMany({
+      where: { id: { in: [...ids] } },
+    });
+    for (const row of rows) {
+      this.realtimeGateway.notifyAdminsWithdrawalVerificationUpdated(
+        withdrawalVerificationPayload(row),
+      );
+    }
+  }
 
   /**
    * Balance is never touched here — only checked, so a rejected or
@@ -136,11 +208,27 @@ export class WithdrawalsService {
     return this.findAll({ ...query, userId });
   }
 
-  /** Pending requests first — see the WithdrawalStatus enum doc comment in schema.prisma for why `orderBy: 'asc'` alone achieves this. */
+  /**
+   * Pending requests first — see the WithdrawalStatus enum doc comment in
+   * schema.prisma for why `orderBy: 'asc'` alone achieves this. The five
+   * verification tabs mirror DepositsService.findAllAdmin: `verified` /
+   * `needs_review` are matchStatus filters on the full composite index; the
+   * two open-payout tabs go through findOpenAdmin with a literal predicate.
+   */
   async findAllAdmin(query: WithdrawalQueryDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
-    const where = {
+    const verification: VerificationFilter = query.verification ?? 'all';
+    const now = new Date();
+
+    if (
+      verification === 'awaiting_bank' ||
+      verification === 'no_bank_transaction'
+    ) {
+      return this.findOpenAdmin(query, verification, page, limit, now);
+    }
+
+    const where: Prisma.WithdrawalWhereInput = {
       status: query.status,
       userId: query.userId,
       createdAt:
@@ -150,6 +238,14 @@ export class WithdrawalsService {
               lte: query.dateTo ? new Date(query.dateTo) : undefined,
             }
           : undefined,
+      ...(verification === 'verified' && {
+        matchStatus: BankMatchStatus.MATCHED,
+      }),
+      ...(verification === 'needs_review' && {
+        matchStatus: {
+          in: [BankMatchStatus.PENDING_REVIEW, BankMatchStatus.SUSPICIOUS],
+        },
+      }),
     };
 
     const [items, total] = await this.prisma.$transaction([
@@ -158,27 +254,77 @@ export class WithdrawalsService {
         orderBy: [{ status: 'asc' }, { createdAt: 'desc' }],
         skip: (page - 1) * limit,
         take: limit,
-        include: {
-          user: {
-            select: {
-              id: true,
-              username: true,
-              displayName: true,
-              phone: true,
-              email: true,
-            },
-          },
-        },
+        include: { user: { select: ADMIN_USER_SELECT } },
       }),
       this.prisma.withdrawal.count({ where }),
     ]);
 
     return {
-      items: items.map((w) => ({ ...this.toResponse(w), user: w.user })),
+      items: items.map((w) => ({
+        ...this.toAdminResponse(w, now),
+        user: w.user,
+      })),
       total,
       page,
       limit,
     };
+  }
+
+  /**
+   * "Awaiting bank" = the open payout set (APPROVED, never bank-checked, no
+   * code keyed in by hand) approved inside the payout window; "no bank
+   * transaction" = the same set approved longer ago than that. Both are
+   * served by the partial withdrawals_open_payout_idx — bounded by the
+   * open set, never by history. A non-APPROVED status filter can match
+   * nothing here and short-circuits.
+   */
+  private async findOpenAdmin(
+    query: WithdrawalQueryDto,
+    verification: 'awaiting_bank' | 'no_bank_transaction',
+    page: number,
+    limit: number,
+    now: Date,
+  ) {
+    if (query.status && query.status !== WithdrawalStatus.APPROVED) {
+      return { items: [], total: 0, page, limit };
+    }
+    const cutoff = new Date(now.getTime() - WITHDRAWAL_PAYOUT_WINDOW_MS);
+    const predicate = Prisma.sql`status = 'APPROVED'::"WithdrawalStatus"
+      AND "bankCheckedAt" IS NULL
+      AND "transferTransactionCode" IS NULL
+      AND ${
+        verification === 'awaiting_bank'
+          ? Prisma.sql`"approvedAt" >= ${cutoff}`
+          : Prisma.sql`"approvedAt" < ${cutoff}`
+      }
+      ${query.dateFrom ? Prisma.sql`AND "createdAt" >= ${new Date(query.dateFrom)}` : Prisma.empty}
+      ${query.dateTo ? Prisma.sql`AND "createdAt" <= ${new Date(query.dateTo)}` : Prisma.empty}
+      ${query.userId ? Prisma.sql`AND "userId" = ${query.userId}` : Prisma.empty}`;
+
+    const [idRows, countRows] = await this.prisma.$transaction([
+      this.prisma.$queryRaw<{ id: string }[]>(
+        Prisma.sql`SELECT id FROM withdrawals WHERE ${predicate}
+          ORDER BY "createdAt" DESC
+          LIMIT ${limit} OFFSET ${(page - 1) * limit}`,
+      ),
+      this.prisma.$queryRaw<{ n: number }[]>(
+        Prisma.sql`SELECT count(*)::int AS n FROM withdrawals WHERE ${predicate}`,
+      ),
+    ]);
+    const ids = idRows.map((row) => row.id);
+    const total = Number(countRows[0]?.n ?? 0);
+    if (ids.length === 0) return { items: [], total, page, limit };
+
+    const rows = await this.prisma.withdrawal.findMany({
+      where: { id: { in: ids } },
+      include: { user: { select: ADMIN_USER_SELECT } },
+    });
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const items = ids
+      .map((id) => byId.get(id))
+      .filter((row): row is NonNullable<typeof row> => row !== undefined)
+      .map((w) => ({ ...this.toAdminResponse(w, now), user: w.user }));
+    return { items, total, page, limit };
   }
 
   private async findAll(query: WithdrawalQueryDto & { userId: string }) {
@@ -271,17 +417,7 @@ export class WithdrawalsService {
 
       const updated = await tx.withdrawal.findUniqueOrThrow({
         where: { id: withdrawalId },
-        include: {
-          user: {
-            select: {
-              id: true,
-              username: true,
-              displayName: true,
-              phone: true,
-              email: true,
-            },
-          },
-        },
+        include: { user: { select: ADMIN_USER_SELECT } },
       });
       const wallet = await tx.wallet.findUniqueOrThrow({
         where: { userId: withdrawal.userId },
@@ -331,8 +467,16 @@ export class WithdrawalsService {
       decimalToNumber(result.balance),
     );
 
+    // Staff pay out right after approving, so the "You sent …" notification
+    // is seconds away: nudge the phone-monitor now. No account is known yet
+    // — the matcher keys on amount + approvedAt, account only when recorded.
+    this.realtimeGateway.notifyBankMonitorsNudge({
+      kind: 'withdrawal',
+      paymentAccountId: null,
+    });
+
     return {
-      ...this.toResponse(result.withdrawal),
+      ...this.toAdminResponse(result.withdrawal),
       user: result.withdrawal.user,
     };
   }
@@ -376,17 +520,7 @@ export class WithdrawalsService {
 
       const updated = await tx.withdrawal.findUniqueOrThrow({
         where: { id: withdrawalId },
-        include: {
-          user: {
-            select: {
-              id: true,
-              username: true,
-              displayName: true,
-              phone: true,
-              email: true,
-            },
-          },
-        },
+        include: { user: { select: ADMIN_USER_SELECT } },
       });
       await this.audit.record({
         action: 'withdrawal.reject',
@@ -428,7 +562,7 @@ export class WithdrawalsService {
     );
 
     return {
-      ...this.toResponse(result.withdrawal),
+      ...this.toAdminResponse(result.withdrawal),
       user: result.withdrawal.user,
     };
   }
@@ -484,17 +618,7 @@ export class WithdrawalsService {
           transferTransactionCode: dto.transferTransactionCode,
           transferTransactionTime: dto.transferTransactionTime,
         },
-        include: {
-          user: {
-            select: {
-              id: true,
-              username: true,
-              displayName: true,
-              phone: true,
-              email: true,
-            },
-          },
-        },
+        include: { user: { select: ADMIN_USER_SELECT } },
       });
 
       // `updatedWithdrawal` is read after syncWithdrawalLink's claim, so its
@@ -513,13 +637,56 @@ export class WithdrawalsService {
         tx,
       });
 
+      // Q8 — the double-payout gap, flagged whichever way the code arrives:
+      // this row and every other one carrying the same code get
+      // DUPLICATE_PAYOUT_CODE (or lose it, if the code just changed to one
+      // nobody else has). Flag, never block — the money decision is the
+      // admin's.
+      const twins = await findWithdrawalCodeTwins(
+        tx,
+        dto.transferTransactionCode,
+        withdrawalId,
+      );
+      const metadata = {
+        trigger: 'transfer_account_update',
+        anchorWithdrawalId: withdrawalId,
+      };
+      const ownReasons = replaceReasonClass(
+        updatedWithdrawal.riskReasons,
+        PAYOUT_CODE_TWIN_REASONS,
+        twins.length > 0 ? ['DUPLICATE_PAYOUT_CODE'] : [],
+      );
+      const changedIds: string[] = [];
+      if (!reasonsEqual(ownReasons, updatedWithdrawal.riskReasons)) {
+        await updateWithdrawalRisk(
+          tx,
+          this.audit,
+          updatedWithdrawal,
+          scoreVerification(
+            ownReasons,
+            updatedWithdrawal.bankCheckedAt !== null,
+          ),
+          metadata,
+        );
+        changedIds.push(withdrawalId);
+      }
+      const changedTwins = await flagWithdrawalCodeTwins(
+        tx,
+        this.audit,
+        twins,
+        metadata,
+      );
+      changedIds.push(...changedTwins.map((twin) => twin.id));
+
       return {
         withdrawal: updatedWithdrawal,
         oldPaymentAccountId,
         newPaymentAccountId,
+        changedIds,
       };
     });
     const updated = result.withdrawal;
+    await this.pushVerificationUpdates(result.changedIds);
 
     // Both sides of a re-link can have their balance changed by
     // syncWithdrawalLink's reversal-then-forward — notify each distinct
@@ -551,9 +718,137 @@ export class WithdrawalsService {
       transferTransactionTime: updated.transferTransactionTime,
     });
 
-    return { ...this.toResponse(updated), user: updated.user };
+    return { ...this.toAdminResponse(updated), user: updated.user };
   }
 
+  /**
+   * A staff decision on a flagged withdrawal — the mirror of
+   * DepositsService.reviewVerification (same three verbs, same audit
+   * shape). `unlink` wipes the bank-written transfer* values and the
+   * screenshot so the row re-enters the open payout set; the code an admin
+   * typed by hand is never touched by it (that row is not in the open set
+   * and was never matched).
+   */
+  async reviewVerification(
+    withdrawalId: string,
+    dto: VerificationReviewDto,
+    admin: AuthenticatedUser,
+  ) {
+    const result = await this.prisma.$transaction(async (tx) => {
+      const withdrawal = await tx.withdrawal.findUnique({
+        where: { id: withdrawalId },
+      });
+      if (!withdrawal) throw new NotFoundException('Withdrawal not found');
+
+      let data: Prisma.WithdrawalUpdateInput;
+      if (dto.action === 'clear') {
+        data = {
+          matchStatus:
+            withdrawal.bankCheckedAt !== null
+              ? BankMatchStatus.MATCHED
+              : BankMatchStatus.UNVERIFIED,
+          riskLevel: null,
+          riskReasons: [],
+        };
+      } else if (dto.action === 'confirm_suspicious') {
+        data = {
+          matchStatus: BankMatchStatus.SUSPICIOUS,
+          riskLevel: BankRiskLevel.HIGH,
+        };
+      } else {
+        if (withdrawal.bankCheckedAt === null) {
+          throw new BadRequestException(
+            'This withdrawal has no bank event to unlink',
+          );
+        }
+        const kept = normalizeReasons(withdrawal.riskReasons).filter(
+          (reason) => !BANK_EVENT_REASONS.includes(reason),
+        );
+        data = {
+          transferAmount: null,
+          transferTransactionCode: null,
+          transferTransactionTime: null,
+          transferTransactionAt: null,
+          transferEventKey: null,
+          transferScreenshotKey: null,
+          bankCheckedAt: null,
+          ...scoreVerification(kept, false),
+        };
+      }
+
+      const updated = await tx.withdrawal.update({
+        where: { id: withdrawalId },
+        data,
+        include: { user: { select: ADMIN_USER_SELECT } },
+      });
+
+      await this.audit.record({
+        action: 'withdrawal.verification_review',
+        actor: admin,
+        target: {
+          type: 'withdrawal',
+          id: withdrawalId,
+          label: withdrawalLabel(updated),
+        },
+        before: withdrawalSnapshot(withdrawal),
+        after: withdrawalSnapshot(updated),
+        metadata: { action: dto.action, note: dto.note ?? null },
+        tx,
+      });
+
+      return {
+        withdrawal: updated,
+        screenshotToDelete:
+          dto.action === 'unlink' ? withdrawal.transferScreenshotKey : null,
+      };
+    });
+
+    if (result.screenshotToDelete) {
+      await this.minioService
+        .deleteObject(result.screenshotToDelete)
+        .catch((error: Error) =>
+          this.logger.warn(
+            `Could not delete bank screenshot ${result.screenshotToDelete}: ${error.message}`,
+          ),
+        );
+    }
+    this.realtimeGateway.notifyAdminsWithdrawalVerificationUpdated(
+      withdrawalVerificationPayload(result.withdrawal),
+    );
+
+    return {
+      ...this.toAdminResponse(result.withdrawal),
+      user: result.withdrawal.user,
+    };
+  }
+
+  /** GET /withdrawals/:id/bank-screenshot — see DepositsService.getBankScreenshot. */
+  async getBankScreenshot(withdrawalId: string): Promise<StreamableFile> {
+    const withdrawal = await this.prisma.withdrawal.findUnique({
+      where: { id: withdrawalId },
+      select: { transferScreenshotKey: true },
+    });
+    if (!withdrawal) throw new NotFoundException('Withdrawal not found');
+    if (!withdrawal.transferScreenshotKey) {
+      throw new NotFoundException('This withdrawal has no bank screenshot');
+    }
+    const object = await this.minioService.getObjectStream(
+      withdrawal.transferScreenshotKey,
+    );
+    if (!object) {
+      throw new NotFoundException('This withdrawal has no bank screenshot');
+    }
+    return new StreamableFile(object.stream, {
+      type: 'image/png',
+      disposition: `inline; filename="bank-${withdrawalId}.png"`,
+      ...(object.contentLength !== null && { length: object.contentLength }),
+    });
+  }
+
+  /**
+   * The USER-SAFE shape (/withdrawals, /withdrawals/me). Every
+   * bank-verification column is stripped — a user never sees a fraud score.
+   */
   private toResponse(withdrawal: {
     id: string;
     userId: string;
@@ -576,9 +871,50 @@ export class WithdrawalsService {
     createdAt: Date;
     updatedAt: Date;
   }) {
+    const visible = omitKeys(withdrawal, USER_HIDDEN_WITHDRAWAL_KEYS);
     return {
-      ...withdrawal,
+      ...visible,
       amount: decimalToNumber(withdrawal.amount as never),
+    };
+  }
+
+  /** The STAFF shape — mirrors DepositsService.toAdminResponse with transfer* naming. */
+  private toAdminResponse(
+    withdrawal: Parameters<WithdrawalsService['toResponse']>[0] & {
+      transferAmount?: unknown;
+      transferTransactionAt?: Date | null;
+      transferScreenshotKey?: string | null;
+      bankCheckedAt?: Date | null;
+      matchStatus?: BankMatchStatus;
+      riskLevel?: BankRiskLevel | null;
+      riskReasons?: string[];
+    },
+    now: Date = new Date(),
+  ) {
+    const view = withdrawalVerificationView(
+      {
+        status: withdrawal.status,
+        bankCheckedAt: withdrawal.bankCheckedAt ?? null,
+        transferTransactionCode: withdrawal.transferTransactionCode ?? null,
+        approvedAt: withdrawal.approvedAt,
+        matchStatus: withdrawal.matchStatus ?? BankMatchStatus.UNVERIFIED,
+        riskLevel: withdrawal.riskLevel ?? null,
+        riskReasons: withdrawal.riskReasons ?? [],
+      },
+      now,
+    );
+    return {
+      ...this.toResponse(withdrawal),
+      transferAmount:
+        withdrawal.transferAmount == null
+          ? null
+          : decimalToNumber(withdrawal.transferAmount as never),
+      transferTransactionAt: withdrawal.transferTransactionAt ?? null,
+      bankCheckedAt: withdrawal.bankCheckedAt ?? null,
+      matchStatus: view.matchStatus,
+      riskLevel: view.riskLevel,
+      riskReasons: view.riskReasons,
+      hasBankScreenshot: Boolean(withdrawal.transferScreenshotKey),
     };
   }
 }
