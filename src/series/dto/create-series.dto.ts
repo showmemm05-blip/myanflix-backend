@@ -3,6 +3,7 @@ import {
   IsArray,
   IsEnum,
   IsInt,
+  IsNumber,
   IsOptional,
   IsString,
   IsUUID,
@@ -12,7 +13,7 @@ import {
   Min,
   MinLength,
 } from 'class-validator';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { AccessType } from '../../generated/prisma/client';
 
 export class CreateSeriesDto {
@@ -49,6 +50,20 @@ export class CreateSeriesDto {
   @Min(1888)
   @Max(2100)
   releaseYear!: number;
+
+  /** Same contract as CreateMovieDto.rating: 0–10, one decimal, 0 = not rated. */
+  // `null` clears, the way ageRating's does — but this column is NOT NULL, so
+  // it is folded to 0 here rather than reaching Prisma as null (a 500). It has
+  // to be a transform: PartialType marks every update field IsOptional, which
+  // skips validation for null, so a validator could never catch it. Omitted
+  // still means "leave alone".
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => (value === null ? 0 : value))
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 1 })
+  @Min(0)
+  @Max(10)
+  rating?: number;
 
   /**
    * One access type for the whole show — episodes are never gated individually.

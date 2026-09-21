@@ -472,6 +472,8 @@ model Series {
   genre       String
   language    String
   releaseYear Int
+  /// Admin-set 0–10 rating, same meaning as Movie.rating: 0 = not rated yet.
+  rating      Float        @default(0)
   /// The whole show is one product — episodes are never gated individually;
   /// this accessType governs every season and episode, including ones added
   /// later. An episode's own Movie.accessType is never consulted.

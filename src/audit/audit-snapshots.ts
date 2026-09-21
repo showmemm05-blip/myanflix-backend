@@ -129,6 +129,7 @@ export function seriesSnapshot(series: SeriesSnapshotInput): Snapshot {
     genre: nullIfUndefined(series.genre),
     language: nullIfUndefined(series.language),
     releaseYear: nullIfUndefined(series.releaseYear),
+    rating: nullIfUndefined(series.rating),
     accessType: nullIfUndefined(series.accessType),
     status: nullIfUndefined(series.status),
     posterUrl: nullIfUndefined(series.posterUrl),

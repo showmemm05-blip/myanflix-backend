@@ -58,3 +58,34 @@ describe('CreateMovieDto — accessType default belongs to Prisma', () => {
     expect(await validate(instance)).toHaveLength(0);
   });
 });
+
+describe('UpdateMovieDto — rating', () => {
+  it.each([0, 7.5, 10])('accepts %s', async (rating) => {
+    const instance = plainToInstance(UpdateMovieDto, { rating });
+    expect(instance.rating).toBe(rating);
+    expect(await validate(instance)).toHaveLength(0);
+  });
+
+  it.each([-0.1, 10.1, 7.55])('rejects %s', async (rating) => {
+    const errors = await validate(plainToInstance(UpdateMovieDto, { rating }));
+    expect(errors.map((e) => e.property)).toEqual(['rating']);
+  });
+
+  it('coerces the string a form posts', async () => {
+    const instance = plainToInstance(UpdateMovieDto, { rating: '8.2' });
+    expect(instance.rating).toBe(8.2);
+    expect(await validate(instance)).toHaveLength(0);
+  });
+
+  it('null clears to 0 instead of reaching the NOT NULL column', async () => {
+    const instance = plainToInstance(UpdateMovieDto, { rating: null });
+    expect(instance.rating).toBe(0);
+    expect(await validate(instance)).toHaveLength(0);
+  });
+
+  it('omitted stays undefined so a partial PUT never zeroes it', async () => {
+    const instance = plainToInstance(UpdateMovieDto, { title: 'T' });
+    expect(instance.rating).toBeUndefined();
+    expect(await validate(instance)).toHaveLength(0);
+  });
+});

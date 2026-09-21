@@ -3,6 +3,7 @@ import {
   IsArray,
   IsEnum,
   IsInt,
+  IsNumber,
   IsOptional,
   IsString,
   IsUUID,
@@ -12,7 +13,7 @@ import {
   Min,
   MinLength,
 } from 'class-validator';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { AccessType, AgeRating } from '../../generated/prisma/client';
 
 export class CreateMovieDto {
@@ -58,6 +59,25 @@ export class CreateMovieDto {
   @IsInt()
   @Min(1)
   duration!: number;
+
+  /**
+   * Admin-set 0–10 rating, shown as "★ 7.5" on the clients. 0 — the Prisma
+   * default — means "not rated yet" and renders as a dash, so an admin can
+   * clear a rating by sending 0. One decimal is all the UI ever shows, so a
+   * finer value is rejected rather than silently rounded.
+   */
+  // `null` clears, the way ageRating's does — but this column is NOT NULL, so
+  // it is folded to 0 here rather than reaching Prisma as null (a 500). It has
+  // to be a transform: PartialType marks every update field IsOptional, which
+  // skips validation for null, so a validator could never catch it. Omitted
+  // still means "leave alone".
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => (value === null ? 0 : value))
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 1 })
+  @Min(0)
+  @Max(10)
+  rating?: number;
 
   /**
    * Create-time default is Prisma `@default(SUBSCRIPTION)` (prisma/schema.prisma
