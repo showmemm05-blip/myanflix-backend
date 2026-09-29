@@ -198,6 +198,10 @@ export class BooksService {
 
     if (query.type) where.type = query.type;
     if (query.categoryId) where.categories = { some: { id: query.categoryId } };
+    // The author page's "their books" list. An exact match on the book's own
+    // authorId column, so it narrows whatever the other filters already built
+    // rather than replacing any of them.
+    if (query.authorId) where.authorId = query.authorId;
     if (query.search) {
       where.OR = [
         { title: { contains: query.search, mode: 'insensitive' } },

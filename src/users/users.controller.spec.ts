@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import {
   CanActivate,
+  ConflictException,
   ExecutionContext,
   INestApplication,
   ValidationPipe,
@@ -20,6 +21,7 @@ import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { AuthorityService } from '../roles/authority.service';
 import { PermissionResolverService } from '../roles/permission-resolver.service';
 import { AuditService } from '../audit/audit.service';
+import { SessionRevocationService } from '../auth/session-revocation.service';
 import { createSeededPermissionResolver } from '../../test/seeded-permission-resolver';
 import { UsersController } from './users.controller';
 import { UsersService } from './users.service';
@@ -56,6 +58,7 @@ class FakeAuthGuard implements CanActivate {
       username: 'john',
       role: Role.USER,
       appRoleId: null,
+      sessionId: 'rt-current',
     };
     return true;
   }
@@ -72,15 +75,24 @@ describe('UsersController — self-service "me" routes (profile, password, avata
     wallet: { findUnique: jest.Mock };
     transaction: { aggregate: jest.Mock };
     userSubscription: { findFirst: jest.Mock };
+    $transaction: jest.Mock;
   };
+  let sessions: {
+    revokeAll: jest.Mock;
+    revokeAllAndDisconnect: jest.Mock;
+    disconnectUser: jest.Mock;
+  };
+  let usersService: UsersService;
   let minio: {
     uploadBuffer: jest.Mock;
     deleteObject: jest.Mock;
     playbackUrl: jest.Mock;
   };
+  let audit: { record: jest.Mock };
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
 
     // A one-row stand-in for the users table: `update` mutates it and
     // `findUnique` reads it back, the way the real Prisma client behaves when
@@ -102,6 +114,15 @@ describe('UsersController — self-service "me" routes (profile, password, avata
         aggregate: jest.fn().mockResolvedValue({ _sum: { amount: null } }),
       },
       userSubscription: { findFirst: jest.fn().mockResolvedValue(null) },
+      $transaction: jest.fn(),
+    };
+    prisma.$transaction.mockImplementation(
+      (run: (tx: typeof prisma) => Promise<unknown>) => run(prisma),
+    );
+    sessions = {
+      revokeAll: jest.fn().mockResolvedValue(undefined),
+      revokeAllAndDisconnect: jest.fn().mockResolvedValue(undefined),
+      disconnectUser: jest.fn(),
     };
     minio = {
       uploadBuffer: jest.fn().mockResolvedValue(undefined),
@@ -125,10 +146,8 @@ describe('UsersController — self-service "me" routes (profile, password, avata
         // STORAGE_PATH for local paths, which no avatar route touches.
         StorageService,
         { provide: ConfigService, useValue: { get: () => undefined } },
-        {
-          provide: AuditService,
-          useValue: { record: jest.fn().mockResolvedValue(undefined) },
-        },
+        { provide: AuditService, useValue: audit },
+        { provide: SessionRevocationService, useValue: sessions },
         { provide: MoviesService, useValue: {} },
         { provide: VideosService, useValue: {} },
         { provide: WalletAdjustmentsService, useValue: {} },
@@ -154,6 +173,7 @@ describe('UsersController — self-service "me" routes (profile, password, avata
       .useClass(FakeAuthGuard)
       .compile();
 
+    usersService = moduleFixture.get(UsersService);
     app = moduleFixture.createNestApplication();
     // Same configuration as the global APP_PIPE in app.module.ts — the
     // profile DTOs (trimming, length limits, forbidNonWhitelisted) are only
@@ -513,6 +533,46 @@ describe('UsersController — self-service "me" routes (profile, password, avata
       );
     });
 
+    it('forwards the caller as the audit actor for staff.password_change (AuditService decides whether a USER-role caller is skipped)', async () => {
+      await request(app.getHttpServer())
+        .patch('/users/me/password')
+        .send({
+          currentPassword: CURRENT_PASSWORD,
+          newPassword: 'brand-new-password',
+        })
+        .expect(200);
+
+      expect(audit.record).toHaveBeenCalledTimes(1);
+      const recorded = audit.record.mock.calls[0][0] as Record<string, unknown>;
+      expect(recorded).toEqual({
+        action: 'staff.password_change',
+        actor: expect.objectContaining({ id: USER_ID, username: 'john' }),
+        target: { type: 'staff', id: USER_ID, label: '@john' },
+      });
+      // Pure event — no before/after/metadata, so no password can ride along.
+      expect(Object.keys(recorded).sort()).toEqual([
+        'action',
+        'actor',
+        'target',
+      ]);
+    });
+
+    it("H-21: signs out every other session but keeps the caller's own (sid of this request)", async () => {
+      await request(app.getHttpServer())
+        .patch('/users/me/password')
+        .send({
+          currentPassword: CURRENT_PASSWORD,
+          newPassword: 'brand-new-password',
+        })
+        .expect(200);
+
+      expect(sessions.revokeAll).toHaveBeenCalledWith(USER_ID, {
+        exceptSessionId: 'rt-current',
+        client: prisma,
+      });
+      expect(sessions.disconnectUser).toHaveBeenCalledWith(USER_ID);
+    });
+
     it('rejects a wrong current password with 400 and never writes', async () => {
       const response = await request(app.getHttpServer())
         .patch('/users/me/password')
@@ -526,6 +586,7 @@ describe('UsersController — self-service "me" routes (profile, password, avata
         'Your current password is incorrect',
       );
       expect(prisma.user.update).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
     });
 
     it('rejects a new password shorter than 8 characters with 400 and never writes', async () => {
@@ -545,6 +606,52 @@ describe('UsersController — self-service "me" routes (profile, password, avata
         .expect(400);
 
       expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('PATCH /users/:id/status (H-16)', () => {
+    it('never accepts CLOSED from staff — only the owner closes an account', async () => {
+      const response = await request(app.getHttpServer())
+        .patch(`/users/${USER_ID}/status`)
+        .send({ status: 'CLOSED' })
+        .expect(400);
+
+      expect(String(response.body.message)).toContain('status');
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('DELETE /users/me (H-16)', () => {
+    it("closes the caller's own account and answers { deleted: true }", async () => {
+      const close = jest
+        .spyOn(usersService, 'deleteOwnAccount')
+        .mockResolvedValue(undefined);
+
+      const response = await request(app.getHttpServer())
+        .delete('/users/me')
+        .expect(200);
+
+      expect(response.body).toEqual({ deleted: true });
+      expect(close).toHaveBeenCalledWith(
+        expect.objectContaining({ id: USER_ID, role: Role.USER }),
+      );
+    });
+
+    it('passes a refusal through as 409 with its message', async () => {
+      jest
+        .spyOn(usersService, 'deleteOwnAccount')
+        .mockRejectedValue(
+          new ConflictException(
+            'Your wallet still has money in it. Withdraw or spend it before deleting your account.',
+          ),
+        );
+
+      const response = await request(app.getHttpServer())
+        .delete('/users/me')
+        .expect(409);
+      expect(response.body.message).toBe(
+        'Your wallet still has money in it. Withdraw or spend it before deleting your account.',
+      );
     });
   });
 });

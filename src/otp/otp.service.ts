@@ -4,13 +4,14 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { randomInt } from 'node:crypto';
+import { OtpPurpose } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { SmsService } from '../sms/sms.service';
 
 const CODE_LENGTH = 6;
 const CODE_TTL_MS = 5 * 60 * 1000;
 const RESEND_COOLDOWN_MS = 60 * 1000;
-const MAX_REQUESTS_PER_HOUR = 5;
+const MAX_REQUESTS_PER_HOUR = 8;
 const MAX_VERIFY_ATTEMPTS = 5;
 
 function generateCode(): string {
@@ -26,10 +27,19 @@ export class OtpService {
     private readonly smsService: SmsService,
   ) {}
 
-  /** Generates and stores a code for `phone`, then hands it to SmsService for delivery. Expects an already-normalized phone. */
-  async requestOtp(phone: string): Promise<void> {
+  /**
+   * Generates and stores a code for `phone`, bound to `purpose`, then hands
+   * it to SmsService for delivery. Expects an already-normalized phone. The
+   * resend cooldown counts only codes of the same purpose, so a sign-in code
+   * never holds up a reset code (or the other way round); the hourly cap
+   * counts every code for the phone, whatever it was requested for.
+   */
+  async requestOtp(
+    phone: string,
+    purpose: OtpPurpose = OtpPurpose.LOGIN,
+  ): Promise<void> {
     const mostRecent = await this.prisma.otpCode.findFirst({
-      where: { phone },
+      where: { phone, purpose },
       orderBy: { createdAt: 'desc' },
     });
     if (
@@ -51,7 +61,12 @@ export class OtpService {
 
     const code = generateCode();
     await this.prisma.otpCode.create({
-      data: { phone, code, expiresAt: new Date(Date.now() + CODE_TTL_MS) },
+      data: {
+        phone,
+        code,
+        purpose,
+        expiresAt: new Date(Date.now() + CODE_TTL_MS),
+      },
     });
 
     await this.smsService.send(
@@ -60,10 +75,19 @@ export class OtpService {
     );
   }
 
-  /** Throws on any invalid/expired/exhausted code; resolves (no return value) on success and marks the code consumed. */
-  async verifyOtp(phone: string, code: string): Promise<void> {
+  /**
+   * Throws on any invalid/expired/exhausted code; resolves (no return value)
+   * on success and marks the code consumed. Only codes requested for
+   * `purpose` count: a code of the other purpose is no code at all here
+   * (same 401, its attempts untouched).
+   */
+  async verifyOtp(
+    phone: string,
+    code: string,
+    purpose: OtpPurpose,
+  ): Promise<void> {
     const otp = await this.prisma.otpCode.findFirst({
-      where: { phone, consumedAt: null },
+      where: { phone, purpose, consumedAt: null },
       orderBy: { createdAt: 'desc' },
     });
 

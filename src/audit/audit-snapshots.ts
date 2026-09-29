@@ -1,6 +1,7 @@
 import type {
   Actor,
   AppRole,
+  BankTransaction,
   Book,
   BookAuthor,
   BookCategory,
@@ -120,6 +121,7 @@ export function movieSnapshot(movie: MovieSnapshotInput): Snapshot {
 
 export type SeriesSnapshotInput = Partial<Series> & {
   categories?: readonly NamedRow[] | null;
+  actors?: readonly NamedRow[] | null;
 };
 
 export function seriesSnapshot(series: SeriesSnapshotInput): Snapshot {
@@ -135,6 +137,7 @@ export function seriesSnapshot(series: SeriesSnapshotInput): Snapshot {
     posterUrl: nullIfUndefined(series.posterUrl),
     coverUrl: nullIfUndefined(series.coverUrl),
     categories: refs(series.categories),
+    actors: refs(series.actors),
   };
 }
 
@@ -331,6 +334,20 @@ export function depositSnapshot(deposit: Partial<Deposit>): Snapshot {
     ),
     walletBalanceBefore: money(deposit.walletBalanceBefore),
     walletBalanceAfter: money(deposit.walletBalanceAfter),
+    // The bank side (bank-events matcher). The screenshot KEY is deliberately
+    // absent: the log records that evidence exists, never where it lives.
+    receivingAmount: money(deposit.receivingAmount),
+    receivingTransactionAt: nullIfUndefined(deposit.receivingTransactionAt),
+    receivingEventKey: nullIfUndefined(deposit.receivingEventKey),
+    hasBankScreenshot:
+      deposit.receivingScreenshotKey === undefined
+        ? null
+        : deposit.receivingScreenshotKey !== null,
+    bankCheckedAt: nullIfUndefined(deposit.bankCheckedAt),
+    matchStatus: nullIfUndefined(deposit.matchStatus),
+    riskLevel: nullIfUndefined(deposit.riskLevel),
+    riskReasons: nullIfUndefined(deposit.riskReasons),
+    declaredTransferAt: nullIfUndefined(deposit.declaredTransferAt),
   };
 }
 
@@ -359,6 +376,51 @@ export function withdrawalSnapshot(withdrawal: Partial<Withdrawal>): Snapshot {
     transferPaymentAccountId: nullIfUndefined(
       withdrawal.transferPaymentAccountId,
     ),
+    // The bank side — same shape as depositSnapshot, transfer* voice.
+    transferAmount: money(withdrawal.transferAmount),
+    transferTransactionAt: nullIfUndefined(withdrawal.transferTransactionAt),
+    transferEventKey: nullIfUndefined(withdrawal.transferEventKey),
+    hasBankScreenshot:
+      withdrawal.transferScreenshotKey === undefined
+        ? null
+        : withdrawal.transferScreenshotKey !== null,
+    bankCheckedAt: nullIfUndefined(withdrawal.bankCheckedAt),
+    matchStatus: nullIfUndefined(withdrawal.matchStatus),
+    riskLevel: nullIfUndefined(withdrawal.riskLevel),
+    riskReasons: nullIfUndefined(withdrawal.riskReasons),
+    // C-4 — the ledger row of the money held at request time; null on a
+    // row from before holds (approve debits those instead).
+    holdTransactionId: nullIfUndefined(withdrawal.holdTransactionId),
+  };
+}
+
+/**
+ * A stored phone notification. The screenshot KEY is deliberately absent
+ * (evidence exists / does not — never where it lives), like the deposit
+ * and withdrawal pickers; the notification text was never stored at all.
+ */
+export function bankTransactionSnapshot(
+  row: Partial<BankTransaction>,
+): Snapshot {
+  return {
+    idempotencyKey: nullIfUndefined(row.idempotencyKey),
+    deviceSerial: nullIfUndefined(row.deviceSerial),
+    paymentAccountId: nullIfUndefined(row.paymentAccountId),
+    direction: nullIfUndefined(row.direction),
+    amount: money(row.amount),
+    currency: nullIfUndefined(row.currency),
+    txCode: nullIfUndefined(row.txCode),
+    txCodeLast6: nullIfUndefined(row.txCodeLast6),
+    occurredAt: nullIfUndefined(row.occurredAt),
+    postedAt: nullIfUndefined(row.postedAt),
+    counterparty: nullIfUndefined(row.counterparty),
+    detailStatus: nullIfUndefined(row.detailStatus),
+    state: nullIfUndefined(row.state),
+    linkedDepositId: nullIfUndefined(row.linkedDepositId),
+    linkedWithdrawalId: nullIfUndefined(row.linkedWithdrawalId),
+    matchedAt: nullIfUndefined(row.matchedAt),
+    hasScreenshot:
+      row.screenshotKey === undefined ? null : row.screenshotKey !== null,
   };
 }
 

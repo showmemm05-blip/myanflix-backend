@@ -84,4 +84,15 @@ export class CreateSeriesDto {
   @ArrayUnique()
   @IsUUID('4', { each: true })
   categoryIds?: string[];
+
+  /**
+   * The show-level cast. On update the submitted list is the WHOLE cast
+   * (the service `set`s it, exactly like a movie's actorIds), so an admin
+   * form must echo the current cast back, not just the additions.
+   */
+  @IsOptional()
+  @IsArray()
+  @ArrayUnique()
+  @IsUUID('4', { each: true })
+  actorIds?: string[];
 }

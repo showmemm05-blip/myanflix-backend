@@ -36,6 +36,11 @@ export class BookQueryDto extends PaginationQueryDto {
   @IsString()
   categoryId?: string;
 
+  /** Matches books credited to this BookAuthor row (exact id, not the name). */
+  @IsOptional()
+  @IsString()
+  authorId?: string;
+
   @IsOptional()
   @IsString()
   search?: string;

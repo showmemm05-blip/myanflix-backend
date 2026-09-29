@@ -19,7 +19,13 @@ await this.audit.record({
 ## What `record()` does for you
 
 - **Drops end-user self-service.** If `actor.role === Role.USER` and `force` is not set,
-  it returns without writing. You never need to check the role yourself.
+  it returns without writing. You never need to check the role yourself. Two
+  security events are forced in on purpose, with the owner as actor:
+  `user.password_reset` (forgot password) and `user.account_delete` (the owner
+  closed their account, H-16). Closing an account is the one time existing rows
+  are edited: `anonymiseUser()` replaces the person's name in them, and clears
+  the IP address and user agent of the rows the account itself performed (the
+  `user.account_delete` row is written just before, so it is cleared too).
 - **Files the row under the right category** — looked up from the catalogue by `action`.
 - **Snapshots the actor** (username, role, appRoleId from the JWT; displayName and
   appRole name from one cached DB lookup, 60 s per actor). `actor: null` stores

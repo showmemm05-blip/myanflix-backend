@@ -188,21 +188,24 @@ interface Bucket {
 
 /**
  * The per-route auth limits, by intent:
- *  - otpRequest: each SMS costs money — 3 codes per phone per 10 min, and
- *    20 per IP per hour so one address cannot burn codes across many phones.
+ *  - otpRequest: each SMS costs money — 4 codes per phone per 10 min, and
+ *    50 per IP per hour so one address cannot burn codes across many phones
+ *    (raised from 3 and 20 on 2026-09-29: many users share one address on
+ *    Wi-Fi and mobile-carrier NAT).
  *  - credential: anything that answers "is this password/code right?" —
- *    10 tries per phone/username per minute, 60 per IP per minute.
+ *    10 tries per phone/username per minute, 120 per IP per minute (raised
+ *    from 60 on 2026-09-29 for the same shared-address reason).
  *  - session: token/identity exchanges with no guessable secret in the body
  *    (google, refresh, register, logout) — 30 per IP per minute.
  */
 export const AUTH_THROTTLE_LIMITS = {
   otpRequest: {
-    [THROTTLER_TARGET]: { ttl: minutes(10), limit: 3 },
-    [THROTTLER_IP]: { ttl: hours(1), limit: 20 },
+    [THROTTLER_TARGET]: { ttl: minutes(10), limit: 4 },
+    [THROTTLER_IP]: { ttl: hours(1), limit: 50 },
   },
   credential: {
     [THROTTLER_TARGET]: { ttl: minutes(1), limit: 10 },
-    [THROTTLER_IP]: { ttl: minutes(1), limit: 60 },
+    [THROTTLER_IP]: { ttl: minutes(1), limit: 120 },
   },
   session: {
     [THROTTLER_IP]: { ttl: minutes(1), limit: 30 },

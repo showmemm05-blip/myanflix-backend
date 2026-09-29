@@ -55,14 +55,30 @@ export const PERMISSION_CATALOGUE = [
     actions: ['VIEW', 'CREATE', 'EDIT', 'DELETE'],
   },
   {
+    // BANK_EVIDENCE gates the bank-notification screenshot stream
+    // (GET /deposits/:id/bank-screenshot): that image shows the business
+    // account BALANCE, so it is separately grantable and — like AUDIT.VIEW —
+    // seeded to no role but the implicit SUPER_ADMIN. Verification review
+    // actions reuse EDIT.
     key: 'DEPOSITS',
     label: 'Deposits',
-    actions: ['VIEW', 'APPROVE', 'REJECT', 'CREATE', 'EDIT'],
+    actions: ['VIEW', 'APPROVE', 'REJECT', 'CREATE', 'EDIT', 'BANK_EVIDENCE'],
   },
   {
     key: 'WITHDRAWALS',
     label: 'Withdrawals',
-    actions: ['VIEW', 'APPROVE', 'REJECT', 'EDIT'],
+    actions: ['VIEW', 'APPROVE', 'REJECT', 'EDIT', 'BANK_EVIDENCE'],
+  },
+  {
+    // The phone-monitor's stored notifications (bank_transactions). VIEW is
+    // the list/detail/devices reads; BANK_EVIDENCE is the screenshot stream,
+    // kept apart for the same reason as DEPOSITS.BANK_EVIDENCE — the image
+    // shows the business account balance. Neither is seeded to any role
+    // but the implicit SUPER_ADMIN (no migration INSERT); the owner grants
+    // them from the roles matrix.
+    key: 'BANK_TRANSACTIONS',
+    label: 'Bank transactions',
+    actions: ['VIEW', 'BANK_EVIDENCE'],
   },
   {
     key: 'PAYMENT_METHODS',

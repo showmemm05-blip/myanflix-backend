@@ -7,6 +7,7 @@ import { UsersService } from '../../users/users.service';
 import { TrackingService } from '../../tracking/tracking.service';
 import type { AuthenticatedUser } from '../types/authenticated-user.type';
 import type { JwtPayload } from '../types/jwt-payload.type';
+import { isAccessTokenRevoked } from '../session-revocation.service';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
@@ -37,6 +38,15 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException('This account is no longer active');
     }
 
+    // H-21: every session of this account was revoked after this token was
+    // issued (password change/reset, suspension, role change...) — refused
+    // at once instead of living out its 15 minutes. Same 401 as an expired
+    // token, so clients take their normal refresh path: the kept session of
+    // a self-service change refreshes fine, every revoked one signs out.
+    if (isAccessTokenRevoked(payload, user.sessionsRevokedAt)) {
+      throw new UnauthorizedException('This session has been signed out');
+    }
+
     // Presence, refreshed off the traffic the clients already send — no
     // extra round trip, no heartbeat endpoint. Deliberately NOT awaited and
     // internally throttled to one write per user per minute, so it adds
@@ -52,6 +62,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       username: user.username,
       role: user.role,
       appRoleId: user.appRoleId,
+      ...(payload.sid && { sessionId: payload.sid }),
     };
   }
 }

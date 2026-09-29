@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import {
+  BadGatewayException,
   BadRequestException,
   ConflictException,
   NotFoundException,
@@ -43,6 +44,9 @@ describe('UploadsService', () => {
   let service: UploadsService;
   let prisma: {
     movie: { findUnique: jest.Mock; update: jest.Mock; updateMany: jest.Mock };
+    video: { update: jest.Mock; create: jest.Mock };
+    subtitle: { findMany: jest.Mock; deleteMany: jest.Mock };
+    $transaction: jest.Mock;
     uploadSession: {
       findFirst: jest.Mock;
       create: jest.Mock;
@@ -55,9 +59,14 @@ describe('UploadsService', () => {
     videoDir: jest.Mock;
     originalVideoPath: jest.Mock;
     originalObjectKey: jest.Mock;
+    hlsPackagePrefix: jest.Mock;
     hlsMasterKey: jest.Mock;
     hlsRenditionKeyPrefix: jest.Mock;
     imageObjectKey: jest.Mock;
+    videoKeyPrefix: jest.Mock;
+    subtitleSourcePrefix: jest.Mock;
+    videoReplaceStagingPrefix: jest.Mock;
+    videoReplaceStagingKey: jest.Mock;
   };
   let minioService: {
     downloadFile: jest.Mock;
@@ -65,6 +74,10 @@ describe('UploadsService', () => {
     uploadFile: jest.Mock;
     uploadBuffer: jest.Mock;
     publicUrl: jest.Mock;
+    listKeys: jest.Mock;
+    copyObject: jest.Mock;
+    deleteKeys: jest.Mock;
+    deleteByPrefix: jest.Mock;
   };
   let videosService: {
     findLatestForMovie: jest.Mock;
@@ -97,13 +110,38 @@ describe('UploadsService', () => {
         // wants a lost race overrides this with { count: 0 }.
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
+      video: {
+        update: jest.fn().mockResolvedValue({ id: 'video-1' }),
+        create: jest.fn().mockResolvedValue({ id: 'video-new' }),
+      },
+      subtitle: {
+        findMany: jest.fn().mockResolvedValue([]),
+        deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
+      // The interactive transaction of the replace swap runs its callback
+      // against the same mocks, so the spec sees every write it makes.
+      $transaction: jest.fn(),
       uploadSession: {
         findFirst: jest.fn(),
         create: jest.fn(),
         update: jest.fn(),
       },
     };
+    prisma.$transaction.mockImplementation(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma),
+    );
     storageService = {
+      videoKeyPrefix: jest.fn((movieId: string) => `videos/${movieId}`),
+      subtitleSourcePrefix: jest.fn(
+        (movieId: string) => `subtitles/${movieId}`,
+      ),
+      videoReplaceStagingPrefix: jest.fn(
+        (movieId: string) => `temp/video-replace/${movieId}`,
+      ),
+      videoReplaceStagingKey: jest.fn(
+        (movieId: string, rel: string) =>
+          `temp/video-replace/${movieId}/${rel}`,
+      ),
       uploadSessionDir: jest.fn((id: string) => `/storage/temp/uploads/${id}`),
       ensureDir: jest.fn().mockResolvedValue(undefined),
       videoDir: jest.fn((movieId: string) => `/storage/temp/videos/${movieId}`),
@@ -114,11 +152,19 @@ describe('UploadsService', () => {
       originalObjectKey: jest.fn(
         (movieId: string, ext: string) => `videos/${movieId}/original${ext}`,
       ),
+      // Mirrors the real builders (asserted for real in
+      // storage.service.spec.ts): a tag, passed only by the replace flow,
+      // moves the whole package one folder deeper into hls/v-<tag>/.
+      hlsPackagePrefix: jest.fn((movieId: string, tag?: string) =>
+        tag ? `videos/${movieId}/hls/v-${tag}` : `videos/${movieId}/hls`,
+      ),
       hlsMasterKey: jest.fn(
-        (movieId: string) => `videos/${movieId}/hls/master.m3u8`,
+        (movieId: string, tag?: string) =>
+          `${storageService.hlsPackagePrefix(movieId, tag)}/master.m3u8`,
       ),
       hlsRenditionKeyPrefix: jest.fn(
-        (movieId: string, name: string) => `videos/${movieId}/hls/${name}`,
+        (movieId: string, name: string, tag?: string) =>
+          `${storageService.hlsPackagePrefix(movieId, tag)}/${name}`,
       ),
       imageObjectKey: jest.fn(
         (purpose: string, imageId: string, ext: string) =>
@@ -131,6 +177,10 @@ describe('UploadsService', () => {
       uploadFile: jest.fn().mockResolvedValue(undefined),
       uploadBuffer: jest.fn().mockResolvedValue(undefined),
       publicUrl: jest.fn((key: string) => `https://cdn.example/${key}`),
+      listKeys: jest.fn().mockResolvedValue([]),
+      copyObject: jest.fn().mockResolvedValue(undefined),
+      deleteKeys: jest.fn().mockResolvedValue(undefined),
+      deleteByPrefix: jest.fn().mockResolvedValue(undefined),
     };
     videosService = {
       findLatestForMovie: jest.fn(),
@@ -1002,18 +1052,128 @@ describe('UploadsService', () => {
       );
     });
 
-    it('throws BadRequestException when the video is not FAILED', async () => {
+    it('throws BadRequestException when the video is READY and its master playlist is present', async () => {
       videosService.findLatestForMovie.mockResolvedValue({
         id: 'video-1',
         status: VideoStatus.READY,
         originalPath: 'videos/movie-1/original.mp4',
+        originalFilename: 'movie.mp4',
+        hlsMasterPath: 'videos/movie-1/hls/master.m3u8',
+      });
+      minioService.objectExists.mockResolvedValue(true);
+
+      await expect(service.reprocessVideo('movie-1', ACTOR)).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(minioService.objectExists).toHaveBeenCalledWith(
+        'videos/movie-1/hls/master.m3u8',
+      );
+      expect(processingService.processVideo).not.toHaveBeenCalled();
+    });
+
+    it('throws BadRequestException for an UPLOADING video — it is not stuck, it is still arriving', async () => {
+      videosService.findLatestForMovie.mockResolvedValue({
+        id: 'video-1',
+        status: VideoStatus.UPLOADING,
+        originalPath: '/storage/temp/videos/movie-1/original.mp4',
         originalFilename: 'movie.mp4',
       });
 
       await expect(service.reprocessVideo('movie-1', ACTOR)).rejects.toThrow(
         BadRequestException,
       );
-      expect(processingService.processVideo).not.toHaveBeenCalled();
+      expect(minioService.objectExists).not.toHaveBeenCalled();
+    });
+
+    it(
+      'accepts a READY video whose master playlist is GONE from the store — functionally failed, ' +
+        'exactly the case the playback diagnosis suggests a reprocess for',
+      async () => {
+        accessMock.mockRejectedValue(new Error('ENOENT'));
+        videosService.findLatestForMovie.mockResolvedValue({
+          id: 'video-1',
+          status: VideoStatus.READY,
+          originalPath: 'videos/movie-1/original.mp4',
+          originalFilename: 'original.mp4',
+          hlsMasterPath: 'videos/movie-1/hls/master.m3u8',
+        });
+        minioService.objectExists.mockResolvedValue(false);
+
+        const result = await service.reprocessVideo('movie-1', ACTOR);
+
+        expect(minioService.objectExists).toHaveBeenCalledWith(
+          'videos/movie-1/hls/master.m3u8',
+        );
+        expect(minioService.downloadFile).toHaveBeenCalledWith(
+          'videos/movie-1/original.mp4',
+          '/storage/temp/videos/movie-1/original.mp4',
+        );
+        expect(processingService.processVideo).toHaveBeenCalledWith(
+          'video-1',
+          'movie-1',
+          '/storage/temp/videos/movie-1/original.mp4',
+        );
+        expect(result).toEqual({
+          videoId: 'video-1',
+          status: VideoStatus.PROCESSING,
+        });
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: 'movie.reprocess',
+            metadata: { videoId: 'video-1', previousVideoStatus: 'READY' },
+          }),
+        );
+      },
+    );
+
+    it('sweeps a replaced hls/v-<tag>/ package before re-transcoding, so the un-versioned output does not orphan it', async () => {
+      accessMock.mockResolvedValue(undefined);
+      videosService.findLatestForMovie.mockResolvedValue({
+        id: 'video-1',
+        status: VideoStatus.FAILED,
+        originalPath: '/storage/temp/videos/movie-1/original.mp4',
+        originalFilename: 'movie.mp4',
+        hlsMasterPath: 'videos/movie-1/hls/v-abc123/master.m3u8',
+      });
+
+      await service.reprocessVideo('movie-1', ACTOR);
+
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+        'videos/movie-1/hls/v-abc123/',
+      );
+      expect(processingService.processVideo).toHaveBeenCalled();
+    });
+
+    it('leaves the un-versioned package alone before re-transcoding (the pipeline resumes per tier on those keys)', async () => {
+      accessMock.mockResolvedValue(undefined);
+      videosService.findLatestForMovie.mockResolvedValue({
+        id: 'video-1',
+        status: VideoStatus.FAILED,
+        originalPath: '/storage/temp/videos/movie-1/original.mp4',
+        originalFilename: 'movie.mp4',
+        hlsMasterPath: 'videos/movie-1/hls/master.m3u8',
+      });
+
+      await service.reprocessVideo('movie-1', ACTOR);
+
+      expect(minioService.deleteByPrefix).not.toHaveBeenCalled();
+      expect(processingService.processVideo).toHaveBeenCalled();
+    });
+
+    it('treats a READY video with no master path at all as master-missing too', async () => {
+      accessMock.mockResolvedValue(undefined);
+      videosService.findLatestForMovie.mockResolvedValue({
+        id: 'video-1',
+        status: VideoStatus.READY,
+        originalPath: '/storage/temp/videos/movie-1/original.mp4',
+        originalFilename: 'movie.mp4',
+        hlsMasterPath: null,
+      });
+
+      await service.reprocessVideo('movie-1', ACTOR);
+
+      expect(minioService.objectExists).not.toHaveBeenCalled();
+      expect(processingService.processVideo).toHaveBeenCalledTimes(1);
     });
 
     it('throws BadRequestException when no original file was ever recorded', async () => {
@@ -1187,6 +1347,812 @@ describe('UploadsService', () => {
 
         expect(processingService.release).not.toHaveBeenCalled();
         expect(processingService.processVideo).toHaveBeenCalledTimes(1);
+      });
+    });
+  });
+
+  describe('video replace — a new bundle for a title that already has a video', () => {
+    /** Original in a different container than the old one, one rendition dropped (1080p), one subtitle. */
+    const replacePaths = [
+      'original.mkv',
+      'hls/master.m3u8',
+      'hls/720p/index.m3u8',
+      'hls/720p/segment_000.ts',
+      'hls/480p/index.m3u8',
+      'hls/480p/segment_000.ts',
+      'subtitles/english.vtt',
+    ];
+    const dto = { relativePaths: replacePaths };
+    const publishedMovie = {
+      id: 'movie-1',
+      title: 'Movie 1',
+      status: MovieStatus.PUBLISHED,
+      seriesId: null,
+      duration: 90,
+    };
+    const movieWithStatus = (status: MovieStatus) => ({
+      ...publishedMovie,
+      status,
+    });
+    const servedVideo = {
+      id: 'video-1',
+      movieId: 'movie-1',
+      status: VideoStatus.READY,
+      originalFilename: 'original.mp4',
+      originalPath: 'videos/movie-1/original.mp4',
+      hlsMasterPath: 'videos/movie-1/hls/master.m3u8',
+      renditions: [
+        {
+          resolution: '1080p',
+          playlistPath: 'videos/movie-1/hls/1080p/index.m3u8',
+        },
+        {
+          resolution: '720p',
+          playlistPath: 'videos/movie-1/hls/720p/index.m3u8',
+        },
+      ],
+      duration: 5400,
+      resolution: null,
+      failureReason: null,
+    };
+    /** What the title holds in MinIO before the swap. */
+    const oldVideoKeys = [
+      'videos/movie-1/original.mp4',
+      'videos/movie-1/hls/master.m3u8',
+      'videos/movie-1/hls/720p/index.m3u8',
+      'videos/movie-1/hls/720p/segment_000.ts',
+      'videos/movie-1/hls/1080p/index.m3u8',
+      'videos/movie-1/hls/1080p/segment_000.ts',
+      'videos/movie-1/hls/subs/old-sub.vtt',
+      'videos/movie-1/hls/subs/old-sub.m3u8',
+    ];
+    const oldSubtitleKeys = ['subtitles/movie-1/old-sub.srt'];
+    const STAGING = 'temp/video-replace/movie-1/';
+    /**
+     * The package tag every replace below mints — pinned so the versioned
+     * keys are literal. Where the new package lands: never the old keys.
+     */
+    const TAG = 'test01';
+    const PACKAGE = `videos/movie-1/hls/v-${TAG}`;
+    const NEW_MASTER = `${PACKAGE}/master.m3u8`;
+    let tagSpy: jest.SpyInstance<string, []>;
+
+    beforeEach(() => {
+      tagSpy = jest
+        .spyOn(
+          service as unknown as { hlsVersionTag: () => string },
+          'hlsVersionTag',
+        )
+        .mockReturnValue(TAG);
+    });
+
+    /** A movie with a served video and its current objects — the normal starting point. */
+    const liveTitle = (status: MovieStatus = MovieStatus.PUBLISHED) => {
+      prisma.movie.findUnique.mockResolvedValue(movieWithStatus(status));
+      videosService.findLatestForMovie.mockResolvedValue(servedVideo);
+      prisma.subtitle.findMany.mockResolvedValue([
+        {
+          id: 'old-sub',
+          language: 'my',
+          label: 'Myanmar',
+          format: 'SRT',
+          objectKey: 'subtitles/movie-1/old-sub.srt',
+          isDefault: true,
+        },
+      ]);
+      minioService.listKeys.mockImplementation(async (prefix: string) =>
+        prefix === 'videos/movie-1/'
+          ? oldVideoKeys
+          : prefix === 'subtitles/movie-1/'
+            ? oldSubtitleKeys
+            : [],
+      );
+    };
+
+    /** Nothing about the title — objects, Video, Subtitle, Movie — was written. */
+    const expectOldTitleUntouched = () => {
+      expect(minioService.copyObject).not.toHaveBeenCalled();
+      expect(minioService.deleteKeys).not.toHaveBeenCalled();
+      expect(prisma.video.update).not.toHaveBeenCalled();
+      expect(prisma.video.create).not.toHaveBeenCalled();
+      expect(prisma.subtitle.deleteMany).not.toHaveBeenCalled();
+      expect(subtitlesService.createFromExistingKey).not.toHaveBeenCalled();
+      expect(prisma.movie.update).not.toHaveBeenCalled();
+      expect(prisma.movie.updateMany).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+    };
+
+    describe('beginReplace', () => {
+      it('throws NotFoundException when the movie does not exist', async () => {
+        prisma.movie.findUnique.mockResolvedValue(null);
+
+        await expect(service.beginReplace('movie-1')).rejects.toThrow(
+          NotFoundException,
+        );
+        expect(minioService.deleteByPrefix).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        MovieStatus.PUBLISHED,
+        MovieStatus.READY_TO_PUBLISH,
+        MovieStatus.FAILED,
+      ])(
+        'opens for a %s movie: clears the staging prefix, hands back the resourceType, writes nothing',
+        async (status) => {
+          liveTitle(status);
+
+          const result = await service.beginReplace('movie-1');
+
+          expect(result).toEqual({
+            movieId: 'movie-1',
+            resourceType: 'movie-replace',
+            stagingPrefix: STAGING,
+          });
+          expect(minioService.deleteByPrefix).toHaveBeenCalledWith(STAGING);
+          expectOldTitleUntouched();
+        },
+      );
+
+      it.each([
+        MovieStatus.UPLOADING,
+        MovieStatus.PROCESSING,
+        MovieStatus.DRAFT,
+        MovieStatus.ARCHIVED,
+      ])('refuses with ConflictException for a %s movie', async (status) => {
+        liveTitle(status);
+
+        await expect(service.beginReplace('movie-1')).rejects.toThrow(
+          ConflictException,
+        );
+        expect(minioService.deleteByPrefix).not.toHaveBeenCalled();
+      });
+
+      it('refuses with ConflictException while the current video is actively transcoding', async () => {
+        liveTitle();
+        processingService.isActivelyProcessing.mockReturnValue(true);
+
+        await expect(service.beginReplace('movie-1')).rejects.toThrow(
+          ConflictException,
+        );
+        expect(processingService.isActivelyProcessing).toHaveBeenCalledWith(
+          'video-1',
+        );
+        expect(minioService.deleteByPrefix).not.toHaveBeenCalled();
+      });
+
+      it('opens for a title that has no Video row yet at all', async () => {
+        prisma.movie.findUnique.mockResolvedValue(publishedMovie);
+        videosService.findLatestForMovie.mockResolvedValue(null);
+
+        await expect(service.beginReplace('movie-1')).resolves.toMatchObject({
+          resourceType: 'movie-replace',
+        });
+      });
+    });
+
+    describe('cancelReplace', () => {
+      it('deletes only the staging prefix', async () => {
+        liveTitle();
+
+        await service.cancelReplace('movie-1');
+
+        expect(minioService.deleteByPrefix).toHaveBeenCalledWith(STAGING);
+        expectOldTitleUntouched();
+      });
+
+      it('throws NotFoundException when the movie does not exist', async () => {
+        prisma.movie.findUnique.mockResolvedValue(null);
+
+        await expect(service.cancelReplace('movie-1')).rejects.toThrow(
+          NotFoundException,
+        );
+      });
+    });
+
+    describe('finalizeReplace', () => {
+      it('throws NotFoundException when the movie does not exist', async () => {
+        prisma.movie.findUnique.mockResolvedValue(null);
+
+        await expect(
+          service.finalizeReplace('movie-1', dto, ACTOR),
+        ).rejects.toThrow(NotFoundException);
+      });
+
+      it.each([
+        MovieStatus.UPLOADING,
+        MovieStatus.PROCESSING,
+        MovieStatus.DRAFT,
+        MovieStatus.ARCHIVED,
+      ])(
+        'refuses with ConflictException and touches nothing when the movie is %s',
+        async (status) => {
+          liveTitle(status);
+
+          await expect(
+            service.finalizeReplace('movie-1', dto, ACTOR),
+          ).rejects.toThrow(ConflictException);
+
+          expect(minioService.objectExists).not.toHaveBeenCalled();
+          expect(minioService.deleteByPrefix).not.toHaveBeenCalled();
+          expectOldTitleUntouched();
+        },
+      );
+
+      it('refuses with ConflictException while the current video is actively transcoding', async () => {
+        liveTitle();
+        processingService.isActivelyProcessing.mockReturnValue(true);
+
+        await expect(
+          service.finalizeReplace('movie-1', dto, ACTOR),
+        ).rejects.toThrow(ConflictException);
+        expectOldTitleUntouched();
+      });
+
+      it(
+        'an invalid bundle structure is a 400 that cleans the staging and leaves the old video, ' +
+          'its subtitles and the movie status exactly as they were',
+        async () => {
+          liveTitle();
+
+          await expect(
+            service.finalizeReplace(
+              'movie-1',
+              { relativePaths: ['hls/master.m3u8'] }, // no original, no rendition
+              ACTOR,
+            ),
+          ).rejects.toThrow(BadRequestException);
+
+          expect(minioService.deleteByPrefix).toHaveBeenCalledWith(STAGING);
+          expect(minioService.objectExists).not.toHaveBeenCalled();
+          expect(minioService.listKeys).not.toHaveBeenCalled();
+          expectOldTitleUntouched();
+        },
+      );
+
+      it(
+        'a required file missing from the STAGING prefix is a 400 that cleans the staging and ' +
+          'leaves the old video untouched — the client is never trusted about what it uploaded',
+        async () => {
+          liveTitle();
+          minioService.objectExists.mockImplementation(
+            async (key: string) =>
+              key !== 'temp/video-replace/movie-1/hls/480p/index.m3u8',
+          );
+
+          await expect(
+            service.finalizeReplace('movie-1', dto, ACTOR),
+          ).rejects.toThrow('missing staged files: hls/480p/index.m3u8');
+
+          // Every check is against the staging, never the live keys.
+          for (const key of minioService.objectExists.mock.calls.map(
+            ([k]) => k as string,
+          )) {
+            expect(key.startsWith(STAGING)).toBe(true);
+          }
+          expect(minioService.objectExists).toHaveBeenCalledWith(
+            'temp/video-replace/movie-1/subtitles/english.vtt',
+          );
+          expect(minioService.deleteByPrefix).toHaveBeenCalledWith(STAGING);
+          expect(minioService.listKeys).not.toHaveBeenCalled();
+          expectOldTitleUntouched();
+        },
+      );
+
+      describe('the swap on a PUBLISHED title', () => {
+        beforeEach(() => {
+          liveTitle();
+          videoDurationService.recoverHlsDurationSeconds.mockResolvedValue(
+            6120,
+          );
+          subtitlesService.createFromExistingKey.mockResolvedValue({
+            id: 'sub-new',
+          });
+        });
+
+        it('copies the HLS package into a FRESH hls/v-<tag>/ folder and the rest to the key a fresh upload would get, with the master strictly LAST', async () => {
+          await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          const copies = minioService.copyObject.mock.calls as [
+            string,
+            string,
+          ][];
+          expect(copies).toHaveLength(replacePaths.length);
+          // Staged key -> final key. hls/** is re-rooted under the versioned
+          // package (the cache servers hold the OLD segment keys for 7 days,
+          // so a same-named 720p/segment_000.ts must never be reused);
+          // the original and the subtitle source keep their un-versioned
+          // keys, subtitles leaving videos/ for subtitles/.
+          expect(copies).toContainEqual([
+            'temp/video-replace/movie-1/original.mkv',
+            'videos/movie-1/original.mkv',
+          ]);
+          expect(copies).toContainEqual([
+            'temp/video-replace/movie-1/hls/720p/segment_000.ts',
+            `${PACKAGE}/720p/segment_000.ts`,
+          ]);
+          expect(copies).toContainEqual([
+            'temp/video-replace/movie-1/hls/720p/index.m3u8',
+            `${PACKAGE}/720p/index.m3u8`,
+          ]);
+          expect(copies).toContainEqual([
+            'temp/video-replace/movie-1/subtitles/english.vtt',
+            'subtitles/movie-1/english.vtt',
+          ]);
+          // Not one HLS object lands on the un-versioned keys the old
+          // package (and the cache) still hold.
+          for (const [, dst] of copies) {
+            expect(dst).not.toMatch(/^videos\/movie-1\/hls\/(?!v-test01\/)/);
+          }
+          // Order is by PHASE: every segment, subtitle source and the
+          // original land before any rendition playlist, and the master
+          // comes strictly last — so a playlist never names a file that is
+          // not at its final key yet.
+          const finals = copies.map(([, dst]) => dst);
+          expect(finals.at(-1)).toBe(NEW_MASTER);
+          const isPlaylist = (key: string) =>
+            key.includes('/hls/') && key.endsWith('/index.m3u8');
+          const firstPlaylist = finals.findIndex(isPlaylist);
+          const lastNonPlaylist = finals
+            .slice(0, -1) // the master
+            .reduce((last, key, i) => (isPlaylist(key) ? last : i), -1);
+          expect(firstPlaylist).toBeGreaterThan(-1);
+          expect(lastNonPlaylist).toBeLessThan(firstPlaylist);
+        });
+
+        it('deletes the WHOLE old HLS package (master, every rendition, subs/) plus the old original and subtitle source — nothing of it is reused', async () => {
+          const result = await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(minioService.listKeys).toHaveBeenCalledWith('videos/movie-1/');
+          expect(minioService.listKeys).toHaveBeenCalledWith(
+            'subtitles/movie-1/',
+          );
+          expect(minioService.deleteKeys).toHaveBeenCalledTimes(1);
+          // The un-versioned hls/ keys go in full — the 720p the new bundle
+          // ALSO carries included, because the new 720p lives in v-test01/.
+          // That is what stops a cache server's 7-day copy of the old
+          // segment_000.ts from ever being served for the new playlist.
+          expect(minioService.deleteKeys.mock.calls[0][0]).toEqual([
+            'videos/movie-1/original.mp4',
+            'videos/movie-1/hls/master.m3u8',
+            'videos/movie-1/hls/720p/index.m3u8',
+            'videos/movie-1/hls/720p/segment_000.ts',
+            'videos/movie-1/hls/1080p/index.m3u8',
+            'videos/movie-1/hls/1080p/segment_000.ts',
+            'videos/movie-1/hls/subs/old-sub.vtt',
+            'videos/movie-1/hls/subs/old-sub.m3u8',
+            'subtitles/movie-1/old-sub.srt',
+          ]);
+          expect(result.deletedObjects).toBe(9);
+          expect(result.copiedObjects).toBe(replacePaths.length);
+        });
+
+        it('snapshots the old keys BEFORE copying, so a same-named key that was overwritten (original, subtitle source) is never deleted', async () => {
+          // Same container and the same subtitle filename as the new bundle:
+          // both are copied over in place, and must survive the sweep.
+          minioService.listKeys.mockImplementation(async (prefix: string) =>
+            prefix === 'videos/movie-1/'
+              ? [
+                  'videos/movie-1/original.mkv',
+                  'videos/movie-1/hls/master.m3u8',
+                ]
+              : prefix === 'subtitles/movie-1/'
+                ? ['subtitles/movie-1/english.vtt']
+                : [],
+          );
+
+          await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          const listOrder = minioService.listKeys.mock.invocationCallOrder[0];
+          const firstCopyOrder =
+            minioService.copyObject.mock.invocationCallOrder[0];
+          expect(listOrder).toBeLessThan(firstCopyOrder);
+          expect(minioService.deleteKeys.mock.calls[0][0]).toEqual([
+            'videos/movie-1/hls/master.m3u8',
+          ]);
+        });
+
+        it('a SECOND replace mints a new tag: the previous v-<tag> package is deleted as stale and the new one is untouched', async () => {
+          const previous = 'videos/movie-1/hls/v-old111';
+          videosService.findLatestForMovie.mockResolvedValue({
+            ...servedVideo,
+            hlsMasterPath: `${previous}/master.m3u8`,
+            renditions: [
+              {
+                resolution: '720p',
+                playlistPath: `${previous}/720p/index.m3u8`,
+              },
+            ],
+          });
+          minioService.listKeys.mockImplementation(async (prefix: string) =>
+            prefix === 'videos/movie-1/'
+              ? [
+                  'videos/movie-1/original.mkv',
+                  `${previous}/master.m3u8`,
+                  `${previous}/720p/index.m3u8`,
+                  `${previous}/720p/segment_000.ts`,
+                  `${previous}/subs/sub-a.vtt`,
+                  `${previous}/subs/sub-a.m3u8`,
+                ]
+              : [],
+          );
+
+          const result = await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(minioService.deleteKeys.mock.calls[0][0]).toEqual([
+            `${previous}/master.m3u8`,
+            `${previous}/720p/index.m3u8`,
+            `${previous}/720p/segment_000.ts`,
+            `${previous}/subs/sub-a.vtt`,
+            `${previous}/subs/sub-a.m3u8`,
+          ]);
+          expect(result.deletedObjects).toBe(5);
+          expect(prisma.video.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({ hlsMasterPath: NEW_MASTER }),
+            }),
+          );
+        });
+
+        it('mints the tag ONCE per swap — every HLS key of the run shares it', async () => {
+          await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(tagSpy).toHaveBeenCalledTimes(1);
+          const hlsFinals = (
+            minioService.copyObject.mock.calls as [string, string][]
+          )
+            .map(([, dst]) => dst)
+            .filter((key) => key.includes('/hls/'));
+          expect(hlsFinals.length).toBeGreaterThan(0);
+          for (const key of hlsFinals) {
+            expect(key.startsWith(`${PACKAGE}/`)).toBe(true);
+          }
+        });
+
+        it('rewrites the served Video row IN PLACE — same id, READY, new paths/renditions/duration, failureReason cleared', async () => {
+          const result = await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+          expect(prisma.video.update).toHaveBeenCalledWith({
+            where: { id: 'video-1' },
+            data: {
+              status: VideoStatus.READY,
+              originalFilename: 'original.mkv',
+              originalPath: 'videos/movie-1/original.mkv',
+              // The row is the ONLY record of which package is live:
+              // playback, diagnosis and the subtitle publisher read these.
+              hlsMasterPath: NEW_MASTER,
+              renditions: [
+                {
+                  resolution: '480p',
+                  playlistPath: `${PACKAGE}/480p/index.m3u8`,
+                },
+                {
+                  resolution: '720p',
+                  playlistPath: `${PACKAGE}/720p/index.m3u8`,
+                },
+              ],
+              resolution: null,
+              duration: 6120,
+              failureReason: null,
+            },
+          });
+          expect(prisma.video.create).not.toHaveBeenCalled();
+          expect(videosService.create).not.toHaveBeenCalled();
+          expect(result).toEqual({
+            videoId: 'video-1',
+            status: VideoStatus.READY,
+            renditions: ['480p', '720p'],
+            subtitles: 1,
+            durationSeconds: 6120,
+            copiedObjects: replacePaths.length,
+            deletedObjects: 9,
+          });
+        });
+
+        it('replaces the Subtitle rows exactly as finalize creates them: deleteMany first, then one createFromExistingKey per staged track', async () => {
+          await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(prisma.subtitle.deleteMany).toHaveBeenCalledWith({
+            where: { videoId: 'video-1' },
+          });
+          expect(subtitlesService.createFromExistingKey).toHaveBeenCalledTimes(
+            1,
+          );
+          expect(subtitlesService.createFromExistingKey).toHaveBeenCalledWith({
+            videoId: 'video-1',
+            language: 'en',
+            label: 'English',
+            format: 'VTT',
+            objectKey: 'subtitles/movie-1/english.vtt',
+          });
+          expect(
+            prisma.subtitle.deleteMany.mock.invocationCallOrder[0],
+          ).toBeLessThan(
+            subtitlesService.createFromExistingKey.mock.invocationCallOrder[0],
+          );
+        });
+
+        it('NEVER writes the Movie row — a PUBLISHED title stays PUBLISHED through the whole swap', async () => {
+          await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(prisma.movie.update).not.toHaveBeenCalled();
+          expect(prisma.movie.updateMany).not.toHaveBeenCalled();
+        });
+
+        it('refreshes the runtime from the FINAL (versioned) master and offers it to the Movie through the duration-0 guard, never a blind write', async () => {
+          await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(
+            videoDurationService.recoverHlsDurationSeconds,
+          ).toHaveBeenCalledWith(NEW_MASTER);
+          // Read after the copy — the duration comes from what viewers will play.
+          expect(
+            videoDurationService.recoverHlsDurationSeconds.mock
+              .invocationCallOrder[0],
+          ).toBeGreaterThan(
+            minioService.copyObject.mock.invocationCallOrder.at(-1)!,
+          );
+          expect(
+            videoDurationService.fillMovieDurationIfUnknown,
+          ).toHaveBeenCalledWith('movie-1', 6120);
+        });
+
+        it('leaves the Movie runtime alone when nothing could be recovered', async () => {
+          videoDurationService.recoverHlsDurationSeconds.mockResolvedValue(
+            null,
+          );
+
+          const result = await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(
+            videoDurationService.fillMovieDurationIfUnknown,
+          ).not.toHaveBeenCalled();
+          expect(prisma.video.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({ duration: null }),
+            }),
+          );
+          expect(result.durationSeconds).toBeNull();
+        });
+
+        it('clears the staging once the swap is done', async () => {
+          await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(minioService.deleteByPrefix).toHaveBeenCalledWith(STAGING);
+          expect(
+            minioService.deleteByPrefix.mock.invocationCallOrder[0],
+          ).toBeGreaterThan(
+            minioService.copyObject.mock.invocationCallOrder.at(-1)!,
+          );
+        });
+
+        it('records ONE movie.video_replace row with the old and new Video + Subtitle snapshots', async () => {
+          await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(audit.record).toHaveBeenCalledTimes(1);
+          expect(audit.record).toHaveBeenCalledWith(
+            expect.objectContaining({
+              action: 'movie.video_replace',
+              actor: ACTOR,
+              target: { type: 'movie', id: 'movie-1', label: 'Movie 1' },
+              before: {
+                video: {
+                  id: 'video-1',
+                  status: VideoStatus.READY,
+                  originalFilename: 'original.mp4',
+                  originalPath: 'videos/movie-1/original.mp4',
+                  hlsMasterPath: 'videos/movie-1/hls/master.m3u8',
+                  renditions: servedVideo.renditions,
+                  duration: 5400,
+                  resolution: null,
+                  failureReason: null,
+                },
+                subtitles: [
+                  expect.objectContaining({ id: 'old-sub', label: 'Myanmar' }),
+                ],
+                movieDuration: 90,
+              },
+              after: expect.objectContaining({
+                video: expect.objectContaining({
+                  id: 'video-1',
+                  status: VideoStatus.READY,
+                  originalPath: 'videos/movie-1/original.mkv',
+                  hlsMasterPath: NEW_MASTER,
+                  duration: 6120,
+                }),
+                subtitles: [
+                  { id: 'sub-new', language: 'en', label: 'English' },
+                ],
+              }),
+              metadata: expect.objectContaining({
+                flow: 'replace',
+                outcome: 'replaced',
+                renditions: ['480p', '720p'],
+                durationSeconds: 6120,
+                copiedObjects: replacePaths.length,
+                deletedObjects: 9,
+                stagingPrefix: STAGING,
+                hlsPackagePrefix: PACKAGE,
+              }),
+            }),
+          );
+        });
+
+        it('never runs ffmpeg', async () => {
+          await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(processingService.processVideo).not.toHaveBeenCalled();
+        });
+
+        it('a failed stale-delete is a logged leak, not a failed swap', async () => {
+          minioService.deleteKeys.mockRejectedValue(new Error('minio hiccup'));
+
+          const result = await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(result.status).toBe(VideoStatus.READY);
+          expect(result.deletedObjects).toBe(0);
+          expect(prisma.video.update).toHaveBeenCalledTimes(1);
+        });
+      });
+
+      it('works the same on a READY_TO_PUBLISH and a FAILED movie, and the status still never changes', async () => {
+        for (const status of [
+          MovieStatus.READY_TO_PUBLISH,
+          MovieStatus.FAILED,
+        ]) {
+          jest.clearAllMocks();
+          prisma.$transaction.mockImplementation(
+            async (fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma),
+          );
+          prisma.video.update.mockResolvedValue({ id: 'video-1' });
+          liveTitle(status);
+
+          const result = await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(result.videoId).toBe('video-1');
+          expect(prisma.movie.update).not.toHaveBeenCalled();
+          expect(prisma.movie.updateMany).not.toHaveBeenCalled();
+        }
+      });
+
+      it('creates the Video row when the title never had one (READY, same fields), instead of updating', async () => {
+        prisma.movie.findUnique.mockResolvedValue(publishedMovie);
+        videosService.findLatestForMovie.mockResolvedValue(null);
+        minioService.listKeys.mockResolvedValue([]);
+
+        const result = await service.finalizeReplace('movie-1', dto, ACTOR);
+
+        expect(prisma.video.create).toHaveBeenCalledWith({
+          data: expect.objectContaining({
+            movieId: 'movie-1',
+            status: VideoStatus.READY,
+            originalPath: 'videos/movie-1/original.mkv',
+            hlsMasterPath: NEW_MASTER,
+          }),
+        });
+        expect(prisma.video.update).not.toHaveBeenCalled();
+        expect(prisma.subtitle.findMany).not.toHaveBeenCalled();
+        expect(prisma.subtitle.deleteMany).toHaveBeenCalledWith({
+          where: { videoId: 'video-new' },
+        });
+        expect(subtitlesService.createFromExistingKey).toHaveBeenCalledWith(
+          expect.objectContaining({ videoId: 'video-new' }),
+        );
+        expect(result.videoId).toBe('video-new');
+        expect(minioService.deleteKeys).toHaveBeenCalledWith([]);
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({
+            before: expect.objectContaining({ video: null, subtitles: [] }),
+          }),
+        );
+      });
+
+      describe('a copy failing mid-swap — the one partial-state case', () => {
+        beforeEach(() => {
+          liveTitle();
+          minioService.copyObject.mockImplementation(
+            async (src: string, dst: string) => {
+              if (dst === `${PACKAGE}/480p/segment_000.ts`) {
+                throw new Error('connection reset');
+              }
+            },
+          );
+        });
+
+        it('answers 502, leaves the served Video untouched (the old package still plays), sweeps the half-written folder, and touches nothing else', async () => {
+          await expect(
+            service.finalizeReplace('movie-1', dto, ACTOR),
+          ).rejects.toThrow(BadGatewayException);
+
+          // The old package is intact in its own folder and the row still
+          // points at it — nothing is marked FAILED any more.
+          expect(prisma.video.update).not.toHaveBeenCalled();
+          // The orphan-to-be is swept; the staging is not.
+          expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+            `${PACKAGE}/`,
+          );
+          expect(minioService.deleteByPrefix).not.toHaveBeenCalledWith(STAGING);
+          // The master was never written, no stale delete, no row rewrite,
+          // no subtitles, no movie write.
+          expect(minioService.copyObject).not.toHaveBeenCalledWith(
+            expect.anything(),
+            NEW_MASTER,
+          );
+          expect(minioService.deleteKeys).not.toHaveBeenCalled();
+          expect(prisma.$transaction).not.toHaveBeenCalled();
+          expect(prisma.subtitle.deleteMany).not.toHaveBeenCalled();
+          expect(subtitlesService.createFromExistingKey).not.toHaveBeenCalled();
+          expect(prisma.movie.update).not.toHaveBeenCalled();
+          expect(prisma.movie.updateMany).not.toHaveBeenCalled();
+        });
+
+        it('KEEPS the staging so finalize-replace can be retried, and records the interruption', async () => {
+          await expect(
+            service.finalizeReplace('movie-1', dto, ACTOR),
+          ).rejects.toThrow('replace interrupted during copy');
+
+          expect(minioService.deleteByPrefix).not.toHaveBeenCalledWith(STAGING);
+          expect(audit.record).toHaveBeenCalledTimes(1);
+          expect(audit.record).toHaveBeenCalledWith(
+            expect.objectContaining({
+              action: 'movie.video_replace',
+              metadata: expect.objectContaining({
+                flow: 'replace',
+                outcome: 'interrupted',
+                failedKey: `${PACKAGE}/480p/segment_000.ts`,
+                copiedObjects: expect.any(Number),
+              }),
+            }),
+          );
+        });
+
+        it('with no Video row — still 502, still audited, nothing written', async () => {
+          videosService.findLatestForMovie.mockResolvedValue(null);
+
+          await expect(
+            service.finalizeReplace('movie-1', dto, ACTOR),
+          ).rejects.toThrow(BadGatewayException);
+
+          expect(prisma.video.update).not.toHaveBeenCalled();
+          expect(audit.record).toHaveBeenCalledWith(
+            expect.objectContaining({
+              metadata: expect.objectContaining({ outcome: 'interrupted' }),
+            }),
+          );
+        });
+      });
+
+      it('three parallel finalize-replace calls for one movie join a single run', async () => {
+        liveTitle();
+
+        const results = await Promise.all([
+          service.finalizeReplace('movie-1', dto, ACTOR),
+          service.finalizeReplace('movie-1', dto, ACTOR),
+          service.finalizeReplace('movie-1', dto, ACTOR),
+        ]);
+
+        expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+        expect(minioService.copyObject).toHaveBeenCalledTimes(
+          replacePaths.length,
+        );
+        expect(audit.record).toHaveBeenCalledTimes(1);
+        expect(results[0]).toBe(results[1]);
+        expect(results[1]).toBe(results[2]);
+      });
+    });
+
+    describe('hlsVersionTag — the real one, unpinned', () => {
+      it('is 8 lowercase hex characters, different on every call', () => {
+        tagSpy.mockRestore();
+        const mint = () =>
+          (
+            service as unknown as { hlsVersionTag: () => string }
+          ).hlsVersionTag();
+
+        const tags = new Set(Array.from({ length: 50 }, mint));
+
+        for (const tag of tags) expect(tag).toMatch(/^[0-9a-f]{8}$/);
+        expect(tags.size).toBe(50);
       });
     });
   });

@@ -1,22 +1,27 @@
 /**
  * Seeds just user accounts (+ their wallets) for testing login — safe to run
  * against a database that already has real data, since it upserts by username
- * instead of wiping the database first like seed.ts does.
+ * instead of wiping the database first like seed.ts does. It DOES reset the
+ * password, role and status of every account it names.
  *
- * Run with: npm run db:seed:users
+ * Run with: SEED_PASSWORD=<a password for every seeded account> npm run db:seed:users
  * (compiles through `nest build` first, same reason as seed.ts — the
  * generated Prisma client's nodenext ".js" imports only resolve once built.)
+ *
+ * H-2: refuses NODE_ENV=production (see seed-guard.ts), and the repo holds
+ * no default password. Production gets its first Super Admin from
+ * `npm run create-superadmin`, never from here.
  */
 import 'dotenv/config';
 import * as bcrypt from 'bcrypt';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient, Role, UserStatus } from '../generated/prisma/client';
+import { assertSeedAllowed, seedPassword } from './seed-guard';
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
 
 const PASSWORD_SALT_ROUNDS = 10;
-const DEFAULT_PASSWORD = 'Password123!';
 
 interface UserSeed {
   username: string;
@@ -98,12 +103,12 @@ const USER_SEEDS: UserSeed[] = [
 ];
 
 async function main() {
+  // Both checks run before anything is written.
+  assertSeedAllowed('seed-users.ts');
+  const password = seedPassword();
   console.log('Seeding users (non-destructive upsert by username)...');
 
-  const passwordHash = await bcrypt.hash(
-    DEFAULT_PASSWORD,
-    PASSWORD_SALT_ROUNDS,
-  );
+  const passwordHash = await bcrypt.hash(password, PASSWORD_SALT_ROUNDS);
 
   for (const seed of USER_SEEDS) {
     const user = await prisma.user.upsert({
@@ -129,7 +134,7 @@ async function main() {
   }
 
   console.log(`Seed complete: ${USER_SEEDS.length} users upserted.`);
-  console.log(`Default password for every seeded account: ${DEFAULT_PASSWORD}`);
+  console.log('Every seeded account uses the SEED_PASSWORD of this run.');
 }
 
 main()

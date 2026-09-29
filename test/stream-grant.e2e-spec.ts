@@ -14,6 +14,7 @@ import {
   ChapterStatus,
   MovieStatus,
   Role,
+  SeriesStatus,
   SubtitleFormat,
   UserStatus,
   VideoStatus,
@@ -60,6 +61,13 @@ describe('Stream grant (e2e)', () => {
   let bookId: string;
   let editionId: string;
   let chapterId: string;
+  // H-7: titles a regular viewer must not be able to stream.
+  let staffUserId: string;
+  let staffToken: string;
+  let draftMovieId: string;
+  let archivedMovieId: string;
+  let hiddenSeriesId: string;
+  let hiddenEpisodeId: string;
 
   async function signToken(id: string): Promise<string> {
     return jwtService.signAsync(
@@ -185,6 +193,74 @@ describe('Stream grant (e2e)', () => {
       },
     });
 
+    // H-7 fixtures: FREE (so nothing but the publish rule can refuse them),
+    // each with a READY video under the real key shape, so a refusal can
+    // only come from the status check.
+    const staff = await prisma.user.create({
+      data: {
+        username: `stream_staff_${suffix}`,
+        password: 'unused-in-these-tests',
+        role: Role.ADMIN,
+        status: UserStatus.ACTIVE,
+      },
+    });
+    staffUserId = staff.id;
+    staffToken = await signToken(staff.id);
+
+    const hiddenSeries = await prisma.series.create({
+      data: {
+        title: `Unpublished show ${suffix}`,
+        description: 'stream grant fixture',
+        genre: 'Drama',
+        language: 'Burmese',
+        releaseYear: 2026,
+        accessType: AccessType.FREE,
+        status: SeriesStatus.DRAFT,
+      },
+    });
+    hiddenSeriesId = hiddenSeries.id;
+
+    const hiddenTitle = async (
+      label: string,
+      status: MovieStatus,
+      episodeOf?: string,
+    ): Promise<string> => {
+      const row = await prisma.movie.create({
+        data: {
+          title: `${label} ${suffix}`,
+          description: 'stream grant fixture',
+          genre: 'Drama',
+          language: 'Burmese',
+          releaseYear: 2026,
+          duration: 45,
+          accessType: AccessType.FREE,
+          status,
+          ...(episodeOf && {
+            seriesId: episodeOf,
+            seasonNumber: 1,
+            episodeNumber: 1,
+          }),
+        },
+      });
+      await prisma.video.create({
+        data: {
+          movieId: row.id,
+          originalFilename: 'fixture.mp4',
+          originalPath: `videos/${row.id}/original.mp4`,
+          status: VideoStatus.READY,
+          hlsMasterPath: `videos/${row.id}/hls/master.m3u8`,
+        },
+      });
+      return row.id;
+    };
+    draftMovieId = await hiddenTitle('Draft film', MovieStatus.DRAFT);
+    archivedMovieId = await hiddenTitle('Archived film', MovieStatus.ARCHIVED);
+    hiddenEpisodeId = await hiddenTitle(
+      'Episode of a draft show',
+      MovieStatus.PUBLISHED,
+      hiddenSeriesId,
+    );
+
     const book = await prisma.book.create({
       data: {
         title: `Signed pages ${suffix}`,
@@ -229,10 +305,20 @@ describe('Stream grant (e2e)', () => {
   afterAll(async () => {
     // Isolated test database — safe to hard-delete everything this suite
     // made. Video/subtitle/page rows cascade from their parents.
-    await prisma.movie.deleteMany({ where: { id: movieId } });
+    await prisma.movie.deleteMany({
+      where: { id: { in: [movieId, draftMovieId, archivedMovieId] } },
+    });
+    // Its episode cascades with it.
+    await prisma.series.deleteMany({ where: { id: hiddenSeriesId } });
     await prisma.book.deleteMany({ where: { id: bookId } });
+    // Money rows no longer cascade from users (H-22: ON DELETE RESTRICT).
+    await prisma.userSubscription.deleteMany({
+      where: { userId: { in: [subscribedUserId, unsubscribedUserId] } },
+    });
     await prisma.user.deleteMany({
-      where: { id: { in: [subscribedUserId, unsubscribedUserId] } },
+      where: {
+        id: { in: [subscribedUserId, unsubscribedUserId, staffUserId] },
+      },
     });
     await prisma.subscriptionPlan.deleteMany({ where: { id: planId } });
     await app.close();
@@ -282,6 +368,37 @@ describe('Stream grant (e2e)', () => {
 
     it('guest: 401', async () => {
       await api().get(`/api/videos/${movieId}/stream`).expect(401);
+    });
+
+    // H-7: the publish decision is part of the grant for a regular viewer —
+    // even a subscriber, on a FREE title, gets the same 404 as a missing id.
+    it.each([
+      ['a DRAFT movie', () => draftMovieId],
+      ['an ARCHIVED movie', () => archivedMovieId],
+      ['a PUBLISHED episode of a DRAFT series', () => hiddenEpisodeId],
+    ])('subscribed USER: 404 for %s', async (_label, id) => {
+      const res = await api()
+        .get(`/api/videos/${id()}/stream`)
+        .set('Authorization', `Bearer ${subscribedToken}`)
+        .expect(404);
+
+      expect(JSON.stringify(res.body)).toContain('Movie not found');
+      expect(JSON.stringify(res.body)).not.toContain('/s/');
+    });
+
+    it.each([
+      ['a DRAFT movie', () => draftMovieId],
+      ['an episode of a DRAFT series', () => hiddenEpisodeId],
+    ])('staff preview: 200 for %s', async (_label, id) => {
+      const res = await api()
+        .get(`/api/videos/${id()}/stream`)
+        .set('Authorization', `Bearer ${staffToken}`)
+        .expect(200);
+
+      const body = res.body as Envelope<StreamInfo>;
+      expect(body.data.playlistUrl).toMatch(
+        new RegExp(`/s/\\d+/[\\w-]+/movies/videos/${id()}/hls/master\\.m3u8$`),
+      );
     });
   });
 

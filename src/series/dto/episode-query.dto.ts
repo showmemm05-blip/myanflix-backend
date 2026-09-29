@@ -1,5 +1,12 @@
 import { Type } from 'class-transformer';
-import { IsEnum, IsInt, IsOptional, IsUUID } from 'class-validator';
+import {
+  IsEnum,
+  IsInt,
+  IsOptional,
+  IsString,
+  IsUUID,
+  MaxLength,
+} from 'class-validator';
 import { MovieStatus } from '../../generated/prisma/client';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 
@@ -17,4 +24,10 @@ export class EpisodeQueryDto extends PaginationQueryDto {
   @IsOptional()
   @IsEnum(MovieStatus)
   status?: MovieStatus;
+
+  /** Episode title or show title, over the whole queue (H-24). */
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  search?: string;
 }

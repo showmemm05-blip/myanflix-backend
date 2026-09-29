@@ -12,6 +12,7 @@ import { JwtAuthGuard } from './auth/guards/jwt-auth.guard';
 import { UsersModule } from './users/users.module';
 import { RolesModule } from './roles/roles.module';
 import { AuditModule } from './audit/audit.module';
+import { SessionRevocationModule } from './auth/session-revocation.module';
 import { StaffModule } from './staff/staff.module';
 import { CategoriesModule } from './categories/categories.module';
 import { ActorsModule } from './actors/actors.module';
@@ -41,6 +42,8 @@ import { TrackingReadModule } from './tracking/tracking-read.module';
 import { CommentsModule } from './comments/comments.module';
 import { FeedbackModule } from './feedback/feedback.module';
 import { LevelsModule } from './levels/levels.module';
+import { BankEventsModule } from './bank-events/bank-events.module';
+import { BankTransactionsModule } from './bank-transactions/bank-transactions.module';
 
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { AppThrottlerGuard } from './common/throttling/app-throttler.guard';
@@ -65,6 +68,7 @@ import { AppService } from './app.service';
     UsersModule,
     RolesModule,
     AuditModule,
+    SessionRevocationModule,
     StaffModule,
     CategoriesModule,
     ActorsModule,
@@ -94,6 +98,8 @@ import { AppService } from './app.service';
     CommentsModule,
     FeedbackModule,
     LevelsModule,
+    BankEventsModule,
+    BankTransactionsModule,
   ],
   controllers: [AppController],
   providers: [

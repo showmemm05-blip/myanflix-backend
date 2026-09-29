@@ -3,6 +3,7 @@ import {
   NotificationType,
   Prisma,
   TransactionType,
+  UserStatus,
   WalletAdjustmentDirection,
 } from '../generated/prisma/client';
 import type {
@@ -12,6 +13,10 @@ import type {
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { AuditService } from '../audit/audit.service';
+import {
+  CLOSED_ACCOUNT_MESSAGE,
+  lockAccountStatus,
+} from '../users/account-status-lock';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
@@ -90,6 +95,16 @@ export class WalletAdjustmentsService {
               notification: null,
               balance: null,
             };
+          }
+
+          // H-16: share-locked before the wallet is touched (see
+          // lockAccountStatus), so an account its owner is closing right now
+          // is either closed already — refused here — or waits for this
+          // adjustment and then sees its result. A suspended or banned
+          // customer can still be adjusted. A replay above moves nothing, so
+          // it still answers with the original row.
+          if ((await lockAccountStatus(tx, userId)) === UserStatus.CLOSED) {
+            throw new ConflictException(CLOSED_ACCOUNT_MESSAGE);
           }
 
           // The debit path keeps WalletService's gte guard — an adjustment can

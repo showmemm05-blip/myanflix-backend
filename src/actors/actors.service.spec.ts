@@ -4,7 +4,8 @@ import { ActorsService } from './actors.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { AuditService } from '../audit/audit.service';
-import { Role } from '../generated/prisma/client';
+import { MovieStatus, Role, SeriesStatus } from '../generated/prisma/client';
+import { CATALOG_INCLUDE } from '../movies/movies.service';
 
 const ACTOR_ID = 'actor-1';
 
@@ -28,6 +29,7 @@ describe('ActorsService', () => {
       count: jest.Mock;
     };
     movie: { findMany: jest.Mock };
+    series: { findMany: jest.Mock };
     $transaction: jest.Mock;
   };
   let minioService: {
@@ -57,6 +59,7 @@ describe('ActorsService', () => {
         count: jest.fn(),
       },
       movie: { findMany: jest.fn().mockResolvedValue([]) },
+      series: { findMany: jest.fn().mockResolvedValue([]) },
       $transaction: jest.fn((ops: unknown[]) => Promise.all(ops)),
     };
     minioService = {
@@ -102,11 +105,142 @@ describe('ActorsService', () => {
       });
     });
 
-    it('always counts movies from the join rather than a stored column', async () => {
+    it('counts STANDALONE movies only — an episode is a Movie row but GET /movies never lists it', async () => {
       await service.findAll({});
       expect(argsOf().include).toEqual({
-        _count: { select: { movies: true } },
+        _count: { select: { movies: { where: { seriesId: null } } } },
       });
+    });
+
+    it('skips the series query entirely for an empty page', async () => {
+      await service.findAll({});
+      expect(prisma.series.findMany).not.toHaveBeenCalled();
+    });
+
+    it('narrows the film count to PUBLISHED titles for a regular viewer — the People list must never promise more than the page can show', async () => {
+      await service.findAll({}, Role.USER);
+      expect(argsOf().include).toEqual({
+        _count: {
+          select: {
+            movies: {
+              where: { seriesId: null, status: MovieStatus.PUBLISHED },
+            },
+          },
+        },
+      });
+    });
+
+    it('counts every standalone film for staff, published or not', async () => {
+      await service.findAll({}, Role.ADMIN);
+      expect(argsOf().include).toEqual({
+        _count: { select: { movies: { where: { seriesId: null } } } },
+      });
+    });
+  });
+
+  /**
+   * The People list said "2 movies" for a person with one film and one
+   * EPISODE, and the person's page then showed one. Episode credits now
+   * roll up into seriesCount instead — by the same show-OR-episode rule the
+   * series catalogue's actorIds filter uses, so the number promised equals
+   * the rows the page can list.
+   */
+  describe('seriesCount', () => {
+    const page = [
+      actor({ id: 'jackie', name: 'Jackie Chan', _count: { movies: 1 } }),
+      actor({ id: 'newcomer', name: 'Newcomer', _count: { movies: 0 } }),
+      actor({ id: 'lead', name: 'Lead', _count: { movies: 2 } }),
+    ];
+
+    beforeEach(() => {
+      prisma.$transaction.mockResolvedValue([page, page.length]);
+      prisma.series.findMany.mockResolvedValue([
+        // Jackie only on an episode; Lead on the show itself.
+        {
+          id: 'show-a',
+          actors: [{ id: 'lead' }],
+          episodes: [{ actors: [{ id: 'jackie' }] }],
+        },
+        // Lead on the show AND on two episodes — still one series.
+        {
+          id: 'show-b',
+          actors: [{ id: 'lead' }],
+          episodes: [
+            { actors: [{ id: 'lead' }] },
+            { actors: [{ id: 'lead' }] },
+          ],
+        },
+      ]);
+    });
+
+    it('is one extra query for the whole page, scoped to the page ids, never one per actor', async () => {
+      await service.findAll({});
+
+      expect(prisma.series.findMany).toHaveBeenCalledTimes(1);
+      const ids = ['jackie', 'newcomer', 'lead'];
+      expect(prisma.series.findMany).toHaveBeenCalledWith({
+        where: {
+          OR: [
+            { actors: { some: { id: { in: ids } } } },
+            { episodes: { some: { actors: { some: { id: { in: ids } } } } } },
+          ],
+        },
+        select: {
+          id: true,
+          actors: { where: { id: { in: ids } }, select: { id: true } },
+          episodes: {
+            where: { actors: { some: { id: { in: ids } } } },
+            select: {
+              actors: { where: { id: { in: ids } }, select: { id: true } },
+            },
+          },
+        },
+      });
+    });
+
+    it('for a regular viewer only PUBLISHED shows are counted — the rule GET /series applies to them', async () => {
+      await service.findAll({}, Role.USER);
+      const ids = ['jackie', 'newcomer', 'lead'];
+      const cast = {
+        OR: [
+          { actors: { some: { id: { in: ids } } } },
+          { episodes: { some: { actors: { some: { id: { in: ids } } } } } },
+        ],
+      };
+      expect(prisma.series.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { AND: [cast, { status: SeriesStatus.PUBLISHED }] },
+        }),
+      );
+    });
+
+    it('counts DISTINCT series: episode-only credits count, show+episode credits count once, none is 0', async () => {
+      const { items } = await service.findAll({});
+
+      expect(items.map((a) => [a.id, a._count.movies, a.seriesCount])).toEqual([
+        ['jackie', 1, 1],
+        ['newcomer', 0, 0],
+        ['lead', 2, 2],
+      ]);
+    });
+
+    it('GET /actors/:id carries the same seriesCount', async () => {
+      prisma.actor.findUnique.mockResolvedValue(page[0]);
+
+      const result = await service.findByIdOrThrow('jackie');
+
+      expect(result.seriesCount).toBe(1);
+      expect(result._count.movies).toBe(1);
+    });
+
+    it('a freshly created actor reports seriesCount 0 without a query', async () => {
+      prisma.actor.findUnique.mockResolvedValue(null);
+      prisma.actor.create.mockResolvedValue(actor({ _count: { movies: 0 } }));
+
+      const created = await service.create({ name: 'New Person' }, STAFF);
+
+      expect(created.seriesCount).toBe(0);
+      expect(prisma.series.findMany).not.toHaveBeenCalled();
     });
   });
 
@@ -216,6 +350,29 @@ describe('ActorsService', () => {
   });
 
   describe('remove', () => {
+    it('audits how many standalone films and series lost this person, counted before the delete', async () => {
+      prisma.actor.findUnique.mockResolvedValue(
+        actor({ _count: { movies: 3 } }),
+      );
+      prisma.series.findMany.mockResolvedValue([
+        { id: 's1', actors: [{ id: ACTOR_ID }], episodes: [] },
+        { id: 's2', actors: [], episodes: [{ actors: [{ id: ACTOR_ID }] }] },
+      ]);
+      const audit = service['audit'] as unknown as { record: jest.Mock };
+
+      await service.remove(ACTOR_ID, STAFF);
+
+      expect(prisma.series.findMany.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.actor.delete.mock.invocationCallOrder[0],
+      );
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'actor.delete',
+          metadata: { unlinkedMovies: 3, unlinkedSeries: 2 },
+        }),
+      );
+    });
+
     it('deletes the row and then the headshot', async () => {
       prisma.actor.findUnique.mockResolvedValue(
         actor({ imageUrl: 'http://x/i.jpg' }),
@@ -248,20 +405,43 @@ describe('ActorsService', () => {
   });
 
   describe('getMovies', () => {
-    it('returns everything the actor appears in, newest first', async () => {
+    it('returns everything the actor appears in to staff, newest first', async () => {
       prisma.actor.findUnique.mockResolvedValue({ id: ACTOR_ID });
 
-      await service.getMovies(ACTOR_ID);
+      await service.getMovies(ACTOR_ID, Role.ADMIN);
 
       expect(prisma.movie.findMany).toHaveBeenCalledWith({
         where: { actors: { some: { id: ACTOR_ID } } },
+        include: CATALOG_INCLUDE,
+        orderBy: { releaseYear: 'desc' },
+      });
+    });
+
+    /**
+     * H-7: this route is open to every signed-in user, so it must not hand
+     * out the ids of DRAFT, ARCHIVED or READY_TO_PUBLISH titles, nor of
+     * episodes (GET /movies never lists an episode) — the same catalogue
+     * rule the People counts use.
+     */
+    it('narrows a regular viewer to PUBLISHED standalone films', async () => {
+      prisma.actor.findUnique.mockResolvedValue({ id: ACTOR_ID });
+
+      await service.getMovies(ACTOR_ID, Role.USER);
+
+      expect(prisma.movie.findMany).toHaveBeenCalledWith({
+        where: {
+          actors: { some: { id: ACTOR_ID } },
+          seriesId: null,
+          status: MovieStatus.PUBLISHED,
+        },
+        include: CATALOG_INCLUDE,
         orderBy: { releaseYear: 'desc' },
       });
     });
 
     it('404s an unknown actor', async () => {
       prisma.actor.findUnique.mockResolvedValue(null);
-      await expect(service.getMovies('nope')).rejects.toBeInstanceOf(
+      await expect(service.getMovies('nope', Role.USER)).rejects.toBeInstanceOf(
         NotFoundException,
       );
     });

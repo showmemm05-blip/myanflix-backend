@@ -1,9 +1,11 @@
 import {
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { basename } from 'node:path';
+import { MovieStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
 import type { Permission } from '../roles/permission-catalogue';
@@ -19,6 +21,29 @@ import {
  * routing rule below must always mean the same thing.
  */
 export const SUBTITLE_RELATIVE_PREFIX = 'subtitles/';
+
+/**
+ * The resourceType a replacement bundle is uploaded under — the admin passes
+ * it to the EXISTING presign-batch / multipart routes, so the files stage
+ * under temp/video-replace/<movieId>/ instead of landing on the live keys.
+ */
+export const MOVIE_REPLACE_RESOURCE_TYPE = 'movie-replace';
+
+/**
+ * The only movie states whose video may be REPLACED (the owner's decision):
+ * a live title, one waiting to be published, or one whose earlier bundle was
+ * rejected. UPLOADING / PROCESSING are mid-flight in another flow and
+ * DRAFT / ARCHIVED have nothing a viewer could be watching. Shared by the
+ * registry entry below (so presign-batch / multipart/init refuse to stage
+ * for a non-replaceable movie) and by every replace route in UploadsService.
+ * Note what is NOT here: the status never CHANGES through a replace — this
+ * list only gates entry.
+ */
+export const REPLACEABLE_MOVIE_STATUSES: readonly MovieStatus[] = [
+  MovieStatus.PUBLISHED,
+  MovieStatus.READY_TO_PUBLISH,
+  MovieStatus.FAILED,
+];
 
 export interface ResourceUploadType {
   permission: Permission;
@@ -90,6 +115,30 @@ export class ResourceUploadTypeRegistry {
                 basename(relativePath),
               )
             : `${this.storageService.videoKeyPrefix(resourceId)}/${relativePath}`,
+      },
+      // A replacement bundle for an EXISTING movie. Same permission and the
+      // same bundle shape as "movie", but every file — subtitles included —
+      // stages verbatim under temp/video-replace/<movieId>/ (a prefix the
+      // cache server denies and nothing can sign), so the title keeps
+      // playing its current files while the new ones upload. The videos/ vs
+      // subtitles/ split happens at swap time (UploadsService.finalizeReplace)
+      // through the "movie" entry above, never here.
+      [MOVIE_REPLACE_RESOURCE_TYPE]: {
+        permission: 'MEDIA.UPLOAD',
+        assertExists: async (resourceId) => {
+          const movie = await this.prisma.movie.findUnique({
+            where: { id: resourceId },
+            select: { id: true, status: true },
+          });
+          if (!movie) throw new NotFoundException('Movie not found');
+          if (!REPLACEABLE_MOVIE_STATUSES.includes(movie.status)) {
+            throw new ConflictException(
+              `Cannot replace the video of a ${movie.status} movie — only a PUBLISHED, READY_TO_PUBLISH or FAILED title can have its video replaced`,
+            );
+          }
+        },
+        buildKey: (resourceId, relativePath) =>
+          this.storageService.videoReplaceStagingKey(resourceId, relativePath),
       },
       book: {
         // BOOKS.EDIT rather than MEDIA.UPLOAD: whoever may edit a book may

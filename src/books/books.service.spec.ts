@@ -479,6 +479,40 @@ describe('BooksService', () => {
         { description: { contains: 'ocean', mode: 'insensitive' } },
       ]);
     });
+
+    it('narrows to one author — the author page asks for exactly their books', async () => {
+      await service.findAll({ authorId: 'author-1' }, Role.ADMIN);
+
+      expect(whereOf().authorId).toBe('author-1');
+    });
+
+    it('leaves authorId out of the where clause when none is asked for', async () => {
+      await service.findAll({}, Role.ADMIN);
+
+      expect(whereOf()).not.toHaveProperty('authorId');
+    });
+
+    it(
+      'composes the author filter with the other filters instead of ' +
+        'replacing them — an author page still obeys the published rule',
+      async () => {
+        await service.findAll(
+          { authorId: 'author-1', categoryId: 'cat-1', search: 'ocean' },
+          Role.USER,
+        );
+
+        expect(whereOf()).toMatchObject({
+          authorId: 'author-1',
+          categories: { some: { id: 'cat-1' } },
+          editions: { some: { status: BookStatus.PUBLISHED } },
+          OR: [
+            { title: { contains: 'ocean', mode: 'insensitive' } },
+            { author: { contains: 'ocean', mode: 'insensitive' } },
+            { description: { contains: 'ocean', mode: 'insensitive' } },
+          ],
+        });
+      },
+    );
   });
 
   describe('findByIdOrThrow', () => {

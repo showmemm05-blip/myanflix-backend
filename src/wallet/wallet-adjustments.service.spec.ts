@@ -4,13 +4,26 @@ import {
   NotificationType,
   Prisma,
   TransactionType,
+  UserStatus,
   WalletAdjustmentDirection,
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { AuditService } from '../audit/audit.service';
+import { lockAccountStatus } from '../users/account-status-lock';
 import { WalletService } from './wallet.service';
 import { WalletAdjustmentsService } from './wallet-adjustments.service';
+
+// The account-row lock is raw SQL of its own (account-status-lock.spec.ts);
+// here it only answers the status. ACTIVE unless a test says otherwise.
+jest.mock('../users/account-status-lock', () => ({
+  ...jest.requireActual<object>('../users/account-status-lock'),
+  lockAccountStatus: jest.fn(),
+}));
+const lockAccountStatusMock = jest.mocked(lockAccountStatus);
+beforeEach(() => {
+  lockAccountStatusMock.mockReset().mockResolvedValue(UserStatus.ACTIVE);
+});
 
 const KEY = 'a3f1c9de-1234-4abc-9def-0123456789ab';
 
@@ -64,6 +77,7 @@ describe('WalletAdjustmentsService', () => {
     notifyUserNotificationCreated: jest.Mock;
     notifyUserBalanceUpdated: jest.Mock;
   };
+  let audit: { record: jest.Mock };
 
   const admin = {
     id: 'admin-1',
@@ -97,6 +111,7 @@ describe('WalletAdjustmentsService', () => {
       notifyUserNotificationCreated: jest.fn(),
       notifyUserBalanceUpdated: jest.fn(),
     };
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -104,10 +119,7 @@ describe('WalletAdjustmentsService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: WalletService, useValue: walletService },
         { provide: RealtimeGateway, useValue: gateway },
-        {
-          provide: AuditService,
-          useValue: { record: jest.fn().mockResolvedValue(undefined) },
-        },
+        { provide: AuditService, useValue: audit },
       ],
     }).compile();
 
@@ -317,6 +329,101 @@ describe('WalletAdjustmentsService', () => {
       expect(prisma.notification.create).not.toHaveBeenCalled();
       expect(gateway.notifyUserNotificationCreated).not.toHaveBeenCalled();
       expect(gateway.notifyUserBalanceUpdated).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('adjust — account status (H-16: a closed account takes no money)', () => {
+    const dtoFor = (direction: WalletAdjustmentDirection) => ({
+      direction,
+      amount: 5000,
+      reason: 'Manual correction',
+      idempotencyKey: KEY,
+    });
+
+    it('share-locks the account row inside the adjustment transaction, before the wallet moves', async () => {
+      primeFreshAdjustment(6000);
+
+      await service.adjust(
+        'user-1',
+        dtoFor(WalletAdjustmentDirection.CREDIT),
+        admin,
+      );
+
+      // The $transaction mock hands `prisma` over as the tx client.
+      expect(lockAccountStatusMock).toHaveBeenCalledWith(prisma, 'user-1');
+      expect(lockAccountStatusMock.mock.invocationCallOrder[0]).toBeLessThan(
+        walletService.creditWithinTransaction.mock.invocationCallOrder[0],
+      );
+    });
+
+    it.each([
+      WalletAdjustmentDirection.CREDIT,
+      WalletAdjustmentDirection.DEBIT,
+    ])(
+      'refuses a %s on a CLOSED account with the closed-account 409 — no money moved, no rows, no audit row, no emits',
+      async (direction) => {
+        primeFreshAdjustment(6000);
+        lockAccountStatusMock.mockResolvedValue(UserStatus.CLOSED);
+
+        const attempt = service.adjust('user-1', dtoFor(direction), admin);
+        await expect(attempt).rejects.toBeInstanceOf(ConflictException);
+        await expect(attempt).rejects.toThrow(
+          'This account was closed by its owner and cannot be changed.',
+        );
+
+        expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
+        expect(walletService.debitWithinTransaction).not.toHaveBeenCalled();
+        expect(prisma.transaction.create).not.toHaveBeenCalled();
+        expect(prisma.walletAdjustment.create).not.toHaveBeenCalled();
+        expect(prisma.notification.create).not.toHaveBeenCalled();
+        expect(audit.record).not.toHaveBeenCalled();
+        expect(gateway.notifyUserNotificationCreated).not.toHaveBeenCalled();
+        expect(gateway.notifyUserBalanceUpdated).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([UserStatus.SUSPENDED, UserStatus.BANNED])(
+      'a %s account is still adjusted, and audited, exactly as before',
+      async (status) => {
+        primeFreshAdjustment(6000);
+        lockAccountStatusMock.mockResolvedValue(status);
+
+        const result = await service.adjust(
+          'user-1',
+          dtoFor(WalletAdjustmentDirection.CREDIT),
+          admin,
+        );
+
+        expect(result.replayed).toBe(false);
+        expect(walletService.creditWithinTransaction).toHaveBeenCalledTimes(1);
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({ action: 'user.wallet_adjust', tx: prisma }),
+        );
+        expect(gateway.notifyUserBalanceUpdated).toHaveBeenCalledWith(
+          'user-1',
+          6000,
+        );
+      },
+    );
+
+    it('a replay of an adjustment recorded before the close still answers with the original row and moves nothing', async () => {
+      prisma.walletAdjustment.findUnique.mockResolvedValue(makeAdjustment());
+      lockAccountStatusMock.mockResolvedValue(UserStatus.CLOSED);
+
+      const result = await service.adjust(
+        'user-1',
+        {
+          ...dtoFor(WalletAdjustmentDirection.CREDIT),
+          reason: 'Manual correction after support ticket #42',
+        },
+        admin,
+      );
+
+      expect(result.replayed).toBe(true);
+      expect(result.id).toBe('adj-1');
+      expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
+      expect(prisma.walletAdjustment.create).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
     });
   });
 

@@ -7,18 +7,22 @@ import {
   Patch,
   Post,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { CreateDepositDto } from './dto/create-deposit.dto';
 import { CreateManualDepositDto } from './dto/create-manual-deposit.dto';
+import { ManualDepositUserLookupDto } from './dto/manual-deposit-user-lookup.dto';
 import { ApproveDepositDto } from './dto/approve-deposit.dto';
 import { RejectDepositDto } from './dto/reject-deposit.dto';
 import { DepositQueryDto } from './dto/deposit-query.dto';
 import { UpdateReceivingAccountDto } from './dto/update-receiving-account.dto';
+import { VerificationReviewDto } from './dto/verification-review.dto';
 import { DepositsService } from './deposits.service';
 
 /**
@@ -53,6 +57,43 @@ export class DepositsController {
   @RequirePermissions('DEPOSITS.VIEW')
   findAll(@Query() query: DepositQueryDto) {
     return this.depositsService.findAllAdmin(query);
+  }
+
+  /**
+   * The queue's stat cards and tab counts over every row matching the list
+   * filters (H-24) — see DepositsService.getAdminStats. Declared before
+   * ':id' so "stats" is never parsed as a deposit id.
+   */
+  @Get('stats')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('DEPOSITS.VIEW')
+  getStats(@Query() query: DepositQueryDto) {
+    return this.depositsService.getAdminStats(query);
+  }
+
+  /**
+   * The manual-deposit dialog's customer picker (H-15) — on DEPOSITS.CREATE,
+   * so a role that may record the deposit can also find whom it is for
+   * without holding USERS.VIEW. Minimal fields; see
+   * DepositsService.lookupUsersForManualDeposit.
+   */
+  @Get('manual/users')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('DEPOSITS.CREATE')
+  lookupUsersForManualDeposit(@Query() query: ManualDepositUserLookupDto) {
+    return this.depositsService.lookupUsersForManualDeposit(query);
+  }
+
+  /**
+   * One deposit in the staff shape — how the bank transactions page opens
+   * a linked row's Verification Details. Declared AFTER 'me' so
+   * GET /deposits/me keeps matching its own route first.
+   */
+  @Get(':id')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('DEPOSITS.VIEW')
+  findOne(@Param('id', ParseUUIDPipe) id: string) {
+    return this.depositsService.findOneAdmin(id);
   }
 
   @Post('manual')
@@ -96,5 +137,34 @@ export class DepositsController {
     @CurrentUser() admin: AuthenticatedUser,
   ) {
     return this.depositsService.updateReceivingAccount(id, dto, admin);
+  }
+
+  /** Staff review of the bank-verification flags — reuses DEPOSITS.EDIT. */
+  @Patch(':id/verification')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('DEPOSITS.EDIT')
+  reviewVerification(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: VerificationReviewDto,
+    @CurrentUser() admin: AuthenticatedUser,
+  ) {
+    return this.depositsService.reviewVerification(id, dto, admin);
+  }
+
+  /**
+   * The bank-notification screenshot (shows the business account balance)
+   * — its own permission, streamed inline, and marked no-store so no proxy
+   * or browser cache ever keeps a copy. `passthrough` keeps Nest in charge
+   * of sending the StreamableFile; we only add a header.
+   */
+  @Get(':id/bank-screenshot')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('DEPOSITS.BANK_EVIDENCE')
+  async bankScreenshot(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    res.setHeader('Cache-Control', 'private, no-store');
+    return this.depositsService.getBankScreenshot(id);
   }
 }

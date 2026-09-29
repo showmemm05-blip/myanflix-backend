@@ -29,6 +29,8 @@ describe('UploadCleanupService', () => {
   let minioService: {
     abortMultipartUpload: jest.Mock;
     listInProgressMultipartUploads: jest.Mock;
+    listObjects: jest.Mock;
+    deleteKeys: jest.Mock;
   };
   let storageService: { scratchRoot: string };
 
@@ -46,6 +48,8 @@ describe('UploadCleanupService', () => {
     minioService = {
       abortMultipartUpload: jest.fn().mockResolvedValue(undefined),
       listInProgressMultipartUploads: jest.fn().mockResolvedValue([]),
+      listObjects: jest.fn().mockResolvedValue([]),
+      deleteKeys: jest.fn().mockResolvedValue(undefined),
     };
     storageService = { scratchRoot: '/storage/temp' };
     // Every scratch root is empty unless a case says otherwise.
@@ -253,6 +257,75 @@ describe('UploadCleanupService', () => {
         recursive: true,
         force: true,
       });
+    });
+  });
+
+  describe('sweepAbandonedReplaceStaging — replacement bundles nobody finalized or cancelled', () => {
+    const DAYS = 24 * HOURS;
+
+    it('deletes only the staged objects older than the 7-day expiry the taxonomy declares', async () => {
+      minioService.listObjects.mockResolvedValue([
+        {
+          key: 'temp/video-replace/movie-1/hls/720p/segment_000.ts',
+          lastModified: new Date(Date.now() - 8 * DAYS),
+        },
+        {
+          key: 'temp/video-replace/movie-1/original.mp4',
+          lastModified: new Date(Date.now() - 7 * DAYS - HOURS),
+        },
+        {
+          key: 'temp/video-replace/movie-2/hls/master.m3u8',
+          lastModified: new Date(Date.now() - 2 * HOURS), // an upload in progress
+        },
+        {
+          key: 'temp/video-replace/movie-3/x.ts',
+          lastModified: undefined, // no stamp = unknown age, never guessed
+        },
+      ]);
+
+      const removed = await service.sweepAbandonedReplaceStaging();
+
+      expect(minioService.listObjects).toHaveBeenCalledWith(
+        'temp/video-replace/',
+      );
+      expect(minioService.deleteKeys).toHaveBeenCalledWith([
+        'temp/video-replace/movie-1/hls/720p/segment_000.ts',
+        'temp/video-replace/movie-1/original.mp4',
+      ]);
+      expect(removed).toBe(2);
+    });
+
+    it('sends no delete at all when nothing is old enough', async () => {
+      minioService.listObjects.mockResolvedValue([
+        {
+          key: 'temp/video-replace/movie-2/hls/master.m3u8',
+          lastModified: new Date(),
+        },
+      ]);
+
+      expect(await service.sweepAbandonedReplaceStaging()).toBe(0);
+      expect(minioService.deleteKeys).not.toHaveBeenCalled();
+    });
+
+    it('logs and returns 0 when MinIO cannot be listed — never throws out of the cron', async () => {
+      minioService.listObjects.mockRejectedValue(new Error('minio down'));
+
+      await expect(service.sweepAbandonedReplaceStaging()).resolves.toBe(0);
+    });
+
+    it('runs as the last step of the 3 AM multipart sweep', async () => {
+      minioService.listObjects.mockResolvedValue([
+        {
+          key: 'temp/video-replace/movie-1/original.mp4',
+          lastModified: new Date(Date.now() - 9 * DAYS),
+        },
+      ]);
+
+      await service.sweepAbandonedMultipartUploads();
+
+      expect(minioService.deleteKeys).toHaveBeenCalledWith([
+        'temp/video-replace/movie-1/original.mp4',
+      ]);
     });
   });
 

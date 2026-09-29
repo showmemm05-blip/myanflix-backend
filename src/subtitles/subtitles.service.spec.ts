@@ -66,9 +66,11 @@ describe('SubtitlesService — publishing on write', () => {
 
     prisma = {
       video: {
-        findUnique: jest
-          .fn()
-          .mockResolvedValue({ id: VIDEO_ID, movieId: MOVIE_ID }),
+        findUnique: jest.fn().mockResolvedValue({
+          id: VIDEO_ID,
+          movieId: MOVIE_ID,
+          hlsMasterPath: `videos/${MOVIE_ID}/hls/master.m3u8`,
+        }),
       },
       subtitle: {
         create: jest.fn().mockResolvedValue(existingRow),
@@ -281,11 +283,13 @@ describe('SubtitlesService — publishing on write', () => {
     expect(hlsSubtitlesService.publishForVideo).toHaveBeenCalledWith(VIDEO_ID);
   });
 
-  it('deletes the published objects and republishes when a track is removed', async () => {
+  it('deletes the published objects (beside the LIVE master) and republishes when a track is removed', async () => {
     await service.remove(SUBTITLE_ID, ACTOR);
 
+    // Keyed by the row's hlsMasterPath, not the movie id: after a video
+    // replace the master — and the subs/ beside it — live in hls/v-<tag>/.
     expect(hlsSubtitlesService.unpublishSubtitle).toHaveBeenCalledWith(
-      MOVIE_ID,
+      `videos/${MOVIE_ID}/hls/master.m3u8`,
       SUBTITLE_ID,
     );
     expect(hlsSubtitlesService.publishForVideo).toHaveBeenCalledWith(VIDEO_ID);

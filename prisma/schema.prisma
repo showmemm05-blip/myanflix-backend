@@ -24,6 +24,19 @@ enum UserStatus {
   ACTIVE
   SUSPENDED
   BANNED
+  /// The owner deleted their own account (DELETE /users/me, H-16): personal
+  /// data anonymised, sessions revoked, money records kept. Terminal — no
+  /// status route can move an account out of it, and no sign-in path
+  /// accepts it.
+  CLOSED
+}
+
+/// What an OTP code was requested for (POST /auth/otp/request `purpose`).
+/// Every verify path accepts only its own: LOGIN for POST /auth/otp/verify,
+/// PASSWORD_RESET for POST /auth/password/reset.
+enum OtpPurpose {
+  LOGIN
+  PASSWORD_RESET
 }
 
 enum MovieStatus {
@@ -176,6 +189,46 @@ enum WithdrawalStatus {
   REJECTED
 }
 
+/// The BANK side of a deposit/withdrawal — orthogonal to DepositStatus /
+/// WithdrawalStatus, which stay the MONEY state. UNVERIFIED = no bank
+/// notification applied yet; MATCHED = every exact check passed and no
+/// reason; PENDING_REVIEW = a soft reason (twin reference, ambiguity, gap,
+/// velocity); SUSPICIOUS = a hard mismatch (amount/code/impossible timing/
+/// shared across users). "No bank transaction after 24 h" is deliberately
+/// NOT a member: it is derived at read time from status + bankCheckedAt +
+/// createdAt, so nothing ever has to sweep the table to set it.
+enum BankMatchStatus {
+  UNVERIFIED
+  MATCHED
+  PENDING_REVIEW
+  SUSPICIOUS
+}
+
+/// Deterministic bucket of the summed reason weights (see
+/// bank-events/risk-rules.ts). Null = not scored yet.
+enum BankRiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+/// Which way the money went, as the phone's notification said it:
+/// "You received …" or "You sent …".
+enum BankTransactionDirection {
+  RECEIVED
+  SENT
+}
+
+/// UNMATCHED = stored, no row claimed it; MATCHED = linked to exactly one
+/// deposit/withdrawal; AMBIGUOUS = ≥ 2 candidates fit and nobody guessed.
+/// "Unclaimed" is NOT a member: it is derived at read time (UNMATCHED and
+/// occurredAt older than 48 h) — nothing ever sweeps.
+enum BankTransactionState {
+  UNMATCHED
+  MATCHED
+  AMBIGUOUS
+}
+
 enum NotificationType {
   DEPOSIT_APPROVED
   DEPOSIT_REJECTED
@@ -277,14 +330,20 @@ model User {
   /// Presence, refreshed (throttled) from any authenticated request on any
   /// client — distinct from `lastLoginAt`, which only moves on a fresh
   /// sign-in and so says nothing about whether the account is active now.
-  lastSeenAt    DateTime?
+  lastSeenAt        DateTime?
   /// Last observed client IP, denormalised from UserSession so the admin's
   /// Phone/IP table is one query. Always masked server-side unless the
   /// caller holds TRACKING.PII_VIEW.
-  lastIpAddress String?
+  lastIpAddress     String?
   /// Last observed client platform, denormalised from UserSession for the
   /// same reason as `lastIpAddress`.
-  lastPlatform  ClientPlatform?
+  lastPlatform      ClientPlatform?
+  /// When every session of this account was last revoked (password change or
+  /// reset, suspension, ban, role change, account deletion — H-21). Access
+  /// tokens issued in an earlier second are refused by JwtStrategy and the
+  /// realtime handshake, so a revoke takes effect at once rather than when
+  /// the 15-minute access token expires. NULL = never revoked.
+  sessionsRevokedAt DateTime?
 
   wallet                              Wallet?
   purchases                           Purchase[]
@@ -390,14 +449,18 @@ model RefreshToken {
 /// yet (see SmsService), so this is how the code is actually retrieved
 /// during development. Once a real provider sends the code over SMS, this
 /// should switch to a hash, matching RefreshToken's pattern.
+///
+/// `purpose` binds the code to the flow it was requested for: a sign-in code
+/// never resets a password, and a reset code never signs anyone in.
 model OtpCode {
-  id           String    @id @default(uuid())
+  id           String     @id @default(uuid())
   phone        String
   code         String
+  purpose      OtpPurpose @default(LOGIN)
   expiresAt    DateTime
   consumedAt   DateTime?
-  attemptCount Int       @default(0)
-  createdAt    DateTime  @default(now())
+  attemptCount Int        @default(0)
+  createdAt    DateTime   @default(now())
 
   @@index([phone])
   @@map("otp_codes")
@@ -486,6 +549,10 @@ model Series {
 
   episodes   Movie[]
   categories Category[]
+  /// Show-level cast (implicit many-to-many, join table _ActorToSeries).
+  /// Episodes keep their own Movie.actors; an actor "is in" a series when
+  /// they are on the show itself OR on any of its episodes.
+  actors     Actor[]
   purchases  SeriesPurchase[]
   comments   Comment[]
 
@@ -503,7 +570,7 @@ model SeriesPurchase {
   amount    Decimal  @db.Decimal(12, 2)
   createdAt DateTime @default(now())
 
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
   series Series @relation(fields: [seriesId], references: [id], onDelete: Cascade)
 
   @@unique([userId, seriesId])
@@ -543,6 +610,7 @@ model Actor {
   updatedAt DateTime @updatedAt
 
   movies Movie[]
+  series Series[]
 
   @@map("actors")
 }
@@ -706,6 +774,13 @@ model BookChapter {
   /// PDF chapters only — why the conversion FAILED, shown next to the retry
   /// action. Cleared when a retry starts.
   processingError String?
+  /// PDF chapters only — ETag of the source PDF the stored `pages` were
+  /// converted from (H-23). The PDF sits at one fixed key, so a re-upload
+  /// overwrites it: a conversion resumes the existing pages only when the
+  /// file it downloaded has this exact ETag, and otherwise clears them and
+  /// converts from page 1 into a fresh pages/v-<tag>/ folder. NULL = no
+  /// pages yet, or pages made before this was tracked (never resumed).
+  pagesSourceEtag String?
 
   /// Optional grouping above chapters. NULL = no part; unparted chapters read
   /// before the first part. SetNull so deleting a part keeps its chapters.
@@ -954,7 +1029,7 @@ model Purchase {
   amount    Decimal  @db.Decimal(12, 2)
   createdAt DateTime @default(now())
 
-  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Restrict)
   movie Movie @relation(fields: [movieId], references: [id], onDelete: Cascade)
 
   @@unique([userId, movieId])
@@ -969,7 +1044,7 @@ model Wallet {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
 
   @@map("wallets")
 }
@@ -983,8 +1058,10 @@ model Transaction {
   movieId   String?
   createdAt DateTime          @default(now())
 
-  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user             User              @relation(fields: [userId], references: [id], onDelete: Restrict)
   walletAdjustment WalletAdjustment?
+  /// Back-relation only: the withdrawal whose held money this row records (C-4).
+  heldWithdrawal   Withdrawal?       @relation("WithdrawalHold")
 
   @@index([userId])
   @@index([createdAt])
@@ -1010,7 +1087,7 @@ model WalletAdjustment {
   transactionId     String?                   @unique
   createdAt         DateTime                  @default(now())
 
-  user        User         @relation("WalletAdjustmentUser", fields: [userId], references: [id], onDelete: Cascade)
+  user        User         @relation("WalletAdjustmentUser", fields: [userId], references: [id], onDelete: Restrict)
   performedBy User?        @relation("WalletAdjustmentPerformedBy", fields: [performedByUserId], references: [id], onDelete: SetNull)
   transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
 
@@ -1024,9 +1101,9 @@ model WalletAdjustment {
 /// itself never touches the ledger directly, so a rejected request leaves no
 /// trace on the Wallet/Transaction tables at all.
 model Deposit {
-  id                        String        @id @default(uuid())
+  id                        String          @id @default(uuid())
   userId                    String
-  amount                    Decimal       @db.Decimal(12, 2)
+  amount                    Decimal         @db.Decimal(12, 2)
   paymentMethod             String
   /// The PaymentAccount.accountName the depositor says they sent to, as a
   /// plain snapshot string (same free-text convention as paymentMethod) —
@@ -1045,7 +1122,7 @@ model Deposit {
   /// distinguishable from "nothing changed" once it's already set. Null for
   /// deposits from a client that hasn't been updated to send it.
   declaredPaymentAccountId  String?
-  status                    DepositStatus @default(PENDING)
+  status                    DepositStatus   @default(PENDING)
   rejectionReason           String?
   approvedByUserId          String?
   approvedAt                DateTime?
@@ -1079,42 +1156,107 @@ model Deposit {
   /// Customer wallet balance immediately before/after this deposit's credit —
   /// captured at approve/manual-create time; null for deposits credited
   /// before these columns existed and for PENDING/REJECTED deposits.
-  walletBalanceBefore       Decimal?      @db.Decimal(12, 2)
-  walletBalanceAfter        Decimal?      @db.Decimal(12, 2)
-  createdAt                 DateTime      @default(now())
-  updatedAt                 DateTime      @updatedAt
+  walletBalanceBefore       Decimal?        @db.Decimal(12, 2)
+  walletBalanceAfter        Decimal?        @db.Decimal(12, 2)
+  /// What the BANK said, written by the matcher only (bank-events module)
+  /// — never by an admin form. Null until a phone-monitor event matched
+  /// this row.
+  receivingAmount           Decimal?        @db.Decimal(12, 2)
+  /// Full timestamp of the bank notification. The old time-of-day column
+  /// receivingTransactionTime stays and is filled from this in Asia/Yangon,
+  /// as an admin would have typed it.
+  receivingTransactionAt    DateTime?
+  /// Private object key (documents/bank-screenshots/deposits/<id>/…) — never
+  /// a URL; the admin only ever learns `hasBankScreenshot`, and the bytes
+  /// are streamed through GET /deposits/:id/bank-screenshot behind
+  /// DEPOSITS.BANK_EVIDENCE.
+  receivingScreenshotKey    String?
+  /// The phone event's idempotency key. UNIQUE: one bank notification can
+  /// credit at most one deposit, and a retried event is recognised as
+  /// already applied instead of being applied twice.
+  receivingEventKey         String?         @unique(map: "deposits_receivingEventKey_key")
+  /// Set once, when a bank event was applied. IS NULL = still in the open
+  /// set the matcher searches; that predicate is what keeps every partial
+  /// index below tiny (work scales with transfers that happen, never rows
+  /// that exist).
+  bankCheckedAt             DateTime?
+  matchStatus               BankMatchStatus @default(UNVERIFIED)
+  riskLevel                 BankRiskLevel?
+  /// Sorted, de-duplicated reason codes (bank-events/risk-rules.ts) — a set,
+  /// so recomputation is idempotent. NO_BANK_TRANSACTION is never stored.
+  riskReasons               String[]        @default([])
+  /// When the user says they transferred (the mobile form does not send it
+  /// yet; rules treat null as "use createdAt").
+  declaredTransferAt        DateTime?
+  createdAt                 DateTime        @default(now())
+  updatedAt                 DateTime        @updatedAt
 
-  user                    User                        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user                    User                        @relation(fields: [userId], references: [id], onDelete: Restrict)
   approvedBy              User?                       @relation("DepositApprovals", fields: [approvedByUserId], references: [id], onDelete: SetNull)
   declaredPaymentAccount  PaymentAccount?             @relation("DepositDeclaredAccount", fields: [declaredPaymentAccountId], references: [id], onDelete: SetNull)
   receivingPaymentAccount PaymentAccount?             @relation("DepositReceivingAccount", fields: [receivingPaymentAccountId], references: [id], onDelete: SetNull)
   ledgerEntries           PaymentAccountTransaction[] @relation("DepositLedgerEntries")
+  /// Back-relation only (no column here): the stored phone event that
+  /// claimed this deposit, when one did. bank_transactions.linkedDepositId
+  /// is UNIQUE, so it is at most one.
+  bankTransaction         BankTransaction?            @relation("BankTransactionDeposit")
 
-  /// One LIVE deposit per reference — enforced by the database so concurrent
-  /// submissions cannot slip past the service-level pre-check. REJECTED is
-  /// excluded so a user can resubmit after a mistaken rejection — see
-  /// DepositsService.create. A P2002 on insert is mapped to 409 there.
+  /// One LIVE deposit per reference PER USER (H-11, 2026-09-28) — a double
+  /// submit by the same user is still refused by the database, so concurrent
+  /// taps cannot slip past the service-level pre-check (P2002 → 409 in
+  /// DepositsService). Different users MAY share a 6-digit reference: the
+  /// last-6 is not a secret, so a global rule let whoever typed it first own
+  /// it and refused the real payer. Such twins are stored and flagged
+  /// (DUPLICATE_REFERENCE / SHARED_REFERENCE_ACROSS_USERS → staff review),
+  /// and the matcher never picks between two open ones (AMBIGUOUS).
+  /// REJECTED is excluded so a user can resubmit after a mistaken rejection.
   /// The predicate is written the way Postgres stores it (`= ANY (ARRAY[...])`
   /// rather than `IN (...)`) so `prisma migrate diff` sees no drift.
-  /// The plain @@index([reference]) below stays: list queries include REJECTED rows.
+  /// The plain @@index([reference]) below stays: the twin lookup and list
+  /// queries search by reference alone, across users and statuses.
   /// Side effect of the partial @@unique: the generated client lists
-  /// `reference` in DepositWhereUniqueInput — never findUnique/upsert by
-  /// reference alone, it is only unique among PENDING/APPROVED rows.
-  @@unique([reference], where: raw("status = ANY (ARRAY['PENDING'::\"DepositStatus\", 'APPROVED'::\"DepositStatus\"])"), map: "deposits_reference_active_key")
+  /// `userId_reference` in DepositWhereUniqueInput — never findUnique/upsert
+  /// by it, it is only unique among PENDING/APPROVED rows.
+  @@unique([userId, reference], where: raw("status = ANY (ARRAY['PENDING'::\"DepositStatus\", 'APPROVED'::\"DepositStatus\"])"), map: "deposits_user_reference_active_key")
   @@index([userId])
   @@index([status])
   @@index([reference])
   @@index([createdAt])
   @@index([declaredPaymentAccountId])
   @@index([receivingPaymentAccountId])
+  /// The OPEN SET — deposits still waiting for their bank notification. A
+  /// row enters it at create and leaves it for good the moment it is
+  /// matched, approved or rejected, so these three partial indexes hold
+  /// "today's unmatched deposits", never history. The bank-events matcher
+  /// and the two open-set admin filters query them with the predicate
+  /// spelled out as literal SQL ($queryRaw) — a parameterised
+  /// `status = $n` cannot prove it implies the index predicate.
+  ///   open_match   — Q1: the user's own last-6 on the declared account.
+  ///   open_created — the "awaiting bank" / "no bank transaction" filters.
+  /// (open_amount, the amount-fallback index, was dropped on 2026-09-22 with
+  /// the fallback itself — see deposit-matcher.ts.)
+  @@index([declaredPaymentAccountId, reference], map: "deposits_open_match_idx", where: raw("status = 'PENDING'::\"DepositStatus\" AND \"bankCheckedAt\" IS NULL"))
+  @@index([createdAt], map: "deposits_open_createdAt_idx", where: raw("status = 'PENDING'::\"DepositStatus\" AND \"bankCheckedAt\" IS NULL"))
+  /// VELOCITY = "rows by this user inside the last few minutes" — reads
+  /// only the rows inside the window, where deposits_userId_idx would read
+  /// a heavy user's whole history and filter createdAt per row.
+  @@index([userId, createdAt])
+  /// The "verified" / "needs review" admin filters ordered by createdAt
+  /// DESC — a paginated scan reads `limit` entries and stops. Not partial:
+  /// a needs-review row must stay findable across any date range.
+  @@index([matchStatus, createdAt])
   @@map("deposits")
 }
 
 /// A user-submitted payout request awaiting admin review — the mirror image
-/// of Deposit. Approving one debits the Wallet and creates a matching
-/// WITHDRAWAL Transaction; the withdrawal row itself never touches the
-/// ledger directly, so a rejected request leaves no trace on Wallet or
-/// Transaction. Unlike Deposit's `accountName` (who the user says they sent
+/// of Deposit. Since C-4 (2026-09-28) the money is HELD when the request is
+/// made: the Wallet is debited and a PENDING WITHDRAWAL Transaction is
+/// written in the same transaction as the insert (holdTransactionId points
+/// at it). Approving only turns that row COMPLETED; rejecting credits the
+/// Wallet back, turns it FAILED and writes a REFUND Transaction. Rows from
+/// before C-4 have no hold (holdTransactionId null): approving one still
+/// debits and writes a COMPLETED WITHDRAWAL row, rejecting one moves no
+/// money. Unlike Deposit's `accountName` (who the user says they sent
 /// FROM), these three fields describe where the admin should send money TO.
 model Withdrawal {
   id                       String           @id @default(uuid())
@@ -1166,19 +1308,152 @@ model Withdrawal {
   /// never picked from the catalog, in which case no ledger entry is ever
   /// created for this withdrawal.
   transferPaymentAccountId String?
+  /// What the BANK said ("You sent …"), written by the matcher only —
+  /// mirrors Deposit.receivingAmount and friends with transfer* naming.
+  transferAmount           Decimal?         @db.Decimal(12, 2)
+  /// Full timestamp of the bank notification; transferTransactionTime (the
+  /// legacy time-of-day text) is filled from this in Asia/Yangon.
+  transferTransactionAt    DateTime?
+  /// Private object key (documents/bank-screenshots/withdrawals/<id>/…) —
+  /// never a URL, streamed only behind WITHDRAWALS.BANK_EVIDENCE.
+  transferScreenshotKey    String?
+  /// The phone event's idempotency key — UNIQUE, so one "sent" notification
+  /// confirms at most one payout and a retry is recognised, not re-applied.
+  transferEventKey         String?          @unique(map: "withdrawals_transferEventKey_key")
+  /// Set once, when a bank event was applied. IS NULL = still in the open
+  /// payout set the matcher searches.
+  bankCheckedAt            DateTime?
+  matchStatus              BankMatchStatus  @default(UNVERIFIED)
+  riskLevel                BankRiskLevel?
+  /// Sorted, de-duplicated reason codes — see bank-events/risk-rules.ts.
+  riskReasons              String[]         @default([])
+  /// C-4 — the wallet-ledger row of the hold taken when this request was
+  /// made (a WITHDRAWAL Transaction: PENDING while the request is open,
+  /// COMPLETED on approve, FAILED on reject). Non-null = the money already
+  /// left the balance, so approve must NOT debit again. Null only on rows
+  /// created before holds existed — approve debits those as it always did.
+  /// RESTRICT: a ledger row that backs a hold can never be deleted.
+  holdTransactionId        String?          @unique
   createdAt                DateTime         @default(now())
   updatedAt                DateTime         @updatedAt
 
-  user                   User                        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user                   User                        @relation(fields: [userId], references: [id], onDelete: Restrict)
   approvedBy             User?                       @relation("WithdrawalApprovals", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  holdTransaction        Transaction?                @relation("WithdrawalHold", fields: [holdTransactionId], references: [id], onDelete: Restrict)
   transferPaymentAccount PaymentAccount?             @relation("WithdrawalTransferAccount", fields: [transferPaymentAccountId], references: [id], onDelete: SetNull)
   ledgerEntries          PaymentAccountTransaction[] @relation("WithdrawalLedgerEntries")
+  /// Back-relation only — see Deposit.bankTransaction.
+  bankTransaction        BankTransaction?            @relation("BankTransactionWithdrawal")
 
   @@index([userId])
   @@index([status])
   @@index([createdAt])
   @@index([transferPaymentAccountId])
+  /// DUPLICATE_PAYOUT_CODE = "this payout code already sits on another
+  /// withdrawal". Without an index that check is a sequential scan. Plain,
+  /// not unique: the decision is flag-not-block.
+  @@index([transferTransactionCode])
+  /// The OPEN PAYOUT SET — approved, not yet bank-checked, no code keyed in
+  /// by hand. The withdrawal matcher ("You sent …") searches it by amount +
+  /// approvedAt window with the predicate as literal SQL; a row leaves it
+  /// when matched or when an admin records the code manually.
+  @@index([amount, approvedAt], map: "withdrawals_open_payout_idx", where: raw("status = 'APPROVED'::\"WithdrawalStatus\" AND \"bankCheckedAt\" IS NULL AND \"transferTransactionCode\" IS NULL"))
+  /// Same open payout set, keyed by createdAt: the "awaiting bank" / "no bank
+  /// transaction" admin filters page the open set ORDER BY createdAt DESC,
+  /// and the payout index above cannot serve that order (amount comes
+  /// first). Without this, EXPLAIN on 50k rows walked withdrawals_createdAt_idx
+  /// and threw away thousands of finished rows to fill one page — work that
+  /// grows with rows that exist. Mirrors deposits_open_createdAt_idx.
+  @@index([createdAt], map: "withdrawals_open_createdAt_idx", where: raw("status = 'APPROVED'::\"WithdrawalStatus\" AND \"bankCheckedAt\" IS NULL AND \"transferTransactionCode\" IS NULL"))
+  /// The CODED PAYOUT SET — not yet bank-checked, code keyed in by hand
+  /// (only an APPROVED row can carry one). When a "You sent …" record
+  /// arrives, the withdrawal matcher first looks here for a withdrawal whose
+  /// typed code is the record's last 6 (ignoring case) approved within 24 h
+  /// either side of the bank time. Keyed by approvedAt so that window is one
+  /// range scan whatever the history; the predicate is two IS [NOT] NULL
+  /// tests, which Prisma renders literally, so its own (case-insensitive)
+  /// findMany can use this index — status stays a filter.
+  @@index([approvedAt], map: "withdrawals_coded_payout_idx", where: raw("\"bankCheckedAt\" IS NULL AND \"transferTransactionCode\" IS NOT NULL"))
+  /// Same role as deposits_matchStatus_createdAt_idx.
+  @@index([matchStatus, createdAt])
   @@map("withdrawals")
+}
+
+/// Every bank notification a phone-monitor captured, stored BEFORE any
+/// matching is attempted (store-first, owner decision 2026-09-22: "every tx
+/// record of each phone on the admin side"). The one new table the
+/// payment-verification feature is allowed. A deposit/withdrawal still
+/// carries the bank's values in its own receiving… / transfer… columns; this
+/// row is the evidence that stays even when no deposit ever claims it, and
+/// the link between the two is what lets a deposit submitted AFTER its
+/// transfer match at create time instead of waiting for the phone's retry.
+model BankTransaction {
+  id                 String                   @id @default(uuid())
+  /// The phone's sha256 event key — UNIQUE, so a re-post never duplicates.
+  idempotencyKey     String                   @unique(map: "bank_transactions_idempotencyKey_key")
+  deviceSerial       String
+  paymentAccountId   String
+  direction          BankTransactionDirection
+  amount             Decimal                  @db.Decimal(12, 2)
+  currency           String                   @default("MMK")
+  /// The full code as the bank printed it; txCodeLast6 is what a user is
+  /// asked to type and what the match lookup keys on.
+  txCode             String
+  txCodeLast6        String
+  /// The BANK's time (voucher) — the match/list axis.
+  occurredAt         DateTime
+  /// The notification's post time (phone), kept for the audit trail.
+  postedAt           DateTime
+  counterparty       String?
+  /// Private object key documents/bank-screenshots/transactions/<id>/<key>.png
+  /// — never a URL. When the row is linked, the deposit's/withdrawal's own
+  /// screenshot column points at this SAME key (no copy).
+  screenshotKey      String?
+  /// What the phone's KBZPay detail flow reported (ok | locked | … |
+  /// not_needed), free text.
+  detailStatus       String?
+  state              BankTransactionState     @default(UNMATCHED)
+  /// UNIQUE: one transaction per deposit / per withdrawal (NULLs are free in
+  /// a Postgres unique index). SET NULL on delete leaves `state` MATCHED with
+  /// both links null — the view reads that as WAITING, nothing sweeps it.
+  linkedDepositId    String?                  @unique(map: "bank_transactions_linkedDepositId_key")
+  linkedWithdrawalId String?                  @unique(map: "bank_transactions_linkedWithdrawalId_key")
+  matchedAt          DateTime?
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+
+  /// RESTRICT: a business account with bank evidence behind it cannot be
+  /// deleted (PaymentAccountsService.remove guards this with a 409, like
+  /// its ledger guard).
+  paymentAccount   PaymentAccount @relation("BankTransactionAccount", fields: [paymentAccountId], references: [id], onDelete: Restrict)
+  /// A deleted deposit/withdrawal (user cascade) leaves the transaction
+  /// UNLINKED, never deleted: it is evidence.
+  linkedDeposit    Deposit?       @relation("BankTransactionDeposit", fields: [linkedDepositId], references: [id], onDelete: SetNull)
+  linkedWithdrawal Withdrawal?    @relation("BankTransactionWithdrawal", fields: [linkedWithdrawalId], references: [id], onDelete: SetNull)
+
+  /// THE OPEN SET — "You received …" rows nobody has claimed. Deposit
+  /// creation and ingestion look up (account, last-6) here with the
+  /// predicate spelled out as literal SQL, exactly like deposits_open_match_idx
+  /// (a bound `state = $n` cannot prove it implies the predicate). Holds
+  /// today's unclaimed transfers, never history. `direction` is in the
+  /// predicate, not the key: two values would always be a heap filter.
+  @@index([paymentAccountId, txCodeLast6], map: "bank_transactions_open_received_idx", where: raw("state = 'UNMATCHED'::\"BankTransactionState\" AND direction = 'RECEIVED'::\"BankTransactionDirection\""))
+  /// The admin list: by phone / by account / everything, newest bank time
+  /// first. Each is (leading equality, occurredAt DESC) so ORDER BY and the
+  /// date range come free and a page reads limit+offset entries, then stops.
+  @@index([deviceSerial, occurredAt(sort: Desc)])
+  @@index([paymentAccountId, occurredAt(sort: Desc)])
+  @@index([occurredAt(sort: Desc)])
+  /// The matched / ambiguous / waiting / unclaimed filters — unclaimed is
+  /// `state = UNMATCHED AND occurredAt < now - 48 h`, one contiguous range.
+  @@index([state, occurredAt(sort: Desc)])
+  /// The Received / Sent filter on its own. Two values, but behind them
+  /// occurredAt DESC makes it a band in time order — the same shape as the
+  /// state index — so a "Sent" list or its capped count with no phone
+  /// selected reads limit+offset entries and stops. Without it that one
+  /// combination was a sequential scan at 200k rows (EXPLAIN, 2026-09-23).
+  @@index([direction, occurredAt(sort: Desc)])
+  @@map("bank_transactions")
 }
 
 /// Single global row holding admin-configurable transaction limits, lazily
@@ -1266,6 +1541,7 @@ model PaymentAccount {
   depositsDeclared Deposit[]                   @relation("DepositDeclaredAccount")
   depositsReceived Deposit[]                   @relation("DepositReceivingAccount")
   withdrawalsSent  Withdrawal[]                @relation("WithdrawalTransferAccount")
+  bankTransactions BankTransaction[]           @relation("BankTransactionAccount")
 
   @@index([isActive])
   @@index([type])
@@ -1363,7 +1639,7 @@ model UserSubscription {
   expiresAt DateTime
   createdAt DateTime @default(now())
 
-  user User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user User             @relation(fields: [userId], references: [id], onDelete: Restrict)
   plan SubscriptionPlan @relation(fields: [planId], references: [id])
 
   @@index([userId])
@@ -1639,7 +1915,11 @@ model UserLevel {
 /// that account is renamed, re-roled or deleted, and `actor` (SetNull) is
 /// only the CURRENT state for the admin to link to when it still exists.
 /// Only staff actions land here — AuditService drops anything performed by
-/// a `Role.USER` account, so end-user self-service is never recorded.
+/// a `Role.USER` account, so end-user self-service is never recorded —
+/// except the two security events forced in on purpose: `user.password_reset`
+/// (forgot password) and `user.account_delete` (the owner closed the account).
+/// Closing an account is also the one time rows are edited: the person's
+/// name is anonymised in them (AuditService.anonymiseUser).
 model AuditLog {
   id               String         @id @default(uuid())
   createdAt        DateTime       @default(now())

@@ -6,9 +6,13 @@ import {
 } from './permission-catalogue';
 
 describe('permission catalogue', () => {
-  it('declares 20 modules and 76 MODULE.ACTION permissions', () => {
-    expect(PERMISSION_CATALOGUE).toHaveLength(20);
-    expect(ALL_PERMISSIONS).toHaveLength(76);
+  it('declares 21 modules and 80 MODULE.ACTION permissions', () => {
+    // 76 + DEPOSITS.BANK_EVIDENCE + WITHDRAWALS.BANK_EVIDENCE (bank
+    // verification: the balance-revealing screenshot streams) + the
+    // BANK_TRANSACTIONS module (VIEW, BANK_EVIDENCE) for the phone-monitor's
+    // stored notifications.
+    expect(PERMISSION_CATALOGUE).toHaveLength(21);
+    expect(ALL_PERMISSIONS).toHaveLength(80);
   });
 
   it('generates every permission as MODULE.ACTION with no duplicates', () => {

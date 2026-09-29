@@ -1,5 +1,17 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
+import {
+  CopyObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  NotFound,
+  S3Client,
+} from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { MinioService } from './minio.service';
 import { requestHostContext } from './request-host.context';
 import {
@@ -7,6 +19,15 @@ import {
   quantizedExpiry,
   signScope,
 } from './stream-signature';
+
+// The streamed-copy fallback in copyObject() hands a GetObject body to
+// lib-storage's Upload; stubbed so the spec can assert it was constructed
+// with the right params without any multipart traffic.
+jest.mock('@aws-sdk/lib-storage', () => ({
+  Upload: jest.fn().mockImplementation(() => ({
+    done: jest.fn().mockResolvedValue(undefined),
+  })),
+}));
 
 /**
  * Covers imageUrl() only — the read-time repair for PERSISTED image URLs.
@@ -359,5 +380,249 @@ describe('MinioService.signedPlaybackUrl', () => {
     );
 
     expect(url).toBe('http://192.168.1.5:8080/movies/images/abc-123.jpeg');
+  });
+});
+
+/**
+ * The object-level helpers the video-replace swap and the playback diagnosis
+ * rely on. `S3Client.prototype.send` is stubbed per command constructor —
+ * what is being proven is which S3 command goes out with which parameters,
+ * never a live bucket.
+ */
+describe('MinioService object helpers', () => {
+  const GIB = 1024 * 1024 * 1024;
+  let service: MinioService;
+  let send: jest.SpyInstance;
+  /** Every command `send` saw, by constructor name, with its input. */
+  const sent = (): { name: string; input: Record<string, unknown> }[] =>
+    send.mock.calls.map(([command]) => ({
+      name: (command as object).constructor.name,
+      input: (command as { input: Record<string, unknown> }).input,
+    }));
+
+  const env: Record<string, string> = {
+    MINIO_BUCKET: 'movies',
+    STREAM_PUBLIC_BASE_URL: 'http://192.168.100.27:8080',
+    STREAM_SIGNING_SECRET: 'unit-test-stream-signing-secret-0123456789',
+    MINIO_ENDPOINT: 'http://minio:9000',
+    MINIO_ACCESS_KEY: 'key',
+    MINIO_SECRET_KEY: 'secret',
+  };
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        MinioService,
+        {
+          provide: ConfigService,
+          useValue: { get: jest.fn((key: string) => env[key]) },
+        },
+      ],
+    }).compile();
+    service = module.get(MinioService);
+    send = jest.spyOn(S3Client.prototype, 'send');
+    (Upload as unknown as jest.Mock).mockClear();
+  });
+
+  afterEach(() => {
+    send.mockRestore();
+  });
+
+  describe('copyObject', () => {
+    it('issues one server-side CopyObject for a source under the 5 GiB cap, typed by the DESTINATION key', async () => {
+      send.mockImplementation(async (command: { constructor: unknown }) => {
+        if (command.constructor === HeadObjectCommand)
+          return { ContentLength: 1234 };
+        if (command.constructor === CopyObjectCommand) return {};
+        throw new Error(`unexpected ${command.constructor}`);
+      });
+
+      await service.copyObject(
+        'temp/video-replace/m1/hls/720p/index.m3u8',
+        'videos/m1/hls/720p/index.m3u8',
+      );
+
+      const copies = sent().filter((c) => c.name === 'CopyObjectCommand');
+      expect(copies).toHaveLength(1);
+      expect(copies[0].input).toEqual({
+        Bucket: 'movies',
+        CopySource: 'movies/temp/video-replace/m1/hls/720p/index.m3u8',
+        Key: 'videos/m1/hls/720p/index.m3u8',
+        ContentType: 'application/vnd.apple.mpegurl',
+        MetadataDirective: 'REPLACE',
+      });
+      expect(Upload).not.toHaveBeenCalled();
+    });
+
+    it('streams GetObject -> multipart Upload for a source at or above the cap — never a single CopyObject', async () => {
+      const body = { pipe: jest.fn() };
+      send.mockImplementation(async (command: { constructor: unknown }) => {
+        if (command.constructor === HeadObjectCommand)
+          return { ContentLength: 6 * GIB };
+        if (command.constructor === GetObjectCommand) return { Body: body };
+        throw new Error(`unexpected ${command.constructor}`);
+      });
+
+      await service.copyObject(
+        'temp/video-replace/m1/original.mkv',
+        'videos/m1/original.mkv',
+      );
+
+      expect(sent().map((c) => c.name)).toEqual([
+        'HeadObjectCommand',
+        'GetObjectCommand',
+      ]);
+      expect(Upload).toHaveBeenCalledWith(
+        expect.objectContaining({
+          params: expect.objectContaining({
+            Bucket: 'movies',
+            Key: 'videos/m1/original.mkv',
+            Body: body,
+            ContentType: 'video/x-matroska',
+          }),
+        }),
+      );
+    });
+
+    it('throws instead of silently copying nothing when the source is missing', async () => {
+      send.mockImplementation(async (command: { constructor: unknown }) => {
+        if (command.constructor === HeadObjectCommand)
+          throw new NotFound({ message: 'nope', $metadata: {} });
+        throw new Error(`unexpected ${command.constructor}`);
+      });
+
+      await expect(
+        service.copyObject('temp/video-replace/m1/gone.ts', 'videos/m1/x.ts'),
+      ).rejects.toThrow('does not exist');
+      expect(sent().some((c) => c.name === 'CopyObjectCommand')).toBe(false);
+    });
+  });
+
+  describe('listObjects / listKeys', () => {
+    it('walks every page of the listing and keeps each key with its stamp', async () => {
+      const stamp = new Date('2026-09-01T00:00:00Z');
+      send
+        .mockResolvedValueOnce({
+          Contents: [{ Key: 'videos/m1/a.ts', LastModified: stamp }],
+          IsTruncated: true,
+          NextContinuationToken: 'page-2',
+        })
+        .mockResolvedValueOnce({
+          Contents: [{ Key: 'videos/m1/b.ts' }, { Key: undefined }],
+          IsTruncated: false,
+        });
+
+      const objects = await service.listObjects('videos/m1/');
+
+      expect(objects).toEqual([
+        { key: 'videos/m1/a.ts', lastModified: stamp },
+        { key: 'videos/m1/b.ts', lastModified: undefined },
+      ]);
+      expect(sent().map((c) => c.input.ContinuationToken)).toEqual([
+        undefined,
+        'page-2',
+      ]);
+      expect(sent().every((c) => c.input.Prefix === 'videos/m1/')).toBe(true);
+    });
+
+    it('listKeys is the same walk reduced to keys', async () => {
+      send.mockResolvedValueOnce({
+        Contents: [{ Key: 'subtitles/m1/english.vtt' }],
+        IsTruncated: false,
+      });
+
+      expect(await service.listKeys('subtitles/m1/')).toEqual([
+        'subtitles/m1/english.vtt',
+      ]);
+    });
+  });
+
+  describe('downloadFile', () => {
+    let dir: string;
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'minio-spec-'));
+    });
+    afterEach(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('streams the object to disk and reports the ETag of the bytes it got, unquoted', async () => {
+      send.mockImplementation((command: { constructor: unknown }) =>
+        command.constructor === GetObjectCommand
+          ? Promise.resolve({
+              Body: Readable.from([Buffer.from('%PDF-1.7')]),
+              ETag: '"abc123"',
+            })
+          : Promise.reject(new Error('unexpected command')),
+      );
+      const target = join(dir, 'original.pdf');
+
+      const result = await service.downloadFile(
+        'documents/books/b/e/c/original.pdf',
+        target,
+      );
+
+      expect(result).toEqual({ etag: 'abc123' });
+      expect(readFileSync(target, 'utf8')).toBe('%PDF-1.7');
+    });
+
+    it('reports a null ETag when the server sends none', async () => {
+      send.mockImplementation(() =>
+        Promise.resolve({ Body: Readable.from([Buffer.from('x')]) }),
+      );
+
+      await expect(
+        service.downloadFile(
+          'documents/books/b/e/c/original.pdf',
+          join(dir, 'x'),
+        ),
+      ).resolves.toEqual({ etag: null });
+    });
+  });
+
+  describe('deleteKeys', () => {
+    it('sends nothing for an empty list', async () => {
+      await service.deleteKeys([]);
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('batches DeleteObjects at 1000 keys per request', async () => {
+      send.mockResolvedValue({});
+      const keys = Array.from({ length: 1001 }, (_, i) => `videos/m1/${i}.ts`);
+
+      await service.deleteKeys(keys);
+
+      const batches = sent().filter((c) => c.name === 'DeleteObjectsCommand');
+      expect(batches).toHaveLength(2);
+      const objectsOf = (input: Record<string, unknown>) =>
+        (input.Delete as { Objects: { Key: string }[] }).Objects;
+      expect(objectsOf(batches[0].input)).toHaveLength(1000);
+      expect(objectsOf(batches[1].input)).toEqual([
+        { Key: 'videos/m1/1000.ts' },
+      ]);
+    });
+  });
+
+  describe('signedPlaybackPath / playbackBaseUrl', () => {
+    const MOVIE_ID = 'f41b5f3d-cadf-40ab-b789-4192ee772a5e';
+    const masterKey = `videos/${MOVIE_ID}/hls/master.m3u8`;
+
+    it('is exactly the path half of signedPlaybackUrl — same token, no origin', () => {
+      requestHostContext.run({ hostname: '192.168.1.5' }, () => {
+        const url = service.signedPlaybackUrl(masterKey);
+        const path = service.signedPlaybackPath(masterKey);
+        expect(path).toMatch(
+          new RegExp(`^/s/\\d+/[\\w-]+/movies/${masterKey}$`),
+        );
+        expect(url).toBe(`http://192.168.1.5:8080${path}`);
+        expect(service.playbackBaseUrl()).toBe('http://192.168.1.5:8080');
+      });
+    });
+
+    it('refuses an unsignable key exactly like the full URL does', () => {
+      expect(() =>
+        service.signedPlaybackPath(`temp/video-replace/${MOVIE_ID}/x.ts`),
+      ).toThrow(StreamKeyNotSignable);
+    });
   });
 });

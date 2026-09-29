@@ -6,7 +6,9 @@ import {
 } from '@nestjs/common';
 import {
   AccessType,
+  MovieStatus,
   Role,
+  SeriesStatus,
   VideoStatus,
   type Prisma,
   type Video,
@@ -128,6 +130,12 @@ export class VideosService {
    * staff access. Subtitles are gated by the exact same check (queried
    * after it passes), not a separate rule — a subtitle track is part of the
    * same title.
+   *
+   * A regular viewer is also held to the publish decision (H-7): the title
+   * must be PUBLISHED and, for an episode, so must its show — the same rule
+   * as MoviesService.findByIdOrThrow. Anything else answers the same 404 as
+   * a missing id, and it is checked before the subscription so a 403 cannot
+   * reveal that an unpublished title exists. Staff keep their preview.
    */
   async getStreamInfo(
     movieId: string,
@@ -145,6 +153,14 @@ export class VideosService {
     if (!movie) throw new NotFoundException('Movie not found');
 
     if (role === Role.USER) {
+      if (
+        movie.status !== MovieStatus.PUBLISHED ||
+        (movie.seriesId !== null &&
+          movie.series?.status !== SeriesStatus.PUBLISHED)
+      ) {
+        throw new NotFoundException('Movie not found');
+      }
+
       // Episodes inherit access from the parent series — one active
       // subscription unlocks every episode, including ones added later. The
       // episode's own accessType is irrelevant by design.

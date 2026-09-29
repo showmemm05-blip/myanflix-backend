@@ -364,6 +364,7 @@ describe('Guest catalogue (e2e)', () => {
           'imageUrl',
           'movieCount',
           'name',
+          'seriesCount',
           'updatedAt',
         ].sort(),
       );

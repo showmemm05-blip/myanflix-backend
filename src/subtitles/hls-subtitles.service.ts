@@ -145,7 +145,7 @@ export class HlsSubtitlesService {
 
       try {
         published.push(
-          await this.writeRendition(video.movieId, subtitle, timeline),
+          await this.writeRendition(masterKey, subtitle, timeline),
         );
       } catch (error) {
         // One unreadable source file must not cost the title every other
@@ -201,11 +201,19 @@ export class HlsSubtitlesService {
    * unreferenced object behind, never a manifest pointing at a missing one.
    * Best-effort: an object that is already gone is the expected outcome for a
    * row that was never publishable (ASS).
+   *
+   * Keyed by the MASTER the track was published beside (Video.hlsMasterPath)
+   * rather than by movie id, because that is where writeRendition() put it —
+   * videos/<id>/hls/subs/ for a first upload, videos/<id>/hls/v-<tag>/subs/
+   * after a replace.
    */
-  async unpublishSubtitle(movieId: string, subtitleId: string): Promise<void> {
+  async unpublishSubtitle(
+    masterKey: string,
+    subtitleId: string,
+  ): Promise<void> {
     const keys = [
-      this.storageService.hlsSubtitleVttKey(movieId, subtitleId),
-      this.storageService.hlsSubtitlePlaylistKey(movieId, subtitleId),
+      this.storageService.hlsSubtitleVttKey(masterKey, subtitleId),
+      this.storageService.hlsSubtitlePlaylistKey(masterKey, subtitleId),
     ];
     for (const key of keys) {
       try {
@@ -217,17 +225,27 @@ export class HlsSubtitlesService {
     }
   }
 
+  /**
+   * Writes the two objects for one track BESIDE the given master: the
+   * master will name the playlist as `subs/<id>.m3u8`, a relative URI the
+   * player resolves against the master's own folder, so the folder the
+   * master lives in (un-versioned, or v-<tag>/ after a replace) is the only
+   * correct place for them.
+   */
   private async writeRendition(
-    movieId: string,
+    masterKey: string,
     subtitle: Subtitle,
     timeline: PublishTimeline,
   ): Promise<PublishedSubtitle> {
     const source = await this.minioService.readText(subtitle.objectKey);
     const vtt = withHlsTimestampMap(srtToVtt(source), timeline.initialPts);
 
-    const vttKey = this.storageService.hlsSubtitleVttKey(movieId, subtitle.id);
+    const vttKey = this.storageService.hlsSubtitleVttKey(
+      masterKey,
+      subtitle.id,
+    );
     const playlistKey = this.storageService.hlsSubtitlePlaylistKey(
-      movieId,
+      masterKey,
       subtitle.id,
     );
 

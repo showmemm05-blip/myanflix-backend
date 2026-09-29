@@ -6,7 +6,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
-import { Role } from '../generated/prisma/client';
+import { Prisma, Role, UserStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import { AuthorityService } from '../roles/authority.service';
@@ -19,6 +19,11 @@ import type { UpdateStaffStatusDto } from './dto/update-staff-status.dto';
 import type { StaffUser } from './dto/staff-response.dto';
 import { AuditService } from '../audit/audit.service';
 import { userSnapshot } from '../audit/audit-snapshots';
+import { SessionRevocationService } from '../auth/session-revocation.service';
+import {
+  MONEY_RECORDS_DELETE_MESSAGE,
+  findMoneyRecordKinds,
+} from '../users/user-money-records';
 
 const PASSWORD_SALT_ROUNDS = 10;
 
@@ -40,6 +45,7 @@ export class StaffService {
     private readonly usersService: UsersService,
     private readonly authority: AuthorityService,
     private readonly audit: AuditService,
+    private readonly sessions: SessionRevocationService,
   ) {}
 
   async findAll(): Promise<StaffUser[]> {
@@ -162,6 +168,9 @@ export class StaffService {
     // a plain update, which the log skips when nothing actually differs.
     const roleChanged =
       updated.role !== target.role || updated.appRoleId !== target.appRoleId;
+    // H-21: a new role means new sessions — nothing keeps acting (or keeps
+    // receiving realtime pushes) under the old assignment.
+    if (roleChanged) await this.sessions.revokeAllAndDisconnect(id);
     await this.audit.record({
       action: roleChanged ? 'staff.role_change' : 'staff.update',
       actor: currentUser,
@@ -178,6 +187,10 @@ export class StaffService {
    * F3: resetting a password is a full account takeover, so a Super Admin's
    * password is only another Super Admin's to reset — STAFF.EDIT alone used to
    * be enough to log in as one.
+   *
+   * H-21: the reset is how a stolen staff login is taken back, so every
+   * session of the account is revoked with it — in the same transaction —
+   * and its sockets are closed once it commits.
    */
   async resetPassword(
     id: string,
@@ -192,10 +205,14 @@ export class StaffService {
       dto.newPassword,
       PASSWORD_SALT_ROUNDS,
     );
-    await this.prisma.user.update({
-      where: { id },
-      data: { password: passwordHash },
+    await this.prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id },
+        data: { password: passwordHash },
+      });
+      await this.sessions.revokeAll(id, { client: tx });
     });
+    this.sessions.disconnectUser(id);
 
     // Pure event: the fact of the reset is what matters — no values, ever.
     await this.audit.record({
@@ -226,6 +243,12 @@ export class StaffService {
       include: STAFF_INCLUDE,
     });
 
+    // H-21: suspended = signed out everywhere now, and those sessions must
+    // not spring back if the account is re-activated later.
+    if (dto.status !== UserStatus.ACTIVE) {
+      await this.sessions.revokeAllAndDisconnect(id);
+    }
+
     // A status change never touches the assignment, so the AppRole loaded
     // with the update names the "before" side too.
     await this.audit.record({
@@ -238,6 +261,15 @@ export class StaffService {
     return updated;
   }
 
+  /**
+   * H-22: money records are never deleted with an account. An account with
+   * a wallet balance or any money row (ledger, deposit, withdrawal,
+   * adjustment, subscription, purchase) answers 409 telling staff to
+   * suspend it instead — the RESTRICT foreign keys are the guarantee, and a
+   * row written between this check and the delete surfaces as P2003,
+   * mapped to the same 409. Otherwise the empty wallet row goes first (its
+   * foreign key is RESTRICT too), then the account, in one transaction.
+   */
   async remove(id: string, currentUser: AuthenticatedUser): Promise<void> {
     if (id === currentUser.id) {
       throw new ForbiddenException('You cannot delete your own account.');
@@ -259,7 +291,27 @@ export class StaffService {
       null,
     );
 
-    await this.prisma.user.delete({ where: { id } });
+    await this.prisma
+      .$transaction(async (tx) => {
+        if ((await findMoneyRecordKinds(tx, id)).length > 0) {
+          throw new ConflictException(MONEY_RECORDS_DELETE_MESSAGE);
+        }
+        await tx.wallet.deleteMany({ where: { userId: id } });
+        await tx.user.delete({ where: { id } });
+      })
+      .catch((error: unknown) => {
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === 'P2003'
+        ) {
+          throw new ConflictException(MONEY_RECORDS_DELETE_MESSAGE);
+        }
+        throw error;
+      });
+
+    // Its refresh tokens went with the row (cascade); its open sockets are
+    // closed here, so a deleted account stops receiving pushes at once.
+    this.sessions.disconnectUser(id);
 
     // Deleting the row leaves the avatar bytes behind, and nothing else will
     // ever reach them: the key lived only in the column that just went away.

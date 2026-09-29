@@ -1,23 +1,33 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
-import type { User, UserStatus } from '../generated/prisma/client';
+import { randomBytes } from 'node:crypto';
+import type { User } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { PASSWORD_SALT_ROUNDS } from '../auth/password.constants';
+import { SessionRevocationService } from '../auth/session-revocation.service';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
 import { AuthorityService } from '../roles/authority.service';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
-import { Role, TransactionType } from '../generated/prisma/client';
+import {
+  DepositStatus,
+  Role,
+  TransactionType,
+  UserStatus,
+  WithdrawalStatus,
+} from '../generated/prisma/client';
 import { AuditService } from '../audit/audit.service';
 import { userSnapshot } from '../audit/audit-snapshots';
+import { CLOSED_ACCOUNT_MESSAGE } from './account-status-lock';
 
 export interface CreateUserInput {
   username: string;
@@ -78,6 +88,23 @@ function matchesMagicBytes(mimetype: string, buffer: Buffer): boolean {
   }
 }
 
+/** H-16 refusals, in the order they are checked. */
+export const ACCOUNT_DELETE_BALANCE_MESSAGE =
+  'Your wallet still has money in it. Withdraw or spend it before deleting your account.';
+export const ACCOUNT_DELETE_PENDING_DEPOSIT_MESSAGE =
+  'You have a deposit waiting for review. Wait until it is approved or rejected before deleting your account.';
+export const ACCOUNT_DELETE_PENDING_WITHDRAWAL_MESSAGE =
+  'You have a withdrawal waiting for review. Wait until it is approved or rejected before deleting your account.';
+
+/**
+ * The username a closed account is left with: unique (it is the row id) and
+ * unclaimable (40 characters, over the 32 that registration accepts), so
+ * nobody can ever sign up as — or be mistaken for — a deleted account.
+ */
+export function closedAccountUsername(userId: string): string {
+  return `deleted_${userId.replace(/-/g, '')}`;
+}
+
 export interface WalletSummary {
   balance: number;
   totalDeposited: number;
@@ -96,6 +123,7 @@ export class UsersService {
     private readonly storageService: StorageService,
     private readonly authority: AuthorityService,
     private readonly audit: AuditService,
+    private readonly sessions: SessionRevocationService,
   ) {}
 
   async create(input: CreateUserInput): Promise<User> {
@@ -274,6 +302,9 @@ export class UsersService {
     }
 
     const target = await this.findWithAppRoleOrThrow(id);
+    if (target.status === UserStatus.CLOSED) {
+      throw new ConflictException(CLOSED_ACCOUNT_MESSAGE);
+    }
     const systemRole = await this.prisma.appRole.findUnique({
       where: { key: role },
       select: { id: true, name: true },
@@ -308,6 +339,13 @@ export class UsersService {
       data: { role, ...(systemRole && { appRoleId: systemRole.id }) },
     });
 
+    // H-21: a new role means new sessions — every token and socket of the
+    // account goes, so nothing keeps acting under the old assignment.
+    const nextAppRoleId = systemRole?.id ?? target.appRoleId;
+    if (role !== target.role || nextAppRoleId !== target.appRoleId) {
+      await this.sessions.revokeAllAndDisconnect(id);
+    }
+
     // The assignment is re-pointed only when the system role exists; otherwise
     // the AppRole stays whatever it was — mirror that in the "after" name.
     await this.audit.record({
@@ -338,6 +376,9 @@ export class UsersService {
     actor: AuthenticatedUser,
   ): Promise<User> {
     const target = await this.findWithAppRoleOrThrow(id);
+    if (target.status === UserStatus.CLOSED) {
+      throw new ConflictException(CLOSED_ACCOUNT_MESSAGE);
+    }
     await this.authority.assertCanChangeStatus(
       actor,
       { id, role: target.role, appRoleId: target.appRoleId },
@@ -355,6 +396,12 @@ export class UsersService {
       where: { id },
       data: { status },
     });
+
+    // H-21: suspended or banned = signed out everywhere, now — and those
+    // sessions must not spring back if the account is re-activated later.
+    if (status !== UserStatus.ACTIVE) {
+      await this.sessions.revokeAllAndDisconnect(id);
+    }
 
     await this.audit.record({
       action: 'user.status_change',
@@ -411,26 +458,181 @@ export class UsersService {
    * Self-service password change: proves ownership with the current password
    * before writing the new hash, using the same bcrypt cost as registration.
    *
-   * Existing refresh tokens are deliberately NOT revoked — signing other
-   * devices out on a password change is a separate product decision and is
-   * out of scope here.
+   * H-21: every OTHER session is signed out in the same transaction — the
+   * caller's own refresh session (`actor.sessionId`) is kept, so their
+   * client's next 401 refreshes into a fresh token instead of a sign-out.
+   *
+   * `actor` is the caller from @CurrentUser(). When given, a successful
+   * change lands in the staff audit log as `staff.password_change`.
+   * AuditService drops end users (role USER) by itself, so only a staff
+   * member's self-change is ever written.
    */
   async changePassword(
     id: string,
     currentPassword: string,
     newPassword: string,
+    actor?: AuthenticatedUser,
   ): Promise<void> {
     const user = await this.findByIdOrThrow(id);
     const matches = await bcrypt.compare(currentPassword, user.password);
     if (!matches) {
+      // Thrown before any audit call: a failed attempt is not a change.
       throw new BadRequestException('Your current password is incorrect');
     }
 
     const passwordHash = await bcrypt.hash(newPassword, PASSWORD_SALT_ROUNDS);
-    await this.prisma.user.update({
-      where: { id },
-      data: { password: passwordHash },
+    await this.prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id },
+        data: { password: passwordHash },
+      });
+      await this.sessions.revokeAll(id, {
+        exceptSessionId: actor?.sessionId,
+        client: tx,
+      });
     });
+    this.sessions.disconnectUser(id);
+
+    // Pure event, like staff.password_reset: the fact of the change is what
+    // matters. Deliberately NO before/after/metadata — nothing password-
+    // related (plain or hashed) may ever reach the audit table.
+    if (actor) {
+      await this.audit.record({
+        action: 'staff.password_change',
+        actor,
+        target: { type: 'staff', id: user.id, label: `@${user.username}` },
+      });
+    }
+  }
+
+  /**
+   * H-16: DELETE /users/me — the owner closes their own account.
+   *
+   * Refused (409) while the wallet holds money or a deposit/withdrawal is
+   * still pending: that money has to be settled first. Otherwise, in ONE
+   * transaction, the account is anonymised and CLOSED — never deleted, so
+   * every money record (ledger, deposits, withdrawals, purchases) stays
+   * intact and still adds up (H-22) — every session is revoked, the traces
+   * that identify the person (codes sent to the phone, IP addresses, the
+   * name, IP address and user agent in the audit trail) are scrubbed, and a
+   * `user.account_delete` row is written with the owner as actor, already
+   * under the anonymised name and scrubbed with the rest.
+   *
+   * The kept money rows are deliberately NOT scrubbed, so they still hold
+   * what was entered on them: a withdrawal's payout account (accountType,
+   * accountName, accountNumber, bankName), the sender name staff may type
+   * on a manual deposit (deposits.accountName), transfer codes and bank
+   * screenshots, and the matched bank notification's counterparty — also in
+   * the deposit.* / withdrawal.* audit snapshots.
+   *
+   * A closed account can never sign in again: the phone, e-mail and Google
+   * id are released (the same phone can sign up afresh as a NEW account),
+   * the password is a hash of random bytes nobody knows, every sign-in path
+   * and the socket handshake require ACTIVE, and no status route can move
+   * an account out of CLOSED.
+   *
+   * Customer accounts only: a staff account is managed from the Staff page.
+   */
+  async deleteOwnAccount(actor: AuthenticatedUser): Promise<void> {
+    const user = await this.findByIdOrThrow(actor.id);
+    if (user.role !== Role.USER) {
+      throw new ForbiddenException(
+        'Staff accounts cannot be deleted here. Ask a Super Admin.',
+      );
+    }
+
+    const username = closedAccountUsername(user.id);
+    const unusablePassword = await bcrypt.hash(
+      randomBytes(32).toString('hex'),
+      PASSWORD_SALT_ROUNDS,
+    );
+
+    await this.prisma.$transaction(async (tx) => {
+      // Lock the account row first. Every deposit/withdrawal insert takes it
+      // FOR SHARE as its own first statement (lockAccountStatus), so one in
+      // flight is waited for and then seen by the checks below — and one
+      // that arrives after this lock waits, reads CLOSED and writes nothing.
+      // Purchases key-share-lock it through their foreign key.
+      await tx.$queryRaw`SELECT "id" FROM "users" WHERE "id" = ${user.id} FOR UPDATE`;
+
+      const wallet = await tx.wallet.findUnique({
+        where: { userId: user.id },
+        select: { balance: true },
+      });
+      if (decimalToNumber(wallet?.balance) > 0) {
+        throw new ConflictException(ACCOUNT_DELETE_BALANCE_MESSAGE);
+      }
+      const pendingDeposit = await tx.deposit.findFirst({
+        where: { userId: user.id, status: DepositStatus.PENDING },
+        select: { id: true },
+      });
+      if (pendingDeposit) {
+        throw new ConflictException(ACCOUNT_DELETE_PENDING_DEPOSIT_MESSAGE);
+      }
+      const pendingWithdrawal = await tx.withdrawal.findFirst({
+        where: { userId: user.id, status: WithdrawalStatus.PENDING },
+        select: { id: true },
+      });
+      if (pendingWithdrawal) {
+        throw new ConflictException(ACCOUNT_DELETE_PENDING_WITHDRAWAL_MESSAGE);
+      }
+
+      await tx.user.update({
+        where: { id: user.id },
+        data: {
+          username,
+          password: unusablePassword,
+          phone: null,
+          email: null,
+          googleId: null,
+          displayName: null,
+          avatar: null,
+          lastIpAddress: null,
+          status: UserStatus.CLOSED,
+        },
+      });
+      await this.sessions.revokeAll(user.id, { client: tx });
+
+      if (user.phone) {
+        await tx.otpCode.deleteMany({ where: { phone: user.phone } });
+      }
+      await tx.userSession.updateMany({
+        where: { userId: user.id },
+        data: { ipAddress: null, userAgent: null },
+      });
+      await tx.comment.updateMany({
+        where: { userId: user.id },
+        data: { ipAddress: null },
+      });
+      await tx.feedback.updateMany({
+        where: { userId: user.id },
+        data: { ipAddress: null },
+      });
+      await tx.searchQuery.updateMany({
+        where: { userId: user.id },
+        data: { ipAddress: null },
+      });
+      // Written BEFORE the audit trail is anonymised (B4), so the scrub
+      // below also takes this row's IP address and user agent — those of
+      // the deletion request itself — and any cached display name.
+      await this.audit.record({
+        action: 'user.account_delete',
+        actor: { ...actor, username },
+        target: { type: 'user', id: user.id, label: `@${username}` },
+        force: true,
+        tx,
+      });
+      await this.audit.anonymiseUser(
+        { userId: user.id, previousUsername: user.username, username },
+        tx,
+      );
+    });
+
+    this.audit.invalidateActorCache(user.id);
+    this.sessions.disconnectUser(user.id);
+    // After the commit and best-effort, like the staff delete: the bytes are
+    // a storage concern, the closed account is the user-facing action.
+    await this.deleteAvatarObjects(user.id);
   }
 
   /**

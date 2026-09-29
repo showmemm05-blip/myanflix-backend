@@ -185,9 +185,12 @@ export class SubtitlesService {
 
   async remove(id: string, actor: AuthenticatedUser): Promise<void> {
     const subtitle = await this.assertExists(id);
+    // hlsMasterPath is where the track's published objects sit (beside the
+    // live master — see HlsSubtitlesService.unpublishSubtitle), which is why
+    // it is read here and not re-derived from the movie id.
     const video = await this.prisma.video.findUnique({
       where: { id: subtitle.videoId },
-      select: { movieId: true },
+      select: { movieId: true, hlsMasterPath: true },
     });
 
     await this.prisma.subtitle.delete({ where: { id } });
@@ -215,8 +218,8 @@ export class SubtitlesService {
     // it — and deleting the last track removes the whole subtitle group (and
     // the SUBTITLES= attributes) rather than leaving a dangling URI.
     const republished = await this.publishQuietly(subtitle.videoId);
-    if (video && republished) {
-      await this.hlsSubtitlesService.unpublishSubtitle(video.movieId, id);
+    if (video?.hlsMasterPath && republished) {
+      await this.hlsSubtitlesService.unpublishSubtitle(video.hlsMasterPath, id);
     }
 
     // The uploaded SOURCE file — previously left behind on every delete, so

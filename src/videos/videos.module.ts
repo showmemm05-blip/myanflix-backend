@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
 import { TrackingModule } from '../tracking/tracking.module';
+import { VideoDiagnosisService } from './video-diagnosis.service';
 import { VideoDurationService } from './video-duration.service';
 import { VideosController } from './videos.controller';
 import { VideosService } from './videos.service';
@@ -12,6 +13,7 @@ import { VideosService } from './videos.service';
   providers: [
     VideosService,
     VideoDurationService,
+    VideoDiagnosisService,
     StorageService,
     MinioService,
   ],

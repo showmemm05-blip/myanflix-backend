@@ -10,7 +10,9 @@ const MOVIE_ID = 'ebfce557-db9f-4515-8329-f28fc10dd28f';
 const VIDEO_ID = '0b94b5e5-7224-4dfd-99a3-4112bb09501c';
 const SUBTITLE_ID = 'cc0ce210-d64a-4a83-ab24-33369b711e43';
 const MASTER_KEY = `videos/${MOVIE_ID}/hls/master.m3u8`;
-/** The uploaded SOURCE — under subtitles/<movieId>/, unlike the renditions this service writes under videos/<movieId>/hls/subs/. */
+/** Where a video REPLACE puts the package — the master one folder deeper, subs/ must follow it. */
+const VERSIONED_MASTER_KEY = `videos/${MOVIE_ID}/hls/v-abc123/master.m3u8`;
+/** The uploaded SOURCE — under subtitles/<movieId>/, unlike the renditions this service writes beside the master (<package>/subs/). */
 const SOURCE_KEY = `subtitles/${MOVIE_ID}/${SUBTITLE_ID}.srt`;
 
 const MASTER =
@@ -97,7 +99,10 @@ describe('HlsSubtitlesService', () => {
     ]);
 
     segments = new Map([
-      [`videos/${MOVIE_ID}/hls/720p/segment_000.ts`, tsPacketWithPts(INITIAL_PTS)],
+      [
+        `videos/${MOVIE_ID}/hls/720p/segment_000.ts`,
+        tsPacketWithPts(INITIAL_PTS),
+      ],
     ]);
 
     prisma = {
@@ -139,12 +144,14 @@ describe('HlsSubtitlesService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: MinioService, useValue: minioService },
         {
+          // Mirrors the real derivation (asserted in storage.service.spec.ts):
+          // the renditions sit in a subs/ folder BESIDE the given master.
           provide: StorageService,
           useValue: {
-            hlsSubtitleVttKey: (movieId: string, id: string) =>
-              `videos/${movieId}/hls/subs/${id}.vtt`,
-            hlsSubtitlePlaylistKey: (movieId: string, id: string) =>
-              `videos/${movieId}/hls/subs/${id}.m3u8`,
+            hlsSubtitleVttKey: (masterKey: string, id: string) =>
+              `${masterKey.slice(0, masterKey.lastIndexOf('/') + 1)}subs/${id}.vtt`,
+            hlsSubtitlePlaylistKey: (masterKey: string, id: string) =>
+              `${masterKey.slice(0, masterKey.lastIndexOf('/') + 1)}subs/${id}.m3u8`,
           },
         },
       ],
@@ -163,7 +170,7 @@ describe('HlsSubtitlesService', () => {
       expect(vtt).toContain('Hello there.');
     });
 
-    it('anchors X-TIMESTAMP-MAP to the media\'s real initial PTS', async () => {
+    it("anchors X-TIMESTAMP-MAP to the media's real initial PTS", async () => {
       await service.publishForVideo(VIDEO_ID);
 
       // Probed off the first segment of the first variant, NOT a constant:
@@ -240,6 +247,76 @@ describe('HlsSubtitlesService', () => {
       );
       expect(result.masterUpdated).toBe(true);
       expect(result.published).toHaveLength(1);
+    });
+  });
+
+  describe('a title whose video was REPLACED — the master lives in hls/v-<tag>/', () => {
+    // WHY this matters: the master names each rendition as the RELATIVE URI
+    // `subs/<id>.m3u8`, which a player resolves against the folder it
+    // fetched the master from. After a replace that folder is
+    // videos/<id>/hls/v-<tag>/, so a rendition written to the old
+    // videos/<id>/hls/subs/ would be advertised at a key that does not
+    // exist and every subtitle load would 404.
+    beforeEach(() => {
+      prisma.video.findUnique.mockResolvedValue({
+        id: VIDEO_ID,
+        movieId: MOVIE_ID,
+        status: 'READY',
+        duration: null,
+        hlsMasterPath: VERSIONED_MASTER_KEY,
+      });
+      stored.set(VERSIONED_MASTER_KEY, MASTER);
+      stored.set(
+        `videos/${MOVIE_ID}/hls/v-abc123/720p/index.m3u8`,
+        '#EXTM3U\n#EXTINF:6.000,\nsegment_000.ts\n#EXT-X-ENDLIST\n',
+      );
+      segments.set(
+        `videos/${MOVIE_ID}/hls/v-abc123/720p/segment_000.ts`,
+        tsPacketWithPts(INITIAL_PTS),
+      );
+    });
+
+    it('writes both rendition objects BESIDE the versioned master, never under the un-versioned hls/subs/', async () => {
+      const result = await service.publishForVideo(VIDEO_ID);
+
+      expect(
+        written.get(`videos/${MOVIE_ID}/hls/v-abc123/subs/${SUBTITLE_ID}.vtt`),
+      ).toContain('Hello there.');
+      expect(
+        written.get(`videos/${MOVIE_ID}/hls/v-abc123/subs/${SUBTITLE_ID}.m3u8`),
+      ).toContain(`${SUBTITLE_ID}.vtt`);
+      expect(
+        written.has(`videos/${MOVIE_ID}/hls/subs/${SUBTITLE_ID}.vtt`),
+      ).toBe(false);
+      expect(result.published[0]).toMatchObject({
+        vttKey: `videos/${MOVIE_ID}/hls/v-abc123/subs/${SUBTITLE_ID}.vtt`,
+        playlistKey: `videos/${MOVIE_ID}/hls/v-abc123/subs/${SUBTITLE_ID}.m3u8`,
+      });
+    });
+
+    it('keeps the master URI relative (`subs/<id>.m3u8`) so it resolves inside the versioned folder — and inside the same signed scope', async () => {
+      await service.publishForVideo(VIDEO_ID);
+
+      const master = written.get(VERSIONED_MASTER_KEY);
+      expect(master).toContain(`URI="subs/${SUBTITLE_ID}.m3u8"`);
+      expect(master).not.toContain('v-abc123');
+      expect(written.has(MASTER_KEY)).toBe(false);
+    });
+
+    it('probes the timeline from the VERSIONED variant and segment, resolved relative to the versioned master', async () => {
+      await service.publishForVideo(VIDEO_ID);
+
+      expect(minioService.readText).toHaveBeenCalledWith(
+        `videos/${MOVIE_ID}/hls/v-abc123/720p/index.m3u8`,
+      );
+      expect(minioService.readBytes).toHaveBeenCalledWith(
+        `videos/${MOVIE_ID}/hls/v-abc123/720p/segment_000.ts`,
+        expect.any(Number),
+      );
+      const vtt = written.get(
+        `videos/${MOVIE_ID}/hls/v-abc123/subs/${SUBTITLE_ID}.vtt`,
+      );
+      expect(vtt?.split('\n')[1]).toBe(hlsTimestampMap(INITIAL_PTS));
     });
   });
 
@@ -340,8 +417,8 @@ describe('HlsSubtitlesService', () => {
   });
 
   describe('unpublishSubtitle', () => {
-    it('deletes both published objects for the track', async () => {
-      await service.unpublishSubtitle(MOVIE_ID, SUBTITLE_ID);
+    it('deletes both published objects for the track, beside the master it was published with', async () => {
+      await service.unpublishSubtitle(MASTER_KEY, SUBTITLE_ID);
 
       expect(minioService.deleteObject).toHaveBeenCalledWith(
         `videos/${MOVIE_ID}/hls/subs/${SUBTITLE_ID}.vtt`,
@@ -351,11 +428,22 @@ describe('HlsSubtitlesService', () => {
       );
     });
 
+    it('follows a versioned master into its hls/v-<tag>/subs/ folder', async () => {
+      await service.unpublishSubtitle(VERSIONED_MASTER_KEY, SUBTITLE_ID);
+
+      expect(minioService.deleteObject).toHaveBeenCalledWith(
+        `videos/${MOVIE_ID}/hls/v-abc123/subs/${SUBTITLE_ID}.vtt`,
+      );
+      expect(minioService.deleteObject).toHaveBeenCalledWith(
+        `videos/${MOVIE_ID}/hls/v-abc123/subs/${SUBTITLE_ID}.m3u8`,
+      );
+    });
+
     it('tolerates an object that was never published', async () => {
       minioService.deleteObject.mockRejectedValue(new Error('NoSuchKey'));
 
       await expect(
-        service.unpublishSubtitle(MOVIE_ID, SUBTITLE_ID),
+        service.unpublishSubtitle(MASTER_KEY, SUBTITLE_ID),
       ).resolves.toBeUndefined();
     });
   });

@@ -365,6 +365,7 @@ export class PaymentAccountsService {
       },
       after: paymentAccountSnapshot(account),
     });
+    this.realtimeGateway.notifyPaymentAccountsChanged();
     return this.toAdminResponse(account);
   }
 
@@ -396,6 +397,9 @@ export class PaymentAccountsService {
       before: paymentAccountSnapshot(before),
       after: paymentAccountSnapshot(account),
     });
+    // Every field here is what a depositor sees (name, number, active) —
+    // deactivation above all — so the public list is pushed out at once.
+    this.realtimeGateway.notifyPaymentAccountsChanged();
     return this.toAdminResponse(account);
   }
 
@@ -413,6 +417,23 @@ export class PaymentAccountsService {
         'This account has transaction history and cannot be deleted. Deactivate it instead.',
       );
     }
+    // Q-BT9 — bank_transactions.paymentAccountId is ON DELETE RESTRICT: a
+    // phone's stored notifications are evidence that outlives nothing.
+    // Ordered by occurredAt so the planner walks
+    // bank_transactions_paymentAccountId_occurredAt_idx to its first entry
+    // and stops — without the ORDER BY a busy account (most rows) makes a
+    // "seq scan, first hit" the cheaper plan on paper. Never a count over
+    // the account's history.
+    const evidence = await this.prisma.bankTransaction.findFirst({
+      where: { paymentAccountId: id },
+      orderBy: { occurredAt: 'desc' },
+      select: { id: true },
+    });
+    if (evidence) {
+      throw new ConflictException(
+        'This account has bank transactions recorded against it and cannot be deleted. Deactivate it instead.',
+      );
+    }
     await this.prisma.paymentAccount.delete({ where: { id } });
     await this.audit.record({
       action: 'payment_account.delete',
@@ -424,6 +445,7 @@ export class PaymentAccountsService {
       },
       before: paymentAccountSnapshot(before),
     });
+    this.realtimeGateway.notifyPaymentAccountsChanged();
     return { deleted: true };
   }
 

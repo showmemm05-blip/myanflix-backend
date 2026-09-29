@@ -33,6 +33,7 @@ export const AUDIT_TARGET_TYPES = [
   'level',
   'deposit',
   'withdrawal',
+  'bank_transaction',
   'payment_account',
   'payment_method_type',
   'payment_account_transaction',
@@ -67,6 +68,13 @@ export const AUDIT_ACTIONS = [
   /** Finalize external / classic upload complete. */
   define('movie.upload', CONTENT, 'movie'),
   define('movie.reprocess', CONTENT, 'movie'),
+  /**
+   * A finalize-replace that reached the swap (POST /uploads/:movieId/
+   * finalize-replace): before/after are the Video + Subtitle snapshots,
+   * metadata.outcome is `replaced` or `interrupted`. The Movie row and its
+   * status are never part of it — they do not change.
+   */
+  define('movie.video_replace', CONTENT, 'movie'),
   define('movie.update', CONTENT, 'movie'),
   define('movie.publish', CONTENT, 'movie'),
   define('movie.unpublish', CONTENT, 'movie'),
@@ -142,6 +150,18 @@ export const AUDIT_ACTIONS = [
    * balanceBefore/After, adjustmentId and transactionId.
    */
   define('user.wallet_adjust', USERS, 'user'),
+  /**
+   * Self-service "forgot password" (POST /auth/password/reset, H-8): phone +
+   * SMS code + new password. The owner is the actor (the row is forced past
+   * the end-user filter); every session was revoked. No values, ever.
+   */
+  define('user.password_reset', USERS, 'user'),
+  /**
+   * The owner deleted their own account (DELETE /users/me, H-16): personal
+   * data anonymised, status CLOSED, sessions revoked, money records kept.
+   * Actor = the owner, already under the anonymised username.
+   */
+  define('user.account_delete', USERS, 'user'),
 
   // --- STAFF --------------------------------------------------------------
   define('staff.create', STAFF, 'staff'),
@@ -151,6 +171,12 @@ export const AUDIT_ACTIONS = [
   define('staff.status_change', STAFF, 'staff'),
   /** No values are ever stored for this one — not even hashed. */
   define('staff.password_reset', STAFF, 'staff'),
+  /**
+   * Self-service: the signed-in staff member changed their OWN password via
+   * PATCH /users/me/password. No values are ever stored — not even hashed.
+   * End users on the same route are skipped by AuditService (role USER).
+   */
+  define('staff.password_change', STAFF, 'staff'),
   define('staff.delete', STAFF, 'staff'),
 
   define('role.create', STAFF, 'role'),
@@ -169,10 +195,39 @@ export const AUDIT_ACTIONS = [
   define('deposit.approve', FINANCE, 'deposit'),
   define('deposit.reject', FINANCE, 'deposit'),
   define('deposit.receiving_account_update', FINANCE, 'deposit'),
+  /**
+   * Bank-side events (bank-events module). The phone-monitor's writes are
+   * system rows (actor null, metadata.source = 'phone-monitor', plus the
+   * device serial and event idempotency key); verification_review is the
+   * staff member's decision on a flagged row.
+   */
+  define('deposit.bank_match', FINANCE, 'deposit'),
+  define('deposit.bank_screenshot_attach', FINANCE, 'deposit'),
+  define('deposit.risk_update', FINANCE, 'deposit'),
+  define('deposit.verification_review', FINANCE, 'deposit'),
 
   define('withdrawal.approve', FINANCE, 'withdrawal'),
   define('withdrawal.reject', FINANCE, 'withdrawal'),
   define('withdrawal.transfer_account_update', FINANCE, 'withdrawal'),
+  define('withdrawal.bank_match', FINANCE, 'withdrawal'),
+  define('withdrawal.bank_screenshot_attach', FINANCE, 'withdrawal'),
+  define('withdrawal.risk_update', FINANCE, 'withdrawal'),
+  define('withdrawal.verification_review', FINANCE, 'withdrawal'),
+
+  /**
+   * bank_transactions rows — one per phone notification, stored before
+   * matching. `store`, `link`, `state_change` and `screenshot_attach` are
+   * system rows (actor null, metadata.source = 'phone-monitor', or
+   * metadata.trigger = 'deposit_create' when a freshly submitted deposit
+   * claimed a waiting transfer); `unlink` is the staff member's decision
+   * on a deposit/withdrawal review. Never amounts or codes in the log
+   * line — the snapshots carry them, as deposit.bank_match's do.
+   */
+  define('bank_transaction.store', FINANCE, 'bank_transaction'),
+  define('bank_transaction.link', FINANCE, 'bank_transaction'),
+  define('bank_transaction.unlink', FINANCE, 'bank_transaction'),
+  define('bank_transaction.state_change', FINANCE, 'bank_transaction'),
+  define('bank_transaction.screenshot_attach', FINANCE, 'bank_transaction'),
 
   define('payment_account.create', FINANCE, 'payment_account'),
   define('payment_account.update', FINANCE, 'payment_account'),

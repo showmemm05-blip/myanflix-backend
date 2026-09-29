@@ -7,6 +7,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import { OtpService } from '../otp/otp.service';
 import { TrackingService } from '../tracking/tracking.service';
+import { AuditService } from '../audit/audit.service';
+import { SessionRevocationService } from './session-revocation.service';
 import { Role, UserStatus } from '../generated/prisma/client';
 import type { User } from '../generated/prisma/client';
 
@@ -70,6 +72,8 @@ describe('AuthService — completeSignIn (shared sign-in tail)', () => {
         },
         { provide: OtpService, useValue: {} },
         { provide: TrackingService, useValue: trackingService },
+        { provide: AuditService, useValue: {} },
+        { provide: SessionRevocationService, useValue: {} },
       ],
     }).compile();
 
