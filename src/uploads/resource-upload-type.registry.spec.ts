@@ -1,7 +1,15 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { ResourceUploadTypeRegistry } from './resource-upload-type.registry';
+import { MovieStatus } from '../generated/prisma/client';
+import {
+  REPLACEABLE_MOVIE_STATUSES,
+  ResourceUploadTypeRegistry,
+} from './resource-upload-type.registry';
 import { PrismaService } from '../prisma/prisma.service';
 import { PermissionResolverService } from '../roles/permission-resolver.service';
 import { StorageService } from '../common/storage/storage.service';
@@ -85,6 +93,81 @@ describe('ResourceUploadTypeRegistry', () => {
       expect(key('hls/subs/track-1.m3u8')).toBe(
         'videos/movie-1/hls/subs/track-1.m3u8',
       );
+    });
+  });
+
+  describe('buildKey — movie-replace (a replacement bundle for an existing title)', () => {
+    const key = (relativePath: string) =>
+      registry.resolve('movie-replace').buildKey('movie-1', relativePath);
+
+    it('stages every bundle file verbatim under temp/video-replace/<movieId>/ — never on the live keys', () => {
+      expect(key('original.mp4')).toBe(
+        'temp/video-replace/movie-1/original.mp4',
+      );
+      expect(key('hls/master.m3u8')).toBe(
+        'temp/video-replace/movie-1/hls/master.m3u8',
+      );
+      expect(key('hls/720p/segment_000.ts')).toBe(
+        'temp/video-replace/movie-1/hls/720p/segment_000.ts',
+      );
+    });
+
+    it('keeps a subtitle source under the staging prefix too — the videos/ vs subtitles/ split happens at swap time', () => {
+      expect(key('subtitles/english.vtt')).toBe(
+        'temp/video-replace/movie-1/subtitles/english.vtt',
+      );
+    });
+
+    it('stages under temp/, a prefix the cache server denies unconditionally and nothing can sign', () => {
+      expect(key('hls/720p/index.m3u8').startsWith('temp/')).toBe(true);
+      expect(key('hls/720p/index.m3u8').startsWith('videos/')).toBe(false);
+    });
+
+    it('requires MEDIA.UPLOAD, the same permission as a fresh bundle', () => {
+      expect(registry.resolve('movie-replace').permission).toBe('MEDIA.UPLOAD');
+    });
+
+    it.each([
+      MovieStatus.PUBLISHED,
+      MovieStatus.READY_TO_PUBLISH,
+      MovieStatus.FAILED,
+    ])('lets a %s movie stage a replacement', async (status) => {
+      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1', status });
+      await expect(
+        registry.resolve('movie-replace').assertExists('movie-1'),
+      ).resolves.toBeUndefined();
+    });
+
+    it.each([
+      MovieStatus.DRAFT,
+      MovieStatus.UPLOADING,
+      MovieStatus.PROCESSING,
+      MovieStatus.ARCHIVED,
+    ])(
+      'refuses with ConflictException to stage for a %s movie — presign-batch/multipart/init reject before a byte lands',
+      async (status) => {
+        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1', status });
+        await expect(
+          registry.resolve('movie-replace').assertExists('movie-1'),
+        ).rejects.toThrow(ConflictException);
+      },
+    );
+
+    it('throws NotFoundException for a movie that does not exist', async () => {
+      prisma.movie.findUnique.mockResolvedValue(null);
+      await expect(
+        registry.resolve('movie-replace').assertExists('movie-1'),
+      ).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('REPLACEABLE_MOVIE_STATUSES', () => {
+    it('is exactly the three states the owner allows a replacement for', () => {
+      expect([...REPLACEABLE_MOVIE_STATUSES]).toEqual([
+        MovieStatus.PUBLISHED,
+        MovieStatus.READY_TO_PUBLISH,
+        MovieStatus.FAILED,
+      ]);
     });
   });
 

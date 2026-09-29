@@ -21,6 +21,7 @@ import { PermissionResolverService } from './permission-resolver.service';
 import { isSystemRoleKey } from './system-roles.seed';
 import { AuditService } from '../audit/audit.service';
 import { roleSnapshot } from '../audit/audit-snapshots';
+import { SessionRevocationService } from '../auth/session-revocation.service';
 
 /** The permission that lets someone edit roles — the one the lockout guard protects. */
 const ROLES_EDIT: Permission = 'ROLES.EDIT';
@@ -48,6 +49,7 @@ export class RolesService {
     private readonly resolver: PermissionResolverService,
     private readonly authority: AuthorityService,
     private readonly audit: AuditService,
+    private readonly sessions: SessionRevocationService,
   ) {}
 
   /** Module/action tree for the permission matrix UI. */
@@ -218,6 +220,11 @@ export class RolesService {
     }
 
     this.resolver.invalidate(id);
+    // H-3: realtime rooms are per permission — open staff sockets re-check
+    // theirs, so a revoked DEPOSITS.VIEW stops the deposit pushes at once.
+    if (toAdd.length > 0 || toRemove.length > 0) {
+      this.sessions.permissionsChanged();
+    }
     const updated = await this.findByIdOrThrow(id);
     return this.toResponse(updated, await this.countUsers(updated));
   }

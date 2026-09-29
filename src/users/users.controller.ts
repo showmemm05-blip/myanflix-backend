@@ -92,9 +92,9 @@ export class UsersController {
   }
 
   /**
-   * Self-service password change. Auth-only, like the routes above. Other
-   * sessions are deliberately left signed in — revoking refresh tokens on a
-   * password change is out of scope here.
+   * Self-service password change. Auth-only, like the routes above. H-21:
+   * every OTHER session of the account is signed out; the caller's own
+   * (the `sid` of this request's token) stays signed in.
    */
   @Patch('me/password')
   @RequirePermissions()
@@ -102,12 +102,29 @@ export class UsersController {
     @CurrentUser() user: AuthenticatedUser,
     @Body() dto: ChangePasswordDto,
   ) {
+    // The caller is also the audit actor: a staff member's self-change is
+    // recorded as staff.password_change; AuditService skips end users.
     await this.usersService.changePassword(
       user.id,
       dto.currentPassword,
       dto.newPassword,
+      user,
     );
     return { changed: true };
+  }
+
+  /**
+   * H-16: the caller closes their OWN account (customer accounts only).
+   * Refused with 409 while the wallet holds money or a deposit/withdrawal is
+   * pending; otherwise personal data is anonymised, the account is CLOSED,
+   * every session is revoked and every money record is kept — see
+   * UsersService.deleteOwnAccount.
+   */
+  @Delete('me')
+  @RequirePermissions()
+  async deleteMe(@CurrentUser() user: AuthenticatedUser) {
+    await this.usersService.deleteOwnAccount(user);
+    return { deleted: true };
   }
 
   /**

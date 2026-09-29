@@ -320,7 +320,8 @@ describe('Deposits (e2e)', () => {
   });
 
   // F-006: the duplicate-reference rule is enforced by the partial unique
-  // index deposits_reference_active_key, so concurrent submissions cannot
+  // index deposits_user_reference_active_key (one live row per user and
+  // reference since H-11), so concurrent submissions cannot
   // slip past the service-level pre-check. Every count below is scoped by
   // userId as well as reference so leftovers from a crashed earlier run
   // (other users' rows) cannot skew the result.

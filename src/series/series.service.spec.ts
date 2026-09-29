@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import {
   SeriesService,
   buildSeriesWhere,
+  seriesCastWhere,
   seriesOrderBy,
   seriesSearchOr,
 } from './series.service';
@@ -235,6 +236,39 @@ describe('SeriesService', () => {
 
       expect(prisma.movie.findMany.mock.calls[0][0].include.series).toEqual({
         select: { id: true, title: true },
+      });
+    });
+
+    // H-24: the queue used to load one 100-row page and search only that.
+    it('searches the episode title and the show title on the server, count included', async () => {
+      prisma.movie.findMany.mockResolvedValue([]);
+      prisma.movie.count.mockResolvedValue(0);
+
+      await service.findEpisodesForAdmin({
+        search: '  pilot ',
+        status: MovieStatus.READY_TO_PUBLISH,
+      });
+
+      const expected = {
+        seriesId: { not: null },
+        status: MovieStatus.READY_TO_PUBLISH,
+        OR: [
+          { title: { contains: 'pilot', mode: 'insensitive' } },
+          { series: { title: { contains: 'pilot', mode: 'insensitive' } } },
+        ],
+      };
+      expect(prisma.movie.findMany.mock.calls[0][0].where).toEqual(expected);
+      expect(prisma.movie.count).toHaveBeenCalledWith({ where: expected });
+    });
+
+    it('treats a blank search as no search', async () => {
+      prisma.movie.findMany.mockResolvedValue([]);
+      prisma.movie.count.mockResolvedValue(0);
+
+      await service.findEpisodesForAdmin({ search: '   ' });
+
+      expect(prisma.movie.findMany.mock.calls[0][0].where).toEqual({
+        seriesId: { not: null },
       });
     });
   });
@@ -563,7 +597,7 @@ describe('SeriesService', () => {
         Role.USER,
       );
 
-      expect(result).toEqual(series);
+      expect(result).toEqual({ ...series, actors: [] });
       expect(prisma.seriesPurchase.findMany).not.toHaveBeenCalled();
     });
 
@@ -588,7 +622,163 @@ describe('SeriesService', () => {
         Role.SUPER_ADMIN,
       );
 
-      expect(result).toEqual(draft);
+      expect(result).toEqual({ ...draft, actors: [] });
+    });
+  });
+
+  /**
+   * Same trap CATALOG_INCLUDE closes for movies: an unloaded cast renders as
+   * `[]`, the admin form seeds itself with that, and the next unrelated save
+   * `set`s the empty list back — wiping the cast. So every read that reaches
+   * a client must load actors.
+   */
+  describe('cast is loaded on every series read', () => {
+    const stored = {
+      id: 'series-1',
+      title: 'A Show',
+      status: SeriesStatus.PUBLISHED,
+      posterUrl: null,
+      coverUrl: null,
+      categories: [],
+      actors: [],
+    };
+
+    it('detail loads categories AND actors', async () => {
+      prisma.series.findUnique.mockResolvedValue(stored);
+      await service.findByIdOrThrow('series-1');
+      expect(prisma.series.findUnique.mock.calls[0][0].include).toEqual({
+        categories: true,
+        actors: true,
+      });
+    });
+
+    it('list rows load actors alongside the episode count', async () => {
+      prisma.series.findMany.mockResolvedValue([]);
+      prisma.series.count.mockResolvedValue(0);
+      await service.findAll({}, Role.USER);
+      expect(prisma.series.findMany.mock.calls[0][0].include).toEqual({
+        categories: true,
+        actors: true,
+        _count: { select: { episodes: true } },
+      });
+    });
+
+    it("update's audit `before` loads the cast too, or a save would diff it as appearing from nothing", async () => {
+      prisma.series.findUnique.mockResolvedValue(stored);
+      prisma.series.update.mockResolvedValue(stored);
+      await service.update('series-1', { title: 'Renamed' }, ACTOR);
+      expect(prisma.series.findUnique.mock.calls[0][0].include).toEqual({
+        categories: true,
+        actors: true,
+      });
+    });
+  });
+
+  describe('cast on the response — MovieActorRef shape, headshots re-hosted', () => {
+    const stale = 'http://192.168.10.122:8080/movies/images/actor/jc.jpeg';
+    const fresh = 'http://current-host:8080/movies/images/actor/jc.jpeg';
+    const jackie = {
+      id: 'actor-1',
+      name: 'Jackie Chan',
+      imageUrl: stale,
+      createdAt: new Date('2026-01-01'),
+      updatedAt: new Date('2026-01-02'),
+    };
+
+    it('detail trims each actor to { id, name, imageUrl } with the URL re-hosted', async () => {
+      prisma.series.findUnique.mockResolvedValue({
+        id: 'series-1',
+        status: SeriesStatus.PUBLISHED,
+        posterUrl: null,
+        coverUrl: null,
+        categories: [],
+        actors: [jackie],
+      });
+
+      const result = await service.getForViewer('series-1', 'u', Role.USER);
+
+      expect(result.actors).toEqual([
+        { id: 'actor-1', name: 'Jackie Chan', imageUrl: fresh },
+      ]);
+    });
+
+    it('list rows carry the same trimmed cast', async () => {
+      prisma.series.findMany.mockResolvedValue([
+        {
+          id: 'series-1',
+          posterUrl: null,
+          coverUrl: null,
+          categories: [],
+          actors: [jackie],
+          _count: { episodes: 1 },
+        },
+      ]);
+      prisma.series.count.mockResolvedValue(1);
+
+      const result = await service.findAll({}, Role.USER);
+
+      expect(result.items[0].actors).toEqual([
+        { id: 'actor-1', name: 'Jackie Chan', imageUrl: fresh },
+      ]);
+      expect(result.items[0].episodeCount).toBe(1);
+    });
+  });
+
+  describe('create / update — actorIds', () => {
+    const row = {
+      id: 'series-1',
+      title: 'A Show',
+      status: SeriesStatus.DRAFT,
+      posterUrl: null,
+      coverUrl: null,
+      categories: [],
+      actors: [],
+    };
+    const base = {
+      title: 'A Show',
+      description: 'd',
+      genre: 'Action',
+      language: 'en',
+      releaseYear: 2020,
+    };
+
+    it('create connects the submitted cast and returns it with the row', async () => {
+      prisma.series.create.mockResolvedValue(row);
+
+      await service.create({ ...base, actorIds: ['a1', 'a2'] }, ACTOR);
+
+      const args = prisma.series.create.mock.calls[0][0];
+      expect(args.data.actors).toEqual({
+        connect: [{ id: 'a1' }, { id: 'a2' }],
+      });
+      expect(args.data.actorIds).toBeUndefined();
+      expect(args.include).toEqual({ categories: true, actors: true });
+    });
+
+    it('create without actorIds leaves the relation untouched', async () => {
+      prisma.series.create.mockResolvedValue(row);
+      await service.create(base, ACTOR);
+      expect(prisma.series.create.mock.calls[0][0].data.actors).toBeUndefined();
+    });
+
+    it('update SETs the cast — the submitted list is the whole cast', async () => {
+      prisma.series.findUnique.mockResolvedValue(row);
+      prisma.series.update.mockResolvedValue(row);
+
+      await service.update('series-1', { actorIds: ['a2'] }, ACTOR);
+
+      const args = prisma.series.update.mock.calls[0][0];
+      expect(args.data.actors).toEqual({ set: [{ id: 'a2' }] });
+      expect(args.data.actorIds).toBeUndefined();
+    });
+
+    it('update without actorIds does not touch the cast', async () => {
+      prisma.series.findUnique.mockResolvedValue(row);
+      prisma.series.update.mockResolvedValue(row);
+
+      await service.update('series-1', { title: 'Renamed' }, ACTOR);
+
+      expect(prisma.series.update.mock.calls[0][0].data.actors).toBeUndefined();
     });
   });
 
@@ -690,6 +880,16 @@ describe('SeriesService', () => {
       expect(tier2Call[0].where.AND).toContainEqual({ NOT: titleCond });
     });
 
+    it('search (top-level OR) and actorIds (under AND) compose instead of overwriting each other', async () => {
+      await service.findAll({ search: 'thrones', actorIds: ['a1'] }, Role.USER);
+      const where = findManyArgs().where as {
+        OR: unknown[];
+        AND: unknown[];
+      };
+      expect(where.OR).toEqual(seriesSearchOr('thrones'));
+      expect(where.AND).toEqual([seriesCastWhere(['a1'])]);
+    });
+
     it('USER forcing to PUBLISHED survives every new param', async () => {
       await service.findAll(
         {
@@ -698,6 +898,7 @@ describe('SeriesService', () => {
           languages: ['Burmese', 'English'],
           yearFrom: 2000,
           yearTo: 2020,
+          actorIds: ['a1'],
           search: 'a',
         },
         Role.USER,
@@ -786,7 +987,7 @@ describe('SeriesService', () => {
       expect(prisma.series.update).toHaveBeenCalledWith({
         where: { id: 'series-1' },
         data: { status: SeriesStatus.PUBLISHED },
-        include: { categories: true },
+        include: { categories: true, actors: true },
       });
       expect(result.status).toBe(SeriesStatus.PUBLISHED);
     });
@@ -1079,6 +1280,30 @@ describe('buildSeriesWhere', () => {
     const where = buildSeriesWhere({ search: 'thrones' }, Role.USER);
     expect(where.OR).toBeUndefined();
     expect(seriesSearchOr('thrones')).toHaveLength(2);
+  });
+
+  it('actorIds: show-level OR episode-level credit, placed under AND so the search OR can coexist', () => {
+    const where = buildSeriesWhere({ actorIds: ['a1', 'a2'] }, Role.USER);
+
+    expect(where.OR).toBeUndefined();
+    expect(where.AND).toEqual([
+      {
+        OR: [
+          { actors: { some: { id: { in: ['a1', 'a2'] } } } },
+          {
+            episodes: {
+              some: { actors: { some: { id: { in: ['a1', 'a2'] } } } },
+            },
+          },
+        ],
+      },
+    ]);
+    // The other facets stay top-level (AND across facets).
+    expect(where.status).toBe(SeriesStatus.PUBLISHED);
+  });
+
+  it('an empty actorIds list adds nothing', () => {
+    expect(buildSeriesWhere({ actorIds: [] }, Role.USER).AND).toBeUndefined();
   });
 });
 

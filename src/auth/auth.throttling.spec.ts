@@ -65,6 +65,7 @@ describe('Auth rate limiting', () => {
       verifyPhonePassword: jest.fn().mockResolvedValue({ ok: true }),
       requestPhoneOtp: jest.fn().mockResolvedValue(undefined),
       verifyPhoneOtp: jest.fn().mockResolvedValue({ accessToken: 'a' }),
+      resetPasswordWithOtp: jest.fn().mockResolvedValue({ reset: true }),
       refresh: jest.fn().mockResolvedValue({ accessToken: 'b' }),
       logout: jest.fn().mockResolvedValue(undefined),
     };
@@ -103,11 +104,11 @@ describe('Auth rate limiting', () => {
     return ip ? req.set('x-forwarded-for', ip) : req;
   };
 
-  describe('POST /auth/otp/request (3 per phone / 10 min, 20 per IP / hour)', () => {
+  describe('POST /auth/otp/request (4 per phone / 10 min, 50 per IP / hour)', () => {
     beforeEach(() => boot());
 
-    it('answers the 4th request for one phone with the 429 envelope and Retry-After', async () => {
-      for (let i = 0; i < 3; i += 1) {
+    it('answers the 5th request for one phone with the 429 envelope and Retry-After', async () => {
+      for (let i = 0; i < 4; i += 1) {
         await otp('+959111111111').expect(200);
       }
       const blocked = await otp('+959111111111').expect(429);
@@ -119,11 +120,11 @@ describe('Auth rate limiting', () => {
       const retryAfter = Number(blocked.headers['retry-after']);
       expect(retryAfter).toBeGreaterThan(0);
       expect(retryAfter).toBeLessThanOrEqual(600);
-      expect(service.requestPhoneOtp).toHaveBeenCalledTimes(3);
+      expect(service.requestPhoneOtp).toHaveBeenCalledTimes(4);
     });
 
     it('keeps serving a different phone from the same IP', async () => {
-      for (let i = 0; i < 3; i += 1) {
+      for (let i = 0; i < 4; i += 1) {
         await otp('+959111111111').expect(200);
       }
       await otp('+959111111111').expect(429);
@@ -134,11 +135,12 @@ describe('Auth rate limiting', () => {
       await otp('09111111111').expect(200);
       await otp('+959111111111').expect(200);
       await otp('09111111111').expect(200);
-      await otp('+959111111111').expect(429);
+      await otp('+959111111111').expect(200);
+      await otp('09111111111').expect(429);
     });
 
-    it('caps one IP at 20 codes an hour across phones', async () => {
-      for (let i = 0; i < 20; i += 1) {
+    it('caps one IP at 50 codes an hour across phones', async () => {
+      for (let i = 0; i < 50; i += 1) {
         await otp(`+9597000000${String(i).padStart(2, '0')}`).expect(200);
       }
       await otp('+959799999999').expect(429);
@@ -152,6 +154,7 @@ describe('Auth rate limiting', () => {
       await otp('+959111111111').expect(200);
       await otp('+959111111111').expect(200);
       await otp('+959111111111').expect(200);
+      await otp('+959111111111').expect(200);
       await request(app.getHttpServer())
         .post('/auth/otp/request')
         .send({ phone: '+959111111111', extra: 'x' })
@@ -162,7 +165,7 @@ describe('Auth rate limiting', () => {
       // The pipe's enableImplicitConversion turns 9111111111 into the
       // string "9111111111" — the tracker must key it the same way, or a
       // JSON number buys a fresh allowance (F-007).
-      for (let i = 0; i < 3; i += 1) {
+      for (let i = 0; i < 4; i += 1) {
         await otp('09111111111').expect(200);
       }
       await request(app.getHttpServer())
@@ -173,7 +176,7 @@ describe('Auth rate limiting', () => {
         .post('/auth/otp/request')
         .send({ phone: 959111111111 })
         .expect(429);
-      expect(service.requestPhoneOtp).toHaveBeenCalledTimes(3);
+      expect(service.requestPhoneOtp).toHaveBeenCalledTimes(4);
     });
 
     it('non-primitive credentials fall back to the per-IP bucket', async () => {
@@ -191,11 +194,11 @@ describe('Auth rate limiting', () => {
         .post('/auth/otp/request')
         .send({ phone: ['09111111111'] })
         .expect(400);
-      for (let i = 0; i < 3; i += 1) {
+      for (let i = 0; i < 4; i += 1) {
         await otp('09111111111').expect(200);
       }
       await otp('09111111111').expect(429);
-      expect(service.requestPhoneOtp).toHaveBeenCalledTimes(3);
+      expect(service.requestPhoneOtp).toHaveBeenCalledTimes(4);
     });
   });
 
@@ -220,6 +223,60 @@ describe('Auth rate limiting', () => {
       expect(blocked.body.message).toMatch(TOO_MANY);
       expect(blocked.headers['retry-after']).toBeDefined();
       expect(service.verifyPhoneOtp).toHaveBeenCalledTimes(10);
+    });
+  });
+
+  describe('POST /auth/password/reset (H-8: 10 per phone / min, like /auth/otp/verify)', () => {
+    beforeEach(() => boot());
+
+    const reset = (phone: unknown, ip?: string) => {
+      const req = request(app.getHttpServer())
+        .post('/auth/password/reset')
+        .send({ phone, code: '111111', newPassword: 'a-new-password' });
+      return ip ? req.set('x-forwarded-for', ip) : req;
+    };
+
+    it('passes the normalized phone, the code and the new password through', async () => {
+      await reset('09777000777').expect(200);
+      expect(service.resetPasswordWithOtp).toHaveBeenCalledWith(
+        '+959777000777',
+        '111111',
+        'a-new-password',
+      );
+    });
+
+    it('blocks the 11th guess at one phone, even from another address', async () => {
+      for (let i = 0; i < 10; i += 1) {
+        await reset('09777000777').expect(200);
+      }
+      const blocked = await reset('09777000777', '203.0.113.9').expect(429);
+      expect(blocked.body.message).toMatch(TOO_MANY);
+      expect(service.resetPasswordWithOtp).toHaveBeenCalledTimes(10);
+    });
+
+    it('rejects a new password shorter than 8 characters', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/password/reset')
+        .send({ phone: '09777000777', code: '111111', newPassword: 'short' })
+        .expect(400);
+      expect(service.resetPasswordWithOtp).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /auth/otp/verify carries the H-6 step token', () => {
+    beforeEach(() => boot());
+
+    it('passes stepToken through to the service', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/otp/verify')
+        .send({ phone: '09777000777', code: '111111', stepToken: 'step-1' })
+        .expect(200);
+      expect(service.verifyPhoneOtp).toHaveBeenCalledWith(
+        '+959777000777',
+        '111111',
+        undefined,
+        'step-1',
+      );
     });
   });
 
@@ -255,7 +312,7 @@ describe('Auth rate limiting', () => {
     });
   });
 
-  describe('POST /auth/login (10 per username / min, 60 per IP / min)', () => {
+  describe('POST /auth/login (10 per username / min, 120 per IP / min)', () => {
     beforeEach(() => boot());
 
     it('blocks the 11th attempt for one username but not another', async () => {

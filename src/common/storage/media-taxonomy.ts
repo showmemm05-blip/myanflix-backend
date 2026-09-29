@@ -20,9 +20,11 @@
  *     documents/books/<b>/<e>/<c>/original.pdf
  *
  *   generated (produced by us, served through the cache under a signed scope)
- *     videos/<movieId>/hls/**
+ *     videos/<movieId>/hls/**                 (a replace packages one level
+ *                                              deeper, in hls/v-<tag>/**)
  *     audio/<audioId>/hls/**                  (reserved)
- *     books/<b>/<e>/<c>/pages/**
+ *     books/<b>/<e>/<c>/pages/**              (each source PDF converts into
+ *                                              its own pages/v-<tag>/**)
  *
  *   public by key (no token, no scope — this is what makes the catalogue
  *   browsable, and it is why nothing private may ever be given an
@@ -174,8 +176,14 @@ export const MEDIA_CLASSES: readonly MediaClass[] = [
     holds:
       'The complete generated playback package and nothing else: ' +
       'master.m3u8, one flat folder per rendition (<tier>/index.m3u8 + ' +
-      'segment_NNN.ts), and subs/. This directory IS the signed scope and IS ' +
-      'the relative-URI root every player resolves segment names against.',
+      'segment_NNN.ts), and subs/. This directory IS the signed scope. A ' +
+      'first upload packages directly in it; a video REPLACE packages in a ' +
+      'fresh v-<tag>/ subfolder (same shape, one level deeper) because the ' +
+      'cache servers keep segments for 7 days by full path and a bundle ' +
+      'written over the old keys would play with week-old segments. ' +
+      'Video.hlsMasterPath records which package is live, and the folder ' +
+      'the live master sits in is the relative-URI root every player ' +
+      'resolves rendition, segment and subs/ names against.',
   },
   {
     id: 'videoHlsSubs',
@@ -190,7 +198,11 @@ export const MEDIA_CLASSES: readonly MediaClass[] = [
       'is a hard technical requirement, not a taste call — master.m3u8 names ' +
       'these by RELATIVE URI (`subs/<id>.m3u8`), so they must resolve under ' +
       'the same scope prefix the master was signed with. Moving them to ' +
-      'subtitles/ would need a second token the player has no way to fetch.',
+      'subtitles/ would need a second token the player has no way to fetch. ' +
+      'For the same reason subs/ always sits BESIDE the live master: once a ' +
+      'replace has moved the master into hls/v-<tag>/, the renditions are ' +
+      'written to hls/v-<tag>/subs/ (StorageService derives the subs keys ' +
+      'from Video.hlsMasterPath, never from the movie id alone).',
     retention: PERMANENT,
     archivable: false,
     localScratchRoot: 'videos',
@@ -280,7 +292,10 @@ export const MEDIA_CLASSES: readonly MediaClass[] = [
     localScratchRoot: null,
     holds:
       'Generated reader page images (WebP), page number zero-padded to ' +
-      'max(3, len(totalPages)). The depth, the three id levels and the ' +
+      'max(3, len(totalPages)). Each converted source PDF writes into its ' +
+      'own pages/v-<tag>/ folder (tag derived from the PDF ETag), so a ' +
+      're-uploaded PDF never reuses a key the cache server still holds; ' +
+      'pages made before that sit flat in pages/. The depth, the three id levels and the ' +
       'literal "pages" segment are load-bearing: they are the signed scope ' +
       'and the one-token-per-chapter guarantee the reader relies on. ' +
       'DELIBERATE EXCEPTION 2 to the taxonomy: these are images and they do ' +
@@ -314,9 +329,11 @@ export const MEDIA_CLASSES: readonly MediaClass[] = [
     archivable: false,
     localScratchRoot: null,
     holds:
-      'The phone-monitor screenshot of the bank notification that was matched ' +
-      'to one deposit or withdrawal (<kind> = deposits | withdrawals, <id> = ' +
-      'that row, filename = the bank event idempotency key + .png). It shows ' +
+      'The phone-monitor screenshot of one bank notification (<kind> = ' +
+      'transactions, <id> = the bank_transactions row; the linked deposit or ' +
+      'withdrawal points at the same key — <kind> = deposits | withdrawals ' +
+      'are the older per-row folders still written by the legacy upload ' +
+      'route; filename = the bank event idempotency key + .png). It shows ' +
       'the business account BALANCE, so it lives under documents/ — denied ' +
       'unconditionally at the cache, unsignable, readable only server-side ' +
       'over credentialed S3 and streamed to staff who hold BANK_EVIDENCE. ' +
@@ -337,6 +354,31 @@ export const MEDIA_CLASSES: readonly MediaClass[] = [
       'yet known. Nothing writes it today — multipart assembles straight at ' +
       'the final key. Denied unsigned, unsignable, and carrying a 7-day ' +
       'expiry so an abandoned staging object can never become permanent cost.',
+  },
+  {
+    id: 'videoReplaceStaging',
+    prefix: 'temp/video-replace/<movieId>/',
+    status: 'active',
+    visibility: 'private',
+    scopePattern: null,
+    retention: { kind: 'expires', afterDays: 7 },
+    archivable: false,
+    localScratchRoot: null,
+    holds:
+      'A replacement transcoder bundle for an EXISTING title, verbatim in the ' +
+      "bundle's own shape (original.<ext>, hls/**, subtitles/*), while it " +
+      'uploads and until POST /uploads/:movieId/finalize-replace copies it ' +
+      'out: hls/** into a fresh videos/<movieId>/hls/v-<tag>/ package (never ' +
+      'over the old keys, which the cache servers hold for 7 days), the ' +
+      'original to videos/<movieId>/ and the subtitle sources to ' +
+      'subtitles/<movieId>/. Never served, never ' +
+      'signable: the cache denies /movies/temp/ unconditionally in BOTH ' +
+      'legacy modes and scopeForKey refuses it, so the old video keeps ' +
+      'playing from its final keys until the swap — a half-uploaded bundle ' +
+      "can never leak through the title's own playback token the way a " +
+      'videos/<id>/hls/incoming/ folder would. The 7 days are enforced by ' +
+      "UploadCleanupService's sweep (MinIO's lifecycle rule only aborts " +
+      'incomplete multipart uploads).',
   },
 ];
 

@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import sharp from 'sharp';
@@ -30,6 +30,20 @@ const WEBP_QUALITY = 82;
  */
 const PAGE_CONCURRENCY = 2;
 
+/**
+ * The pages/v-<tag>/ folder one SOURCE file converts into (H-23). A pure
+ * function of the file's ETag: a retry of the same bytes lands on the same
+ * keys and can resume, while a different file always gets a folder no cache
+ * server has fetched from, so no reader can be served a cached page of the
+ * old file. Without an ETag a run cannot be matched to anything, so it gets
+ * a one-off folder (and never resumes — see runPipeline).
+ */
+export function pagesFolderTag(sourceEtag: string | null): string {
+  return sourceEtag
+    ? createHash('sha256').update(sourceEtag).digest('hex').slice(0, 16)
+    : randomBytes(8).toString('hex');
+}
+
 /** The chapter row as the pipeline loads it: with the ids it needs to build keys. */
 type ProcessableChapter = Prisma.BookChapterGetPayload<{
   include: {
@@ -49,7 +63,9 @@ type ProcessableChapter = Prisma.BookChapterGetPayload<{
  * source of truth, an in-memory in-flight set so orphaned PROCESSING rows
  * are distinguishable from live ones, and idempotent resume — a BookPage
  * row is created only after its WebP is uploaded, so a retry skips every
- * page that already has one.
+ * page that already has one. Resume applies only to a retry of the SAME
+ * source file (BookChapter.pagesSourceEtag): a re-uploaded PDF clears the
+ * old pages first and converts from page 1 (H-23).
  *
  * One deliberate improvement over the video pipeline: pages are countable
  * up front, so `processedPages / pageCount` gives the admin REAL progress
@@ -126,6 +142,9 @@ export class BookProcessingService {
     // The row as it was before this run touched it — the `before` of the
     // READY/FAILED audit event. Declared out here so the catch can see it.
     let chapter: ProcessableChapter | null = null;
+    // Page rows of an older source file this run removed (H-23) — reported
+    // on the outcome audit event either way.
+    let previousPagesRemoved = 0;
 
     try {
       chapter = await this.prisma.bookChapter.findUnique({
@@ -164,23 +183,52 @@ export class BookProcessingService {
       createdScratchDir = scratchDir;
       await this.storageService.ensureDir(scratchDir);
       const localPdf = join(scratchDir, 'original.pdf');
-      await this.minioService.downloadFile(chapter.pdfKey, localPdf);
+      const { etag: sourceEtag } = await this.minioService.downloadFile(
+        chapter.pdfKey,
+        localPdf,
+      );
+
+      // The PDF sits at one fixed key, so a re-upload overwrites it. The
+      // stored pages are this file's only when they were recorded against
+      // this exact ETag — a retry of the same file. Anything else (a new
+      // file, pages from before this was tracked, no ETag at all) is cleared
+      // before a single new page is written, so the chapter never mixes two
+      // files' pages and processedPages can never pass pageCount.
+      const sameSource =
+        sourceEtag !== null && chapter.pagesSourceEtag === sourceEtag;
+      if (!sameSource) {
+        previousPagesRemoved = await this.clearPages(
+          bookId,
+          editionId,
+          chapterId,
+        );
+      }
 
       const { pageCount } = await probePdf(localPdf);
 
-      // Pages that already made it through a previous (partial) run — their
-      // rows only exist because their WebP upload succeeded, so they are
-      // safe to skip wholesale.
-      const existing = await this.prisma.bookPage.findMany({
-        where: { chapterId },
-        select: { pageNumber: true },
-      });
+      // Pages that already made it through a previous (partial) run of THIS
+      // file — their rows only exist because their WebP upload succeeded, so
+      // they are safe to skip wholesale.
+      const existing = sameSource
+        ? await this.prisma.bookPage.findMany({
+            where: { chapterId },
+            select: { pageNumber: true },
+          })
+        : [];
       const done = new Set(existing.map((p) => p.pageNumber));
 
+      // Recorded only now, after any clear finished: a clear that failed half
+      // way leaves the old ETag (or NULL) behind, so the next start clears
+      // again instead of resuming on top of the leftovers.
       await this.prisma.bookChapter.update({
         where: { id: chapterId },
-        data: { pageCount, processedPages: done.size },
+        data: {
+          pageCount,
+          processedPages: done.size,
+          pagesSourceEtag: sourceEtag,
+        },
       });
+      const sourceTag = pagesFolderTag(sourceEtag);
 
       const pending: number[] = [];
       for (let page = 1; page <= pageCount; page++) {
@@ -201,6 +249,7 @@ export class BookProcessingService {
             localPdf,
             pending[index],
             pageCount,
+            sourceTag,
             scratchDir,
           );
         }
@@ -231,6 +280,7 @@ export class BookProcessingService {
           bookId,
           editionId,
           pageCount,
+          previousPagesRemoved,
         },
       });
     } catch (error) {
@@ -258,6 +308,7 @@ export class BookProcessingService {
             bookId: chapter?.edition.book.id ?? null,
             editionId: chapter?.editionId ?? null,
             reason,
+            previousPagesRemoved,
           },
         });
       } catch (updateError) {
@@ -286,11 +337,39 @@ export class BookProcessingService {
     }
   }
 
+  /**
+   * Removes every page of an older source file: the rows first, together
+   * with the counters in one transaction (so a reader is never handed a row
+   * whose image is already gone, and the admin never sees processedPages
+   * above pageCount), then every object under the chapter's pages/ prefix —
+   * which also sweeps any orphan a crashed run uploaded without a row. The
+   * chapter is PROCESSING throughout, so no reader lists it meanwhile.
+   * Returns how many rows went.
+   */
+  private async clearPages(
+    bookId: string,
+    editionId: string,
+    chapterId: string,
+  ): Promise<number> {
+    const [removed] = await this.prisma.$transaction([
+      this.prisma.bookPage.deleteMany({ where: { chapterId } }),
+      this.prisma.bookChapter.update({
+        where: { id: chapterId },
+        data: { pageCount: 0, processedPages: 0, pagesSourceEtag: null },
+      }),
+    ]);
+    await this.minioService.deleteByPrefix(
+      this.storageService.bookPagesPrefix(bookId, editionId, chapterId),
+    );
+    return removed.count;
+  }
+
   private async convertPage(
     ids: { bookId: string; editionId: string; chapterId: string },
     localPdf: string,
     pageNumber: number,
     pageCount: number,
+    sourceTag: string,
     scratchDir: string,
   ): Promise<void> {
     const pngBase = join(scratchDir, `page-${pageNumber}`);
@@ -321,6 +400,7 @@ export class BookProcessingService {
         ids.chapterId,
         pageNumber,
         pageCount,
+        sourceTag,
       );
       await this.minioService.uploadBuffer(imageKey, data);
 

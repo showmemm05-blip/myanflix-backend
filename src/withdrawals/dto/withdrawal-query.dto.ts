@@ -3,7 +3,9 @@ import {
   IsEnum,
   IsIn,
   IsOptional,
+  IsString,
   IsUUID,
+  MaxLength,
 } from 'class-validator';
 import { WithdrawalStatus } from '../../generated/prisma/client';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
@@ -34,4 +36,13 @@ export class WithdrawalQueryDto extends PaginationQueryDto {
   @IsOptional()
   @IsDateString()
   dateTo?: string;
+
+  /**
+   * Admin-only search (H-24) — payout account name/number, and the user's
+   * username / display name / phone. Ignored on /withdrawals/me.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  search?: string;
 }

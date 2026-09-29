@@ -9,6 +9,7 @@ import { RequestOtpDto } from './dto/request-otp.dto';
 import { VerifyOtpDto } from './dto/verify-otp.dto';
 import { CheckPhoneDto } from './dto/check-phone.dto';
 import { VerifyPhonePasswordDto } from './dto/verify-phone-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -50,7 +51,7 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   @Post('otp/request')
   async requestOtp(@Body() dto: RequestOtpDto) {
-    await this.authService.requestPhoneOtp(dto.phone);
+    await this.authService.requestPhoneOtp(dto.phone, dto.purpose);
     return { sent: true };
   }
 
@@ -59,7 +60,30 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   @Post('otp/verify')
   verifyOtp(@Body() dto: VerifyOtpDto) {
-    return this.authService.verifyPhoneOtp(dto.phone, dto.code, dto.password);
+    return this.authService.verifyPhoneOtp(
+      dto.phone,
+      dto.code,
+      dto.password,
+      dto.stepToken,
+    );
+  }
+
+  /**
+   * H-8 "forgot password": the code comes from POST /auth/otp/request with
+   * `purpose: 'password_reset'` (B1: a sign-in code never works here).
+   * Throttled like /auth/otp/verify — it answers "is this code right?" just
+   * the same.
+   */
+  @Public()
+  @ThrottleAuth('credential')
+  @HttpCode(HttpStatus.OK)
+  @Post('password/reset')
+  resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.authService.resetPasswordWithOtp(
+      dto.phone,
+      dto.code,
+      dto.newPassword,
+    );
   }
 
   @Public()

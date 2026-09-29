@@ -34,7 +34,12 @@ export class AnalyticsService {
     private readonly minioService: MinioService,
   ) {}
 
-  async getOverview() {
+  /**
+   * `includeRevenue` is the caller's FINANCE.VIEW: without it the revenue
+   * aggregate is not even run and `revenue` comes back null, so a
+   * dashboard-only role gets every other stat and no money figure.
+   */
+  async getOverview({ includeRevenue }: { includeRevenue: boolean }) {
     const now = new Date();
     const sevenDaysAgo = new Date(now.getTime() - 7 * DAY_MS);
     const thirtyDaysAgo = new Date(now.getTime() - 30 * DAY_MS);
@@ -57,10 +62,12 @@ export class AnalyticsService {
       this.getPopularMovies(),
       this.prisma.user.count({ where: { createdAt: { gte: sevenDaysAgo } } }),
       this.prisma.user.count({ where: { createdAt: { gte: thirtyDaysAgo } } }),
-      this.prisma.transaction.aggregate({
-        _sum: { amount: true },
-        where: { type: { in: REVENUE_TRANSACTION_TYPES } },
-      }),
+      includeRevenue
+        ? this.prisma.transaction.aggregate({
+            _sum: { amount: true },
+            where: { type: { in: REVENUE_TRANSACTION_TYPES } },
+          })
+        : null,
       this.prisma.movie.count(),
       this.prisma.user.count(),
       this.prisma.user.count({ where: { status: 'ACTIVE' } }),
@@ -78,7 +85,7 @@ export class AnalyticsService {
         last7Days: registrationsLast7Days,
         last30Days: registrationsLast30Days,
       },
-      revenue: decimalToNumber(revenueAgg._sum.amount),
+      revenue: revenueAgg ? decimalToNumber(revenueAgg._sum.amount) : null,
       totalMovies,
       totalUsers,
       activeUsers,

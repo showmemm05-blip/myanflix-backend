@@ -12,6 +12,7 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { Role } from '../generated/prisma/client';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { OptionalAuth } from '../common/decorators/optional-auth.decorator';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
@@ -44,9 +45,18 @@ export class ActorsController {
 
   @Get()
   @OptionalAuth()
-  async findAll(@Query() query: ActorQueryDto) {
-    const { items, total, page, limit } =
-      await this.actorsService.findAll(query);
+  async findAll(
+    @Query() query: ActorQueryDto,
+    @CurrentUser() user?: AuthenticatedUser,
+  ) {
+    // Guests and regular users get counts over the PUBLISHED catalogue only,
+    // so a number on the People list never exceeds what the person's page
+    // can show them; staff count everything.
+    const viewerRole = user?.role ?? Role.USER;
+    const { items, total, page, limit } = await this.actorsService.findAll(
+      query,
+      viewerRole,
+    );
     return {
       items: items.map((a) =>
         ActorResponseDto.fromEntity(a, this.resolveImageUrl),
@@ -59,15 +69,22 @@ export class ActorsController {
 
   @Get(':id')
   @OptionalAuth()
-  async findOne(@Param('id', ParseUUIDPipe) id: string) {
-    const actor = await this.actorsService.findByIdOrThrow(id);
+  async findOne(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user?: AuthenticatedUser,
+  ) {
+    const viewerRole = user?.role ?? Role.USER;
+    const actor = await this.actorsService.findByIdOrThrow(id, viewerRole);
     return ActorResponseDto.fromEntity(actor, this.resolveImageUrl);
   }
 
-  /** Everything this person appears in. */
+  /** Everything this person appears in — published films only for a regular viewer. */
   @Get(':id/movies')
-  async getMovies(@Param('id', ParseUUIDPipe) id: string) {
-    const movies = await this.actorsService.getMovies(id);
+  async getMovies(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    const movies = await this.actorsService.getMovies(id, user.role);
     return movies.map((m) =>
       MovieResponseDto.fromEntity(m, this.resolveImageUrl),
     );

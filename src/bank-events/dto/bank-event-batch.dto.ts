@@ -25,6 +25,22 @@ export const MAX_BANK_EVENTS_PER_BATCH = 100;
 export const IDEMPOTENCY_KEY_PATTERN = /^[a-f0-9]{64}$/;
 
 /**
+ * What the phone's KBZPay detail flow reported about reading the voucher.
+ * Stored verbatim on the bank_transactions row for the admin; the server
+ * never branches on it.
+ */
+export const BANK_EVENT_DETAIL_STATUSES = [
+  'ok',
+  'locked',
+  'notification_not_found',
+  'card_not_found',
+  'detail_unreadable',
+  'error',
+  'not_needed',
+] as const;
+export type BankEventDetailStatus = (typeof BANK_EVENT_DETAIL_STATUSES)[number];
+
+/**
  * One bank notification as the phone-monitor captured it. The global
  * ValidationPipe runs with forbidNonWhitelisted, so any key not declared
  * here fails the WHOLE batch with 400 — the phone-monitor must send exactly
@@ -70,13 +86,34 @@ export class BankEventDto {
   })
   txCodeLast6!: string;
 
+  /** The BANK's time (voucher) — the axis every match and list uses. */
   @IsDateString()
   occurredAt!: string;
 
   /**
+   * When the notification was posted on the phone. Optional so a
+   * phone-monitor built before bank_transactions keeps posting through the
+   * rollout window; the server falls back to occurredAt.
+   */
+  @IsOptional()
+  @IsDateString()
+  postedAt?: string;
+
+  /** The other party as the notification named them — stored for the admin list. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  counterparty?: string;
+
+  /** See BANK_EVENT_DETAIL_STATUSES. */
+  @IsOptional()
+  @IsIn(BANK_EVENT_DETAIL_STATUSES)
+  detailStatus?: BankEventDetailStatus;
+
+  /**
    * Accepted so a future admin view can use it, but NOT persisted anywhere
-   * in this feature — there is no column for it and it can name
-   * counterparties. The phone-monitor omits it by default.
+   * — there is no column for it and it can name counterparties beyond what
+   * `counterparty` carries. The phone-monitor omits it by default.
    */
   @IsOptional()
   @IsString()

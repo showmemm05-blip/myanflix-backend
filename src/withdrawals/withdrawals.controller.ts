@@ -55,6 +55,26 @@ export class WithdrawalsController {
     return this.withdrawalsService.findAllAdmin(query);
   }
 
+  /**
+   * The queue's stat cards and tab counts over every row matching the list
+   * filters (H-24) — see WithdrawalsService.getAdminStats. Declared before
+   * ':id' so "stats" is never parsed as a withdrawal id.
+   */
+  @Get('stats')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('WITHDRAWALS.VIEW')
+  getStats(@Query() query: WithdrawalQueryDto) {
+    return this.withdrawalsService.getAdminStats(query);
+  }
+
+  /** Mirrors DepositsController.findOne — declared after 'me' for the same reason. */
+  @Get(':id')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('WITHDRAWALS.VIEW')
+  findOne(@Param('id', ParseUUIDPipe) id: string) {
+    return this.withdrawalsService.findOneAdmin(id);
+  }
+
   @Patch(':id/approve')
   @UseGuards(PermissionsGuard)
   @RequirePermissions('WITHDRAWALS.APPROVE')

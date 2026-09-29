@@ -15,6 +15,7 @@ import { AuthorityService } from './authority.service';
 import { ALL_PERMISSIONS } from './permission-catalogue';
 import { PermissionResolverService } from './permission-resolver.service';
 import { AuditService } from '../audit/audit.service';
+import { SessionRevocationService } from '../auth/session-revocation.service';
 import { RolesService } from './roles.service';
 
 describe('RolesService', () => {
@@ -104,7 +105,10 @@ describe('RolesService', () => {
     appRoleId: 'role-manager',
   };
 
+  let sessions: { permissionsChanged: jest.Mock };
+
   beforeEach(async () => {
+    sessions = { permissionsChanged: jest.fn() };
     prisma = {
       appRole: {
         findMany: jest.fn().mockResolvedValue([]),
@@ -156,6 +160,7 @@ describe('RolesService', () => {
           provide: AuditService,
           useValue: { record: jest.fn().mockResolvedValue(undefined) },
         },
+        { provide: SessionRevocationService, useValue: sessions },
       ],
     }).compile();
 
@@ -163,11 +168,11 @@ describe('RolesService', () => {
   });
 
   describe('getCatalogue', () => {
-    it('returns all 20 modules and all 78 permissions for the matrix UI', () => {
+    it('returns all 21 modules and all 80 permissions for the matrix UI', () => {
       const catalogue = service.getCatalogue();
 
-      expect(catalogue.modules).toHaveLength(20);
-      expect(catalogue.permissions).toHaveLength(78);
+      expect(catalogue.modules).toHaveLength(21);
+      expect(catalogue.permissions).toHaveLength(80);
       expect(catalogue.modules[0]).toEqual({
         key: 'DASHBOARD',
         label: 'Dashboard',
@@ -376,6 +381,11 @@ describe('RolesService', () => {
         where: { roleId: 'role-custom', permission: { in: ['MOVIES.CREATE'] } },
       });
       expect(resolver.invalidate).toHaveBeenCalledWith('role-custom');
+      // H-3: open staff sockets re-check their permission rooms.
+      expect(sessions.permissionsChanged).toHaveBeenCalledTimes(1);
+      expect(
+        sessions.permissionsChanged.mock.invocationCallOrder[0],
+      ).toBeGreaterThan(resolver.invalidate.mock.invocationCallOrder[0]);
     });
 
     it('skips the write entirely when nothing changed', async () => {
@@ -391,6 +401,7 @@ describe('RolesService', () => {
       // Still invalidated — cheap, and keeps the cache honest if a concurrent
       // write landed between the read and here.
       expect(resolver.invalidate).toHaveBeenCalledWith('role-custom');
+      expect(sessions.permissionsChanged).not.toHaveBeenCalled();
     });
 
     it('refuses to edit the protected Super Admin role (409)', async () => {

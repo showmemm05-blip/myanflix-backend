@@ -4,12 +4,13 @@ import {
   IsString,
   Length,
   Matches,
+  MaxLength,
   MinLength,
 } from 'class-validator';
 import { normalizePhone } from '../../common/utils/phone.util';
 
 export class VerifyOtpDto {
-  @Transform(({ value }) =>
+  @Transform(({ value }: { value: unknown }) =>
     typeof value === 'string' ? normalizePhone(value) : value,
   )
   @IsString()
@@ -25,4 +26,14 @@ export class VerifyOtpDto {
   @IsString()
   @MinLength(8)
   password?: string;
+
+  /**
+   * H-6: required when this phone already has an account — the `stepToken`
+   * POST /auth/phone/verify-password returned. Proves the password step
+   * passed; without it the code alone never opens the account.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(2048)
+  stepToken?: string;
 }

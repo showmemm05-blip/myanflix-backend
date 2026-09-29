@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Daily Postgres backup on the owner's Mac: runs scripts/db-backup.sh at 03:30
+  (or at the next wake, if the Mac was asleep then). NOT loaded by the repo.
+  Install and check it with the steps in DOCKER.md, "Backups":
+
+    cp scripts/launchd/com.myanflix.db-backup.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.myanflix.db-backup.plist
+    launchctl kickstart gui/$(id -u)/com.myanflix.db-backup
+    tail ~/Library/Logs/myanflix-db-backup.log
+
+  The off-site destination comes from BACKUP_OFFSITE_DEST in backend/.env.
+  The paths below are this Mac's; change them if the repo moves. macOS does
+  not let background jobs read ~/Desktop until /bin/bash is given Full Disk
+  Access (System Settings > Privacy & Security); "Operation not permitted" in
+  the log means exactly that.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.myanflix.db-backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/pc/Desktop/MyanFlix/backend/scripts/db-backup.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/pc/Library/Logs/myanflix-db-backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/pc/Library/Logs/myanflix-db-backup.log</string>
+</dict>
+</plist>

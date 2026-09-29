@@ -412,6 +412,82 @@ describe('AuditService', () => {
     });
   });
 
+  describe('anonymiseUser (H-16: a closed account leaves no name behind)', () => {
+    let tx: { auditLog: { updateMany: jest.Mock }; $executeRaw: jest.Mock };
+
+    beforeEach(() => {
+      tx = {
+        auditLog: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        $executeRaw: jest.fn().mockResolvedValue(1),
+      };
+    });
+
+    const input = {
+      userId: 'user-1',
+      previousUsername: 'john.smith',
+      username: 'deleted_user1',
+    };
+
+    /** The bound values of the n-th $executeRaw call (tagged template). */
+    const values = (n: number) =>
+      (tx.$executeRaw.mock.calls[n] as unknown[]).slice(1);
+    const sql = (n: number) =>
+      (tx.$executeRaw.mock.calls[n][0] as TemplateStringsArray).join('?');
+
+    it('renames the actor on rows the account itself performed, and drops their IP address and user agent (B4)', async () => {
+      await service.anonymiseUser(input, tx as never);
+
+      // The rows stay (user.password_reset, user.account_delete, …); only
+      // what points at the person goes. The platform (WEB/MOBILE) stays.
+      expect(tx.auditLog.updateMany).toHaveBeenCalledWith({
+        where: { actorId: 'user-1' },
+        data: {
+          actorUsername: 'deleted_user1',
+          actorDisplayName: null,
+          ip: null,
+          userAgent: null,
+        },
+      });
+    });
+
+    it('overwrites the identity fields in the snapshots of rows about the account', async () => {
+      await service.anonymiseUser(input, tx as never);
+
+      expect(sql(0)).toContain("\"targetType\" IN ('user', 'staff')");
+      expect(values(0)).toEqual([
+        JSON.stringify({
+          username: 'deleted_user1',
+          displayName: null,
+          phone: null,
+          email: null,
+        }),
+        JSON.stringify({
+          username: 'deleted_user1',
+          displayName: null,
+          phone: null,
+          email: null,
+        }),
+        'user-1',
+      ]);
+    });
+
+    it('rewrites every "@username" label, matching the whole name only (dots escaped)', async () => {
+      await service.anonymiseUser(input, tx as never);
+
+      expect(sql(1)).toContain('regexp_replace("targetLabel"');
+      expect(values(1)).toEqual([
+        '@john\\.smith(?![A-Za-z0-9_.])',
+        '@deleted_user1',
+        '@john.smith',
+      ]);
+    });
+
+    it('writes nothing to the log itself — no audit row is created here', async () => {
+      await service.anonymiseUser(input, tx as never);
+      expect(prisma.auditLog.create).not.toHaveBeenCalled();
+    });
+  });
+
   describe('read side', () => {
     it('findAll builds the where clause from every filter and pages', async () => {
       prisma.auditLog.findMany.mockResolvedValue([{ id: 'log-1' }]);

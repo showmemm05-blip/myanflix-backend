@@ -6,6 +6,7 @@ import {
   IsInt,
   IsOptional,
   IsString,
+  IsUUID,
   Max,
   MaxLength,
   Min,
@@ -64,6 +65,18 @@ export class SeriesQueryDto extends PaginationQueryDto {
   @IsString({ each: true })
   @MaxLength(64, { each: true })
   languages?: string[];
+
+  /**
+   * OR within the facet: "any of the selected cast". A series matches when
+   * the actor is on the show itself OR on any of its episodes — an
+   * episode-only credit still counts (see buildSeriesWhere).
+   */
+  @IsOptional()
+  @ToStringArray()
+  @IsArray()
+  @ArrayMaxSize(20)
+  @IsUUID('4', { each: true })
+  actorIds?: string[];
 
   @IsOptional()
   @Type(() => Number)

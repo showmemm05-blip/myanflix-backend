@@ -111,6 +111,60 @@ export class AuditService {
     }
   }
 
+  /**
+   * H-16: when an account is closed, the log keeps every row (who did what
+   * stays accountable) but stops naming the person. In the caller's
+   * transaction, so it commits or rolls back with the closure:
+   *
+   * - rows the account itself performed (user.password_reset,
+   *   user.account_delete, …) carry the anonymised username and no longer
+   *   its IP address or user agent;
+   * - snapshots of rows ABOUT the account (targetType user/staff) have their
+   *   identity fields — username, displayName, phone, email — overwritten;
+   * - every label that names it as `@username` (its own rows, and its
+   *   deposits', withdrawals' and wallet adjustments' "… · @username") is
+   *   rewritten. The match is the whole name only: `@user_9591` never
+   *   touches `@user_95912`.
+   *
+   * The only UPDATE the log ever sees; everything else is append-only.
+   */
+  async anonymiseUser(
+    input: { userId: string; previousUsername: string; username: string },
+    tx: Prisma.TransactionClient,
+  ): Promise<void> {
+    const { userId, previousUsername, username } = input;
+
+    await tx.auditLog.updateMany({
+      where: { actorId: userId },
+      data: {
+        actorUsername: username,
+        actorDisplayName: null,
+        ip: null,
+        userAgent: null,
+      },
+    });
+
+    const identity = JSON.stringify({
+      username,
+      displayName: null,
+      phone: null,
+      email: null,
+    });
+    await tx.$executeRaw`
+      UPDATE "audit_logs"
+      SET "before" = CASE WHEN jsonb_typeof("before") = 'object'
+                          THEN "before" || ${identity}::jsonb ELSE "before" END,
+          "after"  = CASE WHEN jsonb_typeof("after") = 'object'
+                          THEN "after" || ${identity}::jsonb ELSE "after" END
+      WHERE "targetId" = ${userId} AND "targetType" IN ('user', 'staff')`;
+
+    const namePattern = `@${escapeRegExp(previousUsername)}(?![A-Za-z0-9_.])`;
+    await tx.$executeRaw`
+      UPDATE "audit_logs"
+      SET "targetLabel" = regexp_replace("targetLabel", ${namePattern}, ${`@${username}`}, 'g')
+      WHERE strpos("targetLabel", ${`@${previousUsername}`}) > 0`;
+  }
+
   /** Forget cached displayName/appRole for one actor (or everyone). */
   invalidateActorCache(actorId?: string): void {
     if (actorId === undefined) this.actorCache.clear();
@@ -297,6 +351,11 @@ export class AuditService {
     if (!entry) throw new NotFoundException('Audit log entry not found');
     return entry;
   }
+}
+
+/** Escapes a literal for use inside a (PostgreSQL ARE) regular expression. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**

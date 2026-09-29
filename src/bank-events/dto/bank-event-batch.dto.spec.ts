@@ -50,6 +50,34 @@ describe('BankEventBatchDto under the global ValidationPipe', () => {
     await expect(validate({ events: [event] })).resolves.toBeDefined();
   });
 
+  it('accepts the three bank_transactions keys (postedAt, counterparty, detailStatus) — and survives without them', async () => {
+    const dto = (await validate({
+      events: [
+        {
+          ...validEvent(),
+          postedAt: '2026-09-18T09:41:20.000Z',
+          counterparty: 'Ko Ko',
+          detailStatus: 'ok',
+        },
+        validEvent(),
+      ],
+    })) as BankEventBatchDto;
+    expect(dto.events[0].postedAt).toBe('2026-09-18T09:41:20.000Z');
+    expect(dto.events[0].counterparty).toBe('Ko Ko');
+    expect(dto.events[0].detailStatus).toBe('ok');
+    expect(dto.events[1].postedAt).toBeUndefined();
+  });
+
+  it.each([
+    ['postedAt', 'yesterday'],
+    ['counterparty', 'x'.repeat(201)],
+    ['detailStatus', 'maybe'],
+  ])('rejects a bad %s (%p)', async (field, value) => {
+    await expect(
+      validate({ events: [{ ...validEvent(), [field]: value }] }),
+    ).rejects.toThrow();
+  });
+
   it('rejects the WHOLE batch on an unknown key (forbidNonWhitelisted)', async () => {
     await expect(
       validate({

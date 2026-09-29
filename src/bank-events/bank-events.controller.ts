@@ -41,14 +41,39 @@ import { MachineTokenGuard } from './machine-token.guard';
 export class BankEventsController {
   constructor(private readonly bankEventsService: BankEventsService) {}
 
-  /** One batch per phone-monitor tick, JSON only — never image bytes. */
+  /**
+   * One batch per phone-monitor tick, JSON only — never image bytes. Every
+   * validated event is STORED (a bank_transactions row) before matching,
+   * so the reply's transactionId is what the phone keys its screenshot
+   * upload on.
+   */
   @Post('match')
   @Throttle({ [THROTTLER_DEFAULT]: { limit: 120, ttl: 60_000 } })
   match(@Body() dto: BankEventBatchDto) {
     return this.bankEventsService.processBatch(dto);
   }
 
-  /** Multipart, ONLY after a match, idempotent per event key. */
+  /** Multipart, after ANY stored reply, idempotent per event key. */
+  @Post('transactions/:id/screenshot')
+  @Throttle({ [THROTTLER_DEFAULT]: { limit: 60, ttl: 60_000 } })
+  @UseInterceptors(
+    FileInterceptor('file', {
+      limits: { fileSize: MAX_BANK_SCREENSHOT_BYTES },
+    }),
+  )
+  attachTransactionScreenshot(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: BankScreenshotDto,
+    @UploadedFile() file: Express.Multer.File | undefined,
+  ) {
+    return this.bankEventsService.attachTransactionScreenshot(id, dto, file);
+  }
+
+  /**
+   * @deprecated — the per-row routes a phone-monitor built before
+   * bank_transactions targets. Kept for the rollout window; see
+   * BankEventsService.attachScreenshot for how they delegate.
+   */
   @Post('deposits/:id/screenshot')
   @Throttle({ [THROTTLER_DEFAULT]: { limit: 60, ttl: 60_000 } })
   @UseInterceptors(

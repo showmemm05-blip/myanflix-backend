@@ -151,7 +151,7 @@ describe('Realtime WebSocket (e2e)', () => {
     }
   });
 
-  it('emits deposit.created to the admins room when a user creates a deposit', async () => {
+  it('emits deposit.created to DEPOSITS.VIEW holders (the seeded Admin role) when a user creates a deposit', async () => {
     const adminSocket = await connect(adminToken);
     const userSocket = await connect(userToken);
 
@@ -177,7 +177,7 @@ describe('Realtime WebSocket (e2e)', () => {
     }
   });
 
-  it('a plain user is never placed in the admins room', async () => {
+  it('a plain user is never placed in a staff permission room', async () => {
     const userSocket = await connect(userToken);
     const otherUserSocket = await connect(userToken);
 
@@ -237,12 +237,20 @@ describe('Realtime WebSocket (e2e)', () => {
     }
   });
 
-  it('emits payment-account.updated to the admins room when a manual ledger entry is recorded', async () => {
+  // H-3: payment-account.updated goes to PAYMENT_ACCOUNTS.VIEW / FINANCE.VIEW
+  // holders. The seeded Admin role holds neither (it cannot open those pages
+  // over REST either), so the Super Admin socket is the one that hears it.
+  it('emits payment-account.updated to PAYMENT_ACCOUNTS.VIEW holders — and not to the seeded Admin role — when a manual ledger entry is recorded', async () => {
+    const superAdminSocket = await connect(superAdminToken);
     const adminSocket = await connect(adminToken);
 
     try {
+      let receivedByAdmin = false;
+      adminSocket.on('payment-account.updated', () => {
+        receivedByAdmin = true;
+      });
       const eventPromise = waitForEvent<{ paymentAccountId: string }>(
-        adminSocket,
+        superAdminSocket,
         'payment-account.updated',
       );
 
@@ -254,13 +262,16 @@ describe('Realtime WebSocket (e2e)', () => {
 
       const event = await eventPromise;
       expect(event.paymentAccountId).toBe(paymentAccountId);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(receivedByAdmin).toBe(false);
     } finally {
+      superAdminSocket.disconnect();
       adminSocket.disconnect();
     }
   });
 
-  it('emits payment-account.updated to admins when a deposit is approved with an auto-credited receiving account', async () => {
-    const adminSocket = await connect(adminToken);
+  it('emits payment-account.updated to PAYMENT_ACCOUNTS.VIEW holders when a deposit is approved with an auto-credited receiving account', async () => {
+    const adminSocket = await connect(superAdminToken);
 
     try {
       const createRes = await request(app.getHttpServer())

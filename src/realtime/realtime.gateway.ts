@@ -1,4 +1,9 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import {
@@ -7,9 +12,10 @@ import {
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
+import type { Subscription } from 'rxjs';
 import type { Server, Socket } from 'socket.io';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { ClientPlatform, UserStatus } from '../generated/prisma/client';
+import { ClientPlatform, Role, UserStatus } from '../generated/prisma/client';
 import {
   resolveClientIp,
   resolveClientPlatform,
@@ -17,20 +23,70 @@ import {
 import { PeakUsersService } from '../peak-users/peak-users.service';
 import { UsersService } from '../users/users.service';
 import type { JwtPayload } from '../auth/types/jwt-payload.type';
+import {
+  type AccountAccessEvent,
+  SessionRevocationService,
+  isAccessTokenRevoked,
+} from '../auth/session-revocation.service';
+import {
+  PermissionResolverService,
+  type PermissionSubject,
+} from '../roles/permission-resolver.service';
+import type { Permission } from '../roles/permission-catalogue';
 
-function adminRoom(): string {
-  return 'admins';
+/**
+ * H-3: the permissions that gate a realtime room. Every staff event goes to
+ * the room of the permission that gates the same data over REST — never to
+ * a room picked by the legacy role enum — so a push reaches exactly the
+ * staff who could have fetched it:
+ *
+ * - deposit.created/updated/verification     -> DEPOSITS.VIEW
+ * - withdrawal.created/updated/verification  -> WITHDRAWALS.VIEW
+ * - bank-transaction.created/updated         -> BANK_TRANSACTIONS.VIEW
+ * - payment-account.updated (an id only)     -> PAYMENT_ACCOUNTS.VIEW or FINANCE.VIEW
+ */
+const REALTIME_PERMISSIONS = [
+  'DEPOSITS.VIEW',
+  'WITHDRAWALS.VIEW',
+  'BANK_TRANSACTIONS.VIEW',
+  'PAYMENT_ACCOUNTS.VIEW',
+  'FINANCE.VIEW',
+] as const satisfies readonly Permission[];
+
+type RealtimePermission = (typeof REALTIME_PERMISSIONS)[number];
+
+const PERMISSION_ROOM_PREFIX = 'perm:';
+
+export function permissionRoom(permission: RealtimePermission): string {
+  return `${PERMISSION_ROOM_PREFIX}${permission}`;
 }
 
 function userRoom(userId: string): string {
   return `user:${userId}`;
 }
 
+/** What this gateway keeps on `socket.data` (socket.io types it as `any`). */
+interface SocketData {
+  userId?: string;
+  role?: Role;
+  machine?: 'phone-monitor';
+}
+
+/** What room syncing needs of a socket — a live Socket or a fetchSockets() entry. */
+interface RoomMember {
+  rooms: Set<string>;
+  join(rooms: string | string[]): unknown;
+  leave(room: string): unknown;
+}
+
 /**
- * The phone-monitor desktop app's sockets. A hint channel only: the backend
- * nudges it when a deposit is created / a withdrawal approved so the common
- * case matches in seconds instead of waiting for its next poll. Never a
- * user room, never counted as audience.
+ * The phone-monitor desktop app's sockets. Since bank_transactions
+ * (store-first ingestion) nothing is emitted INTO this room any more — a
+ * transfer that arrives first matches when the deposit is created, one
+ * that arrives later matches at ingestion, so the old "post your outbox
+ * now" nudge had no third case left to cover. The handshake and the room
+ * stay: the phone-monitor uses the open socket as its "live link"
+ * connectivity indicator. Never a user room, never counted as audience.
  */
 function bankMonitorRoom(): string {
   return 'bank-monitors';
@@ -49,16 +105,18 @@ export interface DepositCreatedPayload {
   paymentMethod: string;
   accountName: string | null;
   reference: string;
+  /** Which of OUR accounts the user says they paid into — the Destination Account column reads it on a live-prepended row. */
+  declaredPaymentAccountId: string | null;
   status: string;
   createdAt: Date;
-  /** Pre-bank flags computed at create time (twins, velocity) — admins-only event, so safe here. */
+  /** Pre-bank flags computed at create time (twins, velocity) — a DEPOSITS.VIEW-room event, so safe here. */
   matchStatus: string;
   riskLevel: string | null;
   riskReasons: string[];
 }
 
 /**
- * Bank-verification state of one deposit, for the admins room ONLY — the
+ * Bank-verification state of one deposit, for the DEPOSITS.VIEW room ONLY — the
  * user-facing `deposit.updated` must never carry a fraud score.
  */
 export interface DepositVerificationPayload {
@@ -71,6 +129,8 @@ export interface DepositVerificationPayload {
   receivingTransactionAt: Date | null;
   bankCheckedAt: Date | null;
   hasBankScreenshot: boolean;
+  /** The bank_transactions row that claimed it, so the dialog can link to it. */
+  bankTransactionId: string | null;
 }
 
 export interface WithdrawalVerificationPayload {
@@ -83,16 +143,47 @@ export interface WithdrawalVerificationPayload {
   transferTransactionAt: Date | null;
   bankCheckedAt: Date | null;
   hasBankScreenshot: boolean;
+  bankTransactionId: string | null;
 }
 
-/** "Something to match just appeared" — the phone-monitor flushes its outbox on receipt. */
-export interface BankEventsNudgePayload {
-  kind: 'deposit' | 'withdrawal';
-  paymentAccountId: string | null;
+/**
+ * One stored phone notification for the admin "Bank transactions" page —
+ * the list item without the payment-account join (the page already holds
+ * the accounts). `view` is the read-time derivation (UNCLAIMED after 48 h);
+ * the screenshot key itself never leaves the server.
+ */
+export interface BankTransactionPayload {
+  id: string;
+  deviceSerial: string;
+  paymentAccountId: string;
+  direction: string;
+  amount: number;
+  currency: string;
+  txCode: string;
+  txCodeLast6: string;
+  occurredAt: Date;
+  postedAt: Date;
+  counterparty: string | null;
+  detailStatus: string | null;
+  state: string;
+  view: 'MATCHED' | 'WAITING' | 'AMBIGUOUS' | 'UNCLAIMED';
+  linkedDepositId: string | null;
+  linkedWithdrawalId: string | null;
+  matchedAt: Date | null;
+  hasScreenshot: boolean;
+  createdAt: Date;
 }
 
 export interface DepositUpdatedPayload {
   id: string;
+  /**
+   * What this update is about. `status` is a decision (approve/reject) and
+   * reaches the user; `receiving_account` is admin bookkeeping (which of OUR
+   * accounts the money landed in) and is emitted to staff only — see
+   * notifyAdminsDepositUpdated. Clients use it to tell "you were approved"
+   * from "an admin corrected a field you never see".
+   */
+  change: 'status' | 'receiving_account';
   status: string;
   amount: number;
   paymentMethod: string;
@@ -128,6 +219,8 @@ export interface WithdrawalCreatedPayload {
 
 export interface WithdrawalUpdatedPayload {
   id: string;
+  /** Mirrors DepositUpdatedPayload.change — `transfer_account` is staff-only bookkeeping. */
+  change: 'status' | 'transfer_account';
   status: string;
   amount: number;
   accountType: string;
@@ -201,9 +294,14 @@ export interface ActiveSocketUser {
 @Injectable()
 @WebSocketGateway({ cors: { origin: '*' } })
 export class RealtimeGateway
-  implements OnGatewayConnection, OnGatewayDisconnect
+  implements
+    OnGatewayConnection,
+    OnGatewayDisconnect,
+    OnModuleInit,
+    OnModuleDestroy
 {
   private readonly logger = new Logger(RealtimeGateway.name);
+  private accessEvents?: Subscription;
 
   @WebSocketServer()
   server!: Server;
@@ -228,7 +326,27 @@ export class RealtimeGateway
     private readonly configService: ConfigService,
     private readonly usersService: UsersService,
     private readonly peakUsersService: PeakUsersService,
+    private readonly permissionResolver: PermissionResolverService,
+    private readonly sessions: SessionRevocationService,
   ) {}
+
+  /**
+   * Listens for account-access changes (H-3/H-21): a revoked, suspended,
+   * deleted or closed account loses every socket at once, and a role
+   * permission edit re-checks the rooms of every open staff socket.
+   */
+  onModuleInit(): void {
+    this.accessEvents = this.sessions.events.subscribe(
+      (event: AccountAccessEvent) => {
+        if (event.kind === 'user') this.disconnectUser(event.userId);
+        else void this.resyncStaffRooms();
+      },
+    );
+  }
+
+  onModuleDestroy(): void {
+    this.accessEvents?.unsubscribe();
+  }
 
   async handleConnection(client: Socket): Promise<void> {
     try {
@@ -243,7 +361,7 @@ export class RealtimeGateway
         if (!expected || !tokensMatch(machineToken, expected)) {
           throw new Error('Machine token rejected');
         }
-        client.data.machine = 'phone-monitor';
+        (client.data as SocketData).machine = 'phone-monitor';
         await client.join(bankMonitorRoom());
         return;
       }
@@ -258,13 +376,19 @@ export class RealtimeGateway
       const user = await this.usersService.findByIdOrThrow(payload.sub);
       if (user.status !== UserStatus.ACTIVE)
         throw new Error('Account is not active');
+      // H-21: the same cutoff JwtStrategy applies to HTTP requests.
+      if (isAccessTokenRevoked(payload, user.sessionsRevokedAt))
+        throw new Error('Session has been signed out');
 
-      client.data.userId = user.id;
-      client.data.role = user.role;
+      const data = client.data as SocketData;
+      data.userId = user.id;
+      data.role = user.role;
 
       await client.join(userRoom(user.id));
-      if (user.role === 'ADMIN' || user.role === 'SUPER_ADMIN') {
-        await client.join(adminRoom());
+      // H-3: staff join one room per permission they actually hold, resolved
+      // through their AppRole. A customer account never joins one.
+      if (user.role !== Role.USER) {
+        await this.syncPermissionRooms(client, user);
       }
 
       if (user.role === 'USER') {
@@ -334,6 +458,63 @@ export class RealtimeGateway
       .sort((a, b) => b.since.getTime() - a.since.getTime());
   }
 
+  /**
+   * Puts a staff socket in exactly the permission rooms its account holds
+   * now: leaves the ones it lost, joins the ones it gained.
+   */
+  private async syncPermissionRooms(
+    socket: RoomMember,
+    user: PermissionSubject,
+  ): Promise<void> {
+    const granted = await this.permissionResolver.permissionsFor(user);
+    const wanted = new Set(
+      REALTIME_PERMISSIONS.filter((permission) => granted.has(permission)).map(
+        permissionRoom,
+      ),
+    );
+    for (const room of [...socket.rooms]) {
+      if (room.startsWith(PERMISSION_ROOM_PREFIX) && !wanted.has(room)) {
+        await socket.leave(room);
+      }
+    }
+    const missing = [...wanted].filter((room) => !socket.rooms.has(room));
+    if (missing.length > 0) await socket.join(missing);
+  }
+
+  /** Every socket of one account, on every tab and device, is closed. */
+  private disconnectUser(userId: string): void {
+    if (!this.server) return;
+    this.server.in(userRoom(userId)).disconnectSockets(true);
+  }
+
+  /**
+   * A role's permissions changed: re-reads every open staff socket's account
+   * and re-syncs its rooms (closing it if the account is no longer active).
+   * Customer and phone-monitor sockets hold no permission rooms, so they are
+   * skipped. Never throws — it runs off an event, not a request.
+   */
+  private async resyncStaffRooms(): Promise<void> {
+    if (!this.server) return;
+    try {
+      const sockets = await this.server.fetchSockets();
+      for (const socket of sockets) {
+        const data = socket.data as SocketData;
+        if (!data.userId || data.role === Role.USER) continue;
+
+        const user = await this.usersService.findById(data.userId);
+        if (!user || user.status !== UserStatus.ACTIVE) {
+          socket.disconnect(true);
+          continue;
+        }
+        await this.syncPermissionRooms(socket, user);
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Could not re-check staff socket rooms: ${(error as Error).message}`,
+      );
+    }
+  }
+
   /** The count PeakUsersService has always been given: distinct users, not sockets. */
   private distinctUserIds(): Set<string> {
     const ids = new Set<string>();
@@ -369,7 +550,7 @@ export class RealtimeGateway
   }
 
   private extractToken(client: Socket): string | undefined {
-    const fromAuth = client.handshake.auth?.['token'];
+    const fromAuth: unknown = client.handshake.auth?.['token'];
     if (typeof fromAuth === 'string' && fromAuth.length > 0) return fromAuth;
 
     const header = client.handshake.headers.authorization;
@@ -379,25 +560,59 @@ export class RealtimeGateway
   }
 
   notifyAdminsDepositCreated(payload: DepositCreatedPayload): void {
-    this.server.to(adminRoom()).emit('deposit.created', payload);
+    this.server
+      .to(permissionRoom('DEPOSITS.VIEW'))
+      .emit('deposit.created', payload);
   }
 
   /**
-   * Broadcast to BOTH the depositing user's own room and the shared admins
-   * room — status changes (approve/reject) and receiving-account saves need
-   * to reach every open admin session, not just the user who deposited, so
-   * a second admin tab reflects another admin's action without a manual
-   * refresh. Same event name in both rooms is fine: each side's listener
-   * only cares about the fields relevant to it (the admin table merges by
-   * `id` into its existing row; the user's own client only ever receives
-   * this for deposits it already knows about).
+   * To EVERY connected client, users and admins alike: the public list of
+   * business accounts changed. A deactivated account has to leave the
+   * deposit picker on every phone and browser at once — not on the next
+   * cache expiry, when a user may already be typing a transfer to it.
+   * Payload-free on purpose: the list is tiny and public, so clients simply
+   * refetch it rather than trusting a partial patch.
+   */
+  notifyPaymentAccountsChanged(): void {
+    this.server.emit('payment-accounts.changed', {});
+  }
+
+  /**
+   * A DECISION on a deposit (approve/reject, `change: 'status'`): broadcast
+   * to BOTH the depositing user's own room and the DEPOSITS.VIEW room. The
+   * user's client toasts and refetches on it; every open staff session that
+   * may see deposits gets it too, so a second admin tab reflects another
+   * admin's action without a manual refresh. Same event name in both rooms is fine: each side's
+   * listener only cares about the fields relevant to it (the admin table
+   * merges by `id` into its existing row; the user's own client only ever
+   * receives this for deposits it already knows about).
+   *
+   * NOT for receiving-account edits — those go through
+   * notifyAdminsDepositUpdated, which never touches the user's room.
    */
   notifyUserDepositUpdated(
     userId: string,
     payload: DepositUpdatedPayload,
   ): void {
     this.server
-      .to([userRoom(userId), adminRoom()])
+      .to([userRoom(userId), permissionRoom('DEPOSITS.VIEW')])
+      .emit('deposit.updated', payload);
+  }
+
+  /**
+   * Admin bookkeeping on a deposit (`change: 'receiving_account'`): an admin
+   * corrected which of OUR business accounts the money landed in, or its
+   * transaction code/time. Emitted as the SAME `deposit.updated` event so the
+   * admin table's existing merge-by-`id` handler keeps every open admin
+   * session in sync — but to the DEPOSITS.VIEW room ONLY. The user never displays
+   * these fields and must never be pinged about them: the website's wallet
+   * hook toasts "Deposit approved" on any `deposit.updated` whose status is
+   * APPROVED, so routing an account edit through the user's room made every
+   * admin correction pop up as a fresh approval on the user's screen.
+   */
+  notifyAdminsDepositUpdated(payload: DepositUpdatedPayload): void {
+    this.server
+      .to(permissionRoom('DEPOSITS.VIEW'))
       .emit('deposit.updated', payload);
   }
 
@@ -413,7 +628,9 @@ export class RealtimeGateway
   }
 
   notifyAdminsWithdrawalCreated(payload: WithdrawalCreatedPayload): void {
-    this.server.to(adminRoom()).emit('withdrawal.created', payload);
+    this.server
+      .to(permissionRoom('WITHDRAWALS.VIEW'))
+      .emit('withdrawal.created', payload);
   }
 
   /** Mirrors notifyUserDepositUpdated's dual-room broadcast — see its doc comment. */
@@ -422,15 +639,29 @@ export class RealtimeGateway
     payload: WithdrawalUpdatedPayload,
   ): void {
     this.server
-      .to([userRoom(userId), adminRoom()])
+      .to([userRoom(userId), permissionRoom('WITHDRAWALS.VIEW')])
+      .emit('withdrawal.updated', payload);
+  }
+
+  /**
+   * Mirrors notifyAdminsDepositUpdated — a transfer-account edit
+   * (`change: 'transfer_account'`, the account WE paid out from) is admin
+   * bookkeeping the user never sees, so it goes to the WITHDRAWALS.VIEW room ONLY;
+   * the user's room would otherwise toast "Withdrawal approved" again.
+   */
+  notifyAdminsWithdrawalUpdated(payload: WithdrawalUpdatedPayload): void {
+    this.server
+      .to(permissionRoom('WITHDRAWALS.VIEW'))
       .emit('withdrawal.updated', payload);
   }
 
   /**
    * Fired whenever a PaymentAccount's balance/ledger changes for any reason
    * (manual credit/debit, a deposit/withdrawal linking or re-linking to an
-   * account) — admins-only, since these are internal bookkeeping accounts a
-   * regular user never sees. Callers must only invoke this AFTER their own
+   * account) — to the PAYMENT_ACCOUNTS.VIEW and FINANCE.VIEW rooms (the
+   * payment-account pages and the finance overview), since these are
+   * internal bookkeeping accounts a regular user never sees. The payload is
+   * an id alone, so it tells a FINANCE.VIEW holder nothing it could not read. Callers must only invoke this AFTER their own
    * `$transaction` has committed (mirroring every other notify* call site in
    * this codebase), never from inside PaymentAccountLedgerService's
    * `applyMovement` itself, which runs inside the caller's transaction and
@@ -439,12 +670,17 @@ export class RealtimeGateway
   notifyAdminsPaymentAccountUpdated(
     payload: PaymentAccountUpdatedPayload,
   ): void {
-    this.server.to(adminRoom()).emit('payment-account.updated', payload);
+    this.server
+      .to([
+        permissionRoom('PAYMENT_ACCOUNTS.VIEW'),
+        permissionRoom('FINANCE.VIEW'),
+      ])
+      .emit('payment-account.updated', payload);
   }
 
   /**
    * Bank-verification change on a deposit (a phone-monitor match, a risk
-   * recompute, a staff review) — admins room ONLY. The depositing user's
+   * recompute, a staff review) — DEPOSITS.VIEW room ONLY. The depositing user's
    * room deliberately never receives it: a user must not see their own
    * fraud score, and `deposit.updated` (which does reach them) never gains
    * these fields.
@@ -452,25 +688,37 @@ export class RealtimeGateway
   notifyAdminsDepositVerificationUpdated(
     payload: DepositVerificationPayload,
   ): void {
-    this.server.to(adminRoom()).emit('deposit.verification', payload);
+    this.server
+      .to(permissionRoom('DEPOSITS.VIEW'))
+      .emit('deposit.verification', payload);
   }
 
-  /** Mirrors notifyAdminsDepositVerificationUpdated — admins only. */
+  /** Mirrors notifyAdminsDepositVerificationUpdated — WITHDRAWALS.VIEW only. */
   notifyAdminsWithdrawalVerificationUpdated(
     payload: WithdrawalVerificationPayload,
   ): void {
-    this.server.to(adminRoom()).emit('withdrawal.verification', payload);
+    this.server
+      .to(permissionRoom('WITHDRAWALS.VIEW'))
+      .emit('withdrawal.verification', payload);
   }
 
   /**
-   * Tells every connected phone-monitor "a row worth matching just
-   * appeared" so it posts its outbox now instead of at its next tick. A
-   * hint, not a delivery mechanism: the phone-monitor's own retry schedule
-   * delivers every event even if no socket is ever connected. Carries no
-   * money data — just which kind and which business account.
+   * A phone notification was stored (BANK_TRANSACTIONS.VIEW room only — it
+   * carries the business account's money movements, and no seeded role but
+   * Super Admin may read them). Emitted only AFTER the per-event
+   * transaction committed, like every notify* here.
    */
-  notifyBankMonitorsNudge(payload: BankEventsNudgePayload): void {
-    this.server.to(bankMonitorRoom()).emit('bank-events.nudge', payload);
+  notifyAdminsBankTransactionCreated(payload: BankTransactionPayload): void {
+    this.server
+      .to(permissionRoom('BANK_TRANSACTIONS.VIEW'))
+      .emit('bank-transaction.created', payload);
+  }
+
+  /** Link / unlink / state change / screenshot attach on a stored row — BANK_TRANSACTIONS.VIEW only. */
+  notifyAdminsBankTransactionUpdated(payload: BankTransactionPayload): void {
+    this.server
+      .to(permissionRoom('BANK_TRANSACTIONS.VIEW'))
+      .emit('bank-transaction.updated', payload);
   }
 }
 

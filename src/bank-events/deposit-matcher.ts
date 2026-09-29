@@ -2,6 +2,15 @@ import { Prisma } from '../generated/prisma/client';
 import type { Deposit } from '../generated/prisma/client';
 import type { AuditService } from '../audit/audit.service';
 import { depositSnapshot } from '../audit/audit-snapshots';
+import {
+  eventFromTransaction,
+  linkToDeposit,
+  markAmbiguous,
+  markUnmatched,
+  transactionMetadata,
+  type LinkTrigger,
+  type StoredBankTransaction,
+} from '../bank-transactions/bank-transaction-store';
 import type {
   DepositMatchOutcome,
   NormalizedBankEvent,
@@ -14,9 +23,6 @@ import {
   type DepositRiskRow,
 } from './deposit-risk';
 import {
-  AMBIGUITY_PROBE_LIMIT,
-  CLOCK_SKEW_MS,
-  DEPOSIT_MATCH_WINDOW_MS,
   type RiskReason,
   amountsEqual,
   depositTimingReasons,
@@ -29,17 +35,26 @@ import {
 } from './risk-rules';
 
 /**
- * Matches one "You received …" bank event to a pending deposit and writes
- * the bank's values onto that row. The matching queries (Q1/Q2) are
- * written as literal SQL on purpose: their WHERE spells out
- * `status = 'PENDING' AND "bankCheckedAt" IS NULL` as text, which is what
- * lets Postgres prove the query implies the predicate of the partial
- * deposits_open_* indexes. A parameterised `status = $n` cannot be proven
- * and would fall back to a bigger index or a scan.
+ * Matches one STORED "You received …" bank transaction to a pending deposit
+ * and writes the bank's values onto that row, linking the two in the same
+ * transaction. The ONLY key is the user's own last-6 (Q1): the owner's rule
+ * is "the code decides, the amount only confirms". There used to be an
+ * amount+window fallback for a mistyped code; it was removed on 2026-09-22
+ * after a live test where a transfer arriving BEFORE its deposit was
+ * submitted got attached to an unrelated pending deposit of the same
+ * amount and consumed — the right deposit, submitted 30 s later, could
+ * then never match. A Q1 miss now leaves the transaction stored and
+ * UNMATCHED; the deposit that carries its code claims it the moment it is
+ * created (DepositsService.create, the reverse lookup) — no retry needed.
+ * The matching query is written as literal SQL on purpose: its WHERE
+ * spells out `status = 'PENDING' AND "bankCheckedAt" IS NULL` as text,
+ * which is what lets Postgres prove the query implies the predicate of the
+ * partial deposits_open_* indexes. A parameterised `status = $n` cannot be
+ * proven and would fall back to a bigger index or a scan.
  */
 
-/** The columns Q1/Q2 return — enough to run every rule without a second read. */
-interface OpenDepositRow {
+/** The columns Q1 returns — enough to run every rule without a second read. */
+export interface OpenDepositRow {
   id: string;
   userId: string;
   amount: Prisma.Decimal;
@@ -75,13 +90,31 @@ function toOpenDepositRow(raw: Record<string, unknown>): OpenDepositRow {
   };
 }
 
+/** A freshly inserted deposit as the claim wants it (DepositsService.create). */
+export function openDepositRowOf(deposit: Deposit): OpenDepositRow {
+  return {
+    id: deposit.id,
+    userId: deposit.userId,
+    amount: deposit.amount,
+    reference: deposit.reference,
+    createdAt: deposit.createdAt,
+    declaredTransferAt: deposit.declaredTransferAt,
+    matchStatus: deposit.matchStatus,
+    riskLevel: deposit.riskLevel,
+    riskReasons: deposit.riskReasons,
+  };
+}
+
 const OPEN_DEPOSIT_COLUMNS = Prisma.sql`id, "userId", amount, reference, "createdAt", "declaredTransferAt", "matchStatus", "riskLevel", "riskReasons"`;
 
 /**
  * Q1 — the user's own last-6 on the declared account, open set only.
- * Index: deposits_open_match_idx. ≤ 1 row by deposits_reference_active_key;
- * LIMIT 2 is a guard so a broken invariant surfaces as "ambiguous" rather
- * than a silent pick.
+ * Index: deposits_open_match_idx. Two or more rows is a real state since
+ * H-11 (2026-09-28): different users may submit the same 6-digit
+ * reference (only one user's own live rows are unique —
+ * deposits_user_reference_active_key), so two open twins on one account
+ * are possible. LIMIT 2 is all the never-guess rule needs: exactly one row
+ * is claimed, two or more are AMBIGUOUS for staff.
  */
 export async function findOpenDepositByReference(
   tx: Prisma.TransactionClient,
@@ -101,49 +134,9 @@ export async function findOpenDepositByReference(
 }
 
 /**
- * Q2 — the fallback when the reference misses: same account, same amount,
- * created inside the window around the bank's timestamp, open set only.
- * Index: deposits_open_amount_idx (equality, equality, range — one
- * contiguous range in createdAt order, so no sort). LIMIT 3: the matcher
- * only needs to tell 0 / 1 / many apart.
- */
-export async function findOpenDepositsByAmount(
-  tx: Prisma.TransactionClient,
-  paymentAccountId: string,
-  amount: Prisma.Decimal,
-  occurredAt: Date,
-): Promise<OpenDepositRow[]> {
-  const from = new Date(occurredAt.getTime() - CLOCK_SKEW_MS);
-  const to = new Date(occurredAt.getTime() + DEPOSIT_MATCH_WINDOW_MS);
-  const rows = await tx.$queryRaw<Record<string, unknown>[]>(
-    Prisma.sql`SELECT ${OPEN_DEPOSIT_COLUMNS}
-      FROM deposits
-      WHERE "declaredPaymentAccountId" = ${paymentAccountId}
-        AND amount = ${amount.toFixed(2)}::numeric
-        AND "createdAt" BETWEEN ${from} AND ${to}
-        AND status = 'PENDING'::"DepositStatus"
-        AND "bankCheckedAt" IS NULL
-      ORDER BY "createdAt"
-      LIMIT ${AMBIGUITY_PROBE_LIMIT}`,
-  );
-  return rows.map(toOpenDepositRow);
-}
-
-function eventMetadata(event: NormalizedBankEvent) {
-  return {
-    source: 'phone-monitor',
-    idempotencyKey: event.idempotencyKey,
-    deviceSerial: event.deviceSerial,
-    paymentAccountId: event.paymentAccountId,
-    direction: event.direction,
-  };
-}
-
-/**
  * Every rule that applies to a row the event is about to be written onto:
  * amount, timing, reference twins, velocity, plus whatever the caller
- * already knows (CODE_MISMATCH on the amount-fallback path). Pure apart
- * from the two indexed reads it needs (Q4, Q5).
+ * already knows. Pure apart from the two indexed reads it needs (Q4, Q5).
  */
 async function evaluateCandidate(
   tx: Prisma.TransactionClient,
@@ -161,22 +154,43 @@ async function evaluateCandidate(
   return { score: scoreVerification(reasons, true), twins };
 }
 
+/** claimDepositWithTransaction's outcome also hands back the claimed row for the caller's create response. */
+export interface DepositClaimOutcome extends DepositMatchOutcome {
+  deposit: Deposit;
+}
+
 /**
- * The claim (Q9): bank values onto exactly one row, guarded by the same
- * open-set predicate the lookup used, so two events racing for one row can
- * never both write. Deliberately never touches receivingPaymentAccountId /
+ * The claim (Q9) + the link (Q-BT2), one transaction: bank values onto
+ * exactly one deposit, guarded by the same open-set predicate the lookup
+ * used, then the bank transaction marked MATCHED and pointed at it. Used
+ * by ingestion (the transfer arrived after the deposit) AND by
+ * DepositsService.create (the transfer was waiting when the deposit was
+ * submitted) — `trigger` says which in the audit rows. The deposit's
+ * receivingEventKey is the transaction's idempotency key and its
+ * screenshot pointer is the transaction's key when one was already
+ * uploaded (the "screenshot arrived before the deposit" case); a later
+ * upload sets both pointers itself.
+ *
+ * A lost race (count ≠ 1: claimed / approved / rejected between lookup and
+ * write) THROWS: the caller's transaction rolls back whole, the phone
+ * answers `error` and retries, and the next post finds the deposit gone
+ * from the open set. Never a guess, never a half-written pair.
+ *
+ * Deliberately never touches receivingPaymentAccountId /
  * receivingAccount* — those drive the payment-account LEDGER at approval
  * (syncDepositLink no-ops when the id is already set), so pre-filling them
  * here would silently skip the DEPOSIT_IN credit.
  */
-async function claimDeposit(
+export async function claimDepositWithTransaction(
   tx: Prisma.TransactionClient,
   audit: AuditService,
   row: OpenDepositRow,
-  event: NormalizedBankEvent,
+  transaction: StoredBankTransaction,
   extra: readonly RiskReason[],
   now: Date,
-): Promise<DepositMatchOutcome> {
+  trigger: LinkTrigger,
+): Promise<DepositClaimOutcome> {
+  const event = eventFromTransaction(transaction);
   const { score, twins } = await evaluateCandidate(tx, row, event, extra);
   const before = await tx.deposit.findUniqueOrThrow({ where: { id: row.id } });
 
@@ -188,6 +202,9 @@ async function claimDeposit(
       receivingTransactionTime: yangonTimeOfDay(event.occurredAt),
       receivingTransactionAt: event.occurredAt,
       receivingEventKey: event.idempotencyKey,
+      ...(transaction.screenshotKey !== null && {
+        receivingScreenshotKey: transaction.screenshotKey,
+      }),
       bankCheckedAt: now,
       matchStatus: score.matchStatus,
       riskLevel: score.riskLevel,
@@ -195,16 +212,7 @@ async function claimDeposit(
     },
   });
   if (claim.count !== 1) {
-    // Claimed (matched/approved/rejected) between the lookup and here; the
-    // phone-monitor's retry will hit Q3 or find nothing — never guess now.
-    return {
-      result: {
-        idempotencyKey: event.idempotencyKey,
-        outcome: 'no_match',
-        reason: 'ROW_CLAIMED_CONCURRENTLY',
-      },
-      touchedDepositIds: [],
-    };
+    throw new Error('DEPOSIT_CLAIMED_CONCURRENTLY');
   }
 
   const after = await tx.deposit.findUniqueOrThrow({ where: { id: row.id } });
@@ -215,7 +223,9 @@ async function claimDeposit(
     before: depositSnapshot(before),
     after: depositSnapshot(after),
     metadata: {
-      ...eventMetadata(event),
+      ...transactionMetadata(transaction),
+      trigger,
+      bankTransactionId: transaction.id,
       outcome: 'matched',
       matchStatus: score.matchStatus,
       riskReasons: score.riskReasons,
@@ -223,8 +233,10 @@ async function claimDeposit(
     tx,
   });
 
+  await linkToDeposit(tx, audit, transaction, row.id, now, trigger);
+
   const changedTwins = await recomputeDepositTwins(tx, audit, row, twins, {
-    ...eventMetadata(event),
+    ...transactionMetadata(transaction),
     trigger: 'bank_match',
     anchorDepositId: row.id,
   });
@@ -233,27 +245,31 @@ async function claimDeposit(
     result: {
       idempotencyKey: event.idempotencyKey,
       outcome: 'matched',
+      transactionId: transaction.id,
+      state: 'MATCHED',
       depositId: row.id,
       matchStatus: score.matchStatus,
-      screenshotWanted: true,
+      screenshotWanted: transaction.screenshotKey === null,
     },
     touchedDepositIds: [row.id, ...changedTwins.map((twin) => twin.id)],
+    transactionChanged: true,
+    deposit: after,
   };
 }
 
 /**
- * ≥ 2 open candidates fit by amount + window and none by reference: NEVER
- * GUESS. No bank values on anyone; each candidate gets AMBIGUOUS_MATCH →
- * PENDING_REVIEW (only if not already there, so a retry is a no-op with
- * zero writes and zero audit rows). An admin resolves by approving /
- * rejecting / unlinking until one candidate remains; the phone-monitor keeps
- * retrying and lands on the 1-row branch then.
+ * ≥ 2 open candidates fit and none can be told apart: NEVER GUESS. No bank
+ * values on anyone; each candidate gets AMBIGUOUS_MATCH → PENDING_REVIEW
+ * (only if not already there, so a re-post is a no-op with zero writes and
+ * zero audit rows), and the transaction goes AMBIGUOUS. An admin resolves
+ * by approving / rejecting / unlinking until one candidate remains, then
+ * presses Resend on the phone — the re-post lands on the 1-row branch.
  */
 async function flagAmbiguous(
   tx: Prisma.TransactionClient,
   audit: AuditService,
   candidates: readonly OpenDepositRow[],
-  event: NormalizedBankEvent,
+  transaction: StoredBankTransaction,
 ): Promise<DepositMatchOutcome> {
   const candidateIds = candidates.map((row) => row.id);
   const touched: string[] = [];
@@ -269,85 +285,123 @@ async function flagAmbiguous(
       audit,
       { ...row, status: 'PENDING', bankCheckedAt: null },
       next,
-      { ...eventMetadata(event), trigger: 'ambiguous_match', candidateIds },
+      {
+        ...transactionMetadata(transaction),
+        trigger: 'ambiguous_match',
+        bankTransactionId: transaction.id,
+        candidateIds,
+      },
     );
     touched.push(row.id);
   }
+  const transactionChanged = await markAmbiguous(
+    tx,
+    audit,
+    transaction,
+    candidateIds,
+  );
   return {
     result: {
-      idempotencyKey: event.idempotencyKey,
+      idempotencyKey: transaction.idempotencyKey,
       outcome: 'ambiguous',
+      transactionId: transaction.id,
+      state: 'AMBIGUOUS',
       reason: 'MULTIPLE_CANDIDATES',
+      screenshotWanted: transaction.screenshotKey === null,
     },
     touchedDepositIds: touched,
+    transactionChanged,
   };
 }
 
 /**
- * Q3 first (already applied?), then Q1 (the user's own last-6 → THE row,
- * bank values always written, reasons say how well it fits), then Q2 (the
- * amount fallback: 0 → no_match, 1 → the "mistyped last-6" case written
- * with CODE_MISMATCH, ≥ 2 → ambiguous). Runs inside the caller's
+ * For a stored, not-yet-MATCHED transaction: legacy backfill first (Q3 —
+ * a deposit already carries this key from before bank_transactions
+ * existed: link the two, reply already_stored; this is how the phone's
+ * existing `sent` rows appear on the admin page when Resent), then Q1
+ * (the user's own last-6 → THE row, bank values always written, reasons
+ * say how well it fits). A Q1 miss leaves the row UNMATCHED — never a
+ * guess by amount (see the file comment). Runs inside the caller's
  * transaction — one per event, so one bad event never rolls back its
  * neighbours.
  */
 export async function applyReceivedEvent(
   tx: Prisma.TransactionClient,
   audit: AuditService,
-  event: NormalizedBankEvent,
+  transaction: StoredBankTransaction,
   now: Date = new Date(),
 ): Promise<DepositMatchOutcome> {
   const applied = await tx.deposit.findUnique({
-    where: { receivingEventKey: event.idempotencyKey },
-    select: { id: true, receivingScreenshotKey: true, matchStatus: true },
+    where: { receivingEventKey: transaction.idempotencyKey },
+    select: { id: true, matchStatus: true, bankCheckedAt: true },
   });
   if (applied) {
+    await linkToDeposit(
+      tx,
+      audit,
+      transaction,
+      applied.id,
+      applied.bankCheckedAt ?? now,
+      'legacy_backfill',
+    );
     return {
       result: {
-        idempotencyKey: event.idempotencyKey,
-        outcome: 'already_applied',
+        idempotencyKey: transaction.idempotencyKey,
+        outcome: 'already_stored',
+        transactionId: transaction.id,
+        state: 'MATCHED',
         depositId: applied.id,
         matchStatus: applied.matchStatus,
-        screenshotWanted: applied.receivingScreenshotKey === null,
+        screenshotWanted: transaction.screenshotKey === null,
       },
-      touchedDepositIds: [],
+      touchedDepositIds: [applied.id],
+      transactionChanged: true,
     };
   }
 
   const byReference = await findOpenDepositByReference(
     tx,
-    event.paymentAccountId,
-    event.txCodeLast6,
+    transaction.paymentAccountId,
+    transaction.txCodeLast6,
   );
   if (byReference.length > 1) {
-    // Impossible while deposits_reference_active_key holds; treat exactly
-    // like any other ambiguity rather than picking one.
-    return flagAmbiguous(tx, audit, byReference, event);
+    // Two users typed the same last-6 on this account (H-11 twins): never
+    // pick one — both go to staff as AMBIGUOUS.
+    return flagAmbiguous(tx, audit, byReference, transaction);
   }
   if (byReference.length === 1) {
-    return claimDeposit(tx, audit, byReference[0], event, [], now);
-  }
-
-  const byAmount = await findOpenDepositsByAmount(
-    tx,
-    event.paymentAccountId,
-    event.amount,
-    event.occurredAt,
-  );
-  if (byAmount.length === 0) {
+    const claimed = await claimDepositWithTransaction(
+      tx,
+      audit,
+      byReference[0],
+      transaction,
+      [],
+      now,
+      'ingestion',
+    );
     return {
-      result: {
-        idempotencyKey: event.idempotencyKey,
-        outcome: 'no_match',
-        reason: 'NO_OPEN_CANDIDATE',
-      },
-      touchedDepositIds: [],
+      result: claimed.result,
+      touchedDepositIds: claimed.touchedDepositIds,
+      transactionChanged: claimed.transactionChanged,
     };
   }
-  if (byAmount.length === 1) {
-    return claimDeposit(tx, audit, byAmount[0], event, ['CODE_MISMATCH'], now);
-  }
-  return flagAmbiguous(tx, audit, byAmount, event);
+
+  // Nothing to claim: the row stays stored and waits for its deposit. A
+  // re-posted AMBIGUOUS row whose candidates have all been resolved away
+  // is plainly waiting again.
+  const transactionChanged = await markUnmatched(tx, audit, transaction);
+  return {
+    result: {
+      idempotencyKey: transaction.idempotencyKey,
+      outcome: 'stored_unmatched',
+      transactionId: transaction.id,
+      state: 'UNMATCHED',
+      reason: 'NO_OPEN_CANDIDATE',
+      screenshotWanted: transaction.screenshotKey === null,
+    },
+    touchedDepositIds: [],
+    transactionChanged,
+  };
 }
 
 /** Re-exported so the service can type the rows it pushes over the socket. */

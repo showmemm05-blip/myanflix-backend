@@ -4,15 +4,17 @@ import {
   Prisma,
 } from '../generated/prisma/client';
 import type { AuditService } from '../audit/audit.service';
-import type { NormalizedBankEvent } from './bank-event.types';
+import type { StoredBankTransaction } from '../bank-transactions/bank-transaction-store';
 import { applyReceivedEvent } from './deposit-matcher';
 import { CLOCK_SKEW_MS, VELOCITY_LIMIT } from './risk-rules';
 
 /**
  * The deposit matcher against a hand-rolled Prisma transaction mock, in the
- * same style as deposits.service.spec.ts. Q1/Q2 are `$queryRaw` and are
+ * same style as deposits.service.spec.ts. Its input is now a STORED
+ * bank_transactions row (store-first ingestion). Q1 is `$queryRaw` and is
  * told apart by call order (Q1 always runs first); Q4 (twins) and Q5
- * (velocity) both go through findMany and are told apart by their `where`.
+ * (velocity) both go through findMany and are told apart by their `where`;
+ * the link (Q-BT2) is `bankTransaction.updateMany`.
  */
 
 const KEY = 'a'.repeat(64);
@@ -20,23 +22,26 @@ const ACCOUNT = '11111111-1111-4111-8111-111111111111';
 const BANK_AT = new Date('2026-09-18T09:00:00.000Z');
 const NOW = new Date('2026-09-18T09:00:30.000Z');
 
-function makeEvent(
-  overrides: Partial<NormalizedBankEvent> = {},
-): NormalizedBankEvent {
+function makeTransaction(
+  overrides: Partial<StoredBankTransaction> = {},
+): StoredBankTransaction {
   return {
+    id: 'tx-1',
     idempotencyKey: KEY,
     deviceSerial: 'PIXEL10',
     paymentAccountId: ACCOUNT,
-    direction: 'received',
+    direction: 'RECEIVED',
     amount: new Prisma.Decimal(50000),
     txCode: 'KBZ20260918AB12CD',
     txCodeLast6: 'AB12CD',
     occurredAt: BANK_AT,
+    screenshotKey: null,
+    state: 'UNMATCHED',
     ...overrides,
   };
 }
 
-/** A row as Q1/Q2 return it (raw column shapes: Decimal + Date). */
+/** A row as Q1 returns it (raw column shapes: Decimal + Date). */
 function openRow(overrides: Record<string, unknown> = {}) {
   return {
     id: 'dep-1',
@@ -75,6 +80,7 @@ describe('applyReceivedEvent', () => {
       updateMany: jest.Mock;
       update: jest.Mock;
     };
+    bankTransaction: { updateMany: jest.Mock };
   };
   let audit: { record: jest.Mock };
   let twins: unknown[];
@@ -100,55 +106,67 @@ describe('applyReceivedEvent', () => {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         update: jest.fn().mockResolvedValue({}),
       },
+      bankTransaction: {
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
     };
     audit = { record: jest.fn().mockResolvedValue(undefined) };
   });
 
-  const run = (event = makeEvent()) =>
+  const run = (transaction = makeTransaction()) =>
     applyReceivedEvent(
       tx as never,
       audit as unknown as AuditService,
-      event,
+      transaction,
       NOW,
     );
 
-  it('recognises an already-applied event by its key without touching anything (idempotent re-apply)', async () => {
+  it('legacy backfill: a deposit already carrying the key (matched by an older build) is linked and answered already_stored', async () => {
+    const checked = new Date('2026-09-18T09:00:10.000Z');
     tx.deposit.findUnique.mockResolvedValue({
       id: 'dep-1',
-      receivingScreenshotKey: null,
       matchStatus: 'MATCHED',
+      bankCheckedAt: checked,
     });
 
     const outcome = await run();
 
     expect(outcome.result).toEqual({
       idempotencyKey: KEY,
-      outcome: 'already_applied',
+      outcome: 'already_stored',
+      transactionId: 'tx-1',
+      state: 'MATCHED',
       depositId: 'dep-1',
       matchStatus: 'MATCHED',
       screenshotWanted: true,
     });
     expect(tx.$queryRaw).not.toHaveBeenCalled();
     expect(tx.deposit.updateMany).not.toHaveBeenCalled();
-    expect(audit.record).not.toHaveBeenCalled();
-  });
-
-  it('says the screenshot is not wanted when the applied row already has one', async () => {
-    tx.deposit.findUnique.mockResolvedValue({
-      id: 'dep-1',
-      receivingScreenshotKey: 'documents/bank-screenshots/deposits/dep-1/x.png',
-      matchStatus: 'MATCHED',
+    expect(tx.bankTransaction.updateMany).toHaveBeenCalledWith({
+      where: { id: 'tx-1', state: { in: ['UNMATCHED', 'AMBIGUOUS'] } },
+      data: { state: 'MATCHED', linkedDepositId: 'dep-1', matchedAt: checked },
     });
-    expect((await run()).result.screenshotWanted).toBe(false);
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'bank_transaction.link',
+        actor: null,
+        metadata: expect.objectContaining({ trigger: 'legacy_backfill' }),
+      }),
+    );
+    expect(outcome.touchedDepositIds).toEqual(['dep-1']);
+    expect(outcome.transactionChanged).toBe(true);
   });
 
-  it("matches by the user's own last-6 (Q1) and writes the bank values with MATCHED when every check passes", async () => {
+  it("matches by the user's own last-6 (Q1), writes the bank values with MATCHED when every check passes, and links the row in the same transaction", async () => {
     tx.$queryRaw.mockResolvedValueOnce([openRow()]);
 
     const outcome = await run();
 
-    expect(outcome.result).toMatchObject({
+    expect(outcome.result).toEqual({
+      idempotencyKey: KEY,
       outcome: 'matched',
+      transactionId: 'tx-1',
+      state: 'MATCHED',
       depositId: 'dep-1',
       matchStatus: BankMatchStatus.MATCHED,
       screenshotWanted: true,
@@ -167,10 +185,16 @@ describe('applyReceivedEvent', () => {
         riskReasons: [],
       },
     });
-    // Never the ledger-driving columns.
+    // Never the ledger-driving columns; no screenshot pointer when the
+    // transaction holds none yet (the upload sets both later).
     const data = tx.deposit.updateMany.mock.calls[0][0].data;
     expect(data).not.toHaveProperty('receivingPaymentAccountId');
     expect(data).not.toHaveProperty('receivingAccountType');
+    expect(data).not.toHaveProperty('receivingScreenshotKey');
+    expect(tx.bankTransaction.updateMany).toHaveBeenCalledWith({
+      where: { id: 'tx-1', state: { in: ['UNMATCHED', 'AMBIGUOUS'] } },
+      data: { state: 'MATCHED', linkedDepositId: 'dep-1', matchedAt: NOW },
+    });
     expect(audit.record).toHaveBeenCalledWith(
       expect.objectContaining({
         action: 'deposit.bank_match',
@@ -180,12 +204,36 @@ describe('applyReceivedEvent', () => {
           source: 'phone-monitor',
           idempotencyKey: KEY,
           deviceSerial: 'PIXEL10',
+          trigger: 'ingestion',
+          bankTransactionId: 'tx-1',
           outcome: 'matched',
         }),
         tx,
       }),
     );
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'bank_transaction.link',
+        metadata: expect.objectContaining({
+          trigger: 'ingestion',
+          depositId: 'dep-1',
+        }),
+      }),
+    );
     expect(outcome.touchedDepositIds).toEqual(['dep-1']);
+    expect(outcome.transactionChanged).toBe(true);
+  });
+
+  it('copies the screenshot pointer onto the deposit when the transaction already holds one (screenshot arrived before the deposit)', async () => {
+    const key = `documents/bank-screenshots/transactions/tx-1/${KEY}.png`;
+    tx.$queryRaw.mockResolvedValueOnce([openRow()]);
+
+    const outcome = await run(makeTransaction({ screenshotKey: key }));
+
+    expect(tx.deposit.updateMany.mock.calls[0][0].data).toMatchObject({
+      receivingScreenshotKey: key,
+    });
+    expect(outcome.result.screenshotWanted).toBe(false);
   });
 
   it('spells the open-set predicate as literal SQL with only the values bound (what makes the partial index usable)', async () => {
@@ -254,8 +302,8 @@ describe('applyReceivedEvent', () => {
       'SHARED_REFERENCE_ACROSS_USERS',
     ]);
     expect(outcome.result.matchStatus).toBe(BankMatchStatus.SUSPICIOUS);
-    // The twin learns about the anchor: DUPLICATE + SHARED, PENDING… no —
-    // SHARED is hard, so the rejected twin becomes SUSPICIOUS too.
+    // The twin learns about the anchor: SHARED is hard, so the rejected
+    // twin becomes SUSPICIOUS too.
     expect(tx.deposit.update).toHaveBeenCalledWith({
       where: { id: 'dep-2' },
       data: {
@@ -286,141 +334,132 @@ describe('applyReceivedEvent', () => {
     ]);
   });
 
-  it('answers no_match (never guesses) when the row was claimed between the lookup and the write', async () => {
+  it('THROWS (so the whole per-event transaction rolls back) when the deposit was claimed between lookup and write — never a half-written pair', async () => {
     tx.$queryRaw.mockResolvedValueOnce([openRow()]);
     tx.deposit.updateMany.mockResolvedValue({ count: 0 });
 
-    const outcome = await run();
-
-    expect(outcome.result).toEqual({
-      idempotencyKey: KEY,
-      outcome: 'no_match',
-      reason: 'ROW_CLAIMED_CONCURRENTLY',
-    });
+    await expect(run()).rejects.toThrow('DEPOSIT_CLAIMED_CONCURRENTLY');
+    expect(tx.bankTransaction.updateMany).not.toHaveBeenCalled();
     expect(audit.record).not.toHaveBeenCalled();
-    expect(outcome.touchedDepositIds).toEqual([]);
   });
 
-  it('answers no_match and writes nothing when neither the reference nor the amount finds an open row', async () => {
+  it('THROWS when the transaction row itself was linked by a racing event (the deposit claim rolls back with it)', async () => {
+    tx.$queryRaw.mockResolvedValueOnce([openRow()]);
+    tx.bankTransaction.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(run()).rejects.toThrow(
+      'BANK_TRANSACTION_CLAIMED_CONCURRENTLY',
+    );
+  });
+
+  it('answers stored_unmatched and writes nothing when the reference finds no open row — and never looks by amount', async () => {
+    // The AMBIGUOUS→UNMATCHED guard matches nothing on an UNMATCHED row.
+    tx.bankTransaction.updateMany.mockResolvedValue({ count: 0 });
+
     const outcome = await run();
 
     expect(outcome.result).toEqual({
       idempotencyKey: KEY,
-      outcome: 'no_match',
+      outcome: 'stored_unmatched',
+      transactionId: 'tx-1',
+      state: 'UNMATCHED',
       reason: 'NO_OPEN_CANDIDATE',
+      screenshotWanted: true,
     });
-    expect(tx.$queryRaw).toHaveBeenCalledTimes(2);
+    // One query only: the user's last-6. A transfer that arrives before its
+    // deposit is submitted must stay stored and unmatched, not attach to
+    // another pending deposit of the same amount (the 2026-09-22 live-test
+    // bug) — the deposit claims it at create time.
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
     expect(tx.deposit.updateMany).not.toHaveBeenCalled();
     expect(tx.deposit.update).not.toHaveBeenCalled();
     expect(audit.record).not.toHaveBeenCalled();
+    expect(tx.bankTransaction.updateMany).toHaveBeenCalledWith({
+      where: { id: 'tx-1', state: 'AMBIGUOUS' },
+      data: { state: 'UNMATCHED' },
+    });
+    expect(outcome.transactionChanged).toBe(false);
   });
 
-  it('falls back to the single same-amount candidate (the mistyped last-6 case) and writes it with CODE_MISMATCH → SUSPICIOUS', async () => {
-    tx.$queryRaw
-      .mockResolvedValueOnce([]) // Q1 miss
-      .mockResolvedValueOnce([openRow({ reference: '999999' })]); // Q2 one hit
+  it('a re-posted AMBIGUOUS row whose candidates are all gone goes back to UNMATCHED (audited state_change)', async () => {
+    tx.bankTransaction.updateMany.mockResolvedValue({ count: 1 });
 
-    const outcome = await run();
+    const outcome = await run(makeTransaction({ state: 'AMBIGUOUS' }));
 
-    expect(outcome.result).toMatchObject({
-      outcome: 'matched',
-      depositId: 'dep-1',
-      matchStatus: BankMatchStatus.SUSPICIOUS,
-    });
-    const data = tx.deposit.updateMany.mock.calls[0][0].data;
-    expect(data.riskReasons).toEqual(['CODE_MISMATCH']);
-    expect(data.riskLevel).toBe(BankRiskLevel.MEDIUM);
-    // The bank's code is stored as printed so the admin sees both side by side.
-    expect(data.receivingTransactionCode).toBe('AB12CD');
-  });
-
-  it('binds the Q2 window around the bank time and the amount at two decimals', async () => {
-    tx.$queryRaw.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
-    await run();
-    const q2 = tx.$queryRaw.mock.calls[1][0] as Prisma.Sql;
-    expect(q2.strings.join('?')).toContain(
-      `status = 'PENDING'::"DepositStatus"`,
-    );
-    expect(q2.values).toEqual([
-      ACCOUNT,
-      '50000.00',
-      new Date(BANK_AT.getTime() - CLOCK_SKEW_MS),
-      new Date(BANK_AT.getTime() + 24 * 3_600_000),
-      3,
-    ]);
-  });
-
-  it('NEVER GUESSES between several same-amount candidates: no bank values, AMBIGUOUS_MATCH on each, reply ambiguous', async () => {
-    tx.$queryRaw
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([
-        openRow({ id: 'dep-1', reference: '111111' }),
-        openRow({ id: 'dep-2', reference: '222222', userId: 'user-2' }),
-      ]);
-
-    const outcome = await run();
-
-    expect(outcome.result).toEqual({
-      idempotencyKey: KEY,
-      outcome: 'ambiguous',
-      reason: 'MULTIPLE_CANDIDATES',
-    });
-    expect(tx.deposit.updateMany).not.toHaveBeenCalled();
-    expect(tx.deposit.update).toHaveBeenCalledTimes(2);
-    expect(tx.deposit.update).toHaveBeenCalledWith({
-      where: { id: 'dep-1' },
-      data: {
-        matchStatus: BankMatchStatus.PENDING_REVIEW,
-        riskLevel: BankRiskLevel.MEDIUM,
-        riskReasons: ['AMBIGUOUS_MATCH'],
-      },
-    });
-    expect(audit.record).toHaveBeenCalledTimes(2);
+    expect(outcome.result.outcome).toBe('stored_unmatched');
     expect(audit.record).toHaveBeenCalledWith(
       expect.objectContaining({
-        action: 'deposit.risk_update',
-        metadata: expect.objectContaining({
-          trigger: 'ambiguous_match',
-          candidateIds: ['dep-1', 'dep-2'],
-        }),
+        action: 'bank_transaction.state_change',
+        before: { state: 'AMBIGUOUS' },
+        after: { state: 'UNMATCHED' },
       }),
     );
-    expect(outcome.touchedDepositIds).toEqual(['dep-1', 'dep-2']);
+    expect(outcome.transactionChanged).toBe(true);
   });
 
-  it('a retried ambiguous event writes zero rows and zero audit rows (the flags are already there)', async () => {
-    tx.$queryRaw.mockResolvedValueOnce([]).mockResolvedValueOnce([
+  it('a re-posted ambiguous event writes zero deposit rows and zero deposit audit rows (the flags are already there) and marks the transaction AMBIGUOUS once', async () => {
+    // Ambiguity can only come from Q1 now (two open rows with the same
+    // last-6 on one account — two users' twins, allowed since H-11; the
+    // matcher refuses to pick). Both already carry the flag.
+    tx.$queryRaw.mockResolvedValueOnce([
       openRow({
         id: 'dep-1',
-        reference: '111111',
         matchStatus: 'PENDING_REVIEW',
         riskLevel: 'MEDIUM',
         riskReasons: ['AMBIGUOUS_MATCH'],
       }),
       openRow({
         id: 'dep-2',
-        reference: '222222',
+        userId: 'user-2',
         matchStatus: 'PENDING_REVIEW',
         riskLevel: 'MEDIUM',
         riskReasons: ['AMBIGUOUS_MATCH'],
       }),
     ]);
+    // Already AMBIGUOUS: the guarded state write matches nothing.
+    tx.bankTransaction.updateMany.mockResolvedValue({ count: 0 });
 
-    const outcome = await run();
+    const outcome = await run(makeTransaction({ state: 'AMBIGUOUS' }));
 
-    expect(outcome.result.outcome).toBe('ambiguous');
+    expect(outcome.result).toEqual({
+      idempotencyKey: KEY,
+      outcome: 'ambiguous',
+      transactionId: 'tx-1',
+      state: 'AMBIGUOUS',
+      reason: 'MULTIPLE_CANDIDATES',
+      screenshotWanted: true,
+    });
     expect(tx.deposit.update).not.toHaveBeenCalled();
     expect(audit.record).not.toHaveBeenCalled();
     expect(outcome.touchedDepositIds).toEqual([]);
+    expect(outcome.transactionChanged).toBe(false);
   });
 
-  it('treats two rows for one reference on Q1 (an impossible state) as ambiguous rather than picking one', async () => {
+  it("H-11: two users' open deposits with the same reference on one account are ambiguous — never picks one; flags both, marks the row AMBIGUOUS", async () => {
     tx.$queryRaw.mockResolvedValueOnce([
       openRow({ id: 'dep-1' }),
-      openRow({ id: 'dep-2' }),
+      openRow({ id: 'dep-2', userId: 'user-2' }),
     ]);
+
     const outcome = await run();
+
     expect(outcome.result.outcome).toBe('ambiguous');
     expect(tx.deposit.updateMany).not.toHaveBeenCalled();
+    expect(tx.deposit.update).toHaveBeenCalledTimes(2);
+    expect(tx.bankTransaction.updateMany).toHaveBeenCalledWith({
+      where: { id: 'tx-1', state: 'UNMATCHED' },
+      data: { state: 'AMBIGUOUS' },
+    });
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'bank_transaction.state_change',
+        after: { state: 'AMBIGUOUS' },
+        metadata: expect.objectContaining({
+          candidateIds: ['dep-1', 'dep-2'],
+        }),
+      }),
+    );
+    expect(outcome.touchedDepositIds).toEqual(['dep-1', 'dep-2']);
+    expect(outcome.transactionChanged).toBe(true);
   });
 });

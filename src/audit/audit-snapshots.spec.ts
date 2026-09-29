@@ -7,6 +7,7 @@ import {
   MovieStatus,
   Prisma,
   Role,
+  SeriesStatus,
   UserStatus,
 } from '../generated/prisma/client';
 import {
@@ -20,6 +21,7 @@ import {
   movieSnapshot,
   paymentAccountSnapshot,
   roleSnapshot,
+  seriesSnapshot,
   textPreview,
   userSnapshot,
 } from './audit-snapshots';
@@ -83,6 +85,31 @@ describe('audit snapshot pickers', () => {
       categories: [],
       actors: [],
     });
+  });
+
+  it('seriesSnapshot carries the show-level cast as name refs, like movieSnapshot', () => {
+    expect(
+      seriesSnapshot({
+        title: 'A Show',
+        status: SeriesStatus.DRAFT,
+        categories: [{ id: 'c1', name: 'Action', description: null }],
+        actors: [{ id: 'a1', name: 'Jackie Chan', imageUrl: 'x' }],
+      }),
+    ).toMatchObject({
+      title: 'A Show',
+      status: 'DRAFT',
+      categories: [{ id: 'c1', name: 'Action' }],
+      actors: [{ id: 'a1', name: 'Jackie Chan' }],
+    });
+    // A row loaded without the relation diffs as an empty cast, not a crash.
+    expect(seriesSnapshot({ title: 'Bare' })).toMatchObject({ actors: [] });
+  });
+
+  it('seriesSnapshot carries the admin-set rating, like movieSnapshot', () => {
+    expect(seriesSnapshot({ title: 'Rated', rating: 7.5 })).toMatchObject({
+      rating: 7.5,
+    });
+    expect(seriesSnapshot({ title: 'Bare' })).toMatchObject({ rating: null });
   });
 
   it('bookSnapshot / bookChapterSnapshot never carry the TipTap document', () => {

@@ -66,6 +66,23 @@ describe('scopeForKey', () => {
     }
   });
 
+  it('maps a REPLACED title’s versioned package (hls/v-<tag>/**) to the very same videos/<id>/hls scope', () => {
+    // A replace writes its package one folder deeper so the cache servers'
+    // 7-day copies of the old segment keys can never be served for it. The
+    // token a viewer already holds must keep working: the scope is the
+    // prefix, and v-<tag>/… is just a longer (still clean) remainder.
+    const scope = `videos/${MOVIE_ID}/hls`;
+    for (const key of [
+      `videos/${MOVIE_ID}/hls/v-abc123/master.m3u8`,
+      `videos/${MOVIE_ID}/hls/v-abc123/720p/index.m3u8`,
+      `videos/${MOVIE_ID}/hls/v-abc123/720p/segment_000.ts`,
+      `videos/${MOVIE_ID}/hls/v-abc123/subs/${SUBTITLE_ID}.m3u8`,
+      `videos/${MOVIE_ID}/hls/v-abc123/subs/${SUBTITLE_ID}.vtt`,
+    ]) {
+      expect(scopeForKey(key)).toBe(scope);
+    }
+  });
+
   it('maps every HLS object of an audio release to its audio/<id>/hls scope', () => {
     // Reserved: nothing writes audio/ yet, but the arm ships with the rest of
     // the taxonomy so a music or audiobook feature needs no signing change.

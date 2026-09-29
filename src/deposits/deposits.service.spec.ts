@@ -4,13 +4,16 @@ import {
   BadRequestException,
   ConflictException,
   NotFoundException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { Prisma } from '../generated/prisma/client';
 import {
   DepositStatus,
   NotificationType,
   TransactionType,
+  UserStatus,
 } from '../generated/prisma/client';
+import { lockAccountStatus } from '../users/account-status-lock';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
@@ -18,7 +21,26 @@ import { FinanceSettingsService } from '../finance-settings/finance-settings.ser
 import { PaymentAccountLedgerService } from '../payment-accounts/payment-account-ledger.service';
 import { AuditService } from '../audit/audit.service';
 import { MinioService } from '../common/storage/minio.service';
+import { StorageService } from '../common/storage/storage.service';
 import { DepositsService } from './deposits.service';
+
+// The account-row lock is raw SQL of its own (account-status-lock.spec.ts);
+// here it only answers the status, so the $queryRaw mock stays the
+// waiting-transfer lookup's alone. ACTIVE unless a test says otherwise.
+jest.mock('../users/account-status-lock', () => ({
+  ...jest.requireActual<object>('../users/account-status-lock'),
+  lockAccountStatus: jest.fn(),
+}));
+const lockAccountStatusMock = jest.mocked(lockAccountStatus);
+beforeEach(() => {
+  lockAccountStatusMock.mockReset().mockResolvedValue(UserStatus.ACTIVE);
+});
+
+/** Only the key-ownership check the unlink path uses — the real thing needs ConfigService. */
+const storageStub = {
+  ownsBankScreenshot: (kind: string, rowId: string, key: string) =>
+    key.startsWith(`documents/bank-screenshots/${kind}/${rowId}/`),
+};
 
 function makeDeposit(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -47,7 +69,7 @@ function makeDeposit(overrides: Partial<Record<string, unknown>> = {}) {
   };
 }
 
-/** What Prisma throws when an insert trips deposits_reference_active_key. */
+/** What Prisma throws when an insert trips deposits_user_reference_active_key. */
 function makeP2002() {
   return new Prisma.PrismaClientKnownRequestError(
     'Unique constraint failed on the fields: (`reference`)',
@@ -75,8 +97,13 @@ describe('DepositsService', () => {
     wallet: { findUniqueOrThrow: jest.Mock };
     transaction: { create: jest.Mock };
     notification: { create: jest.Mock };
-    user: { findUnique: jest.Mock; findUniqueOrThrow: jest.Mock };
+    user: {
+      findUnique: jest.Mock;
+      findUniqueOrThrow: jest.Mock;
+      findMany: jest.Mock;
+    };
     paymentAccount: { findUnique: jest.Mock };
+    bankTransaction: Record<string, jest.Mock>;
     $transaction: jest.Mock;
     $queryRaw: jest.Mock;
   };
@@ -85,11 +112,12 @@ describe('DepositsService', () => {
   let gateway: {
     notifyAdminsDepositCreated: jest.Mock;
     notifyUserDepositUpdated: jest.Mock;
+    notifyAdminsDepositUpdated: jest.Mock;
     notifyUserNotificationCreated: jest.Mock;
     notifyUserBalanceUpdated: jest.Mock;
     notifyAdminsPaymentAccountUpdated: jest.Mock;
     notifyAdminsDepositVerificationUpdated: jest.Mock;
-    notifyBankMonitorsNudge: jest.Mock;
+    notifyAdminsBankTransactionUpdated: jest.Mock;
   };
   let financeSettingsService: { getLimits: jest.Mock };
   let paymentAccountLedgerService: { syncDepositLink: jest.Mock };
@@ -110,8 +138,25 @@ describe('DepositsService', () => {
       wallet: { findUniqueOrThrow: jest.fn() },
       transaction: { create: jest.fn() },
       notification: { create: jest.fn() },
-      user: { findUnique: jest.fn(), findUniqueOrThrow: jest.fn() },
-      paymentAccount: { findUnique: jest.fn() },
+      user: {
+        findUnique: jest.fn(),
+        findUniqueOrThrow: jest.fn(),
+        findMany: jest.fn(),
+      },
+      // create() now checks the declared account is still active; tests
+      // about a specific account override this per test.
+      paymentAccount: { findUnique: jest.fn().mockResolvedValue({ isActive: true }) },
+      // The stored phone notifications (bank_transactions): create() looks
+      // for a waiting transfer through $queryRaw (Q-BT1, default: none) and
+      // links by updateMany; unlink reads the link by findUnique.
+      bankTransaction: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        findFirst: jest.fn().mockResolvedValue(null),
+        findMany: jest.fn().mockResolvedValue([]),
+        create: jest.fn(),
+        update: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
       // Both call styles are in use: the callback form for the write paths —
       // where `tx` is just `prisma` itself, since every mocked method lives
       // directly on this object (mirrors how the real PrismaService's tx
@@ -143,11 +188,12 @@ describe('DepositsService', () => {
     gateway = {
       notifyAdminsDepositCreated: jest.fn(),
       notifyUserDepositUpdated: jest.fn(),
+      notifyAdminsDepositUpdated: jest.fn(),
       notifyUserNotificationCreated: jest.fn(),
       notifyUserBalanceUpdated: jest.fn(),
       notifyAdminsPaymentAccountUpdated: jest.fn(),
       notifyAdminsDepositVerificationUpdated: jest.fn(),
-      notifyBankMonitorsNudge: jest.fn(),
+      notifyAdminsBankTransactionUpdated: jest.fn(),
     };
     financeSettingsService = {
       getLimits: jest.fn().mockResolvedValue({
@@ -178,6 +224,7 @@ describe('DepositsService', () => {
         },
         { provide: AuditService, useValue: audit },
         { provide: MinioService, useValue: minio },
+        { provide: StorageService, useValue: storageStub },
       ],
     }).compile();
 
@@ -185,6 +232,101 @@ describe('DepositsService', () => {
   });
 
   describe('create', () => {
+    describe('H-16: an account closed while the request was in flight', () => {
+      const request = {
+        amount: 5000,
+        paymentMethod: 'KBZ Pay',
+        reference: '000123',
+      };
+
+      it('share-locks the account row inside the insert transaction, before the insert', async () => {
+        prisma.deposit.findFirst.mockResolvedValue(null);
+        prisma.deposit.create.mockResolvedValue(makeDeposit());
+        prisma.user.findUniqueOrThrow.mockResolvedValue({ username: 'john' });
+
+        await service.create('user-1', request);
+
+        // tx is `prisma` itself in this mock.
+        expect(lockAccountStatusMock).toHaveBeenCalledWith(prisma, 'user-1');
+        expect(lockAccountStatusMock.mock.invocationCallOrder[0]).toBeLessThan(
+          prisma.deposit.create.mock.invocationCallOrder[0],
+        );
+        expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      });
+
+      it.each([
+        UserStatus.CLOSED,
+        UserStatus.SUSPENDED,
+        UserStatus.BANNED,
+        null,
+      ])(
+        'refuses an account that is %p by the time the lock is granted — nothing inserted, nobody told',
+        async (status) => {
+          prisma.deposit.findFirst.mockResolvedValue(null);
+          lockAccountStatusMock.mockResolvedValue(status);
+
+          await expect(service.create('user-1', request)).rejects.toThrow(
+            new UnauthorizedException('This account is no longer active'),
+          );
+          expect(prisma.deposit.create).not.toHaveBeenCalled();
+          expect(gateway.notifyAdminsDepositCreated).not.toHaveBeenCalled();
+        },
+      );
+    });
+
+    it('refuses a deposit declared against a DEACTIVATED account, whatever the client had cached', async () => {
+      prisma.deposit.findFirst.mockResolvedValue(null);
+      prisma.paymentAccount.findUnique.mockResolvedValue({ isActive: false });
+
+      await expect(
+        service.create('user-1', {
+          amount: 5000,
+          paymentMethod: 'KBZPay',
+          reference: '000123',
+          paymentAccountId: 'acct-off',
+        }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.paymentAccount.findUnique).toHaveBeenCalledWith({
+        where: { id: 'acct-off' },
+        select: { isActive: true },
+      });
+      expect(prisma.deposit.create).not.toHaveBeenCalled();
+    });
+
+    it('refuses a deposit declared against an account that no longer exists', async () => {
+      prisma.deposit.findFirst.mockResolvedValue(null);
+      prisma.paymentAccount.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.create('user-1', {
+          amount: 5000,
+          paymentMethod: 'KBZPay',
+          reference: '000123',
+          paymentAccountId: 'acct-gone',
+        }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.deposit.create).not.toHaveBeenCalled();
+    });
+
+    it('accepts a deposit declared against an ACTIVE account', async () => {
+      prisma.deposit.findFirst.mockResolvedValue(null);
+      prisma.paymentAccount.findUnique.mockResolvedValue({ isActive: true });
+      prisma.deposit.create.mockResolvedValue(makeDeposit());
+      prisma.user.findUniqueOrThrow.mockResolvedValue({ username: 'john' });
+
+      const result = await service.create('user-1', {
+        amount: 5000,
+        paymentMethod: 'KBZPay',
+        reference: '000123',
+        paymentAccountId: 'acct-on',
+      });
+
+      expect(result.status).toBe(DepositStatus.PENDING);
+      expect(prisma.deposit.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ declaredPaymentAccountId: 'acct-on' }),
+      });
+    });
+
     it('creates a PENDING deposit and never touches the wallet', async () => {
       prisma.deposit.findFirst.mockResolvedValue(null);
       const deposit = makeDeposit();
@@ -247,7 +389,7 @@ describe('DepositsService', () => {
       expect(result.reference).toBe('000123');
     });
 
-    it('rejects a reference already used by a PENDING or APPROVED deposit', async () => {
+    it('rejects a reference the SAME user already has on a PENDING or APPROVED deposit (a double submit)', async () => {
       prisma.deposit.findFirst.mockResolvedValue(
         makeDeposit({ status: DepositStatus.PENDING }),
       );
@@ -278,10 +420,36 @@ describe('DepositsService', () => {
       ).resolves.toBeDefined();
       expect(prisma.deposit.findFirst).toHaveBeenCalledWith({
         where: {
+          userId: 'user-1',
           reference: '000123',
           status: { in: [DepositStatus.PENDING, DepositStatus.APPROVED] },
         },
       });
+    });
+
+    it("H-11: another user's live deposit with the same reference never refuses this one — the pre-check only looks at the caller's own rows", async () => {
+      // The real payer must always get a row into the queue; the twin rules
+      // (DUPLICATE_REFERENCE / SHARED_REFERENCE_ACROSS_USERS) send both rows
+      // to staff review instead — see the twin tests below.
+      prisma.deposit.findFirst.mockImplementation(
+        (args: { where: { userId?: string } }) =>
+          Promise.resolve(
+            args.where.userId === undefined
+              ? makeDeposit({ id: 'deposit-other', userId: 'user-2' })
+              : null,
+          ),
+      );
+      prisma.deposit.create.mockResolvedValue(makeDeposit());
+      prisma.user.findUniqueOrThrow.mockResolvedValue({ username: 'john' });
+
+      await expect(
+        service.create('user-1', {
+          amount: 5000,
+          paymentMethod: 'KBZ Pay',
+          reference: '000123',
+        }),
+      ).resolves.toBeDefined();
+      expect(prisma.deposit.create).toHaveBeenCalled();
     });
 
     it('maps a P2002 from deposit.create to ConflictException', async () => {
@@ -512,6 +680,7 @@ describe('DepositsService', () => {
                 email: true,
               },
             },
+            bankTransaction: { select: { id: true } },
           },
         }),
       );
@@ -621,6 +790,14 @@ describe('DepositsService', () => {
       expect(prisma.notification.create).toHaveBeenCalledTimes(1);
       expect(result.status).toBe(DepositStatus.APPROVED);
       expect(gateway.notifyUserDepositUpdated).toHaveBeenCalledTimes(1);
+      expect(gateway.notifyUserDepositUpdated).toHaveBeenCalledWith(
+        'user-1',
+        expect.objectContaining({
+          status: DepositStatus.APPROVED,
+          change: 'status',
+        }),
+      );
+      expect(gateway.notifyAdminsDepositUpdated).not.toHaveBeenCalled();
       expect(gateway.notifyUserBalanceUpdated).toHaveBeenCalledWith(
         'user-1',
         10000,
@@ -697,6 +874,7 @@ describe('DepositsService', () => {
                 email: true,
               },
             },
+            bankTransaction: { select: { id: true } },
           },
         }),
       );
@@ -909,6 +1087,13 @@ describe('DepositsService', () => {
       expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
       expect(prisma.transaction.create).not.toHaveBeenCalled();
       expect(prisma.notification.create).toHaveBeenCalledTimes(1);
+      expect(gateway.notifyUserDepositUpdated).toHaveBeenCalledWith(
+        'user-1',
+        expect.objectContaining({
+          status: DepositStatus.REJECTED,
+          change: 'status',
+        }),
+      );
     });
 
     it('throws ConflictException on double-rejection (or reject-after-approve)', async () => {
@@ -955,6 +1140,7 @@ describe('DepositsService', () => {
                 email: true,
               },
             },
+            bankTransaction: { select: { id: true } },
           },
         }),
       );
@@ -1059,13 +1245,19 @@ describe('DepositsService', () => {
               email: true,
             },
           },
+          bankTransaction: { select: { id: true } },
         },
       });
       expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
       expect(prisma.transaction.create).not.toHaveBeenCalled();
       expect(prisma.deposit.updateMany).not.toHaveBeenCalled();
-      expect(gateway.notifyUserDepositUpdated).toHaveBeenCalledWith('user-1', {
+      // Admin bookkeeping: other admin sessions get the same-named event so
+      // their table stays in sync, but the user's room is never pinged —
+      // their client would toast "Deposit approved" again for a deposit
+      // that was approved long ago.
+      expect(gateway.notifyAdminsDepositUpdated).toHaveBeenCalledWith({
         id: 'deposit-1',
+        change: 'receiving_account',
         status: DepositStatus.APPROVED,
         amount: 5000,
         paymentMethod: 'KBZ Pay',
@@ -1078,6 +1270,7 @@ describe('DepositsService', () => {
         receivingTransactionCode: '123456',
         receivingTransactionTime: '06:56:28',
       });
+      expect(gateway.notifyUserDepositUpdated).not.toHaveBeenCalled();
       // The user's own deposit info (what they submitted) is untouched.
       expect(result.paymentMethod).toBe('KBZ Pay');
       expect(result.receivingAccountName).toBe('MyanFlix');
@@ -1194,6 +1387,58 @@ describe('DepositsService', () => {
     });
   });
 
+  /**
+   * H-15 — the manual-deposit picker's own lookup, so a role with
+   * DEPOSITS.CREATE (the seeded Admin) can find the customer without the
+   * whole USERS.VIEW surface: customers only, a handful of rows, and only
+   * the four fields the picker renders.
+   */
+  describe('lookupUsersForManualDeposit', () => {
+    it('matches the trimmed term on username, display name and phone — customer accounts only, minimal fields', async () => {
+      const rows = [
+        {
+          id: 'user-1',
+          username: 'kokoo',
+          displayName: 'Ko Ko',
+          phone: '+959123456789',
+        },
+      ];
+      prisma.user.findMany.mockResolvedValue(rows);
+
+      const result = await service.lookupUsersForManualDeposit({
+        search: '  ko ',
+        limit: 8,
+      });
+
+      expect(result).toEqual({ items: rows });
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: {
+          role: 'USER',
+          // H-16: a closed account can take no money — never offered.
+          status: { not: 'CLOSED' },
+          OR: [
+            { username: { contains: 'ko', mode: 'insensitive' } },
+            { displayName: { contains: 'ko', mode: 'insensitive' } },
+            { phone: { contains: 'ko' } },
+          ],
+        },
+        select: { id: true, username: true, displayName: true, phone: true },
+        orderBy: { createdAt: 'desc' },
+        take: 8,
+      });
+    });
+
+    it('defaults to 8 rows', async () => {
+      prisma.user.findMany.mockResolvedValue([]);
+
+      await service.lookupUsersForManualDeposit({ search: 'ko' });
+
+      expect(prisma.user.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 8 }),
+      );
+    });
+  });
+
   describe('createManual', () => {
     const admin = { id: 'admin-1', username: 'admin', role: 'ADMIN' } as never;
 
@@ -1211,7 +1456,7 @@ describe('DepositsService', () => {
       prisma.paymentAccount.findUnique.mockResolvedValue({ id: 'acct-dest' });
     });
 
-    it('rejects a reference already used by a PENDING or APPROVED deposit, writing nothing', async () => {
+    it('rejects a reference the same user already has on a PENDING or APPROVED deposit, writing nothing', async () => {
       // The exact double-credit scenario: the user already submitted this
       // transfer through the app, and an admin records it manually too.
       prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
@@ -1222,6 +1467,13 @@ describe('DepositsService', () => {
       await expect(service.createManual(dto, admin)).rejects.toThrow(
         ConflictException,
       );
+      expect(prisma.deposit.findFirst).toHaveBeenCalledWith({
+        where: {
+          userId: 'user-1',
+          reference: '000123',
+          status: { in: [DepositStatus.PENDING, DepositStatus.APPROVED] },
+        },
+      });
 
       expect(prisma.deposit.create).not.toHaveBeenCalled();
       expect(
@@ -1451,6 +1703,7 @@ describe('DepositsService', () => {
       });
       expect(gateway.notifyUserDepositUpdated).toHaveBeenCalledWith('user-1', {
         id: 'deposit-1',
+        change: 'status',
         status: DepositStatus.APPROVED,
         amount: 5000,
         paymentMethod: 'KBZ Pay',
@@ -1519,8 +1772,39 @@ describe('DepositsService', () => {
       });
     });
 
+    it('share-locks the customer row before anything is written', async () => {
+      // Stop right at the insert: only the order up to it matters here.
+      prisma.deposit.create.mockRejectedValue(new Error('stop here'));
+
+      await expect(service.createManual(dto, admin)).rejects.toThrow(
+        'stop here',
+      );
+
+      expect(lockAccountStatusMock).toHaveBeenCalledWith(prisma, 'user-1');
+      expect(lockAccountStatusMock.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.deposit.create.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('H-16: refuses a CLOSED account with the closed-account 409 — no deposit, no credit, no audit row', async () => {
+      lockAccountStatusMock.mockResolvedValue(UserStatus.CLOSED);
+
+      await expect(service.createManual(dto, admin)).rejects.toThrow(
+        new ConflictException(
+          'This account was closed by its owner and cannot be changed.',
+        ),
+      );
+      expect(prisma.deposit.create).not.toHaveBeenCalled();
+      expect(
+        paymentAccountLedgerService.syncDepositLink,
+      ).not.toHaveBeenCalled();
+      expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+      expect(gateway.notifyUserBalanceUpdated).not.toHaveBeenCalled();
+    });
+
     it('throws NotFoundException for an unknown user without creating or crediting anything', async () => {
-      prisma.user.findUnique.mockResolvedValue(null);
+      lockAccountStatusMock.mockResolvedValue(null);
 
       await expect(service.createManual(dto, admin)).rejects.toThrow(
         NotFoundException,
@@ -1586,6 +1870,7 @@ describe('DepositsService — bank verification', () => {
     notification: { create: jest.Mock };
     user: { findUnique: jest.Mock; findUniqueOrThrow: jest.Mock };
     paymentAccount: { findUnique: jest.Mock };
+    bankTransaction: Record<string, jest.Mock>;
     $transaction: jest.Mock;
     $queryRaw: jest.Mock;
   };
@@ -1628,7 +1913,20 @@ describe('DepositsService — bank verification', () => {
         findUnique: jest.fn(),
         findUniqueOrThrow: jest.fn().mockResolvedValue({ username: 'john' }),
       },
-      paymentAccount: { findUnique: jest.fn() },
+      // create() now checks the declared account is still active; tests
+      // about a specific account override this per test.
+      paymentAccount: { findUnique: jest.fn().mockResolvedValue({ isActive: true }) },
+      // The stored phone notifications (bank_transactions): create() looks
+      // for a waiting transfer through $queryRaw (Q-BT1, default: none) and
+      // links by updateMany; unlink reads the link by findUnique.
+      bankTransaction: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        findFirst: jest.fn().mockResolvedValue(null),
+        findMany: jest.fn().mockResolvedValue([]),
+        create: jest.fn(),
+        update: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
       $transaction: jest.fn((arg: unknown) =>
         typeof arg === 'function'
           ? (arg as (tx: unknown) => unknown)(prisma)
@@ -1639,11 +1937,12 @@ describe('DepositsService — bank verification', () => {
     gateway = {
       notifyAdminsDepositCreated: jest.fn(),
       notifyUserDepositUpdated: jest.fn(),
+      notifyAdminsDepositUpdated: jest.fn(),
       notifyUserNotificationCreated: jest.fn(),
       notifyUserBalanceUpdated: jest.fn(),
       notifyAdminsPaymentAccountUpdated: jest.fn(),
       notifyAdminsDepositVerificationUpdated: jest.fn(),
-      notifyBankMonitorsNudge: jest.fn(),
+      notifyAdminsBankTransactionUpdated: jest.fn(),
     };
     audit = { record: jest.fn().mockResolvedValue(undefined) };
     minio = {
@@ -1679,6 +1978,7 @@ describe('DepositsService — bank verification', () => {
         },
         { provide: AuditService, useValue: audit },
         { provide: MinioService, useValue: minio },
+        { provide: StorageService, useValue: storageStub },
       ],
     }).compile();
     service = module.get(DepositsService);
@@ -1702,8 +2002,24 @@ describe('DepositsService — bank verification', () => {
 
   const dto = { amount: 5000, paymentMethod: 'KBZ Pay', reference: '000123' };
 
-  describe('create — create-time rules and the nudge', () => {
-    it('nudges the phone-monitor for the declared account and reports UNVERIFIED with no reasons on a clean row', async () => {
+  /** A stored "You received …" row as Q-BT1 returns it (raw column shapes). */
+  function waitingTransaction(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'tx-1',
+      idempotencyKey: 'a'.repeat(64),
+      deviceSerial: 'PIXEL10',
+      paymentAccountId: 'acct-1',
+      amount: '5000.00',
+      txCode: 'KBZ20260922000123',
+      txCodeLast6: '000123',
+      occurredAt: new Date(Date.now() - 60_000),
+      screenshotKey: null,
+      ...overrides,
+    };
+  }
+
+  describe('create — create-time rules and the waiting-transaction claim', () => {
+    it('looks up the open bank transactions for the declared account + reference (literal open-set predicate), and with none reports UNVERIFIED with no reasons', async () => {
       prisma.deposit.create.mockResolvedValue(
         makeDeposit({ declaredPaymentAccountId: 'acct-1' }),
       );
@@ -1711,12 +2027,18 @@ describe('DepositsService — bank verification', () => {
 
       await service.create('user-1', { ...dto, paymentAccountId: 'acct-1' });
 
+      const q = prisma.$queryRaw.mock.calls[0][0] as Prisma.Sql;
+      const text = q.strings.join('?');
+      expect(text).toContain('FROM bank_transactions');
+      expect(text).toContain(`state = 'UNMATCHED'::"BankTransactionState"`);
+      expect(text).toContain(
+        `direction = 'RECEIVED'::"BankTransactionDirection"`,
+      );
+      expect(q.values).toEqual(['acct-1', '000123']);
       expect(prisma.deposit.update).not.toHaveBeenCalled();
+      expect(prisma.deposit.updateMany).not.toHaveBeenCalled();
       expect(audit.record).not.toHaveBeenCalled();
-      expect(gateway.notifyBankMonitorsNudge).toHaveBeenCalledWith({
-        kind: 'deposit',
-        paymentAccountId: 'acct-1',
-      });
+      expect(gateway.notifyAdminsBankTransactionUpdated).not.toHaveBeenCalled();
       expect(gateway.notifyAdminsDepositCreated).toHaveBeenCalledWith(
         expect.objectContaining({
           matchStatus: 'UNVERIFIED',
@@ -1724,6 +2046,174 @@ describe('DepositsService — bank verification', () => {
           riskReasons: [],
         }),
       );
+    });
+
+    it('never looks for a transaction when the depositor declared no account (no key to look up by)', async () => {
+      prisma.deposit.create.mockResolvedValue(makeDeposit());
+      mockLookups([]);
+      await service.create('user-1', dto);
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    });
+
+    it('exactly one waiting transaction: claims it in the same transaction — bank values on the deposit, the link, both audit rows, the admin pushes with POST-claim values', async () => {
+      const created = makeDeposit({
+        declaredPaymentAccountId: 'acct-1',
+        createdAt: new Date(),
+      });
+      prisma.deposit.create.mockResolvedValue(created);
+      prisma.$queryRaw.mockResolvedValueOnce([
+        waitingTransaction({
+          screenshotKey: `documents/bank-screenshots/transactions/tx-1/${'a'.repeat(64)}.png`,
+        }),
+      ]);
+      const claimed = makeDeposit({
+        ...created,
+        bankCheckedAt: new Date(),
+        matchStatus: 'MATCHED',
+        riskLevel: 'LOW',
+        receivingAmount: new Prisma.Decimal(5000),
+        receivingTransactionCode: '000123',
+        receivingEventKey: 'a'.repeat(64),
+      });
+      prisma.deposit.findUniqueOrThrow
+        .mockResolvedValueOnce(created)
+        .mockResolvedValueOnce(claimed);
+      mockLookups([], 1, [{ ...claimed, bankTransaction: { id: 'tx-1' } }]);
+      prisma.bankTransaction.findUnique.mockResolvedValue({
+        ...waitingTransaction(),
+        direction: 'RECEIVED',
+        currency: 'MMK',
+        postedAt: new Date(),
+        counterparty: null,
+        detailStatus: 'ok',
+        state: 'MATCHED',
+        linkedDepositId: 'deposit-1',
+        linkedWithdrawalId: null,
+        matchedAt: new Date(),
+        createdAt: new Date(),
+        amount: new Prisma.Decimal(5000),
+      });
+
+      const result = await service.create('user-1', {
+        ...dto,
+        paymentAccountId: 'acct-1',
+      });
+
+      // The claim: the same guarded write ingestion does, plus the
+      // screenshot pointer because the transaction already holds one.
+      expect(prisma.deposit.updateMany).toHaveBeenCalledWith({
+        where: { id: 'deposit-1', status: 'PENDING', bankCheckedAt: null },
+        data: expect.objectContaining({
+          receivingAmount: new Prisma.Decimal('5000.00'),
+          receivingTransactionCode: '000123',
+          receivingEventKey: 'a'.repeat(64),
+          receivingScreenshotKey: `documents/bank-screenshots/transactions/tx-1/${'a'.repeat(64)}.png`,
+          matchStatus: 'MATCHED',
+          riskLevel: 'LOW',
+          riskReasons: [],
+        }),
+      });
+      // The link, guarded on "not already MATCHED".
+      expect(prisma.bankTransaction.updateMany).toHaveBeenCalledWith({
+        where: { id: 'tx-1', state: { in: ['UNMATCHED', 'AMBIGUOUS'] } },
+        data: expect.objectContaining({
+          state: 'MATCHED',
+          linkedDepositId: 'deposit-1',
+        }),
+      });
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'deposit.bank_match',
+          actor: null,
+          metadata: expect.objectContaining({
+            trigger: 'deposit_create',
+            bankTransactionId: 'tx-1',
+          }),
+          tx: prisma,
+        }),
+      );
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'bank_transaction.link',
+          actor: null,
+          target: expect.objectContaining({ id: 'tx-1' }),
+          metadata: expect.objectContaining({
+            trigger: 'deposit_create',
+            depositId: 'deposit-1',
+          }),
+        }),
+      );
+      // After commit: the created event carries the POST-claim state, the
+      // verification push goes out for the deposit, the transaction row is
+      // pushed as updated.
+      expect(gateway.notifyAdminsDepositCreated).toHaveBeenCalledWith(
+        expect.objectContaining({ matchStatus: 'MATCHED', riskLevel: 'LOW' }),
+      );
+      expect(
+        gateway.notifyAdminsDepositVerificationUpdated,
+      ).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'deposit-1', bankTransactionId: 'tx-1' }),
+      );
+      expect(gateway.notifyAdminsBankTransactionUpdated).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'tx-1',
+          state: 'MATCHED',
+          view: 'MATCHED',
+          linkedDepositId: 'deposit-1',
+        }),
+      );
+      // The user-facing response still never shows the bank side.
+      expect(result).not.toHaveProperty('matchStatus');
+      expect(result).not.toHaveProperty('receivingEventKey');
+    });
+
+    it('several waiting transactions: AMBIGUOUS_MATCH on the new deposit only — no claim, no link, the transactions untouched', async () => {
+      prisma.deposit.create.mockResolvedValue(
+        makeDeposit({ declaredPaymentAccountId: 'acct-1' }),
+      );
+      prisma.$queryRaw.mockResolvedValueOnce([
+        waitingTransaction({ id: 'tx-1' }),
+        waitingTransaction({ id: 'tx-2', idempotencyKey: 'b'.repeat(64) }),
+      ]);
+      mockLookups([]);
+
+      await service.create('user-1', { ...dto, paymentAccountId: 'acct-1' });
+
+      expect(prisma.deposit.update).toHaveBeenCalledWith({
+        where: { id: 'deposit-1' },
+        data: {
+          matchStatus: 'PENDING_REVIEW',
+          riskLevel: 'MEDIUM',
+          riskReasons: ['AMBIGUOUS_MATCH'],
+        },
+      });
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'deposit.risk_update',
+          metadata: expect.objectContaining({
+            trigger: 'deposit_create',
+            reason: 'AMBIGUOUS_BANK_TRANSACTIONS',
+            candidateTransactionIds: ['tx-1', 'tx-2'],
+          }),
+        }),
+      );
+      expect(prisma.deposit.updateMany).not.toHaveBeenCalled();
+      expect(prisma.bankTransaction.updateMany).not.toHaveBeenCalled();
+      expect(gateway.notifyAdminsBankTransactionUpdated).not.toHaveBeenCalled();
+      expect(gateway.notifyAdminsDepositCreated).toHaveBeenCalledWith(
+        expect.objectContaining({
+          matchStatus: 'PENDING_REVIEW',
+          riskReasons: ['AMBIGUOUS_MATCH'],
+        }),
+      );
+    });
+
+    it('a duplicate reference (P2002) still rolls the whole transaction back to the same 409 — the claim included', async () => {
+      prisma.deposit.create.mockRejectedValue(makeP2002());
+      await expect(
+        service.create('user-1', { ...dto, paymentAccountId: 'acct-1' }),
+      ).rejects.toThrow(ConflictException);
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
     });
 
     it('flags the new row DUPLICATE_REFERENCE + SHARED_REFERENCE_ACROSS_USERS from a rejected twin of another user, and flags the twin back', async () => {
@@ -1776,6 +2266,41 @@ describe('DepositsService — bank verification', () => {
           riskLevel: 'HIGH',
         }),
       );
+    });
+
+    it('H-11: a PENDING twin of ANOTHER user is stored, not refused — both rows go to staff review (SUSPICIOUS), nothing is guessed', async () => {
+      prisma.deposit.create.mockResolvedValue(makeDeposit());
+      mockLookups([
+        {
+          id: 'deposit-first',
+          userId: 'user-2',
+          amount: new Prisma.Decimal(5000),
+          status: DepositStatus.PENDING,
+          bankCheckedAt: null,
+          matchStatus: 'UNVERIFIED',
+          riskLevel: null,
+          riskReasons: [],
+        },
+      ]);
+
+      await expect(service.create('user-1', dto)).resolves.toMatchObject({
+        id: 'deposit-1',
+        status: DepositStatus.PENDING,
+      });
+
+      for (const id of ['deposit-1', 'deposit-first']) {
+        expect(prisma.deposit.update).toHaveBeenCalledWith({
+          where: { id },
+          data: {
+            matchStatus: 'SUSPICIOUS',
+            riskLevel: 'HIGH',
+            riskReasons: [
+              'DUPLICATE_REFERENCE',
+              'SHARED_REFERENCE_ACROSS_USERS',
+            ],
+          },
+        });
+      }
     });
 
     it('flags VELOCITY (PENDING_REVIEW) at three rows by one user inside ten minutes', async () => {
@@ -2083,7 +2608,7 @@ describe('DepositsService — bank verification', () => {
       });
     });
 
-    it('unlink wipes every bank column and the screenshot, keeps the submission reasons, and deletes the object after commit', async () => {
+    it('unlink wipes every bank column and the screenshot pointer, keeps the submission reasons, and deletes a LEGACY object after commit', async () => {
       prisma.deposit.findUnique.mockResolvedValue(
         makeDeposit({
           bankCheckedAt: new Date(),
@@ -2121,6 +2646,80 @@ describe('DepositsService — bank verification', () => {
       );
       expect(minio.deleteObject).toHaveBeenCalledWith(
         'documents/bank-screenshots/deposits/deposit-1/k.png',
+      );
+      // A row from before bank_transactions: nothing to unlink, no push.
+      expect(prisma.bankTransaction.findUnique).toHaveBeenCalledWith({
+        where: { linkedDepositId: 'deposit-1' },
+        select: { id: true, state: true },
+      });
+      expect(prisma.bankTransaction.update).not.toHaveBeenCalled();
+      expect(gateway.notifyAdminsBankTransactionUpdated).not.toHaveBeenCalled();
+    });
+
+    it("unlink puts the linked bank transaction back to UNMATCHED (audited as the admin's act, pushed after commit) and NEVER deletes the transaction's own screenshot object", async () => {
+      const key = `documents/bank-screenshots/transactions/tx-1/${'k'.repeat(64)}.png`;
+      prisma.deposit.findUnique.mockResolvedValue(
+        makeDeposit({
+          bankCheckedAt: new Date(),
+          receivingEventKey: 'k'.repeat(64),
+          receivingScreenshotKey: key,
+          matchStatus: 'MATCHED',
+          riskLevel: 'LOW',
+        }),
+      );
+      prisma.deposit.update.mockResolvedValue(withUser(makeDeposit()));
+      prisma.bankTransaction.findUnique
+        .mockResolvedValueOnce({ id: 'tx-1', state: 'MATCHED' })
+        .mockResolvedValueOnce({
+          id: 'tx-1',
+          idempotencyKey: 'k'.repeat(64),
+          deviceSerial: 'PIXEL10',
+          paymentAccountId: 'acct-1',
+          direction: 'RECEIVED',
+          amount: new Prisma.Decimal(5000),
+          currency: 'MMK',
+          txCode: 'KBZ000123',
+          txCodeLast6: '000123',
+          occurredAt: new Date(),
+          postedAt: new Date(),
+          counterparty: null,
+          screenshotKey: key,
+          detailStatus: null,
+          state: 'UNMATCHED',
+          linkedDepositId: null,
+          linkedWithdrawalId: null,
+          matchedAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+
+      await service.reviewVerification(
+        'deposit-1',
+        { action: 'unlink' },
+        admin,
+      );
+
+      expect(prisma.bankTransaction.update).toHaveBeenCalledWith({
+        where: { id: 'tx-1' },
+        data: { state: 'UNMATCHED', linkedDepositId: null, matchedAt: null },
+      });
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'bank_transaction.unlink',
+          actor: admin,
+          target: expect.objectContaining({ id: 'tx-1' }),
+          metadata: { depositId: 'deposit-1' },
+          tx: prisma,
+        }),
+      );
+      expect(minio.deleteObject).not.toHaveBeenCalled();
+      expect(gateway.notifyAdminsBankTransactionUpdated).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'tx-1',
+          state: 'UNMATCHED',
+          view: 'WAITING',
+          hasScreenshot: true,
+        }),
       );
     });
 

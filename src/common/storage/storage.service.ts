@@ -10,6 +10,16 @@ import {
   UPLOAD_SCRATCH_ROOT,
 } from './media-taxonomy';
 
+/** The `<kind>` segment of the bankScreenshot class — see bankScreenshotPrefix. */
+export type BankScreenshotKind = 'deposits' | 'withdrawals' | 'transactions';
+
+/**
+ * Root of the `videoReplaceStaging` class (media-taxonomy.ts): every
+ * replacement bundle stages under `<root>/<movieId>/`. Exported so the
+ * cleanup sweep can list the whole root without knowing a movie id.
+ */
+export const VIDEO_REPLACE_STAGING_ROOT = 'temp/video-replace';
+
 /**
  * The ONLY place that builds a path or an object key. The shapes themselves
  * are declared in media-taxonomy.ts — this class is how the rest of the code
@@ -37,18 +47,39 @@ import {
  *      images/user/<userId>/<stamp><ext>          public, unsigned
  *      videos/<movieId>/original.<ext>            private source
  *      videos/<movieId>/hls/**                    signed, generated
+ *      videos/<movieId>/hls/v-<tag>/**            signed, generated — the
+ *                                                 package a REPLACE writes
  *      subtitles/<movieId>/<name><ext>            signed source
  *      documents/books/<b>/<e>/<c>/original.pdf   private source
  *      books/<b>/<e>/<c>/pages/page-NNN.webp      signed, generated
  *
+ * One HLS "package" (master.m3u8 + <tier>/ folders + subs/) lives at ONE
+ * package prefix, and Video.hlsMasterPath records which one is live:
+ *
+ *   - a first upload (transcode or finalized bundle) packages at
+ *     videos/<movieId>/hls/ itself, as it always has;
+ *   - a video REPLACE packages at videos/<movieId>/hls/v-<tag>/ with a fresh
+ *     random <tag> per replace. Every cache server keeps a segment for 7 days
+ *     BY FULL PATH, so a replacement written over the old keys would hand
+ *     viewers the new playlist with week-old cached segments whenever the
+ *     transcoder reused a segment name (720p/segment_000.ts ...). A fresh
+ *     folder means no key is ever reused, the title plays the new bundle the
+ *     moment the swap finishes, and the whole previous package (versioned or
+ *     not) is deleted as stale because none of its keys survive.
+ *   Both shapes sit under the same signed scope (videos/<movieId>/hls), so
+ *   the cache server, the signer and the players need no change at all.
+ *
  * Source lives apart from generated output everywhere, with TWO deliberate
  * exceptions that are technical requirements rather than oversights:
  *
- *   1. videos/<movieId>/hls/subs/ holds GENERATED subtitle renditions under
- *      videos/ instead of subtitles/. master.m3u8 names them by RELATIVE URI
+ *   1. <package>/subs/ holds GENERATED subtitle renditions under videos/
+ *      instead of subtitles/. master.m3u8 names them by RELATIVE URI
  *      (`subs/<id>.m3u8`), and a token signs a PREFIX — so they have to sit
- *      under the same prefix the master was signed with, or the player would
- *      need a second token it has no way to ask for.
+ *      beside the master that names them, under the same prefix the master
+ *      was signed with, or the player would need a second token it has no
+ *      way to ask for. That is why the subs keys are derived from the LIVE
+ *      master key (Video.hlsMasterPath) rather than from the movie id: after
+ *      a replace the master lives in v-<tag>/ and its subs must follow it.
  *   2. Generated book pages stay under books/ instead of moving under
  *      images/. images/ is public by key — that is what makes the catalogue
  *      browsable without a token — and a book page is paid content that must
@@ -95,9 +126,28 @@ export class StorageService {
     return join(this.videoDir(movieId), 'hls');
   }
 
-  /** MinIO object key for a movie's master playlist — mirrors hlsDir()'s local layout, without the local-disk root. */
-  hlsMasterKey(movieId: string): string {
-    return `videos/${movieId}/hls/master.m3u8`;
+  /**
+   * MinIO key prefix of one HLS PACKAGE — the folder master.m3u8, the
+   * <tier>/ folders and subs/ share, and the folder every relative URI in
+   * that master resolves against. Without a tag it is the title's own
+   * hls/ folder (first uploads); with one it is the fresh hls/v-<tag>/
+   * folder a replace writes (see the class comment for why a replace can
+   * never reuse the old keys). The tag is minted by the replace flow, never
+   * here, so a key builder stays a pure function of its arguments.
+   */
+  hlsPackagePrefix(movieId: string, versionTag?: string): string {
+    const base = `videos/${movieId}/hls`;
+    return versionTag ? `${base}/v-${versionTag}` : base;
+  }
+
+  /**
+   * MinIO object key for a movie's master playlist — mirrors hlsDir()'s
+   * local layout, without the local-disk root. `versionTag` is set only by
+   * the replace flow; everything else (transcode, finalize, seed) keeps the
+   * un-versioned key it always wrote.
+   */
+  hlsMasterKey(movieId: string, versionTag?: string): string {
+    return `${this.hlsPackagePrefix(movieId, versionTag)}/master.m3u8`;
   }
 
   /**
@@ -118,9 +168,16 @@ export class StorageService {
     return `${this.videoKeyPrefix(movieId)}/original${extension}`;
   }
 
-  /** MinIO object key prefix for one rendition's segments + its own playlist. */
-  hlsRenditionKeyPrefix(movieId: string, renditionName: string): string {
-    return `videos/${movieId}/hls/${renditionName}`;
+  /**
+   * MinIO object key prefix for one rendition's segments + its own playlist.
+   * Same `versionTag` rule as hlsMasterKey(): only a replace passes one.
+   */
+  hlsRenditionKeyPrefix(
+    movieId: string,
+    renditionName: string,
+    versionTag?: string,
+  ): string {
+    return `${this.hlsPackagePrefix(movieId, versionTag)}/${renditionName}`;
   }
 
   /**
@@ -131,19 +188,27 @@ export class StorageService {
    * live under videos/ rather than subtitles/ (exception 1 in the class
    * comment). Distinct from subtitleSourceKey() below, the uploaded SOURCE
    * file, which no player ever fetches.
+   *
+   * Derived from the LIVE MASTER KEY (Video.hlsMasterPath), not from the
+   * movie id: a player resolves `subs/<id>.m3u8` against the folder it
+   * fetched the master from, so the renditions must be written into THAT
+   * folder — videos/<movieId>/hls/subs/ for a first upload, and
+   * videos/<movieId>/hls/v-<tag>/subs/ once a replace has moved the master
+   * into a versioned package. One derivation for both means the subtitle
+   * publisher never has to know whether a title was ever replaced.
    */
-  hlsSubtitleKeyPrefix(movieId: string): string {
-    return `videos/${movieId}/hls/subs`;
+  hlsSubtitleKeyPrefix(masterKey: string): string {
+    return `${masterKey.slice(0, masterKey.lastIndexOf('/') + 1)}subs`;
   }
 
-  /** MinIO key for one published WebVTT track. */
-  hlsSubtitleVttKey(movieId: string, subtitleId: string): string {
-    return `${this.hlsSubtitleKeyPrefix(movieId)}/${subtitleId}.vtt`;
+  /** MinIO key for one published WebVTT track, beside the master that names it. */
+  hlsSubtitleVttKey(masterKey: string, subtitleId: string): string {
+    return `${this.hlsSubtitleKeyPrefix(masterKey)}/${subtitleId}.vtt`;
   }
 
   /** MinIO key for the single-segment media playlist wrapping that WebVTT. */
-  hlsSubtitlePlaylistKey(movieId: string, subtitleId: string): string {
-    return `${this.hlsSubtitleKeyPrefix(movieId)}/${subtitleId}.m3u8`;
+  hlsSubtitlePlaylistKey(masterKey: string, subtitleId: string): string {
+    return `${this.hlsSubtitleKeyPrefix(masterKey)}/${subtitleId}.m3u8`;
   }
 
   /**
@@ -164,6 +229,31 @@ export class StorageService {
    */
   subtitleSourceKey(movieId: string, filename: string): string {
     return `${this.subtitleSourcePrefix(movieId)}/${filename}`;
+  }
+
+  /**
+   * MinIO key prefix where a REPLACEMENT bundle for an existing title waits
+   * while it uploads (the `videoReplaceStaging` class). Deliberately under
+   * temp/ and not under videos/<movieId>/: the cache server's deny map
+   * refuses `/movies/temp/` unconditionally in both legacy modes and
+   * scopeForKey cannot sign it, so nothing here is reachable by a viewer —
+   * whereas `videos/<id>/incoming/` would be served unsigned by the legacy
+   * allow mode, and `videos/<id>/hls/incoming/` would be covered by the
+   * title's own playback token. The old video keeps playing from its final
+   * keys until finalize-replace copies the staged files over them.
+   */
+  videoReplaceStagingPrefix(movieId: string): string {
+    return `${VIDEO_REPLACE_STAGING_ROOT}/${movieId}`;
+  }
+
+  /**
+   * One staged bundle file, keyed by the bundle's OWN relativePath (no
+   * subtitles/ split here — staging keeps the bundle's shape verbatim; the
+   * videos/ vs subtitles/ routing happens at swap time through the registry's
+   * `movie` entry, exactly as every other upload path routes it).
+   */
+  videoReplaceStagingKey(movieId: string, relativePath: string): string {
+    return `${this.videoReplaceStagingPrefix(movieId)}/${relativePath}`;
   }
 
   /**
@@ -287,26 +377,30 @@ export class StorageService {
   }
 
   /**
-   * MinIO key prefix for one deposit's / withdrawal's bank-notification
-   * screenshots (the `bankScreenshot` class). Under documents/ because the
-   * image shows the business account balance: denied at the cache,
-   * unsignable, streamed only by the API behind BANK_EVIDENCE. One folder
-   * per row so an unlink or a row delete is one prefix delete.
+   * MinIO key prefix for the bank-notification screenshots of one row (the
+   * `bankScreenshot` class). `transactions` is where every screenshot lands
+   * since bank_transactions exists — a deposit/withdrawal then POINTS at
+   * the transaction's key rather than owning a copy; `deposits` /
+   * `withdrawals` are the pre-existing per-row folders, still written by
+   * the legacy upload route for a phone-monitor that has not been
+   * restarted. Under documents/ because the image shows the business
+   * account balance: denied at the cache, unsignable, streamed only by the
+   * API behind BANK_EVIDENCE. One folder per row so a row delete is one
+   * prefix delete — and the reason an unlink must check WHICH folder a key
+   * is in before deleting anything (a transaction's evidence outlives the
+   * link).
    */
-  bankScreenshotPrefix(
-    kind: 'deposits' | 'withdrawals',
-    rowId: string,
-  ): string {
+  bankScreenshotPrefix(kind: BankScreenshotKind, rowId: string): string {
     return `documents/bank-screenshots/${kind}/${rowId}`;
   }
 
   /**
-   * MinIO object key of the screenshot for one matched bank event. The
-   * filename is the event's idempotency key, so a retried upload of the same
+   * MinIO object key of the screenshot for one bank event. The filename is
+   * the event's idempotency key, so a retried upload of the same
    * notification lands on the same key instead of piling up copies.
    */
   bankScreenshotKey(
-    kind: 'deposits' | 'withdrawals',
+    kind: BankScreenshotKind,
     rowId: string,
     eventKey: string,
   ): string {
@@ -314,9 +408,43 @@ export class StorageService {
   }
 
   /**
+   * Does this object key live in the given row's OWN legacy screenshot
+   * folder? An unlink may delete only those: a key under
+   * documents/bank-screenshots/transactions/ belongs to the bank
+   * transaction and is never deleted by a deposit/withdrawal review.
+   */
+  ownsBankScreenshot(
+    kind: 'deposits' | 'withdrawals',
+    rowId: string,
+    objectKey: string,
+  ): boolean {
+    return objectKey.startsWith(`${this.bankScreenshotPrefix(kind, rowId)}/`);
+  }
+
+  /**
+   * MinIO key prefix holding EVERY converted page of one chapter, whichever
+   * source file it came from — trailing slash included, so a prefix delete
+   * can never reach a sibling folder. Replacing a chapter's PDF clears it.
+   */
+  bookPagesPrefix(
+    bookId: string,
+    editionId: string,
+    chapterId: string,
+  ): string {
+    return `${this.bookChapterPrefix(bookId, editionId, chapterId)}/pages/`;
+  }
+
+  /**
    * MinIO object key of one converted page, numbered WITHIN ITS CHAPTER. The
    * page number is zero-padded to at least three digits (widening for very
    * long chapters) so both key listings and filenames sort in reading order.
+   *
+   * Pages of one source file share a pages/v-<sourceTag>/ folder (H-23), for
+   * the reason a video replace packages into hls/v-<tag>/: the cache server
+   * keeps every object 7 days by its path, so the pages of a re-uploaded PDF
+   * written over the old keys would be served as the old pages. The tag is
+   * minted by the conversion, never here. Rows made before this keep their
+   * flat pages/page-NNN.webp keys — a row stores its own key.
    *
    * These are images and they still do NOT live under images/ (exception 2 in
    * the class comment): images/ is public by key, and a book page is paid
@@ -328,10 +456,11 @@ export class StorageService {
     chapterId: string,
     pageNumber: number,
     totalPages: number,
+    sourceTag: string,
   ): string {
     const width = Math.max(3, String(totalPages).length);
     const padded = String(pageNumber).padStart(width, '0');
-    return `${this.bookChapterPrefix(bookId, editionId, chapterId)}/pages/page-${padded}.webp`;
+    return `${this.bookPagesPrefix(bookId, editionId, chapterId)}v-${sourceTag}/page-${padded}.webp`;
   }
 
   async ensureDir(path: string): Promise<void> {

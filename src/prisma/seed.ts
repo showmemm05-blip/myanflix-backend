@@ -1,16 +1,22 @@
 /**
  * Populates every table with realistic demo data for local development.
+ * DESTRUCTIVE: it wipes users, movies and money tables first.
  *
- * Run with: npm run db:seed
+ * Run with: SEED_PASSWORD=<a password for every seeded account> npm run db:seed
  * (compiles through `nest build` first — the generated Prisma client uses
  * nodenext-style ".js" relative imports that only resolve once compiled,
  * so this must run against dist/, not directly via ts-node.)
+ *
+ * H-2: refuses NODE_ENV=production (see seed-guard.ts), and the repo holds
+ * no default password. Production gets its first Super Admin from
+ * `npm run create-superadmin`, never from here.
  */
 import 'dotenv/config';
 import * as bcrypt from 'bcrypt';
 import { ConfigService } from '@nestjs/config';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { StorageService } from '../common/storage/storage.service';
+import { assertSeedAllowed, seedPassword } from './seed-guard';
 import {
   PrismaClient,
   Prisma,
@@ -38,10 +44,16 @@ const prisma = new PrismaClient({ adapter });
 const storage = new StorageService(new ConfigService());
 
 const PASSWORD_SALT_ROUNDS = 10;
-const DEFAULT_PASSWORD = 'Password123!';
 
 async function resetData() {
   await prisma.watchHistory.deleteMany();
+  // Money tables no longer cascade from users (H-22: ON DELETE RESTRICT), so
+  // a wipe clears them explicitly first — withdrawals before transactions,
+  // since a held withdrawal points at its ledger row (C-4).
+  await prisma.withdrawal.deleteMany();
+  await prisma.walletAdjustment.deleteMany();
+  await prisma.deposit.deleteMany();
+  await prisma.seriesPurchase.deleteMany();
   await prisma.transaction.deleteMany();
   await prisma.purchase.deleteMany();
   await prisma.userSubscription.deleteMany();
@@ -81,11 +93,8 @@ async function seedCategories() {
   return new Map(categories.map((c) => [c.name, c]));
 }
 
-async function seedUsers() {
-  const passwordHash = await bcrypt.hash(
-    DEFAULT_PASSWORD,
-    PASSWORD_SALT_ROUNDS,
-  );
+async function seedUsers(password: string) {
+  const passwordHash = await bcrypt.hash(password, PASSWORD_SALT_ROUNDS);
 
   const staff = await Promise.all([
     prisma.user.create({
@@ -611,11 +620,14 @@ function daysAgo(days: number): Date {
 }
 
 async function main() {
+  // Both checks run before anything is written.
+  assertSeedAllowed('seed.ts');
+  const password = seedPassword();
   console.log('Seeding MyanFlix database...');
 
   await resetData();
   const categoriesByName = await seedCategories();
-  const { staff, users } = await seedUsers();
+  const { staff, users } = await seedUsers(password);
   const movies = await seedMovies(categoriesByName);
   const plans = await seedSubscriptionPlans();
   const activePlans = plans.filter((p) => p.isActive);
@@ -628,9 +640,7 @@ async function main() {
   );
   console.log(`  movies: ${movies.length}`);
   console.log(`  subscription plans: ${plans.length}`);
-  console.log(
-    `  default password for every seeded account: ${DEFAULT_PASSWORD}`,
-  );
+  console.log('  every seeded account uses the SEED_PASSWORD of this run');
 }
 
 main()

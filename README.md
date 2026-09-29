@@ -50,8 +50,9 @@ $ npm run start:prod
 # unit tests
 $ npm run test
 
-# e2e tests
-$ npm run test:e2e
+# e2e tests: they write real rows, so they need their own database whose
+# name ends in _test (built with `prisma migrate deploy`). No URL is committed:
+$ E2E_DATABASE_URL='postgresql://<user>:<password>@localhost:5432/myanflix_test?schema=public' npm run test:e2e
 
 # test coverage
 $ npm run test:cov

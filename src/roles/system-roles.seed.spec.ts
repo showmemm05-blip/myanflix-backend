@@ -306,16 +306,9 @@ const GUARDED_ROUTES: GuardedRoute[] = [
     legacy: 'FINANCE_VIEW',
     granular: 'FINANCE.VIEW',
   },
-  {
-    route: 'GET /analytics/overview',
-    legacy: 'FINANCE_VIEW',
-    granular: 'FINANCE.VIEW',
-  },
-  {
-    route: 'GET /analytics/user-growth',
-    legacy: 'FINANCE_VIEW',
-    granular: 'FINANCE.VIEW',
-  },
+  // GET /analytics/overview and /analytics/user-growth were FINANCE_VIEW
+  // here until H-26 re-gated them on DASHBOARD.VIEW on purpose (the seeded
+  // Admin's dashboard 403'd). They now sit in POST_RBAC_GUARDED_ROUTES.
   // videos
   {
     route: 'GET /videos/status/:movieId',
@@ -669,6 +662,67 @@ const POST_RBAC_GUARDED_ROUTES: PostRbacRoute[] = [
     granular: ['WITHDRAWALS.BANK_EVIDENCE'],
     allowed: [Role.SUPER_ADMIN],
   },
+  // bank transactions (bank_transactions): the phone-monitor's stored
+  // notifications. VIEW and BANK_EVIDENCE are seeded to no role but the
+  // implicit SUPER_ADMIN, like the other BANK_EVIDENCE permissions. The two
+  // GET-by-id routes let the admin page open a linked row's Verification
+  // Details and sit behind the existing VIEW permissions.
+  {
+    route: 'GET /bank-transactions',
+    granular: ['BANK_TRANSACTIONS.VIEW'],
+    allowed: [Role.SUPER_ADMIN],
+  },
+  {
+    route: 'GET /bank-transactions/devices',
+    granular: ['BANK_TRANSACTIONS.VIEW'],
+    allowed: [Role.SUPER_ADMIN],
+  },
+  {
+    route: 'GET /bank-transactions/:id',
+    granular: ['BANK_TRANSACTIONS.VIEW'],
+    allowed: [Role.SUPER_ADMIN],
+  },
+  {
+    route: 'GET /bank-transactions/:id/screenshot',
+    granular: ['BANK_TRANSACTIONS.BANK_EVIDENCE'],
+    allowed: [Role.SUPER_ADMIN],
+  },
+  {
+    route: 'GET /deposits/:id',
+    granular: ['DEPOSITS.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /withdrawals/:id',
+    granular: ['WITHDRAWALS.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  // dashboard stats (H-26): moved out of the parity table above. Re-gated
+  // from FINANCE.VIEW to DASHBOARD.VIEW so every role that can open the
+  // dashboard can load it; the overview's revenue figure is still nulled
+  // for callers without FINANCE.VIEW (AnalyticsController).
+  {
+    route: 'GET /analytics/overview',
+    granular: ['DASHBOARD.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /analytics/user-growth',
+    granular: ['DASHBOARD.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  // queue totals (H-24): the stat cards and tab counts of the deposits and
+  // withdrawals pages, computed server-side under the list's own VIEW.
+  {
+    route: 'GET /deposits/stats',
+    granular: ['DEPOSITS.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /withdrawals/stats',
+    granular: ['WITHDRAWALS.VIEW'],
+    allowed: STAFF_ONLY,
+  },
 ];
 
 const seedFor = (role: Role) => {
@@ -731,16 +785,18 @@ describe('System role seeds', () => {
    * (bank_verification) added DEPOSITS.BANK_EVIDENCE and
    * WITHDRAWALS.BANK_EVIDENCE (76 -> 78), again to NO seeded role: a bank
    * screenshot shows the business account balance, so a super admin grants
-   * it explicitly in the roles matrix.
+   * it explicitly in the roles matrix. Bank transactions (bank_transactions)
+   * added BANK_TRANSACTIONS.VIEW and .BANK_EVIDENCE (78 -> 80), once more
+   * to no seeded role.
    */
-  it('has the expected seed sizes (78 / 46 / 24 / 0, matching the migrations)', () => {
+  it('has the expected seed sizes (80 / 46 / 24 / 0, matching the migrations)', () => {
     expect({
       SUPER_ADMIN: seedFor(Role.SUPER_ADMIN).permissions.length,
       ADMIN: seedFor(Role.ADMIN).permissions.length,
       CONTENT_UPLOADER: seedFor(Role.CONTENT_UPLOADER).permissions.length,
       USER: seedFor(Role.USER).permissions.length,
     }).toEqual({
-      SUPER_ADMIN: 78,
+      SUPER_ADMIN: 80,
       ADMIN: 46,
       CONTENT_UPLOADER: 24,
       USER: 0,
@@ -783,15 +839,17 @@ describe('System role seeds — access parity with the pre-RBAC ROLE_PERMISSIONS
    *   3 of which are auth-only (@RequirePermissions() on /users/me*)
    * + 30 routes behind those 7 class-level decorators
    * + 5 MultipartUploadController routes gated by ResourceUploadTypeRegistry
-   * = 79 routes, 76 of them permission-gated.
+   * = 79 routes, 76 of them permission-gated,
+   * - 2 /analytics reads H-26 deliberately re-gated (now in the second table)
+   * = 77 routes, 74 of them permission-gated.
    *
    * Routes added since the migration are counted in
    * POST_RBAC_GUARDED_ROUTES instead — this number is frozen at what the
    * migration had to preserve.
    */
   it('covers every permission-gated route in the backend', () => {
-    expect(GUARDED_ROUTES).toHaveLength(79);
-    expect(GUARDED_ROUTES.filter((r) => r.granular !== null)).toHaveLength(76);
+    expect(GUARDED_ROUTES).toHaveLength(77);
+    expect(GUARDED_ROUTES.filter((r) => r.granular !== null)).toHaveLength(74);
     expect(GUARDED_ROUTES.filter((r) => r.granular === null)).toHaveLength(3);
   });
 });
@@ -831,17 +889,23 @@ describe('System role seeds — routes added after the RBAC migration', () => {
    * +  3 Audit — list, catalogue, one entry, all behind AUDIT.VIEW.
    * +  4 Bank verification — the two review PATCHes (EDIT) and the two
    *   screenshot streams (BANK_EVIDENCE).
+   * +  6 Bank transactions — list, devices, detail (VIEW), the screenshot
+   *   stream (BANK_EVIDENCE), and the two deposit/withdrawal GET-by-id
+   *   routes the admin page opens linked rows through (existing VIEW).
+   * +  2 Dashboard stats — the two /analytics reads, moved here from the
+   *   parity table when H-26 re-gated them on DASHBOARD.VIEW.
+   * +  2 Queue totals — GET /deposits/stats and /withdrawals/stats (H-24).
    */
   it('covers every post-migration permission-gated route', () => {
-    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(32);
+    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(42);
     expect(
       POST_RBAC_GUARDED_ROUTES.filter((r) => r.granular.length > 1),
     ).toHaveLength(2);
   });
 
-  it('leaves the backend with 111 routes in the two tables, 108 permission-gated', () => {
+  it('leaves the backend with 119 routes in the two tables, 116 permission-gated', () => {
     const gatedLegacy = GUARDED_ROUTES.filter((r) => r.granular !== null);
-    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(108);
-    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(111);
+    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(116);
+    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(119);
   });
 });

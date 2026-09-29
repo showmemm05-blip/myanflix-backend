@@ -4,10 +4,26 @@ import { rm, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { UploadStatus, VideoStatus } from '../generated/prisma/client';
 import { MinioService } from '../common/storage/minio.service';
-import { StorageService } from '../common/storage/storage.service';
-import { LOCAL_SCRATCH_ROOTS } from '../common/storage/media-taxonomy';
+import {
+  StorageService,
+  VIDEO_REPLACE_STAGING_ROOT,
+} from '../common/storage/storage.service';
+import {
+  LOCAL_SCRATCH_ROOTS,
+  MEDIA_CLASSES,
+} from '../common/storage/media-taxonomy';
 import { PrismaService } from '../prisma/prisma.service';
 import { ABANDONED_SESSION_AGE_MS } from './multipart-upload.service';
+
+// The videoReplaceStaging row's declared expiry, read from the taxonomy so
+// the sweep and the documented retention can never disagree. MinIO's own
+// lifecycle rule (MinioService.ensureLifecycle) only aborts incomplete
+// multipart uploads, so this sweep IS the enforcement of that expiry.
+const REPLACE_STAGING_MAX_AGE_MS = (() => {
+  const row = MEDIA_CLASSES.find((c) => c.id === 'videoReplaceStaging');
+  const days = row?.retention.kind === 'expires' ? row.retention.afterDays : 7;
+  return days * 24 * 60 * 60 * 1000;
+})();
 
 // A scratch directory nobody has touched for this long belongs to a run
 // that is over — every flow that writes under <STORAGE_PATH>/temp/ either
@@ -81,6 +97,50 @@ export class UploadCleanupService {
         `Cleanup swept ${abortedRows} stale session row(s) and ${abortedOrphans} orphaned MinIO upload(s)`,
       );
     }
+    // Last, and on its own: the two sweeps above touch multipart state, this
+    // one touches finished objects, and a MinIO listing failure here must
+    // not be what stops the others from running next time.
+    await this.sweepAbandonedReplaceStaging();
+  }
+
+  /**
+   * Removes replacement bundles that were staged under
+   * temp/video-replace/<movieId>/ and never finalized or cancelled — the
+   * admin tab closed, the operator gave up. Age is the object's own
+   * last-modified stamp against the taxonomy row's expiry; a finalize that
+   * succeeds deletes its staging itself, and replace-begin clears the
+   * prefix on every fresh attempt, so anything old enough to be seen here
+   * is abandoned by construction.
+   */
+  async sweepAbandonedReplaceStaging(): Promise<number> {
+    const cutoffMs = Date.now() - REPLACE_STAGING_MAX_AGE_MS;
+    let stale: string[];
+    try {
+      const objects = await this.minioService.listObjects(
+        `${VIDEO_REPLACE_STAGING_ROOT}/`,
+      );
+      stale = objects
+        .filter(
+          (object) =>
+            object.lastModified !== undefined &&
+            object.lastModified.getTime() < cutoffMs,
+        )
+        .map((object) => object.key);
+      if (stale.length > 0) await this.minioService.deleteKeys(stale);
+    } catch (error) {
+      this.logger.warn(
+        `Could not sweep abandoned video-replace staging: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return 0;
+    }
+    if (stale.length > 0) {
+      this.logger.log(
+        `Cleanup removed ${stale.length} abandoned video-replace staging object(s)`,
+      );
+    }
+    return stale.length;
   }
 
   private async sweepStaleSessionRows(): Promise<number> {

@@ -145,4 +145,48 @@ export class UploadsController {
   ) {
     return this.uploadsService.finalizeExternalUpload(movieId, dto, user);
   }
+
+  /**
+   * Opens a REPLACE of an existing title's video with a new transcoder
+   * bundle. Allowed for a PUBLISHED, READY_TO_PUBLISH or FAILED movie (409
+   * otherwise, 409 while its video is being transcoded). A live title never
+   * changes status here: the bundle uploads to a private staging prefix
+   * (via the existing presign-batch / multipart routes with resourceType
+   * "movie-replace") and playback keeps serving the old files until the
+   * swap in finalize-replace. Clears any stale staging from an earlier
+   * attempt; writes nothing else.
+   */
+  @Post(':movieId/replace-begin')
+  replaceBegin(@Param('movieId', ParseUUIDPipe) movieId: string) {
+    return this.uploadsService.beginReplace(movieId);
+  }
+
+  /**
+   * The swap. Validates the STAGED bundle (400 with the staging cleaned and
+   * the old video untouched when the structure is wrong or a file is
+   * missing), then copies it over the title's final keys with the master
+   * last, deletes the old objects the new bundle does not carry, rewrites
+   * the Video row in place (same id) and recreates its Subtitle rows. The
+   * Movie row and its status are never written. 502 if a copy fails
+   * mid-swap — the Video row is then FAILED (playback 404s rather than
+   * serving a mix) and the staging is kept so this call can be retried.
+   * Parallel calls for one movie join a single run.
+   */
+  @Post(':movieId/finalize-replace')
+  finalizeReplace(
+    @Param('movieId', ParseUUIDPipe) movieId: string,
+    @Body() dto: ValidateExternalBundleDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.uploadsService.finalizeReplace(movieId, dto, user);
+  }
+
+  /** Abandons a replace mid-upload: only the staging prefix is deleted; the title's files were never touched. */
+  @Post(':movieId/replace-cancel')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async replaceCancel(
+    @Param('movieId', ParseUUIDPipe) movieId: string,
+  ): Promise<void> {
+    await this.uploadsService.cancelReplace(movieId);
+  }
 }

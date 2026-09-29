@@ -5,7 +5,10 @@ import {
 } from '../generated/prisma/client';
 import type { Withdrawal } from '../generated/prisma/client';
 import type { AuditService } from '../audit/audit.service';
-import type { WithdrawalVerificationPayload } from '../realtime/realtime.gateway';
+import type {
+  RealtimeGateway,
+  WithdrawalVerificationPayload,
+} from '../realtime/realtime.gateway';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import {
   PAYOUT_CODE_PROBE_LIMIT,
@@ -15,7 +18,11 @@ import {
   scoreVerification,
   withdrawalVerificationView,
 } from './risk-rules';
-import { riskSnapshot, type RiskWrite } from './deposit-risk';
+import {
+  BANK_TRANSACTION_LINK_INCLUDE,
+  riskSnapshot,
+  type RiskWrite,
+} from './deposit-risk';
 
 /**
  * Withdrawal-side twins of deposit-risk.ts. The one rule that lives here
@@ -133,7 +140,7 @@ export function withdrawalVerificationPayload(
     | 'transferTransactionCode'
     | 'transferTransactionAt'
     | 'transferScreenshotKey'
-  >,
+  > & { bankTransaction?: { id: string } | null },
   now: Date = new Date(),
 ): WithdrawalVerificationPayload {
   const view = withdrawalVerificationView(row, now);
@@ -148,5 +155,45 @@ export function withdrawalVerificationPayload(
     transferTransactionAt: row.transferTransactionAt,
     bankCheckedAt: row.bankCheckedAt,
     hasBankScreenshot: row.transferScreenshotKey !== null,
+    bankTransactionId: row.bankTransaction?.id ?? null,
   };
+}
+
+/** Exactly the columns withdrawalVerificationPayload reads, plus the link id. */
+const WITHDRAWAL_VERIFICATION_SELECT = {
+  id: true,
+  status: true,
+  approvedAt: true,
+  bankCheckedAt: true,
+  matchStatus: true,
+  riskLevel: true,
+  riskReasons: true,
+  transferAmount: true,
+  transferTransactionCode: true,
+  transferTransactionAt: true,
+  transferScreenshotKey: true,
+  ...BANK_TRANSACTION_LINK_INCLUDE,
+} satisfies Prisma.WithdrawalSelect;
+
+/**
+ * Admins-room push for every withdrawal whose verification state changed —
+ * after commit, by primary key. Shared by ingestion (BankEventsService) and
+ * the staff paths (WithdrawalsService), so a match reads the same whichever
+ * event completed it. Never the user's room.
+ */
+export async function pushWithdrawalVerificationUpdates(
+  db: Pick<Prisma.TransactionClient, 'withdrawal'>,
+  gateway: Pick<RealtimeGateway, 'notifyAdminsWithdrawalVerificationUpdated'>,
+  ids: readonly string[],
+): Promise<void> {
+  if (ids.length === 0) return;
+  const rows = await db.withdrawal.findMany({
+    where: { id: { in: [...ids] } },
+    select: WITHDRAWAL_VERIFICATION_SELECT,
+  });
+  for (const row of rows) {
+    gateway.notifyAdminsWithdrawalVerificationUpdated(
+      withdrawalVerificationPayload(row),
+    );
+  }
 }

@@ -94,6 +94,79 @@ describe('JwtStrategy — presence touch', () => {
     expect(trackingService.touchLastSeen).not.toHaveBeenCalled();
   });
 
+  it('H-16: rejects a closed (self-deleted) account', async () => {
+    usersService.findById.mockResolvedValue(
+      makeUser({ status: UserStatus.CLOSED }),
+    );
+
+    await expect(strategy.validate({ sub: 'user-1' })).rejects.toThrow(
+      UnauthorizedException,
+    );
+  });
+
+  describe('H-21: access tokens die with a session revoke', () => {
+    const revokedAt = new Date('2026-09-28T10:00:00.400Z');
+    const revokedSecond = Math.floor(revokedAt.getTime() / 1000);
+
+    beforeEach(() => {
+      usersService.findById.mockResolvedValue(
+        makeUser({ sessionsRevokedAt: revokedAt }),
+      );
+    });
+
+    it('refuses a token issued before the revoke, without recording presence', async () => {
+      await expect(
+        strategy.validate({
+          sub: 'user-1',
+          iat: revokedSecond - 60,
+          ims: revokedAt.getTime() - 60_000,
+        }),
+      ).rejects.toThrow(UnauthorizedException);
+      expect(trackingService.touchLastSeen).not.toHaveBeenCalled();
+    });
+
+    it('refuses a token minted earlier in the very same second as the revoke', async () => {
+      await expect(
+        strategy.validate({
+          sub: 'user-1',
+          iat: revokedSecond,
+          ims: revokedAt.getTime() - 100,
+        }),
+      ).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('accepts the fresh token a refresh mints after the revoke — even within the same second', async () => {
+      await expect(
+        strategy.validate({
+          sub: 'user-1',
+          iat: revokedSecond,
+          ims: revokedAt.getTime() + 5,
+        }),
+      ).resolves.toEqual(expect.objectContaining({ id: 'user-1' }));
+    });
+
+    it('accepts any token when the account was never revoked', async () => {
+      usersService.findById.mockResolvedValue(
+        makeUser({ sessionsRevokedAt: null }),
+      );
+      await expect(
+        strategy.validate({ sub: 'user-1', iat: revokedSecond - 60 }),
+      ).resolves.toEqual(expect.objectContaining({ id: 'user-1' }));
+    });
+  });
+
+  it('carries the refresh session id (sid) as sessionId, so a self-service password change can keep it', async () => {
+    await expect(
+      strategy.validate({ sub: 'user-1', sid: 'rt-1' }),
+    ).resolves.toEqual({
+      id: 'user-1',
+      username: 'blake',
+      role: Role.USER,
+      appRoleId: null,
+      sessionId: 'rt-1',
+    });
+  });
+
   it('rejects a token for an account that no longer exists with 401, not 404', async () => {
     usersService.findById.mockResolvedValue(null);
 

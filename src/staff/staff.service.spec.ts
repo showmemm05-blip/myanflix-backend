@@ -5,17 +5,19 @@ import {
   ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
-import { Role, UserStatus } from '../generated/prisma/client';
+import { Prisma, Role, UserStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { AuthorityService } from '../roles/authority.service';
 import { PermissionResolverService } from '../roles/permission-resolver.service';
 import { AuditService } from '../audit/audit.service';
+import { SessionRevocationService } from '../auth/session-revocation.service';
 import {
   createRoleAwarePermissionResolver,
   seededRoleRow,
 } from '../../test/seeded-permission-resolver';
+import { MONEY_RECORDS_DELETE_MESSAGE } from '../users/user-money-records';
 import { StaffService } from './staff.service';
 
 /**
@@ -33,6 +35,15 @@ describe('StaffService — role assignment', () => {
       count: jest.Mock;
     };
     appRole: { findUnique: jest.Mock; findMany: jest.Mock };
+    wallet: { findUnique: jest.Mock; deleteMany: jest.Mock };
+    transaction: { findFirst: jest.Mock };
+    deposit: { findFirst: jest.Mock };
+    withdrawal: { findFirst: jest.Mock };
+    walletAdjustment: { findFirst: jest.Mock };
+    userSubscription: { findFirst: jest.Mock };
+    purchase: { findFirst: jest.Mock };
+    seriesPurchase: { findFirst: jest.Mock };
+    $transaction: jest.Mock;
   };
   let usersService: {
     findByUsername: jest.Mock;
@@ -42,6 +53,11 @@ describe('StaffService — role assignment', () => {
   };
   let resolver: ReturnType<typeof createRoleAwarePermissionResolver>;
   let audit: { record: jest.Mock; invalidateActorCache: jest.Mock };
+  let sessions: {
+    revokeAll: jest.Mock;
+    revokeAllAndDisconnect: jest.Mock;
+    disconnectUser: jest.Mock;
+  };
 
   const actor: AuthenticatedUser = {
     id: 'boss-1',
@@ -119,6 +135,23 @@ describe('StaffService — role assignment', () => {
           return Promise.resolve(byKey ?? null);
         }),
       },
+      // H-22: remove() checks the money tables first; an empty wallet and
+      // no history is the default (an ordinary staff account).
+      wallet: {
+        findUnique: jest
+          .fn()
+          .mockResolvedValue({ balance: new Prisma.Decimal(0) }),
+        deleteMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+      transaction: { findFirst: jest.fn().mockResolvedValue(null) },
+      deposit: { findFirst: jest.fn().mockResolvedValue(null) },
+      withdrawal: { findFirst: jest.fn().mockResolvedValue(null) },
+      walletAdjustment: { findFirst: jest.fn().mockResolvedValue(null) },
+      userSubscription: { findFirst: jest.fn().mockResolvedValue(null) },
+      purchase: { findFirst: jest.fn().mockResolvedValue(null) },
+      seriesPurchase: { findFirst: jest.fn().mockResolvedValue(null) },
+      // The callback form, with `tx` being this same mock.
+      $transaction: jest.fn((fn: (tx: unknown) => unknown) => fn(prisma)),
     };
     usersService = {
       findByUsername: jest.fn().mockResolvedValue(null),
@@ -161,6 +194,12 @@ describe('StaffService — role assignment', () => {
       },
     ]);
 
+    sessions = {
+      revokeAll: jest.fn().mockResolvedValue(undefined),
+      revokeAllAndDisconnect: jest.fn().mockResolvedValue(undefined),
+      disconnectUser: jest.fn(),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         StaffService,
@@ -176,6 +215,7 @@ describe('StaffService — role assignment', () => {
           },
         },
         { provide: PermissionResolverService, useValue: resolver },
+        { provide: SessionRevocationService, useValue: sessions },
       ],
     }).compile();
 
@@ -581,6 +621,91 @@ describe('StaffService — role assignment', () => {
     });
   });
 
+  /**
+   * H-21: resetting a stolen staff login must lock the thief out at once,
+   * and a suspension or role change must not leave old sessions running
+   * (or springing back on re-activation). H-3: their sockets go too.
+   */
+  describe('H-21: staff sessions are revoked', () => {
+    it("a password reset by another staff member revokes every session of the account, in the reset's transaction", async () => {
+      await service.resetPassword(
+        'staff-1',
+        { newPassword: 'rotated12345' },
+        actor,
+      );
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(sessions.revokeAll).toHaveBeenCalledWith('staff-1', {
+        client: prisma,
+      });
+      expect(sessions.disconnectUser).toHaveBeenCalledWith('staff-1');
+    });
+
+    it('a refused reset revokes nothing', async () => {
+      prisma.user.findUnique.mockResolvedValue(superAdminRow);
+
+      await expect(
+        service.resetPassword(
+          'staff-1',
+          { newPassword: 'takeover123' },
+          staffManager,
+        ),
+      ).rejects.toThrow();
+      expect(sessions.revokeAll).not.toHaveBeenCalled();
+      expect(sessions.disconnectUser).not.toHaveBeenCalled();
+    });
+
+    it('suspending signs the account out everywhere; re-activating does not', async () => {
+      await service.updateStatus(
+        'staff-1',
+        { status: UserStatus.SUSPENDED },
+        actor,
+      );
+      expect(sessions.revokeAllAndDisconnect).toHaveBeenCalledWith('staff-1');
+
+      sessions.revokeAllAndDisconnect.mockClear();
+      await service.updateStatus(
+        'staff-1',
+        { status: UserStatus.ACTIVE },
+        actor,
+      );
+      expect(sessions.revokeAllAndDisconnect).not.toHaveBeenCalled();
+    });
+
+    it('a role change signs the account out everywhere', async () => {
+      prisma.user.update.mockResolvedValue({
+        ...staffRow,
+        role: Role.ADMIN,
+        appRoleId: 'role-admin',
+      });
+
+      await service.updateStaffFields('staff-1', { role: Role.ADMIN }, actor);
+
+      expect(sessions.revokeAllAndDisconnect).toHaveBeenCalledWith('staff-1');
+    });
+
+    it('a plain rename leaves the sessions alone', async () => {
+      prisma.user.update.mockResolvedValue({
+        ...staffRow,
+        username: 'renamed',
+      });
+
+      await service.updateStaffFields(
+        'staff-1',
+        { username: 'renamed' },
+        actor,
+      );
+
+      expect(sessions.revokeAllAndDisconnect).not.toHaveBeenCalled();
+    });
+
+    it('deleting an account closes its sockets (its tokens went with the row)', async () => {
+      await service.remove('staff-1', actor);
+
+      expect(sessions.disconnectUser).toHaveBeenCalledWith('staff-1');
+    });
+  });
+
   describe('updateStatus / remove (F3, F8)', () => {
     const roleManagerRow = {
       ...staffRow,
@@ -687,6 +812,79 @@ describe('StaffService — role assignment', () => {
       expect(prisma.user.delete).toHaveBeenCalledWith({
         where: { id: 'staff-1' },
       });
+    });
+  });
+
+  /**
+   * H-22: money records are never deleted with a user. The foreign keys are
+   * ON DELETE RESTRICT; remove() says so first, in words staff can act on.
+   */
+  describe('H-22: remove keeps money records', () => {
+    it('an empty wallet and no history: the wallet row goes, then the account, in one transaction — audited', async () => {
+      await service.remove('staff-1', actor);
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.wallet.deleteMany).toHaveBeenCalledWith({
+        where: { userId: 'staff-1' },
+      });
+      expect(prisma.user.delete).toHaveBeenCalledWith({
+        where: { id: 'staff-1' },
+      });
+      expect(prisma.wallet.deleteMany.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.user.delete.mock.invocationCallOrder[0],
+      );
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'staff.delete' }),
+      );
+    });
+
+    it.each([
+      ['a deposit', 'deposit'],
+      ['a withdrawal', 'withdrawal'],
+      ['a wallet ledger row', 'transaction'],
+      ['a balance correction', 'walletAdjustment'],
+      ['a subscription', 'userSubscription'],
+      ['a movie purchase', 'purchase'],
+      ['a series purchase', 'seriesPurchase'],
+    ] as const)(
+      'refuses when the account has %s — 409 telling staff to suspend instead, nothing deleted or audited',
+      async (_label, table) => {
+        prisma[table].findFirst.mockResolvedValue({ id: 'row-1' });
+
+        await expect(service.remove('staff-1', actor)).rejects.toThrow(
+          new ConflictException(MONEY_RECORDS_DELETE_MESSAGE),
+        );
+        expect(prisma.wallet.deleteMany).not.toHaveBeenCalled();
+        expect(prisma.user.delete).not.toHaveBeenCalled();
+        expect(usersService.deleteAvatarObjects).not.toHaveBeenCalled();
+        expect(audit.record).not.toHaveBeenCalled();
+      },
+    );
+
+    it('refuses while the wallet still holds money', async () => {
+      prisma.wallet.findUnique.mockResolvedValue({
+        balance: new Prisma.Decimal(1500),
+      });
+
+      await expect(service.remove('staff-1', actor)).rejects.toThrow(
+        new ConflictException(MONEY_RECORDS_DELETE_MESSAGE),
+      );
+      expect(prisma.user.delete).not.toHaveBeenCalled();
+    });
+
+    it('a money row written between the check and the delete: the database refuses (P2003) and the answer is the same 409', async () => {
+      prisma.user.delete.mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError(
+          'Foreign key constraint violated',
+          { code: 'P2003', clientVersion: 'test' },
+        ),
+      );
+
+      await expect(service.remove('staff-1', actor)).rejects.toThrow(
+        new ConflictException(MONEY_RECORDS_DELETE_MESSAGE),
+      );
+      expect(usersService.deleteAvatarObjects).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
     });
   });
 

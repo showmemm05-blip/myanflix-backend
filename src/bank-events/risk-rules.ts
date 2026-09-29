@@ -29,6 +29,16 @@ export const DEPOSIT_MATCH_WINDOW_MS = 24 * 3_600_000;
 export const NO_BANK_TRANSACTION_AFTER_MS = DEPOSIT_MATCH_WINDOW_MS;
 
 /**
+ * A stored bank transaction nobody has claimed for two days is "unclaimed"
+ * — twice the deposit window, because the owner's "a day-late submission
+ * is rare but real" still deserves the benefit of the doubt before the row
+ * is shown as money with no owner. Read-time only (bank-transactions
+ * view): the row keeps matching a late deposit at create time — the
+ * deposit then carries the timing reasons — and nothing ever sweeps it.
+ */
+export const UNCLAIMED_AFTER_MS = 48 * 3_600_000;
+
+/**
  * Staff pay out the day they approve; a "sent" notification a day after
  * approval is still that payout.
  */
@@ -46,6 +56,22 @@ export const VELOCITY_PROBE_LIMIT = 10;
 
 /** Q2 only needs to tell 0 / 1 / "more than one" apart. */
 export const AMBIGUITY_PROBE_LIMIT = 3;
+
+/**
+ * The code-key lookups (a hand-typed payout code ↔ a stored "sent" record)
+ * only need to tell 0 / 1 / "more than one" apart: exactly one is a match,
+ * two is never guessed between.
+ */
+export const CODE_KEY_PROBE_LIMIT = 2;
+
+/**
+ * An approval re-runs the "sent" records parked in the CLOCK_SKEW_MS before
+ * it, oldest first, each in its own transaction. More same-amount payouts
+ * than this inside five minutes is not a pattern this shop produces; the
+ * bound keeps one click's work small, and anything past it still has the
+ * phone's Resend and the typed code.
+ */
+export const PARKED_REMATCH_LIMIT = 5;
 
 /** Bounds Q4; a reference reused more than 20 times is flagged the same way. */
 export const TWIN_PROBE_LIMIT = 20;
@@ -275,6 +301,19 @@ export function codesEqual(a: string, b: string): boolean {
 /** The last six characters as printed — the part the user is asked to type. */
 export function last6(code: string): string {
   return code.slice(-6);
+}
+
+/**
+ * A code the case-insensitive lookups may use as it is. Prisma renders
+ * `mode: 'insensitive'` equality as ILIKE, where `%`, `_` and `\` are
+ * pattern characters; for letters and digits ILIKE is exactly codesEqual.
+ * Every code that reaches a lookup was already validated alphanumeric (the
+ * bank-event DTO and the transfer-account DTO), so this refuses only what
+ * could never be a code — and keeps "equal, ignoring case" from ever
+ * widening into a pattern.
+ */
+export function isPlainCode(code: string): boolean {
+  return /^[A-Za-z0-9]+$/.test(code);
 }
 
 /**

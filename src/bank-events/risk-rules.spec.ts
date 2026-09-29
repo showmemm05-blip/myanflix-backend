@@ -16,6 +16,7 @@ import {
   codesEqual,
   depositTimingReasons,
   isNoBankTransaction,
+  isPlainCode,
   isWithdrawalNoBankTransaction,
   last6,
   maxRiskLevel,
@@ -167,6 +168,14 @@ describe('individual rules', () => {
     expect(codesEqual('ab12CD', 'AB12cd')).toBe(true);
     expect(codesEqual('AB12CD', 'AB12CE')).toBe(false);
     expect(last6('KBZ-20260918-AB12CD'.replace(/-/g, ''))).toBe('AB12CD');
+  });
+
+  it('lets only letters and digits into a case-insensitive (ILIKE) code lookup', () => {
+    expect(isPlainCode('ab12CD')).toBe(true);
+    expect(isPlainCode('000123')).toBe(true);
+    for (const pattern of ['AB12_D', 'AB%2CD', 'AB\\2CD', 'AB 2CD', '']) {
+      expect(isPlainCode(pattern)).toBe(false);
+    }
   });
 
   describe('depositTimingReasons', () => {

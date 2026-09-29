@@ -1,4 +1,5 @@
 import {
+  BadGatewayException,
   BadRequestException,
   ConflictException,
   Injectable,
@@ -7,12 +8,13 @@ import {
 } from '@nestjs/common';
 import { access, readdir, rm, writeFile } from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { basename, extname, join } from 'node:path';
 import {
   MovieStatus,
   UploadStatus,
   VideoStatus,
+  type Prisma,
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
@@ -28,6 +30,8 @@ import {
   EXTENSION_TO_FORMAT,
 } from '../subtitles/subtitles.service';
 import {
+  MOVIE_REPLACE_RESOURCE_TYPE,
+  REPLACEABLE_MOVIE_STATUSES,
   ResourceUploadTypeRegistry,
   SUBTITLE_RELATIVE_PREFIX,
 } from './resource-upload-type.registry';
@@ -94,6 +98,41 @@ interface BundleStructure {
 type CompleteUploadResult =
   | { videoId: string; status: VideoStatus }
   | { relativePath: string; status: UploadStatus };
+
+/** The 201 body of POST /uploads/:movieId/finalize-replace. */
+export interface FinalizeReplaceResult {
+  videoId: string;
+  status: VideoStatus;
+  renditions: string[];
+  subtitles: number;
+  durationSeconds: number | null;
+  copiedObjects: number;
+  deletedObjects: number;
+}
+
+// How many staged objects are copied to their final keys at once during a
+// replace. A rendition can be ~900 segments; each copy is a server-side
+// CopyObject (no bytes through this process), so this bounds MinIO's
+// concurrent work rather than our memory.
+const REPLACE_COPY_CONCURRENCY = 8;
+
+// The bundle folder that holds the HLS package (master, <tier>/ folders).
+// On a replace everything under it is re-rooted into the versioned package
+// folder — see replaceDestinationKey; the original and subtitles/ are not.
+const HLS_RELATIVE_PREFIX = 'hls/';
+
+// The master is the one file a player fetches FIRST and the cache server
+// re-fetches after 10 s; it is copied strictly after everything else so a
+// player can only ever see a master whose every referenced file already
+// exists — see runFinalizeReplace step 4.
+const MASTER_RELATIVE_PATH = `${HLS_RELATIVE_PREFIX}master.m3u8`;
+
+// Bytes of randomness behind a replace's package tag (hex-encoded: 8 chars,
+// 2^32 values). A tag only has to differ from the handful of packages one
+// title has ever had, so a collision with a still-live folder — which would
+// merely fall back to overwriting keys in place, never to data loss — is
+// not a case worth a lookup.
+const HLS_VERSION_TAG_BYTES = 4;
 
 @Injectable()
 export class UploadsService {
@@ -675,6 +714,566 @@ export class UploadsService {
     return { videoId: video.id, status: VideoStatus.READY };
   }
 
+  // ---------------------------------------------------------------------
+  // REPLACE — a new transcoder bundle for a title that already has a video.
+  //
+  // Three routes, deliberately separate from validate-external/finalize:
+  // finalize's status guard ("a live title is never unpublished or failed
+  // from here") and its single-flight stay untouched, and a "replace" flag
+  // on finalize would have had to bypass that very guard. The invariants
+  // every method below keeps:
+  //   - the Movie row and Movie.status are NEVER written;
+  //   - the old Video row keeps serving /videos/:movieId/stream until the
+  //     swap (the new bundle stages under temp/video-replace/<movieId>/, a
+  //     prefix the cache server denies and nothing can sign);
+  //   - a failure BEFORE the swap leaves MinIO's final keys and the DB
+  //     untouched and cleans the staging;
+  //   - the new HLS package lands in a FRESH folder,
+  //     videos/<movieId>/hls/v-<tag>/, never over the old keys: every cache
+  //     server keeps a segment for 7 days by full path, so a bundle written
+  //     over the old keys played the NEW playlist with OLD cached segments
+  //     wherever the transcoder reused a segment name. A fresh folder is
+  //     what makes the title play the new bundle the moment the swap ends,
+  //     and what lets the stale-delete remove the whole previous package.
+  //     The original and the subtitle sources keep their un-versioned keys:
+  //     the original is never served, and a source is cached for 10 s only;
+  //   - watch history / resume positions are keyed by movieId and are not
+  //     touched — it is the same title.
+  // ---------------------------------------------------------------------
+
+  /** `temp/video-replace/<movieId>/` — with the trailing slash a prefix listing/delete needs. */
+  private stagingPrefix(movieId: string): string {
+    return `${this.storageService.videoReplaceStagingPrefix(movieId)}/`;
+  }
+
+  private stagingKey(movieId: string, relativePath: string): string {
+    return this.storageService.videoReplaceStagingKey(movieId, relativePath);
+  }
+
+  private assertReplaceable(movie: { status: MovieStatus }): void {
+    if (!REPLACEABLE_MOVIE_STATUSES.includes(movie.status)) {
+      throw new ConflictException(
+        `Cannot replace the video of a ${movie.status} movie — only a PUBLISHED, READY_TO_PUBLISH or FAILED title can have its video replaced`,
+      );
+    }
+  }
+
+  private assertNotActivelyProcessing(video: { id: string } | null): void {
+    if (video && this.processingService.isActivelyProcessing(video.id)) {
+      throw new ConflictException(
+        'This video is being transcoded right now — wait for it to finish before replacing it',
+      );
+    }
+  }
+
+  /**
+   * Opens a replace: confirms the movie may be replaced and hands the admin
+   * the resourceType + staging prefix its presign-batch / multipart uploads
+   * will use. The one side effect is clearing the staging prefix, so a file
+   * left by an earlier aborted attempt can never satisfy the validation of
+   * this one. Nothing durable changes (no Movie/Video write, no status
+   * change), so nothing is audited — the audit row belongs to the swap.
+   */
+  async beginReplace(movieId: string): Promise<{
+    movieId: string;
+    resourceType: string;
+    stagingPrefix: string;
+  }> {
+    const movie = await this.prisma.movie.findUnique({
+      where: { id: movieId },
+      select: { id: true, status: true },
+    });
+    if (!movie) throw new NotFoundException('Movie not found');
+    this.assertReplaceable(movie);
+    this.assertNotActivelyProcessing(
+      await this.videosService.findLatestForMovie(movieId),
+    );
+
+    const stagingPrefix = this.stagingPrefix(movieId);
+    await this.minioService.deleteByPrefix(stagingPrefix);
+    this.logger.log(
+      `Video replace opened for movie ${movieId} (${movie.status}) — staging ${stagingPrefix}`,
+    );
+    return {
+      movieId,
+      resourceType: MOVIE_REPLACE_RESOURCE_TYPE,
+      stagingPrefix,
+    };
+  }
+
+  /**
+   * Best-effort abandon — the admin calls it when the operator removes the
+   * folder or closes the dialog mid-upload. Only the staging goes; the
+   * title's real files were never touched.
+   */
+  async cancelReplace(movieId: string): Promise<void> {
+    const movie = await this.prisma.movie.findUnique({
+      where: { id: movieId },
+      select: { id: true },
+    });
+    if (!movie) throw new NotFoundException('Movie not found');
+    await this.minioService.deleteByPrefix(this.stagingPrefix(movieId));
+  }
+
+  /** Single-flight per movie, exactly like finalizingMovies. */
+  private readonly replacingMovies = new Map<
+    string,
+    Promise<FinalizeReplaceResult>
+  >();
+
+  /**
+   * Swaps a fully-staged replacement bundle in for the title's current
+   * video. Validates the staged files (same structure + existence checks as
+   * finalize, against the STAGING keys), copies them to their final keys —
+   * the HLS package into a fresh videos/<movieId>/hls/v-<tag>/ folder —
+   * with the master last, deletes whatever old object the new bundle does
+   * not carry (which is the whole previous package), rewrites the Video row
+   * in place and recreates its Subtitle rows exactly as finalize creates
+   * them. Parallel calls for one movie join a single run.
+   */
+  async finalizeReplace(
+    movieId: string,
+    dto: ValidateExternalBundleDto,
+    actor: AuthenticatedUser,
+  ): Promise<FinalizeReplaceResult> {
+    const inFlight = this.replacingMovies.get(movieId);
+    if (inFlight) return inFlight;
+
+    const promise = this.runFinalizeReplace(movieId, dto, actor).finally(() => {
+      this.replacingMovies.delete(movieId);
+    });
+    this.replacingMovies.set(movieId, promise);
+    return promise;
+  }
+
+  private async runFinalizeReplace(
+    movieId: string,
+    dto: ValidateExternalBundleDto,
+    actor: AuthenticatedUser,
+  ): Promise<FinalizeReplaceResult> {
+    // 0. Gate. The movie's status is read once and never written.
+    const movie = await this.prisma.movie.findUnique({
+      where: { id: movieId },
+    });
+    if (!movie) throw new NotFoundException('Movie not found');
+    this.assertReplaceable(movie);
+    const video = await this.videosService.findLatestForMovie(movieId);
+    this.assertNotActivelyProcessing(video);
+
+    const stagingPrefix = this.stagingPrefix(movieId);
+
+    // 1. Structure. A rejected bundle costs nothing but its staging.
+    const { originalPath, renditions, subtitlePaths, errors } =
+      this.parseBundleStructure(dto.relativePaths);
+    if (errors.length > 0 || originalPath === null) {
+      await this.minioService.deleteByPrefix(stagingPrefix);
+      throw new BadRequestException(
+        `Cannot replace — invalid bundle structure: ${errors.join('; ')}`,
+      );
+    }
+
+    // 2. Every file must actually be STAGED — the required ones AND every
+    // segment the client listed. The client's own upload bookkeeping is
+    // never trusted, same as finalize; and checking the segments here, not
+    // in the copy, is what keeps step 4 from starting a swap it cannot
+    // finish (a missing segment used to surface as a copy failure halfway,
+    // the one path that leaves old and new files mixed). Bounded, not
+    // Promise.all: a bundle can list thousands of segments.
+    const toCheck = Array.from(
+      new Set([
+        originalPath,
+        MASTER_RELATIVE_PATH,
+        ...renditions.map((r) => `hls/${r}/index.m3u8`),
+        ...subtitlePaths,
+        ...dto.relativePaths,
+      ]),
+    );
+    const missing: string[] = [];
+    await runPool(toCheck, REPLACE_COPY_CONCURRENCY, async (relativePath) => {
+      const exists = await this.minioService.objectExists(
+        this.stagingKey(movieId, relativePath),
+      );
+      if (!exists) missing.push(relativePath);
+    });
+    missing.sort();
+    if (missing.length > 0) {
+      await this.minioService.deleteByPrefix(stagingPrefix);
+      throw new BadRequestException(
+        `Cannot replace — missing staged files: ${missing.join(', ')}`,
+      );
+    }
+
+    // 3. Snapshot before anything is written: the title's current keys (so
+    // step 5 can delete exactly the stale ones) and the rows for the audit.
+    const videoPrefix = `${this.storageService.videoKeyPrefix(movieId)}/`;
+    const subtitlePrefix = `${this.storageService.subtitleSourcePrefix(movieId)}/`;
+    const oldKeys = new Set<string>([
+      ...(await this.minioService.listKeys(videoPrefix)),
+      ...(await this.minioService.listKeys(subtitlePrefix)),
+    ]);
+    const oldSubtitles = video
+      ? await this.prisma.subtitle.findMany({
+          where: { videoId: video.id },
+          select: {
+            id: true,
+            language: true,
+            label: true,
+            format: true,
+            objectKey: true,
+            isDefault: true,
+          },
+        })
+      : [];
+    const before = {
+      video: video
+        ? {
+            id: video.id,
+            status: video.status,
+            originalFilename: video.originalFilename,
+            originalPath: video.originalPath,
+            hlsMasterPath: video.hlsMasterPath,
+            renditions: video.renditions,
+            duration: video.duration,
+            resolution: video.resolution,
+            failureReason: video.failureReason,
+          }
+        : null,
+      subtitles: oldSubtitles,
+      movieDuration: movie.duration,
+    };
+
+    // 4. Copy staged -> final. The HLS package (hls/**) goes into a FRESH
+    // videos/<movieId>/hls/v-<tag>/ folder — see replaceDestinationKey for
+    // why it can never go over the old keys — while the original and the
+    // subtitle sources take the SAME key the "movie" registry entry gives a
+    // fresh upload (subtitles leave videos/ for subtitles/<movieId>/). The
+    // old package is untouched until step 7 points the row at the new one,
+    // so the title keeps playing throughout; the master goes last so a
+    // player can only see a master whose every referenced file already
+    // exists. This is the ONE step that can leave a partial state — see the
+    // catch (a retry mints a new tag, and the half-written folder is swept
+    // as stale by the retry's own step 5, being none of ITS final keys).
+    const versionTag = this.hlsVersionTag();
+    const newFinalKeys = new Set<string>();
+    let copiedObjects = 0;
+    const copyOne = async (relativePath: string) => {
+      const destination = this.replaceDestinationKey(
+        movieId,
+        relativePath,
+        versionTag,
+      );
+      try {
+        await this.minioService.copyObject(
+          this.stagingKey(movieId, relativePath),
+          destination,
+        );
+      } catch (error) {
+        throw new ReplaceCopyError(destination, error);
+      }
+      newFinalKeys.add(destination);
+      copiedObjects++;
+    };
+    try {
+      // Phases are awaited one after another: a pool over one sorted list
+      // only TENDS to keep the order, and a rendition playlist landing before
+      // the segments it names would hand a viewer mid-playback a 404.
+      for (const phase of this.swapPhases(dto.relativePaths)) {
+        await runPool(phase, REPLACE_COPY_CONCURRENCY, copyOne);
+      }
+      await copyOne(MASTER_RELATIVE_PATH);
+    } catch (error) {
+      const failedKey =
+        error instanceof ReplaceCopyError ? error.key : '(unknown)';
+      const message =
+        error instanceof ReplaceCopyError
+          ? error.causeMessage
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      // Nothing the viewer can reach has changed: the new package lives in
+      // its own hls/v-<tag>/ folder, so the OLD package is intact and the
+      // Video row still points at it — the title keeps playing and no
+      // status is touched (marking it FAILED here would be a self-inflicted
+      // outage). What is left is a half-written v-<tag>/ folder nobody
+      // references; it is swept so an abandoned attempt leaves no orphan.
+      // The staging is KEPT so a retried finalize-replace re-runs the copy
+      // into a fresh folder. The original and subtitle SOURCES phase 1 may
+      // already have overwritten in place are the new bundle's: they feed
+      // re-processing and the subtitle rows, never playback.
+      const failureReason = `replace interrupted during copy at ${failedKey}: ${message}`;
+      const halfWrittenPackage = `${this.storageService.hlsPackagePrefix(movieId, versionTag)}/`;
+      try {
+        await this.minioService.deleteByPrefix(halfWrittenPackage);
+      } catch (sweepError) {
+        this.logger.warn(
+          `Could not sweep the half-written package ${halfWrittenPackage}: ${sweepError instanceof Error ? sweepError.message : String(sweepError)}`,
+        );
+      }
+      this.logger.error(
+        `Video replace for movie ${movieId} interrupted after ${copiedObjects} object(s): ${failureReason}`,
+      );
+      await this.audit.record({
+        action: 'movie.video_replace',
+        actor,
+        target: { type: 'movie', id: movieId, label: movie.title },
+        before,
+        metadata: {
+          flow: 'replace',
+          outcome: 'interrupted',
+          failedKey,
+          copiedObjects,
+          stagingPrefix,
+          ...(movie.seriesId ? { seriesId: movie.seriesId } : {}),
+        },
+      });
+      throw new BadGatewayException(failureReason);
+    }
+
+    // 5. Delete what the new bundle does not carry: the WHOLE previous HLS
+    // package (its master, every rendition, its subs/* renditions — none of
+    // those keys is reused, because the new package sits in its own v-<tag>
+    // folder; a second replace sweeps the previous v-<tag> folder the same
+    // way), the old original when its extension changed, and every old
+    // subtitle SOURCE the bundle does not re-supply (bundle-uploaded and
+    // single-uploaded alike — the rows are replaced below the same way).
+    // A failure here is a storage leak, not a broken title: logged, counted,
+    // and the swap goes on.
+    const staleKeys = [...oldKeys].filter((key) => !newFinalKeys.has(key));
+    let deletedObjects = 0;
+    try {
+      await this.minioService.deleteKeys(staleKeys);
+      deletedObjects = staleKeys.length;
+    } catch (error) {
+      this.logger.warn(
+        `Video replace for movie ${movieId}: could not delete ${staleKeys.length} stale object(s) — ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
+    // 6. Runtime from the HLS now at the FINAL (versioned) master key. Never
+    // throws.
+    const masterKey = this.storageService.hlsMasterKey(movieId, versionTag);
+    const durationSeconds =
+      await this.videoDurationService.recoverHlsDurationSeconds(masterKey);
+
+    // 7. The Video row, rewritten IN PLACE so its id (the subtitles' FK,
+    // SubtitleManager's videoId) stays stable and "latest row = served row"
+    // keeps holding; created only when the title never had one. The old
+    // Subtitle rows go in the same transaction. hlsMasterPath and every
+    // playlistPath point into the versioned package — this row is the only
+    // record of which package is live (playback, diagnosis and the subtitle
+    // publisher all read the paths from here, never rebuild them).
+    const originalKey = this.bundleKey(movieId, originalPath);
+    const videoData = {
+      status: VideoStatus.READY,
+      originalFilename: basename(originalPath),
+      originalPath: originalKey,
+      hlsMasterPath: masterKey,
+      renditions: renditions.map((resolution) => ({
+        resolution,
+        playlistPath: `${this.storageService.hlsRenditionKeyPrefix(movieId, resolution, versionTag)}/index.m3u8`,
+      })) as unknown as Prisma.InputJsonValue,
+      resolution: null,
+      duration: durationSeconds,
+      failureReason: null,
+    };
+    const savedVideo = await this.prisma.$transaction(async (tx) => {
+      const row = video
+        ? await tx.video.update({ where: { id: video.id }, data: videoData })
+        : await tx.video.create({ data: { movieId, ...videoData } });
+      await tx.subtitle.deleteMany({ where: { videoId: row.id } });
+      return row;
+    });
+
+    // 8. New Subtitle rows, derived exactly as finalize derives them. Each
+    // create republishes the (new) master with the subtitle group, writing
+    // the renditions BESIDE it — videos/<id>/hls/v-<tag>/subs/<newId>.{vtt,
+    // m3u8} — because HlsSubtitlesService derives their keys from the row's
+    // hlsMasterPath just written in step 7, and the master names them by
+    // the relative URI `subs/<id>.m3u8`.
+    const createdSubtitles: Array<{
+      id: string;
+      language: string;
+      label: string;
+    }> = [];
+    for (const relativePath of subtitlePaths) {
+      const filename = basename(relativePath);
+      const extension = extname(filename).toLowerCase();
+      const stem = filename.slice(0, filename.length - extension.length);
+      const code = LANGUAGE_NAME_TO_CODE[stem.toLowerCase()];
+      const language = code ?? stem.toLowerCase();
+      const label = stem.charAt(0).toUpperCase() + stem.slice(1).toLowerCase();
+
+      const created = await this.subtitlesService.createFromExistingKey({
+        videoId: savedVideo.id,
+        language,
+        label,
+        format: EXTENSION_TO_FORMAT[extension],
+        objectKey: this.bundleKey(movieId, relativePath),
+      });
+      createdSubtitles.push({ id: created.id, language, label });
+    }
+
+    // 9. Movie.duration, guarded by `duration = 0` in the predicate exactly
+    // like finalize/backfill — a human-entered runtime is never overwritten.
+    // The seconds are returned so the admin can show them either way.
+    if (durationSeconds !== null) {
+      try {
+        await this.videoDurationService.fillMovieDurationIfUnknown(
+          movieId,
+          durationSeconds,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Could not fill duration for movie ${movieId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
+    // 10. Staging is spent. Best-effort: the cleanup sweep catches leftovers.
+    try {
+      await this.minioService.deleteByPrefix(stagingPrefix);
+    } catch (error) {
+      this.logger.warn(
+        `Video replace for movie ${movieId}: staging ${stagingPrefix} not cleared — ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
+    // 11. One audit row for the swap. No realtime emit: RealtimeGateway has
+    // no movie/video event.
+    const current = await this.prisma.movie.findUnique({
+      where: { id: movieId },
+      select: { duration: true },
+    });
+    await this.audit.record({
+      action: 'movie.video_replace',
+      actor,
+      target: { type: 'movie', id: movieId, label: movie.title },
+      before,
+      after: {
+        video: {
+          id: savedVideo.id,
+          status: VideoStatus.READY,
+          originalFilename: videoData.originalFilename,
+          originalPath: originalKey,
+          hlsMasterPath: masterKey,
+          renditions: videoData.renditions,
+          duration: durationSeconds,
+          resolution: null,
+          failureReason: null,
+        },
+        subtitles: createdSubtitles,
+        movieDuration: current?.duration ?? movie.duration,
+      },
+      metadata: {
+        flow: 'replace',
+        outcome: 'replaced',
+        renditions,
+        subtitles: createdSubtitles,
+        durationSeconds,
+        copiedObjects,
+        deletedObjects,
+        stagingPrefix,
+        hlsPackagePrefix: this.storageService.hlsPackagePrefix(
+          movieId,
+          versionTag,
+        ),
+        ...(movie.seriesId ? { seriesId: movie.seriesId } : {}),
+      },
+    });
+
+    this.logger.log(
+      `Video replaced for movie ${movieId} into hls/v-${versionTag}: ${copiedObjects} object(s) copied, ${deletedObjects} stale object(s) deleted, ${createdSubtitles.length} subtitle track(s)`,
+    );
+
+    return {
+      videoId: savedVideo.id,
+      status: VideoStatus.READY,
+      renditions,
+      subtitles: createdSubtitles.length,
+      durationSeconds,
+      copiedObjects,
+      deletedObjects,
+    };
+  }
+
+  /**
+   * The copy phases of step 4, master excluded (it is copied on its own
+   * afterwards). Each phase is fully written before the next starts, so a
+   * playlist can only ever name files that already exist at their final
+   * keys:
+   *   1. segments, subtitle sources, the original — nothing points at them
+   *      yet, so they can land in any order;
+   *   2. the rendition playlists (hls/<r>/index.m3u8), which name phase 1;
+   *   and then the master, which names phase 2, strictly last.
+   */
+  private swapPhases(relativePaths: string[]): string[][] {
+    const isRenditionPlaylist = (path: string) =>
+      path.startsWith(HLS_RELATIVE_PREFIX) && path.endsWith('/index.m3u8');
+    const rest = relativePaths.filter((path) => path !== MASTER_RELATIVE_PATH);
+    return [
+      rest.filter((path) => !isRenditionPlaylist(path)),
+      rest.filter(isRenditionPlaylist),
+    ].filter((phase) => phase.length > 0);
+  }
+
+  /**
+   * The tag naming one replace's package folder, minted ONCE per
+   * finalize-replace: 8 lowercase hex characters from the CSPRNG. An
+   * instance method rather than a free function so a test can pin it.
+   */
+  /** Deletes a replace's `hls/v-<tag>/` package when `hlsMasterPath` points into one; a no-op for the un-versioned layout. */
+  private async sweepVersionedPackage(
+    hlsMasterPath: string | null,
+  ): Promise<void> {
+    if (!hlsMasterPath || !hlsMasterPath.includes('/hls/v-')) return;
+    const prefix = hlsMasterPath.slice(0, hlsMasterPath.lastIndexOf('/') + 1);
+    try {
+      await this.minioService.deleteByPrefix(prefix);
+    } catch (error) {
+      this.logger.warn(
+        `Could not sweep the replaced package ${prefix} before reprocessing: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  private hlsVersionTag(): string {
+    return randomBytes(HLS_VERSION_TAG_BYTES).toString('hex');
+  }
+
+  /**
+   * The final key one staged bundle file is copied to during a replace.
+   *
+   * hls/** is re-rooted into videos/<movieId>/hls/v-<tag>/** instead of
+   * the videos/<movieId>/hls/** a first upload uses. Every cache server
+   * keeps a segment for 7 days BY FULL PATH and a transcoder names segments
+   * the same way every run (720p/segment_000.ts ...), so a bundle copied
+   * over the old keys was served as the new playlist with week-old cached
+   * segments; a folder no one has ever fetched from has nothing cached.
+   * The same package shape sits one level deeper, so the master's relative
+   * URIs, the videos/<movieId>/hls signing scope and the cache server's
+   * rules all hold unchanged.
+   *
+   * Everything else — the original and the subtitle sources — keeps the
+   * registry key a fresh upload would get: the original is never served
+   * through the cache, and a subtitle source is cached for 10 s only.
+   */
+  private replaceDestinationKey(
+    movieId: string,
+    relativePath: string,
+    versionTag: string,
+  ): string {
+    if (!relativePath.startsWith(HLS_RELATIVE_PREFIX)) {
+      return this.bundleKey(movieId, relativePath);
+    }
+    return `${this.storageService.hlsPackagePrefix(movieId, versionTag)}/${relativePath.slice(HLS_RELATIVE_PREFIX.length)}`;
+  }
+
   /**
    * FAILED is a real lifecycle step the admin sees on the movie, so the
    * rejected finalize is filed as a status change with what was wrong.
@@ -834,6 +1433,20 @@ export class UploadsService {
       }
       // Status says PROCESSING but nothing in this process is actually
       // working on it — orphaned. Safe to reprocess immediately.
+    } else if (video.status === VideoStatus.READY) {
+      // A READY row whose master playlist is gone from the store is
+      // functionally FAILED — /stream would hand out a link to nothing —
+      // and the playback diagnosis suggests exactly this action for it.
+      // One HEAD, evaluated only for a READY video, so a genuinely playable
+      // title still gets the 400 below rather than a surprise transcode.
+      const masterPresent =
+        video.hlsMasterPath !== null &&
+        (await this.minioService.objectExists(video.hlsMasterPath));
+      if (masterPresent) {
+        throw new BadRequestException(
+          'Only a failed or stuck video can be reprocessed',
+        );
+      }
     } else if (video.status !== VideoStatus.FAILED) {
       throw new BadRequestException(
         'Only a failed or stuck video can be reprocessed',
@@ -863,6 +1476,14 @@ export class UploadsService {
       this.processingService.release(video.id);
       throw error;
     }
+
+    // A replace leaves the live package in its own hls/v-<tag>/ folder,
+    // while ProcessingService always writes the un-versioned hls/ package
+    // (its per-tier resume depends on those fixed keys). Sweep the versioned
+    // folder first, or it would outlive the row that pointed at it. Best
+    // effort: a sweep failure is a storage leak, not a reason to refuse the
+    // repair the admin asked for.
+    await this.sweepVersionedPackage(video.hlsMasterPath);
 
     // Fire-and-forget, matching the exact same pattern completeUpload() uses
     // to kick off processing after a normal upload.
@@ -964,4 +1585,49 @@ export class UploadsService {
     }
     return session;
   }
+}
+
+/** A copy that failed mid-swap, carrying the FINAL key it was writing. */
+class ReplaceCopyError extends Error {
+  readonly causeMessage: string;
+  constructor(
+    readonly key: string,
+    cause: unknown,
+  ) {
+    const causeMessage = cause instanceof Error ? cause.message : String(cause);
+    super(`copy to ${key} failed: ${causeMessage}`);
+    this.name = 'ReplaceCopyError';
+    this.causeMessage = causeMessage;
+  }
+}
+
+/**
+ * Runs `work` over `items` with at most `concurrency` in flight — the same
+ * shape as MinioService.uploadDirectory's worker pool. The first failure
+ * rejects the whole pool; workers already past their `next++` finish their
+ * current item, nothing new starts.
+ */
+async function runPool<T>(
+  items: T[],
+  concurrency: number,
+  work: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  let failed = false;
+  const worker = async () => {
+    for (;;) {
+      if (failed) return;
+      const index = next++;
+      if (index >= items.length) return;
+      try {
+        await work(items[index]);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, worker),
+  );
 }

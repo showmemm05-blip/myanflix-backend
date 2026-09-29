@@ -6,6 +6,7 @@ import { quantizedExpiry, scopeForKey, signScope } from './stream-signature';
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
+  CopyObjectCommand,
   CreateBucketCommand,
   CreateMultipartUploadCommand,
   DeleteObjectCommand,
@@ -69,6 +70,14 @@ const PRESIGNED_URL_EXPIRY_SECONDS = 60 * 60;
 // UploadCleanupService) — if that cron is ever down or buggy, MinIO itself
 // still reclaims an abandoned multipart upload's part storage on its own.
 const ABANDONED_MULTIPART_LIFECYCLE_DAYS = 7;
+
+// The S3 API caps a single CopyObject at 5 GiB; a larger source (a big
+// archived original) has to be streamed through this process instead — see
+// copyObject().
+const SINGLE_COPY_MAX_BYTES = 5 * 1024 * 1024 * 1024;
+
+// DeleteObjects accepts at most 1000 keys per request.
+const DELETE_BATCH_SIZE = 1000;
 
 const CONTENT_TYPES: Record<string, string> = {
   '.m3u8': 'application/vnd.apple.mpegurl',
@@ -243,13 +252,36 @@ export class MinioService {
    * playbackUrl()/imageUrl(), originals and PDFs are never handed out.
    */
   signedPlaybackUrl(objectKey: string): string {
+    return `${this.playbackBase()}${this.signedPlaybackPath(objectKey)}`;
+  }
+
+  /**
+   * The PATH half of signedPlaybackUrl() — `/s/<expires>/<signature>/
+   * <bucket>/<objectKey>` — with no origin in front of it. Exists for the
+   * playback diagnosis, which fetches the exact token a client would receive
+   * but through the backend's own route to the cache server
+   * (STREAM_INTERNAL_BASE_URL) rather than the request-derived host, which
+   * inside a container is the container itself. Same StreamKeyNotSignable
+   * rule as the full URL.
+   */
+  signedPlaybackPath(objectKey: string): string {
     const scope = scopeForKey(objectKey);
     const expires = quantizedExpiry(
       Math.floor(Date.now() / 1000),
       this.streamUrlTtlSeconds,
     );
     const signature = signScope(scope, expires, this.streamSigningSecret);
-    return `${this.playbackBase()}/s/${expires}/${signature}/${this.bucket}/${objectKey}`;
+    return `/s/${expires}/${signature}/${this.bucket}/${objectKey}`;
+  }
+
+  /**
+   * The `<protocol>://<host>:<port>` this request's playback URLs hang off
+   * (see playbackBase()). Public only so a server-side probe can report the
+   * origin a client would be sent to; persisted URLs must keep using
+   * publicUrl().
+   */
+  playbackBaseUrl(): string {
+    return this.playbackBase();
   }
 
   /**
@@ -687,6 +719,111 @@ export class MinioService {
     } while (continuationToken);
   }
 
+  /**
+   * Every object key under `prefix`, with its last-modified stamp — the
+   * listing half of deleteByPrefix(), paginated the same way. Used by the
+   * video-replace swap to snapshot a title's current keys before anything is
+   * written, and by the cleanup sweep to age abandoned staging objects.
+   */
+  async listObjects(
+    prefix: string,
+  ): Promise<{ key: string; lastModified: Date | undefined }[]> {
+    const objects: { key: string; lastModified: Date | undefined }[] = [];
+    let continuationToken: string | undefined;
+    do {
+      const page = await this.client.send(
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          Prefix: prefix,
+          ContinuationToken: continuationToken,
+        }),
+      );
+      for (const object of page.Contents ?? []) {
+        if (!object.Key) continue;
+        objects.push({ key: object.Key, lastModified: object.LastModified });
+      }
+      continuationToken = page.IsTruncated
+        ? page.NextContinuationToken
+        : undefined;
+    } while (continuationToken);
+    return objects;
+  }
+
+  /** Just the keys under `prefix` — see listObjects(). */
+  async listKeys(prefix: string): Promise<string[]> {
+    return (await this.listObjects(prefix)).map((object) => object.key);
+  }
+
+  /**
+   * Deletes an explicit list of keys in DeleteObjects batches — the
+   * counterpart to deleteByPrefix() for callers that already decided WHICH
+   * objects go (the swap keeps every key the new bundle carries and removes
+   * only the stale rest, which a prefix delete cannot express). A key that is
+   * already gone is not an error, matching S3 delete semantics.
+   */
+  async deleteKeys(keys: string[]): Promise<void> {
+    for (let start = 0; start < keys.length; start += DELETE_BATCH_SIZE) {
+      const batch = keys.slice(start, start + DELETE_BATCH_SIZE);
+      await this.client.send(
+        new DeleteObjectsCommand({
+          Bucket: this.bucket,
+          Delete: { Objects: batch.map((Key) => ({ Key })) },
+        }),
+      );
+    }
+  }
+
+  /**
+   * Server-side copy of one object to another key in the same bucket — no
+   * bytes pass through this process for anything under the S3 single-copy
+   * cap (5 GiB). A larger source (a big archived original) is streamed
+   * GetObject -> multipart Upload instead: slower, but bounded memory, like
+   * uploadFile(). The content type is re-derived from the DESTINATION key so
+   * a staged file lands with the same type a direct upload would have given
+   * it. Throws when the source does not exist — the swap must never
+   * "succeed" by copying nothing.
+   */
+  async copyObject(sourceKey: string, destinationKey: string): Promise<void> {
+    const size = await this.objectSize(sourceKey);
+    if (size === null) {
+      throw new Error(`Object "${sourceKey}" does not exist`);
+    }
+
+    if (size < SINGLE_COPY_MAX_BYTES) {
+      await this.client.send(
+        new CopyObjectCommand({
+          Bucket: this.bucket,
+          // The SDK contract: `<bucket>/<key>`, URL-encoded per path segment.
+          CopySource: `${this.bucket}/${sourceKey
+            .split('/')
+            .map(encodeURIComponent)
+            .join('/')}`,
+          Key: destinationKey,
+          ContentType: this.contentTypeForKey(destinationKey),
+          MetadataDirective: 'REPLACE',
+        }),
+      );
+      return;
+    }
+
+    const response = await this.client.send(
+      new GetObjectCommand({ Bucket: this.bucket, Key: sourceKey }),
+    );
+    if (!response.Body) throw new Error(`Object "${sourceKey}" has no body`);
+    const upload = new Upload({
+      client: this.client,
+      params: {
+        Bucket: this.bucket,
+        Key: destinationKey,
+        Body: response.Body as Readable,
+        ContentType: this.contentTypeForKey(destinationKey),
+      },
+      partSize: UPLOAD_PART_SIZE,
+      queueSize: UPLOAD_QUEUE_SIZE,
+    });
+    await upload.done();
+  }
+
   /** Inverse of publicUrl() — recovers the object key from a URL this service previously produced, or null if it doesn't look like one of ours (e.g. a stale external URL). */
   keyFromPublicUrl(url: string): string | null {
     try {
@@ -704,13 +841,23 @@ export class MinioService {
    * download-side counterpart to uploadFile()'s streamed upload, so pulling
    * a multi-GB archived original back down for reprocessing never buffers
    * the whole thing in memory either.
+   *
+   * Returns the ETag (quotes stripped) of the bytes that were actually
+   * downloaded — the same response, so it cannot describe a different
+   * version than the file on disk. The book conversion uses it to tell a
+   * retry of the same PDF from a re-upload at the same key. Null only when
+   * the server sends none.
    */
-  async downloadFile(key: string, localFilePath: string): Promise<void> {
+  async downloadFile(
+    key: string,
+    localFilePath: string,
+  ): Promise<{ etag: string | null }> {
     const response = await this.client.send(
       new GetObjectCommand({ Bucket: this.bucket, Key: key }),
     );
     const body = response.Body as Readable;
     await pipeline(body, createWriteStream(localFilePath));
+    return { etag: response.ETag?.replace(/"/g, '') || null };
   }
 
   /** Uploads every file in `localDir` (non-recursive — HLS rendition dirs are flat) under `keyPrefix`. */

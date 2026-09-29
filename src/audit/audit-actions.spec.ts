@@ -48,6 +48,7 @@ describe('audit action catalogue', () => {
       'movie.update',
       'movie.publish',
       'movie.reprocess',
+      'movie.video_replace',
       'movie.unpublish',
       'movie.status_change',
       'movie.delete',
@@ -101,12 +102,15 @@ describe('audit action catalogue', () => {
       'user.status_change',
       'user.role_change',
       'user.wallet_adjust',
+      'user.password_reset',
+      'user.account_delete',
       // STAFF
       'staff.create',
       'staff.update',
       'staff.role_change',
       'staff.status_change',
       'staff.password_reset',
+      'staff.password_change',
       'staff.delete',
       'role.create',
       'role.update',
@@ -132,6 +136,11 @@ describe('audit action catalogue', () => {
       'withdrawal.bank_screenshot_attach',
       'withdrawal.risk_update',
       'withdrawal.verification_review',
+      'bank_transaction.store',
+      'bank_transaction.link',
+      'bank_transaction.unlink',
+      'bank_transaction.state_change',
+      'bank_transaction.screenshot_attach',
       'payment_account.create',
       'payment_account.update',
       'payment_account.delete',
@@ -157,6 +166,8 @@ describe('audit action catalogue', () => {
     expect(categoryOf('movie.update')).toBe(AuditCategory.CONTENT);
     expect(categoryOf('book_category.delete')).toBe(AuditCategory.CONTENT);
     expect(categoryOf('user.wallet_adjust')).toBe(AuditCategory.USERS);
+    expect(categoryOf('user.password_reset')).toBe(AuditCategory.USERS);
+    expect(categoryOf('user.account_delete')).toBe(AuditCategory.USERS);
     expect(categoryOf('staff.password_reset')).toBe(AuditCategory.STAFF);
     expect(categoryOf('role.permissions_change')).toBe(AuditCategory.STAFF);
     expect(categoryOf('level.reorder')).toBe(AuditCategory.STAFF);

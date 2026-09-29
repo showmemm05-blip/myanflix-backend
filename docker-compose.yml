@@ -55,8 +55,16 @@ services:
       # Left unset, playback URLs keep deriving their host from the request,
       # which is right for a dev machine that hops networks and wrong for a
       # split deployment — there, the host serving the API is the one machine
-      # with no cache server on it.
+      # with no cache server on it. The backend refuses to start while this is
+      # empty and the base above is a public address (see DOCKER.md).
       STREAM_PUBLIC_BASE_URL_IS_PUBLIC: ${STREAM_PUBLIC_BASE_URL_IS_PUBLIC:-}
+      # Where THIS container reaches the cache server for its own server-side
+      # checks (the admin's "Check playback" probe fetches the signed master
+      # through it). Never used for client URLs. Inside the container the
+      # request-derived host is usually `localhost` — the container itself —
+      # so without this the probe would report a false connection-refused.
+      # Real deployment: the cache server's address as seen from the API host.
+      STREAM_INTERNAL_BASE_URL: ${STREAM_INTERNAL_BASE_URL:-http://host.docker.internal:8080}
       # Signs the path token on every playback link; must equal the cache
       # server's STREAM_SIGNING_SECRET. Deliberately no default — a missing
       # secret refuses to boot rather than minting links nobody can play.

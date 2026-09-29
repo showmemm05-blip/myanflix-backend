@@ -4,6 +4,7 @@ import {
   Prisma,
   Role,
   SeriesStatus,
+  type Actor,
   type Category,
   type Series,
 } from '../generated/prisma/client';
@@ -30,7 +31,34 @@ import type { EpisodeQueryDto } from './dto/episode-query.dto';
 import type { UpdateSeriesDto } from './dto/update-series.dto';
 import { SeriesSort, type SeriesQueryDto } from './dto/series-query.dto';
 
-type SeriesWithCategories = Series & { categories?: Category[] };
+/** A cast entry as every series response carries it — same shape as MovieResponseDto.actors. */
+export interface SeriesActorRef {
+  id: string;
+  name: string;
+  imageUrl: string | null;
+}
+
+/** A stored series row with the relations every read path loads. */
+type SeriesWithRelations = Series & {
+  categories?: Category[];
+  actors?: Actor[];
+};
+
+/** The re-hosted view of SeriesWithRelations — what leaves the service. */
+type SeriesWithCategories = Omit<SeriesWithRelations, 'actors'> & {
+  actors: SeriesActorRef[];
+};
+
+/**
+ * The relations a series carries on every read — list rows, detail, and
+ * the rows create/update/updateStatus return. One constant so an admin
+ * edit can never receive a series without its cast and echo the emptiness
+ * back as a deletion (the same trap CATALOG_INCLUDE closes for movies).
+ */
+const SERIES_INCLUDE = {
+  categories: true,
+  actors: true,
+} satisfies Prisma.SeriesInclude;
 
 export interface SeriesFacets {
   genres: FacetValue[];
@@ -71,7 +99,32 @@ export function buildSeriesWhere(
   const yearRange = numberRange(query.yearFrom, query.yearTo);
   if (yearRange) where.releaseYear = yearRange;
 
+  // Cast: the show itself OR any of its episodes credits one of the
+  // selected actors. Placed under AND on purpose — findAll assigns the
+  // search predicate to `where.OR` at the top level, so a top-level OR
+  // here would be overwritten (or overwrite it) instead of composing.
+  if (query.actorIds?.length) {
+    where.AND = [
+      ...(Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : []),
+      seriesCastWhere(query.actorIds),
+    ];
+  }
+
   return where;
+}
+
+/**
+ * "This series features any of these actors": on the show-level cast OR on
+ * any episode's cast. Exported so the actor counts can reuse the exact
+ * same rule (ActorsService.seriesCount).
+ */
+export function seriesCastWhere(actorIds: string[]): Prisma.SeriesWhereInput {
+  return {
+    OR: [
+      { actors: { some: { id: { in: actorIds } } } },
+      { episodes: { some: { actors: { some: { id: { in: actorIds } } } } } },
+    ],
+  };
 }
 
 /** The series search predicate — title OR description, case-insensitive. */
@@ -109,9 +162,9 @@ export function seriesOrderBy(
   return [...SERIES_SORT_ORDER_BY[sort]];
 }
 
-/** The list-row include — categories plus the derived episode count. */
+/** The list-row include — the shared relations plus the derived episode count. */
 const SERIES_LIST_INCLUDE = {
-  categories: true,
+  ...SERIES_INCLUDE,
   _count: { select: { episodes: true } },
 } satisfies Prisma.SeriesInclude;
 
@@ -151,12 +204,24 @@ export class SeriesService {
    * values are never touched.
    */
   private withImageUrls<
-    T extends { posterUrl: string | null; coverUrl: string | null },
-  >(series: T): T {
+    T extends {
+      posterUrl: string | null;
+      coverUrl: string | null;
+      actors?: Actor[];
+    },
+  >(series: T): Omit<T, 'actors'> & { actors: SeriesActorRef[] } {
     return {
       ...series,
       posterUrl: this.minioService.imageUrl(series.posterUrl),
       coverUrl: this.minioService.imageUrl(series.coverUrl),
+      // The cast trimmed to what a client renders, headshots re-hosted —
+      // the exact shape MovieResponseDto.actors has, so the clients share
+      // one type for both.
+      actors: (series.actors ?? []).map((a) => ({
+        id: a.id,
+        name: a.name,
+        imageUrl: this.minioService.imageUrl(a.imageUrl),
+      })),
     };
   }
 
@@ -326,7 +391,7 @@ export class SeriesService {
   async findByIdOrThrow(id: string): Promise<SeriesWithCategories> {
     const series = await this.prisma.series.findUnique({
       where: { id },
-      include: { categories: true },
+      include: SERIES_INCLUDE,
     });
     if (!series) throw new NotFoundException('Series not found');
     return this.withImageUrls(series);
@@ -375,15 +440,18 @@ export class SeriesService {
   }
 
   async create(dto: CreateSeriesDto, actor: AuthenticatedUser) {
-    const { categoryIds, ...data } = dto;
+    const { categoryIds, actorIds, ...data } = dto;
     const created = await this.prisma.series.create({
       data: {
         ...this.withCanonicalImageUrls(data),
         categories: categoryIds
           ? { connect: categoryIds.map((id) => ({ id })) }
           : undefined,
+        actors: actorIds
+          ? { connect: actorIds.map((id) => ({ id })) }
+          : undefined,
       },
-      include: { categories: true },
+      include: SERIES_INCLUDE,
     });
 
     await this.audit.record({
@@ -399,7 +467,7 @@ export class SeriesService {
   async update(id: string, dto: UpdateSeriesDto, actor: AuthenticatedUser) {
     // The stored row, not the re-hosted view: image URLs must diff as saved.
     const before = await this.findStoredOrThrow(id);
-    const { categoryIds, ...data } = dto;
+    const { categoryIds, actorIds, ...data } = dto;
     const updated = await this.prisma.series.update({
       where: { id },
       data: {
@@ -407,8 +475,13 @@ export class SeriesService {
         categories: categoryIds
           ? { set: categoryIds.map((cid) => ({ id: cid })) }
           : undefined,
+        // `set`, not `connect`: the cast the admin submits is the whole cast,
+        // so anyone dropped from the list has to come off the show too.
+        actors: actorIds
+          ? { set: actorIds.map((aid) => ({ id: aid })) }
+          : undefined,
       },
-      include: { categories: true },
+      include: SERIES_INCLUDE,
     });
 
     await this.audit.record({
@@ -436,7 +509,7 @@ export class SeriesService {
     const updated = await this.prisma.series.update({
       where: { id },
       data: { status },
-      include: { categories: true },
+      include: SERIES_INCLUDE,
     });
 
     // → PUBLISHED = publish, PUBLISHED → other = unpublish, DRAFT ↔
@@ -455,9 +528,11 @@ export class SeriesService {
 
   /** The row exactly as stored (no image re-hosting) — what an audit `before` must be. */
   private async findStoredOrThrow(id: string) {
+    // Cast included too: the audit `before` must carry it, or a save that
+    // never touched the cast would diff as a cast appearing from nothing.
     const series = await this.prisma.series.findUnique({
       where: { id },
-      include: { categories: true },
+      include: SERIES_INCLUDE,
     });
     if (!series) throw new NotFoundException('Series not found');
     return series;
@@ -484,7 +559,7 @@ export class SeriesService {
     const series = await this.prisma.series.findUnique({
       where: { id },
       include: {
-        categories: true,
+        ...SERIES_INCLUDE,
         episodes: { include: { videos: { include: { subtitles: true } } } },
       },
     });
@@ -724,6 +799,7 @@ export class SeriesService {
     seriesId?: string;
     seasonNumber?: number;
     status?: MovieStatus;
+    search?: string;
   }): Prisma.MovieWhereInput {
     const where: Prisma.MovieWhereInput = {
       seriesId: filters.seriesId ?? { not: null },
@@ -731,6 +807,13 @@ export class SeriesService {
     if (filters.seasonNumber !== undefined)
       where.seasonNumber = filters.seasonNumber;
     if (filters.status) where.status = filters.status;
+    const search = filters.search?.trim();
+    if (search) {
+      where.OR = [
+        { title: { contains: search, mode: 'insensitive' } },
+        { series: { title: { contains: search, mode: 'insensitive' } } },
+      ];
+    }
     return where;
   }
 
@@ -767,6 +850,7 @@ export class SeriesService {
     seriesId?: string;
     seasonNumber?: number;
     status?: MovieStatus;
+    search?: string;
   }): Promise<number> {
     return this.prisma.movie.count({ where: this.buildEpisodeWhere(filters) });
   }

@@ -1,6 +1,12 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
-import { AccessType, Role, VideoStatus } from '../generated/prisma/client';
+import {
+  AccessType,
+  MovieStatus,
+  Role,
+  SeriesStatus,
+  VideoStatus,
+} from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { TrackingService } from '../tracking/tracking.service';
@@ -160,7 +166,9 @@ describe('VideosService — getStreamInfo', () => {
       movie: {
         findUnique: jest.fn().mockResolvedValue({
           id: MOVIE_ID,
+          status: MovieStatus.PUBLISHED,
           accessType: AccessType.SUBSCRIPTION,
+          seriesId: null,
           series: null,
         }),
       },
@@ -208,7 +216,9 @@ describe('VideosService — getStreamInfo', () => {
   it('never asks about a subscription for a FREE movie', async () => {
     prisma.movie.findUnique.mockResolvedValue({
       id: MOVIE_ID,
+      status: MovieStatus.PUBLISHED,
       accessType: AccessType.FREE,
+      seriesId: null,
       series: null,
     });
 
@@ -228,8 +238,13 @@ describe('VideosService — getStreamInfo', () => {
   it('gates an episode by the parent series, not its own accessType', async () => {
     prisma.movie.findUnique.mockResolvedValue({
       id: MOVIE_ID,
+      status: MovieStatus.PUBLISHED,
       accessType: AccessType.FREE,
-      series: { accessType: AccessType.SUBSCRIPTION },
+      seriesId: 'series-1',
+      series: {
+        status: SeriesStatus.PUBLISHED,
+        accessType: AccessType.SUBSCRIPTION,
+      },
     });
 
     await expect(
@@ -244,6 +259,126 @@ describe('VideosService — getStreamInfo', () => {
     await expect(
       service.getStreamInfo(MOVIE_ID, 'user-1', Role.USER),
     ).rejects.toThrow(NotFoundException);
+  });
+
+  /**
+   * H-7: the publish decision is part of the grant. A regular viewer is only
+   * ever sent a playable link for a title the catalogue would show them —
+   * the same rule as MoviesService.findByIdOrThrow — so an archived, draft
+   * or not-yet-released title, or an episode of a show that is not
+   * PUBLISHED, answers exactly like an id that does not exist. Checked
+   * before the subscription lookup, so a non-subscriber cannot tell an
+   * unpublished title from a missing one by getting a 403 instead of a 404.
+   */
+  describe('unpublished titles', () => {
+    const standalone = (status: MovieStatus) => ({
+      id: MOVIE_ID,
+      status,
+      accessType: AccessType.FREE,
+      seriesId: null,
+      series: null,
+    });
+    const episode = (status: MovieStatus, seriesStatus: SeriesStatus) => ({
+      id: MOVIE_ID,
+      status,
+      accessType: AccessType.FREE,
+      seriesId: 'series-1',
+      series: { status: seriesStatus, accessType: AccessType.FREE },
+    });
+
+    it.each([
+      MovieStatus.DRAFT,
+      MovieStatus.ARCHIVED,
+      MovieStatus.READY_TO_PUBLISH,
+      MovieStatus.PROCESSING,
+      MovieStatus.UPLOADING,
+      MovieStatus.FAILED,
+    ])(
+      'a USER gets the same 404 as a missing title for a %s movie, and no URL is minted',
+      async (status) => {
+        prisma.movie.findUnique.mockResolvedValue(standalone(status));
+
+        await expect(
+          service.getStreamInfo(MOVIE_ID, 'user-1', Role.USER),
+        ).rejects.toThrow(new NotFoundException('Movie not found'));
+        expect(prisma.video.findFirst).not.toHaveBeenCalled();
+        expect(minioService.signedPlaybackUrl).not.toHaveBeenCalled();
+      },
+    );
+
+    it('404s (not 403) a non-subscriber on an unpublished SUBSCRIPTION title — no existence leak', async () => {
+      prisma.movie.findUnique.mockResolvedValue({
+        ...standalone(MovieStatus.ARCHIVED),
+        accessType: AccessType.SUBSCRIPTION,
+      });
+
+      await expect(
+        service.getStreamInfo(MOVIE_ID, 'user-1', Role.USER),
+      ).rejects.toThrow(NotFoundException);
+      expect(prisma.userSubscription.findFirst).not.toHaveBeenCalled();
+    });
+
+    it.each([SeriesStatus.DRAFT, SeriesStatus.UNPUBLISHED])(
+      'a USER gets 404 for a PUBLISHED episode of a %s series',
+      async (seriesStatus) => {
+        prisma.movie.findUnique.mockResolvedValue(
+          episode(MovieStatus.PUBLISHED, seriesStatus),
+        );
+
+        await expect(
+          service.getStreamInfo(MOVIE_ID, 'user-1', Role.USER),
+        ).rejects.toThrow(new NotFoundException('Movie not found'));
+        expect(minioService.signedPlaybackUrl).not.toHaveBeenCalled();
+      },
+    );
+
+    it('a USER gets 404 for a DRAFT episode even when its series is PUBLISHED', async () => {
+      prisma.movie.findUnique.mockResolvedValue(
+        episode(MovieStatus.DRAFT, SeriesStatus.PUBLISHED),
+      );
+
+      await expect(
+        service.getStreamInfo(MOVIE_ID, 'user-1', Role.USER),
+      ).rejects.toThrow(NotFoundException);
+      expect(minioService.signedPlaybackUrl).not.toHaveBeenCalled();
+    });
+
+    it('a USER can play a PUBLISHED episode of a PUBLISHED series', async () => {
+      prisma.movie.findUnique.mockResolvedValue(
+        episode(MovieStatus.PUBLISHED, SeriesStatus.PUBLISHED),
+      );
+
+      const result = await service.getStreamInfo(MOVIE_ID, 'user-1', Role.USER);
+
+      expect(result.playlistUrl).toBe(`signed:${MASTER_KEY}`);
+    });
+
+    it.each([Role.SUPER_ADMIN, Role.ADMIN, Role.CONTENT_UPLOADER])(
+      'staff preview keeps working: %s can play a DRAFT movie',
+      async (role) => {
+        prisma.movie.findUnique.mockResolvedValue(
+          standalone(MovieStatus.DRAFT),
+        );
+
+        const result = await service.getStreamInfo(MOVIE_ID, 'staff-1', role);
+
+        expect(result.playlistUrl).toBe(`signed:${MASTER_KEY}`);
+      },
+    );
+
+    it('staff preview keeps working: an ADMIN can play an episode of an UNPUBLISHED series', async () => {
+      prisma.movie.findUnique.mockResolvedValue(
+        episode(MovieStatus.READY_TO_PUBLISH, SeriesStatus.UNPUBLISHED),
+      );
+
+      const result = await service.getStreamInfo(
+        MOVIE_ID,
+        'admin-1',
+        Role.ADMIN,
+      );
+
+      expect(result.playlistUrl).toBe(`signed:${MASTER_KEY}`);
+    });
   });
 
   it('404s when there is no READY video, even for staff', async () => {

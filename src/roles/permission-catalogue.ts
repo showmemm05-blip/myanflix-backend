@@ -70,6 +70,17 @@ export const PERMISSION_CATALOGUE = [
     actions: ['VIEW', 'APPROVE', 'REJECT', 'EDIT', 'BANK_EVIDENCE'],
   },
   {
+    // The phone-monitor's stored notifications (bank_transactions). VIEW is
+    // the list/detail/devices reads; BANK_EVIDENCE is the screenshot stream,
+    // kept apart for the same reason as DEPOSITS.BANK_EVIDENCE — the image
+    // shows the business account balance. Neither is seeded to any role
+    // but the implicit SUPER_ADMIN (no migration INSERT); the owner grants
+    // them from the roles matrix.
+    key: 'BANK_TRANSACTIONS',
+    label: 'Bank transactions',
+    actions: ['VIEW', 'BANK_EVIDENCE'],
+  },
+  {
     key: 'PAYMENT_METHODS',
     label: 'Payment Methods',
     actions: ['VIEW', 'CREATE', 'EDIT', 'DELETE'],

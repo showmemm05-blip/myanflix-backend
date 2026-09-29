@@ -89,8 +89,26 @@ describe('MEDIA_CLASSES', () => {
     );
     expect(expiring.map((mediaClass) => mediaClass.prefix)).toEqual([
       'temp/<sessionId>/',
+      'temp/video-replace/<movieId>/',
     ]);
-    expect(expiring[0].retention).toEqual({ kind: 'expires', afterDays: 7 });
+    for (const mediaClass of expiring) {
+      expect(mediaClass.retention).toEqual({ kind: 'expires', afterDays: 7 });
+    }
+  });
+
+  it('keeps the video-replace staging private and unsignable — the old video must keep playing until the swap', () => {
+    const staging = MEDIA_CLASSES.find(
+      (mediaClass) => mediaClass.id === 'videoReplaceStaging',
+    );
+    expect(staging).toBeDefined();
+    expect(staging!.prefix).toBe('temp/video-replace/<movieId>/');
+    expect(staging!.visibility).toBe('private');
+    expect(staging!.scopePattern).toBeNull();
+    // Lives under temp/, a namespace the cache server denies unconditionally
+    // (see the deny map in cacheserver/nginx/templates/default.conf.template)
+    // — never under videos/<id>/, where a legacy-allow mode would serve it
+    // unsigned or the title's own playback token would cover it.
+    expect(staging!.prefix.startsWith('temp/')).toBe(true);
   });
 });
 
@@ -117,11 +135,19 @@ describe('STREAM_SCOPE_PATTERNS', () => {
     expect(match?.[2]).toBe('720p/segment_000.ts');
   });
 
+  it('captures a replaced title’s versioned package under the same scope, the v-<tag> folder being part of the remainder', () => {
+    const match = STREAM_SCOPE_PATTERNS[0].exec(
+      `videos/${MOVIE_ID}/hls/v-abc123/720p/segment_000.ts`,
+    );
+    expect(match?.[1]).toBe(`videos/${MOVIE_ID}/hls`);
+    expect(match?.[2]).toBe('v-abc123/720p/segment_000.ts');
+  });
+
   it('requires a real remainder — the bare scope addresses no object', () => {
     for (const key of [`videos/${MOVIE_ID}/hls`, `videos/${MOVIE_ID}/hls/`]) {
-      expect(
-        STREAM_SCOPE_PATTERNS.some((pattern) => pattern.test(key)),
-      ).toBe(false);
+      expect(STREAM_SCOPE_PATTERNS.some((pattern) => pattern.test(key))).toBe(
+        false,
+      );
     }
   });
 });

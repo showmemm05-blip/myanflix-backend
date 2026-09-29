@@ -219,7 +219,7 @@ export function depositVerificationPayload(
     | 'receivingTransactionCode'
     | 'receivingTransactionAt'
     | 'receivingScreenshotKey'
-  >,
+  > & { bankTransaction?: { id: string } | null },
   now: Date = new Date(),
 ): DepositVerificationPayload {
   const view = verificationView(row, now);
@@ -234,5 +234,11 @@ export function depositVerificationPayload(
     receivingTransactionAt: row.receivingTransactionAt,
     bankCheckedAt: row.bankCheckedAt,
     hasBankScreenshot: row.receivingScreenshotKey !== null,
+    bankTransactionId: row.bankTransaction?.id ?? null,
   };
 }
+
+/** The one-column include every admin deposit/withdrawal read adds — a probe of the unique link index per row. */
+export const BANK_TRANSACTION_LINK_INCLUDE = {
+  bankTransaction: { select: { id: true } },
+} as const;

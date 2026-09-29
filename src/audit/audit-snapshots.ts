@@ -1,6 +1,7 @@
 import type {
   Actor,
   AppRole,
+  BankTransaction,
   Book,
   BookAuthor,
   BookCategory,
@@ -120,6 +121,7 @@ export function movieSnapshot(movie: MovieSnapshotInput): Snapshot {
 
 export type SeriesSnapshotInput = Partial<Series> & {
   categories?: readonly NamedRow[] | null;
+  actors?: readonly NamedRow[] | null;
 };
 
 export function seriesSnapshot(series: SeriesSnapshotInput): Snapshot {
@@ -129,11 +131,13 @@ export function seriesSnapshot(series: SeriesSnapshotInput): Snapshot {
     genre: nullIfUndefined(series.genre),
     language: nullIfUndefined(series.language),
     releaseYear: nullIfUndefined(series.releaseYear),
+    rating: nullIfUndefined(series.rating),
     accessType: nullIfUndefined(series.accessType),
     status: nullIfUndefined(series.status),
     posterUrl: nullIfUndefined(series.posterUrl),
     coverUrl: nullIfUndefined(series.coverUrl),
     categories: refs(series.categories),
+    actors: refs(series.actors),
   };
 }
 
@@ -384,6 +388,39 @@ export function withdrawalSnapshot(withdrawal: Partial<Withdrawal>): Snapshot {
     matchStatus: nullIfUndefined(withdrawal.matchStatus),
     riskLevel: nullIfUndefined(withdrawal.riskLevel),
     riskReasons: nullIfUndefined(withdrawal.riskReasons),
+    // C-4 — the ledger row of the money held at request time; null on a
+    // row from before holds (approve debits those instead).
+    holdTransactionId: nullIfUndefined(withdrawal.holdTransactionId),
+  };
+}
+
+/**
+ * A stored phone notification. The screenshot KEY is deliberately absent
+ * (evidence exists / does not — never where it lives), like the deposit
+ * and withdrawal pickers; the notification text was never stored at all.
+ */
+export function bankTransactionSnapshot(
+  row: Partial<BankTransaction>,
+): Snapshot {
+  return {
+    idempotencyKey: nullIfUndefined(row.idempotencyKey),
+    deviceSerial: nullIfUndefined(row.deviceSerial),
+    paymentAccountId: nullIfUndefined(row.paymentAccountId),
+    direction: nullIfUndefined(row.direction),
+    amount: money(row.amount),
+    currency: nullIfUndefined(row.currency),
+    txCode: nullIfUndefined(row.txCode),
+    txCodeLast6: nullIfUndefined(row.txCodeLast6),
+    occurredAt: nullIfUndefined(row.occurredAt),
+    postedAt: nullIfUndefined(row.postedAt),
+    counterparty: nullIfUndefined(row.counterparty),
+    detailStatus: nullIfUndefined(row.detailStatus),
+    state: nullIfUndefined(row.state),
+    linkedDepositId: nullIfUndefined(row.linkedDepositId),
+    linkedWithdrawalId: nullIfUndefined(row.linkedWithdrawalId),
+    matchedAt: nullIfUndefined(row.matchedAt),
+    hasScreenshot:
+      row.screenshotKey === undefined ? null : row.screenshotKey !== null,
   };
 }
 
