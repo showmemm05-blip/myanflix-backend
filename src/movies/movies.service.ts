@@ -70,6 +70,9 @@ export interface MovieFacets {
 
 const FACETS_TTL_MS = 60_000;
 
+/** How long the most-viewed / most-purchased rankings may be reused. */
+const POPULARITY_TTL_MS = 60_000;
+
 type StatusDerivedAuditAction<Prefix extends 'movie' | 'series'> = Extract<
   AuditAction,
   | `${Prefix}.update`
@@ -163,6 +166,9 @@ export function buildMovieWhere(
 
   if (query.accessType) where.accessType = query.accessType;
   if (query.categoryId) where.categories = { some: { id: query.categoryId } };
+  // Only narrows: the PUBLISHED / standalone rules above still apply, so an
+  // unpublished id or an episode id is simply not returned to a viewer.
+  if (query.ids?.length) where.id = { in: query.ids };
 
   // Legacy ?genre= (the pre-filter-system deep-link contract) merges into
   // the canonical genres list rather than being a second code path.
@@ -416,6 +422,13 @@ export class MoviesService {
    * restore order. The id-only scan is fine to ~10k catalog rows; the
    * at-scale successor is a raw-SQL LEFT JOIN ... GROUP BY ... ORDER BY
    * count with LIMIT/OFFSET pushed into the database.
+   *
+   * Step (1) comes from getPopularityCounts (a 60s in-memory cache), so the
+   * whole-table count runs at most once a minute per instance instead of on
+   * every page. The `where` (PUBLISHED-only for guests/users, standalone
+   * films only) is still applied fresh in step (2) on every request, so the
+   * cache can make the RANKING up to a minute old but never shows a title
+   * the viewer may not see.
    */
   private async findAggregateOrderedPage(
     where: Prisma.MovieWhereInput,
@@ -423,19 +436,7 @@ export class MoviesService {
     page: number,
     limit: number,
   ): Promise<{ items: MovieWithCategories[]; total: number }> {
-    const grouped =
-      sort === MovieSort.MOST_VIEWED
-        ? await this.prisma.watchHistory.groupBy({
-            by: ['movieId'],
-            _count: { _all: true },
-          })
-        : await this.prisma.purchase.groupBy({
-            by: ['movieId'],
-            _count: { _all: true },
-          });
-    const countByMovieId = new Map(
-      grouped.map((g) => [g.movieId, g._count._all]),
-    );
+    const countByMovieId = await this.getPopularityCounts(sort);
 
     const rows = await this.prisma.movie.findMany({
       where,
@@ -466,6 +467,48 @@ export class MoviesService {
       return movie ? [movie] : [];
     });
     return { items, total };
+  }
+
+  /**
+   * Per-sort popularity counts (movieId -> count), cached for 60s per
+   * instance — the same trade-off getFacets documents. The IN-FLIGHT promise
+   * is stored, not just the finished map, so requests that arrive together
+   * after expiry share one groupBy instead of each running its own. A
+   * rejected promise is dropped at once so the next request retries.
+   */
+  private popularityCache = new Map<
+    MovieSort.MOST_VIEWED | MovieSort.MOST_PURCHASED,
+    { promise: Promise<Map<string, number>>; expiresAt: number }
+  >();
+
+  private getPopularityCounts(
+    sort: MovieSort.MOST_VIEWED | MovieSort.MOST_PURCHASED,
+  ): Promise<Map<string, number>> {
+    const now = Date.now();
+    const cached = this.popularityCache.get(sort);
+    if (cached && cached.expiresAt > now) return cached.promise;
+
+    const promise = (async () => {
+      const grouped =
+        sort === MovieSort.MOST_VIEWED
+          ? await this.prisma.watchHistory.groupBy({
+              by: ['movieId'],
+              _count: { _all: true },
+            })
+          : await this.prisma.purchase.groupBy({
+              by: ['movieId'],
+              _count: { _all: true },
+            });
+      return new Map(grouped.map((g) => [g.movieId, g._count._all]));
+    })();
+    const entry = { promise, expiresAt: now + POPULARITY_TTL_MS };
+    this.popularityCache.set(sort, entry);
+    promise.catch(() => {
+      if (this.popularityCache.get(sort) === entry) {
+        this.popularityCache.delete(sort);
+      }
+    });
+    return promise;
   }
 
   private facetsCache: { data: MovieFacets; expiresAt: number } | null = null;
@@ -836,25 +879,57 @@ export class MoviesService {
     }
   }
 
+  /**
+   * The most-purchased ranking (movie ids, most bought first), cached per
+   * `limit` for 60s per instance (same pattern as getPopularityCounts: the
+   * in-flight promise is shared, a failure is dropped so the next call
+   * retries). Only the expensive purchases groupBy is cached. The movie rows
+   * — and with them the PUBLISHED filter — are read fresh on every request,
+   * so a title that staff unpublish or delete leaves this public row at once,
+   * whichever code path changed it.
+   */
+  private mostPurchasedCache = new Map<
+    number,
+    { promise: Promise<string[]>; expiresAt: number }
+  >();
+
+  private getMostPurchasedIds(limit: number): Promise<string[]> {
+    const now = Date.now();
+    const cached = this.mostPurchasedCache.get(limit);
+    if (cached && cached.expiresAt > now) return cached.promise;
+
+    const promise = this.prisma.purchase
+      .groupBy({
+        by: ['movieId'],
+        _count: { movieId: true },
+        orderBy: { _count: { movieId: 'desc' } },
+        take: limit,
+      })
+      .then((grouped) => grouped.map((g) => g.movieId));
+    const entry = { promise, expiresAt: now + POPULARITY_TTL_MS };
+    this.mostPurchasedCache.set(limit, entry);
+    promise.catch(() => {
+      if (this.mostPurchasedCache.get(limit) === entry) {
+        this.mostPurchasedCache.delete(limit);
+      }
+    });
+    return promise;
+  }
+
   /** Published movies ranked by how many users have purchased them. */
   async getMostPurchased(limit = 12): Promise<MovieWithCategories[]> {
-    const grouped = await this.prisma.purchase.groupBy({
-      by: ['movieId'],
-      _count: { movieId: true },
-      orderBy: { _count: { movieId: 'desc' } },
-      take: limit,
-    });
-    if (grouped.length === 0) return [];
+    const rankedIds = await this.getMostPurchasedIds(limit);
+    if (rankedIds.length === 0) return [];
 
     const movies = await this.prisma.movie.findMany({
       where: {
-        id: { in: grouped.map((g) => g.movieId) },
+        id: { in: rankedIds },
         status: MovieStatus.PUBLISHED,
       },
       include: CATALOG_INCLUDE,
     });
 
-    const orderById = new Map(grouped.map((g, index) => [g.movieId, index]));
+    const orderById = new Map(rankedIds.map((id, index) => [id, index]));
     return movies.sort(
       (a, b) => (orderById.get(a.id) ?? 0) - (orderById.get(b.id) ?? 0),
     );

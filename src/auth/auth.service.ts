@@ -8,7 +8,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import type { StringValue } from 'ms';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { OtpPurpose, Role, UserStatus } from '../generated/prisma/client';
 import type { Prisma, User } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -16,13 +16,13 @@ import { UsersService } from '../users/users.service';
 import { OtpService } from '../otp/otp.service';
 import { TrackingService } from '../tracking/tracking.service';
 import { AuditService } from '../audit/audit.service';
-import type { RegisterDto } from './dto/register.dto';
 import type { LoginDto } from './dto/login.dto';
 import type { OtpRequestPurpose } from './dto/request-otp.dto';
 import type { AuthenticatedUser } from './types/authenticated-user.type';
 import type { JwtPayload, RefreshPayload } from './types/jwt-payload.type';
 import { PASSWORD_SALT_ROUNDS } from './password.constants';
 import { SessionRevocationService } from './session-revocation.service';
+import { isUniqueViolation } from './unique-violation.util';
 
 export interface AuthTokens {
   accessToken: string;
@@ -40,6 +40,16 @@ function hashToken(token: string): string {
  * opens one. Lives long enough to cover the 5-minute code plus a resend.
  */
 const PHONE_LOGIN_STEP_TTL = '10m';
+
+/**
+ * M-20: how many usernames a phone sign-up tries before giving up —
+ * `user_<digits>` first, then `user_<digits>_<6 hex>` picked at random. A
+ * squatter can take the first name (through any door that lets a caller
+ * choose a username); two random hex suffixes colliding is not realistic.
+ */
+const PHONE_SIGNUP_USERNAME_ATTEMPTS = 3;
+const PHONE_SIGNUP_CONFLICT_MESSAGE =
+  'This phone could not be signed up right now, please try again';
 const PHONE_LOGIN_STEP_PURPOSE = 'phone-login';
 const STEP_TOKEN_REFUSED = 'Please enter your password again.';
 const RESET_UNKNOWN_PHONE = 'No account was found for this phone number.';
@@ -95,30 +105,6 @@ export class AuthService {
     private readonly audit: AuditService,
     private readonly sessions: SessionRevocationService,
   ) {}
-
-  async register(
-    dto: RegisterDto,
-  ): Promise<{ user: AuthenticatedUser } & AuthTokens> {
-    const existing = await this.usersService.findByUsername(dto.username);
-    if (existing) {
-      throw new ConflictException('Username is already registered');
-    }
-
-    const passwordHash = await bcrypt.hash(dto.password, PASSWORD_SALT_ROUNDS);
-    const user = await this.usersService.create({
-      username: dto.username,
-      password: passwordHash,
-    });
-
-    const authenticatedUser: AuthenticatedUser = {
-      id: user.id,
-      username: user.username,
-      role: user.role,
-      appRoleId: user.appRoleId,
-    };
-    const tokens = await this.issueTokens(authenticatedUser);
-    return { user: authenticatedUser, ...tokens };
-  }
 
   /**
    * The staff door (the admin app). H-6: a customer account (role USER)
@@ -257,15 +243,7 @@ export class AuthService {
           'A password is required to create a new account',
         );
       }
-      // A username has no independent meaning for a phone account —
-      // synthesize a unique placeholder (the digits make it unique per
-      // phone) so the required unique column stays satisfied.
-      const digits = phone.replace(/\D/g, '');
-      user = await this.usersService.create({
-        username: `user_${digits}`,
-        password: await bcrypt.hash(password, PASSWORD_SALT_ROUNDS),
-        phone,
-      });
+      user = await this.createPhoneAccount(phone, password);
     }
 
     if (user.status !== 'ACTIVE') {
@@ -286,6 +264,44 @@ export class AuthService {
       this.trackingService.startSession(user.id),
     );
     return { user: authenticatedUser, ...tokens };
+  }
+
+  /**
+   * A username has no independent meaning for a phone account — synthesize
+   * a placeholder from the digits (`user_959123456789`) so the required
+   * unique column stays satisfied. M-20: that name is NOT guaranteed free
+   * (a Google e-mail or a staff-created account may already hold it), so a
+   * taken name falls back to `user_<digits>_<random>` instead of surfacing
+   * the unique violation as a 500 — the caller's one-time code was already
+   * spent, so the sign-up must not die on a name nobody will ever see.
+   * Still taken after every attempt → 409, never 500.
+   */
+  private async createPhoneAccount(
+    phone: string,
+    password: string,
+  ): Promise<User> {
+    const digits = phone.replace(/\D/g, '');
+    const passwordHash = await bcrypt.hash(password, PASSWORD_SALT_ROUNDS);
+    for (
+      let attempt = 1;
+      attempt <= PHONE_SIGNUP_USERNAME_ATTEMPTS;
+      attempt++
+    ) {
+      const username =
+        attempt === 1
+          ? `user_${digits}`
+          : `user_${digits}_${randomBytes(3).toString('hex')}`;
+      try {
+        return await this.usersService.create({
+          username,
+          password: passwordHash,
+          phone,
+        });
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+      }
+    }
+    throw new ConflictException(PHONE_SIGNUP_CONFLICT_MESSAGE);
   }
 
   /**

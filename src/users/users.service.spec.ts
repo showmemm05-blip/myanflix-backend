@@ -6,7 +6,13 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
-import { Role, UserStatus } from '../generated/prisma/client';
+import {
+  Prisma,
+  Role,
+  SmsMessageStatus,
+  UserStatus,
+} from '../generated/prisma/client';
+import { SMS_REDACTED } from '../sms/sms.config';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
@@ -19,7 +25,7 @@ import {
   createRoleAwarePermissionResolver,
   seededRoleRow,
 } from '../../test/seeded-permission-resolver';
-import { UsersService } from './users.service';
+import { UsersService, walletTotalsFromTypeSums } from './users.service';
 
 /** SessionRevocationService stand-in: records what was revoked and kicked. */
 function makeSessions() {
@@ -534,6 +540,64 @@ describe('UsersService — findAll search', () => {
     service = module.get(UsersService);
   });
 
+  it('reads both wallet totals for the page in ONE grouped query, with the same sums as the old two (bam-09)', async () => {
+    prisma.user.findMany.mockResolvedValue([
+      blake,
+      { ...blake, id: 'user-2', username: 'john' },
+      { ...blake, id: 'user-3', username: 'nobody' },
+    ]);
+    prisma.transaction.groupBy.mockResolvedValue([
+      {
+        userId: 'user-1',
+        type: 'PURCHASE',
+        _sum: { amount: new Prisma.Decimal('0.1') },
+      },
+      {
+        userId: 'user-1',
+        type: 'SUBSCRIPTION',
+        _sum: { amount: new Prisma.Decimal('0.2') },
+      },
+      {
+        userId: 'user-1',
+        type: 'DEPOSIT',
+        _sum: { amount: new Prisma.Decimal(50000) },
+      },
+      {
+        userId: 'user-2',
+        type: 'SUBSCRIPTION',
+        _sum: { amount: new Prisma.Decimal(3000) },
+      },
+    ]);
+
+    const { walletByUserId } = await service.findAll({});
+
+    expect(prisma.transaction.groupBy).toHaveBeenCalledTimes(1);
+    expect(prisma.transaction.groupBy).toHaveBeenCalledWith({
+      by: ['userId', 'type'],
+      where: {
+        userId: { in: ['user-1', 'user-2', 'user-3'] },
+        type: { in: ['PURCHASE', 'SUBSCRIPTION', 'DEPOSIT'] },
+        status: 'COMPLETED',
+      },
+      _sum: { amount: true },
+    });
+    // Added as Decimals, so 0.1 + 0.2 is exactly 0.3 — what one SQL SUM
+    // over both types returned (plain number addition would give
+    // 0.30000000000000004).
+    expect(walletByUserId.get('user-1')).toMatchObject({
+      totalSpent: 0.3,
+      totalDeposited: 50000,
+    });
+    expect(walletByUserId.get('user-2')).toMatchObject({
+      totalSpent: 3000,
+      totalDeposited: 0,
+    });
+    expect(walletByUserId.get('user-3')).toMatchObject({
+      totalSpent: 0,
+      totalDeposited: 0,
+    });
+  });
+
   it('matches the display name case-insensitively, alongside username and phone', async () => {
     await service.findAll({ search: 'blake' });
 
@@ -824,6 +888,7 @@ describe('UsersService — deleteOwnAccount (H-16)', () => {
     withdrawal: { findFirst: jest.Mock };
     user: { update: jest.Mock; delete: jest.Mock };
     otpCode: { deleteMany: jest.Mock };
+    smsMessage: { updateMany: jest.Mock };
     userSession: { updateMany: jest.Mock };
     comment: { updateMany: jest.Mock };
     feedback: { updateMany: jest.Mock };
@@ -877,6 +942,7 @@ describe('UsersService — deleteOwnAccount (H-16)', () => {
       withdrawal: { findFirst: jest.fn().mockResolvedValue(null) },
       user: { update: jest.fn().mockResolvedValue({}), delete: jest.fn() },
       otpCode: { deleteMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      smsMessage: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
       userSession: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
       comment: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
       feedback: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
@@ -932,6 +998,10 @@ describe('UsersService — deleteOwnAccount (H-16)', () => {
       displayName: null,
       avatar: null,
       lastIpAddress: null,
+      withdrawalCodeHash: null,
+      withdrawalCodeSetAt: null,
+      withdrawalCodeFailedCount: 0,
+      withdrawalCodeLockedUntil: null,
       status: UserStatus.CLOSED,
     });
     // The stored password is a hash of nothing anyone knows.
@@ -968,6 +1038,31 @@ describe('UsersService — deleteOwnAccount (H-16)', () => {
       },
       tx,
     );
+  });
+
+  it('B4: cancels the QUEUED SMS to that phone and redacts its number and body from sms_messages, inside the transaction', async () => {
+    await service.deleteOwnAccount(caller);
+
+    expect(tx.smsMessage.updateMany).toHaveBeenNthCalledWith(1, {
+      where: { phone: owner.phone, status: SmsMessageStatus.QUEUED },
+      data: { status: SmsMessageStatus.CANCELLED },
+    });
+    expect(tx.smsMessage.updateMany).toHaveBeenNthCalledWith(2, {
+      where: { phone: owner.phone },
+      data: {
+        phone: SMS_REDACTED,
+        body: SMS_REDACTED,
+        redactedAt: expect.any(Date),
+      },
+    });
+  });
+
+  it('B4: an account without a phone has no SMS to redact', async () => {
+    prisma.user.findUnique.mockResolvedValue({ ...owner, phone: null });
+
+    await service.deleteOwnAccount(caller);
+
+    expect(tx.smsMessage.updateMany).not.toHaveBeenCalled();
   });
 
   it('records user.account_delete with the owner as actor, under the anonymised name, inside the transaction', async () => {
@@ -1070,6 +1165,76 @@ describe('UsersService — deleteOwnAccount (H-16)', () => {
         service.deleteOwnAccount({ ...caller, role: Role.ADMIN }),
       ).rejects.toBeInstanceOf(ForbiddenException);
       expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('walletTotalsFromTypeSums (bam-09)', () => {
+  const sum = (value: string | null) => ({
+    amount: value === null ? null : new Prisma.Decimal(value),
+  });
+
+  it('adds PURCHASE and SUBSCRIPTION into "spent" and keeps DEPOSIT apart', () => {
+    expect(
+      walletTotalsFromTypeSums([
+        { type: 'PURCHASE', _sum: sum('1500') },
+        { type: 'SUBSCRIPTION', _sum: sum('3000.50') },
+        { type: 'DEPOSIT', _sum: sum('10000') },
+      ]),
+    ).toEqual({ totalSpent: 4500.5, totalDeposited: 10000 });
+  });
+
+  it('gives 0 for a total with no rows or a NULL sum, as the old aggregates did', () => {
+    expect(walletTotalsFromTypeSums([])).toEqual({
+      totalSpent: 0,
+      totalDeposited: 0,
+    });
+    expect(
+      walletTotalsFromTypeSums([{ type: 'DEPOSIT', _sum: sum(null) }]),
+    ).toEqual({ totalSpent: 0, totalDeposited: 0 });
+  });
+
+  it('ignores any other type, should one ever be grouped', () => {
+    expect(
+      walletTotalsFromTypeSums([
+        { type: 'REFUND', _sum: sum('999') },
+        { type: 'WITHDRAWAL', _sum: sum('999') },
+      ]),
+    ).toEqual({ totalSpent: 0, totalDeposited: 0 });
+  });
+});
+
+describe('UsersService.findAuthSubject (be-cat-16 / db-14)', () => {
+  it('reads only the columns an authentication check needs — never the password or withdrawal-code hash', async () => {
+    const row = {
+      id: 'user-1',
+      username: 'blake',
+      role: Role.USER,
+      appRoleId: null,
+      status: UserStatus.ACTIVE,
+      sessionsRevokedAt: null,
+    };
+    const prisma = { user: { findUnique: jest.fn().mockResolvedValue(row) } };
+    const service = new UsersService(
+      prisma as unknown as PrismaService,
+      {} as MinioService,
+      {} as StorageService,
+      {} as AuthorityService,
+      {} as AuditService,
+      {} as SessionRevocationService,
+    );
+
+    await expect(service.findAuthSubject('user-1')).resolves.toBe(row);
+    expect(prisma.user.findUnique).toHaveBeenCalledWith({
+      where: { id: 'user-1' },
+      select: {
+        id: true,
+        username: true,
+        role: true,
+        appRoleId: true,
+        status: true,
+        sessionsRevokedAt: true,
+      },
     });
   });
 });

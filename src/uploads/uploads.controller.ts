@@ -2,7 +2,6 @@ import {
   BadRequestException,
   Body,
   Controller,
-  Get,
   HttpCode,
   HttpStatus,
   Param,
@@ -14,7 +13,6 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { SkipThrottle } from '@nestjs/throttler';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
@@ -34,8 +32,11 @@ export class UploadsController {
   constructor(private readonly uploadsService: UploadsService) {}
 
   @Post('init')
-  initUpload(@Body() dto: InitUploadDto) {
-    return this.uploadsService.initUpload(dto);
+  initUpload(
+    @Body() dto: InitUploadDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.uploadsService.initUpload(user, dto);
   }
 
   // Serves poster/cover art for movies, series, episodes AND categories, so
@@ -52,6 +53,7 @@ export class UploadsController {
   async uploadImage(
     @UploadedFile() file: Express.Multer.File | undefined,
     @Body() dto: UploadImageDto,
+    @CurrentUser() user: AuthenticatedUser,
   ) {
     if (!file)
       throw new BadRequestException(
@@ -61,6 +63,7 @@ export class UploadsController {
       dto.purpose,
       file.originalname,
       file.buffer,
+      user,
     );
     return { url };
   }
@@ -71,9 +74,9 @@ export class UploadsController {
   // forcing a fresh OPTIONS round-trip for every single chunk.
   // No response body: the client already knows what it just sent and never
   // reads this response (chunkNumber travels with each chunk, so nothing
-  // here needs echoing back). Returning getStatus() used to run a second
-  // session lookup plus a readdir+sort of every chunk received so far on
-  // EVERY chunk request — pure O(n) waste per chunk that nothing consumed.
+  // here needs echoing back). Returning the session status used to run a
+  // second session lookup plus a readdir+sort of every chunk received so far
+  // on EVERY chunk request — pure O(n) waste per chunk that nothing consumed.
   @Post(':uploadId/chunk')
   @HttpCode(HttpStatus.NO_CONTENT)
   @UseInterceptors(
@@ -92,13 +95,6 @@ export class UploadsController {
     await this.uploadsService.saveChunk(uploadId, chunkNumber, file.buffer);
   }
 
-  /** Polled by the admin during an upload — never rate limited. */
-  @SkipThrottle()
-  @Get(':uploadId/status')
-  getStatus(@Param('uploadId', ParseUUIDPipe) uploadId: string) {
-    return this.uploadsService.getStatus(uploadId);
-  }
-
   @Post(':uploadId/complete')
   completeUpload(
     @Param('uploadId', ParseUUIDPipe) uploadId: string,
@@ -114,15 +110,6 @@ export class UploadsController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.uploadsService.reprocessVideo(movieId, user);
-  }
-
-  /** Cross-checks an externally-pre-transcoded bundle's uploaded files against what's actually in MinIO. */
-  @Post(':movieId/validate-external')
-  validateExternal(
-    @Param('movieId', ParseUUIDPipe) movieId: string,
-    @Body() dto: ValidateExternalBundleDto,
-  ) {
-    return this.uploadsService.validateExternalBundle(movieId, dto);
   }
 
   /**
@@ -157,8 +144,11 @@ export class UploadsController {
    * attempt; writes nothing else.
    */
   @Post(':movieId/replace-begin')
-  replaceBegin(@Param('movieId', ParseUUIDPipe) movieId: string) {
-    return this.uploadsService.beginReplace(movieId);
+  replaceBegin(
+    @Param('movieId', ParseUUIDPipe) movieId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.uploadsService.beginReplace(movieId, user);
   }
 
   /**
@@ -186,7 +176,8 @@ export class UploadsController {
   @HttpCode(HttpStatus.NO_CONTENT)
   async replaceCancel(
     @Param('movieId', ParseUUIDPipe) movieId: string,
+    @CurrentUser() user: AuthenticatedUser,
   ): Promise<void> {
-    await this.uploadsService.cancelReplace(movieId);
+    await this.uploadsService.cancelReplace(movieId, user);
   }
 }

@@ -16,10 +16,8 @@ import type { Subscription } from 'rxjs';
 import type { Server, Socket } from 'socket.io';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { ClientPlatform, Role, UserStatus } from '../generated/prisma/client';
-import {
-  resolveClientIp,
-  resolveClientPlatform,
-} from '../common/storage/request-host.context';
+import { resolveClientPlatform } from '../common/storage/request-host.context';
+import { trustedClientIp } from '../config/trusted-proxies';
 import { PeakUsersService } from '../peak-users/peak-users.service';
 import { UsersService } from '../users/users.service';
 import type { JwtPayload } from '../auth/types/jwt-payload.type';
@@ -131,6 +129,8 @@ export interface DepositVerificationPayload {
   hasBankScreenshot: boolean;
   /** The bank_transactions row that claimed it, so the dialog can link to it. */
   bankTransactionId: string | null;
+  /** The bank's "from" name (M-16) — beside the depositor's own name in the dialog. */
+  bankCounterparty: string | null;
 }
 
 export interface WithdrawalVerificationPayload {
@@ -321,6 +321,15 @@ export class RealtimeGateway
     ConnectedUserSocket
   >();
 
+  /**
+   * How many audience sockets each USER currently holds, kept in step with
+   * connectedUserSockets (a user is removed when their last socket closes).
+   * Its size is the distinct-user count the peak tracker is given — read in
+   * O(1) instead of rebuilding a set of every connected socket on each
+   * connect, which made a mass reconnect after a restart O(n²).
+   */
+  private readonly userSocketCounts = new Map<string, number>();
+
   constructor(
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
@@ -373,7 +382,9 @@ export class RealtimeGateway
         secret: this.configService.get<string>('JWT_SECRET'),
       });
 
-      const user = await this.usersService.findByIdOrThrow(payload.sub);
+      // Narrow read: only the columns checked here (no password hash).
+      const user = await this.usersService.findAuthSubject(payload.sub);
+      if (!user) throw new Error('User not found');
       if (user.status !== UserStatus.ACTIVE)
         throw new Error('Account is not active');
       // H-21: the same cutoff JwtStrategy applies to HTTP requests.
@@ -392,13 +403,13 @@ export class RealtimeGateway
       }
 
       if (user.role === 'USER') {
-        this.connectedUserSockets.set(client.id, {
+        this.trackUserSocket(client.id, {
           userId: user.id,
           platform: this.platformOf(client),
           ip: this.ipOf(client),
           connectedAt: new Date(),
         });
-        const distinctUsers = this.distinctUserIds().size;
+        const distinctUsers = this.userSocketCounts.size;
         // Fire-and-forget — peak tracking must never block or break the
         // connection path.
         this.peakUsersService
@@ -420,7 +431,27 @@ export class RealtimeGateway
   handleDisconnect(client: Socket): void {
     // Room membership is discarded with the socket; only the concurrent
     // USER-count bookkeeping needs explicit cleanup.
-    this.connectedUserSockets.delete(client.id);
+    this.untrackUserSocket(client.id);
+  }
+
+  private trackUserSocket(socketId: string, entry: ConnectedUserSocket): void {
+    // A socket id is only ever connected once; never count one twice.
+    if (this.connectedUserSockets.has(socketId))
+      this.untrackUserSocket(socketId);
+    this.connectedUserSockets.set(socketId, entry);
+    this.userSocketCounts.set(
+      entry.userId,
+      (this.userSocketCounts.get(entry.userId) ?? 0) + 1,
+    );
+  }
+
+  private untrackUserSocket(socketId: string): void {
+    const entry = this.connectedUserSockets.get(socketId);
+    if (!entry) return;
+    this.connectedUserSockets.delete(socketId);
+    const remaining = (this.userSocketCounts.get(entry.userId) ?? 1) - 1;
+    if (remaining > 0) this.userSocketCounts.set(entry.userId, remaining);
+    else this.userSocketCounts.delete(entry.userId);
   }
 
   /**
@@ -515,14 +546,6 @@ export class RealtimeGateway
     }
   }
 
-  /** The count PeakUsersService has always been given: distinct users, not sockets. */
-  private distinctUserIds(): Set<string> {
-    const ids = new Set<string>();
-    for (const entry of this.connectedUserSockets.values())
-      ids.add(entry.userId);
-    return ids;
-  }
-
   /**
    * Which client opened this socket. Both apps declare it in the handshake
    * (`auth: { token, platform }`); the user-agent fallback and UNKNOWN
@@ -538,12 +561,14 @@ export class RealtimeGateway
   }
 
   /**
-   * The socket's client IP. `handshake.address` is the peer address, which
-   * behind nginx/the cache server is the proxy — so the forwarded header
-   * wins, exactly as it does for HTTP requests.
+   * The socket's client IP. `handshake.address` is the peer address; the
+   * forwarded header is believed only when that peer is a proxy listed in
+   * TRUSTED_PROXIES — the same rule as HTTP requests and the rate limiter
+   * (config/trusted-proxies.ts, M-5), so a client cannot pick the address
+   * the live "active users" list shows for it.
    */
   private ipOf(client: Socket): string | null {
-    return resolveClientIp(
+    return trustedClientIp(
       client.handshake.headers['x-forwarded-for'],
       client.handshake.address,
     );

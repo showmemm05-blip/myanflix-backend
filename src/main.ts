@@ -1,43 +1,85 @@
 import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
+import { JwtService } from '@nestjs/jwt';
 import { IoAdapter } from '@nestjs/platform-socket.io';
 import type { NestExpressApplication } from '@nestjs/platform-express';
-import { json, urlencoded } from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import { AppModule } from './app.module';
 import {
   CLIENT_PLATFORM_HEADER,
   requestHostContext,
-  resolveClientIp,
   resolveClientPlatform,
 } from './common/storage/request-host.context';
-
-// Express's default JSON body limit is 100kb — too small for
-// POST /uploads/:movieId/finalize, whose body lists every file in a
-// pre-transcoded bundle (every HLS segment across every rendition). A
-// multi-hour movie at several renditions can list thousands of paths and
-// blow past 100kb even though the payload is just plain text.
-const JSON_BODY_LIMIT = '20mb';
+import {
+  registerBodyParsers,
+  signedAccessTokenCheck,
+} from './config/body-limits';
+import { buildCorsOptions, parseCorsOrigins } from './config/cors.config';
+import { trustedClientIp, trustedProxyList } from './config/trusted-proxies';
 
 // Node's default is 5 minutes. A single chunk upload can legitimately take
 // longer than that on a slow/mobile connection — this only bounds how long
 // the server waits on one request, not how much data it accepts.
 const REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 
+/**
+ * The socket.io server with the same browser-origin allowlist as the HTTP
+ * API (M-31). RealtimeGateway declares `cors: { origin: '*' }` on its
+ * decorator; while CORS_ORIGINS is unset that is exactly what runs, so
+ * nothing changes for a machine that has not set it. Once it is set, the
+ * allowlist replaces the wildcard here, where the server is created, so the
+ * gateway itself stays untouched.
+ *
+ * What it does, honestly: CORS is a rule BROWSERS apply to fetch/XHR, so it
+ * stops a page on an unlisted site from using the polling transport. It
+ * does not stop a WebSocket connection — engine.io only adds the headers on
+ * an upgrade, it never aborts it — so a page that opens socket.io with
+ * `transports: ['websocket']` from an unlisted origin still reaches the
+ * handshake. The real gate there is, and always was, the token check in
+ * RealtimeGateway.handleConnection; this allowlist is the same courtesy
+ * layer the HTTP API gets, not a hard block (that would need engine.io's
+ * `allowRequest`, which this round deliberately leaves alone).
+ */
+class CorsAwareIoAdapter extends IoAdapter {
+  constructor(
+    app: NestExpressApplication,
+    private readonly corsOrigins: string | undefined,
+  ) {
+    super(app);
+  }
+
+  override createIOServer(port: number, options?: Record<string, unknown>) {
+    const merged =
+      parseCorsOrigins(this.corsOrigins) === null
+        ? options
+        : { ...options, cors: buildCorsOptions(this.corsOrigins) };
+    return super.createIOServer(port, merged) as unknown;
+  }
+}
+
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
   const configService = app.get(ConfigService);
+  const corsOrigins = configService.get<string>('CORS_ORIGINS');
 
-  app.use(json({ limit: JSON_BODY_LIMIT }));
-  app.use(urlencoded({ extended: true, limit: JSON_BODY_LIMIT }));
+  // 1 MB everywhere, 20 MB only on the transcoder-bundle routes and only
+  // for a caller whose access token is genuinely signed by this server
+  // (expired is fine: the guard still answers 401 and the admin client
+  // refreshes) — a guest never gets the server to read more than 1 MB,
+  // whatever path it posts to (M-18).
+  const accessTokens = new JwtService({
+    secret: configService.get<string>('JWT_SECRET'),
+  });
+  registerBodyParsers(app, signedAccessTokenCheck(accessTokens));
 
-  // Every request reaches this API through nginx/the cache server, so the
-  // socket's peer address is that proxy, not the user. Trusting the proxy
-  // makes Express's own `req.ip`/`req.protocol` reflect the original client
-  // via x-forwarded-for (the context middleware below reads the header
-  // directly, so it does not depend on this — but anything else that uses
-  // req.ip would otherwise silently see the proxy).
-  app.set('trust proxy', true);
+  // Express's own `req.ip` / `req.protocol` believe X-Forwarded-For only
+  // from the proxies listed in TRUSTED_PROXIES — the same rule the context
+  // middleware below, the socket gateway and the rate limiter apply
+  // (config/trusted-proxies.ts). Empty list = trust nobody, which is right
+  // while the API is reached directly; once nginx/HTTPS sits in front, its
+  // address goes into TRUSTED_PROXIES (see DOCKER.md) or every user would
+  // look like the proxy.
+  app.set('trust proxy', trustedProxyList());
 
   // Per-request context, read back through requestHostContext /
   // requestClientContext:
@@ -47,6 +89,9 @@ async function bootstrap() {
   //    hard-coded IP breaks on every hop;
   //  - ip / userAgent / platform, so tracking rows can record where a
   //    request came from without plumbing @Req() through every service.
+  //    The ip is a trusted fact (M-5): the socket peer, or the forwarded
+  //    client only when that peer is a trusted proxy — never a header the
+  //    client typed itself.
   //
   // Runs UNCONDITIONALLY. It used to skip the ALS entirely when the Host
   // header was empty, which would now silently drop IP and platform capture
@@ -64,7 +109,7 @@ async function bootstrap() {
     requestHostContext.run(
       {
         hostname,
-        ip: resolveClientIp(
+        ip: trustedClientIp(
           req.headers['x-forwarded-for'],
           req.socket.remoteAddress,
         ),
@@ -78,14 +123,15 @@ async function bootstrap() {
     );
   });
 
-  // maxAge (seconds) lets the browser cache a preflight instead of repeating
-  // it on every request to the same URL — without it, browsers default to a
-  // few seconds at most.
-  app.enableCors({ maxAge: 86400 });
+  // Browser origins allowed to call the API: everyone while CORS_ORIGINS is
+  // unset (today's behaviour), only the listed sites once it is set; a
+  // request with no Origin header (the apps, curl) is always served. The
+  // maxAge lets the browser cache a preflight for a day (config/cors.config.ts).
+  app.enableCors(buildCorsOptions(corsOrigins));
   app.setGlobalPrefix('api');
-  // Nest defaults to this once @nestjs/platform-socket.io is installed —
-  // set explicitly anyway as cheap insurance against that default changing.
-  app.useWebSocketAdapter(new IoAdapter(app));
+  // Nest defaults to the plain IoAdapter once @nestjs/platform-socket.io is
+  // installed — this one also carries the CORS allowlist to socket.io.
+  app.useWebSocketAdapter(new CorsAwareIoAdapter(app, corsOrigins));
   app.getHttpServer().requestTimeout = REQUEST_TIMEOUT_MS;
 
   const port = configService.get<number>('PORT') ?? 3001;

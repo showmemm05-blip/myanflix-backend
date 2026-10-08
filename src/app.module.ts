@@ -29,6 +29,7 @@ import { FinanceModule } from './finance/finance.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { DepositsModule } from './deposits/deposits.module';
 import { WithdrawalsModule } from './withdrawals/withdrawals.module';
+import { WithdrawalCodeModule } from './withdrawal-code/withdrawal-code.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { SubtitlesModule } from './subtitles/subtitles.module';
@@ -44,6 +45,8 @@ import { FeedbackModule } from './feedback/feedback.module';
 import { LevelsModule } from './levels/levels.module';
 import { BankEventsModule } from './bank-events/bank-events.module';
 import { BankTransactionsModule } from './bank-transactions/bank-transactions.module';
+import { SmsGatewayModule } from './sms-gateway/sms-gateway.module';
+import { HomeModule } from './home/home.module';
 
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { AppThrottlerGuard } from './common/throttling/app-throttler.guard';
@@ -82,6 +85,9 @@ import { AppService } from './app.service';
     AnalyticsModule,
     DepositsModule,
     WithdrawalsModule,
+    // Also reached through WithdrawalsModule; listed so the
+    // /users/me/withdrawal-code routes do not depend on that chain.
+    WithdrawalCodeModule,
     NotificationsModule,
     RealtimeModule,
     SubtitlesModule,
@@ -100,13 +106,22 @@ import { AppService } from './app.service';
     LevelsModule,
     BankEventsModule,
     BankTransactionsModule,
+    // The company-phone SMS gateway's device + staff-status routes. Also
+    // reached through Auth -> Otp -> Sms; listed here so the routes do not
+    // depend on that chain.
+    SmsGatewayModule,
+    // The home showcase: public GET /home/showcase + the staff "Home promos"
+    // routes (2026-10-08).
+    HomeModule,
   ],
   controllers: [AppController],
   providers: [
     AppService,
     { provide: APP_GUARD, useClass: JwtAuthGuard },
-    // Order relative to JwtAuthGuard is irrelevant: the auth routes it
-    // protects most tightly are @Public, and both guards are independent.
+    // Keep this AFTER JwtAuthGuard: on a signed-in route with
+    // @ThrottleAuth() (POST /withdrawals, the withdrawal-code routes) the
+    // per-credential bucket keys on `req.user`, which JwtAuthGuard sets. The
+    // @Public auth routes do not care (they key on phone/username/IP).
     { provide: APP_GUARD, useClass: AppThrottlerGuard },
     {
       provide: APP_PIPE,

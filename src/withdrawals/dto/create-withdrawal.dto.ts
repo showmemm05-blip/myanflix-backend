@@ -1,4 +1,4 @@
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   IsNotEmpty,
   IsNumber,
@@ -7,6 +7,7 @@ import {
   MaxLength,
   Min,
 } from 'class-validator';
+import { normalizeCodeInput } from '../../withdrawal-code/withdrawal-code.rules';
 
 export class CreateWithdrawalDto {
   @Type(() => Number)
@@ -39,4 +40,18 @@ export class CreateWithdrawalDto {
   @IsString()
   @MaxLength(120)
   bankName?: string;
+
+  /**
+   * The account's 6-digit withdrawal code — required on every request
+   * (2026-10-05). Optional at the validator only so that a missing or
+   * malformed code gets a coded answer from WithdrawalCodeService
+   * (WITHDRAWAL_CODE_NOT_SET 409 when the account has none yet, else
+   * WITHDRAWAL_CODE_REQUIRED / _INVALID_FORMAT 400) instead of a bare
+   * validator message. Never stored, logged or echoed.
+   */
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => normalizeCodeInput(value))
+  @IsString()
+  @MaxLength(32)
+  withdrawalCode?: string;
 }

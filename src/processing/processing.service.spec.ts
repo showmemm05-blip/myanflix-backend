@@ -570,4 +570,111 @@ describe('ProcessingService', () => {
       expect(audit.record).not.toHaveBeenCalled();
     });
   });
+
+  describe('process-wide transcode limit (VIDEO_TRANSCODE_CONCURRENCY, default 1)', () => {
+    const savedEnv = process.env.VIDEO_TRANSCODE_CONCURRENCY;
+    afterEach(() => {
+      if (savedEnv === undefined)
+        delete process.env.VIDEO_TRANSCODE_CONCURRENCY;
+      else process.env.VIDEO_TRANSCODE_CONCURRENCY = savedEnv;
+    });
+
+    beforeEach(() => {
+      delete process.env.VIDEO_TRANSCODE_CONCURRENCY;
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 120,
+        width: 426,
+        height: 240,
+      });
+    });
+
+    const flush = () => new Promise((r) => setImmediate(r));
+
+    it('runs one transcode at a time: the second video waits (already PROCESSING and still "active") until the first finishes', async () => {
+      let finishFirst!: () => void;
+      transcodeToHlsMock
+        .mockImplementationOnce(
+          () => new Promise<void>((resolve) => (finishFirst = resolve)),
+        )
+        .mockResolvedValue(undefined);
+
+      const first = service.processVideo('video-1', 'movie-1', '/in/1.mp4');
+      await flush();
+      const second = service.processVideo('video-2', 'movie-2', '/in/2.mp4');
+      await flush();
+
+      // The waiting video is already marked PROCESSING and still counts as
+      // active, so reprocess/replace keep answering 409 for it.
+      expect(videosService.markProcessing).toHaveBeenCalledWith('video-2');
+      expect(service.isActivelyProcessing('video-2')).toBe(true);
+      expect(service.reserve('video-2')).toBe(false);
+      // ...but its pipeline has not started.
+      expect(probeVideoMock).toHaveBeenCalledTimes(1);
+      expect(probeVideoMock).toHaveBeenCalledWith('/in/1.mp4');
+      expect(service.transcodeLoad).toEqual({ active: 1, queued: 1 });
+
+      finishFirst();
+      await first;
+      await second;
+
+      expect(probeVideoMock).toHaveBeenCalledTimes(2);
+      expect(probeVideoMock).toHaveBeenLastCalledWith('/in/2.mp4');
+      expect(service.transcodeLoad).toEqual({ active: 0, queued: 0 });
+      expect(service.isActivelyProcessing('video-2')).toBe(false);
+    });
+
+    it('frees the slot when a transcode fails, so the next video still runs', async () => {
+      probeVideoMock
+        .mockRejectedValueOnce(new Error('bad file'))
+        .mockResolvedValue({ durationSeconds: 1, width: 426, height: 240 });
+      transcodeToHlsMock.mockResolvedValue(undefined);
+
+      await service.processVideo('video-1', 'movie-1', '/in/1.mp4');
+      await service.processVideo('video-2', 'movie-2', '/in/2.mp4');
+
+      expect(videosService.markFailed).toHaveBeenCalledWith(
+        'video-1',
+        'bad file',
+      );
+      expect(videosService.markReady).toHaveBeenCalledTimes(1);
+      expect(service.transcodeLoad).toEqual({ active: 0, queued: 0 });
+    });
+
+    it('never releases a slot it did not take (markProcessing threw first)', async () => {
+      videosService.markProcessing.mockRejectedValueOnce(new Error('db down'));
+
+      await expect(
+        service.processVideo('video-1', 'movie-1', '/in/1.mp4'),
+      ).rejects.toThrow('db down');
+
+      expect(service.transcodeLoad).toEqual({ active: 0, queued: 0 });
+      expect(service.isActivelyProcessing('video-1')).toBe(false);
+    });
+
+    it('honours VIDEO_TRANSCODE_CONCURRENCY=2', async () => {
+      process.env.VIDEO_TRANSCODE_CONCURRENCY = '2';
+      const releases: Array<() => void> = [];
+      transcodeToHlsMock.mockImplementation(
+        () => new Promise<void>((resolve) => releases.push(resolve)),
+      );
+
+      const runs = ['1', '2', '3'].map((n) =>
+        service.processVideo(`video-${n}`, `movie-${n}`, `/in/${n}.mp4`),
+      );
+      await flush();
+      await flush();
+
+      expect(service.transcodeLoad).toEqual({ active: 2, queued: 1 });
+      expect(probeVideoMock).toHaveBeenCalledTimes(2);
+
+      // Finishing one of the two running transcodes lets the third start.
+      releases.shift()?.();
+      for (let i = 0; i < 5 && releases.length < 2; i++) await flush();
+      expect(probeVideoMock).toHaveBeenCalledTimes(3);
+      releases.splice(0).forEach((release) => release());
+      await Promise.all(runs);
+      expect(probeVideoMock).toHaveBeenCalledTimes(3);
+      expect(service.transcodeLoad).toEqual({ active: 0, queued: 0 });
+    });
+  });
 });

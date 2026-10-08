@@ -14,6 +14,7 @@ import {
   Min,
   MinLength,
 } from 'class-validator';
+import { IsBoundedDocument } from './document-limits';
 
 /**
  * A section is one of two things depending on the book type, and the service
@@ -32,6 +33,7 @@ export class CreateBookSectionDto {
   /** WRITTEN chapters only — validated as "an object", like a chapter's. */
   @IsOptional()
   @IsObject()
+  @IsBoundedDocument()
   content?: Record<string, unknown>;
 
   /** PDF chapters only — bounded by the chapter's pageCount in the service. */

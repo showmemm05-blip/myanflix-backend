@@ -43,6 +43,14 @@ export const AUDIT_TARGET_TYPES = [
   'peak_users',
   'comment',
   'feedback',
+  /** The OTP SMS gateway phone (its token-to-device pin). */
+  'sms_gateway',
+  /** A still image uploaded through POST /uploads/image — no owner row exists yet, so targetId is null and metadata carries the key. */
+  'image',
+  /** A slide / spotlight / coming-soon card on the admin "Home promos" page. */
+  'home_promo',
+  /** The single home settings row (web address, store links, games teaser). */
+  'home_settings',
 ] as const;
 
 export type AuditTargetType = (typeof AUDIT_TARGET_TYPES)[number];
@@ -75,6 +83,26 @@ export const AUDIT_ACTIONS = [
    * status are never part of it — they do not change.
    */
   define('movie.video_replace', CONTENT, 'movie'),
+  /**
+   * The storage-writing steps of a direct upload, each one a staff act on
+   * the title's files (M-22): presigned PUT URLs handed out for a batch of
+   * bundle files (metadata.fileCount + relativePaths), and a multipart
+   * session opened / completed / aborted (metadata.phase). The resource
+   * type ("movie" or "movie-replace") is in metadata.resourceType.
+   */
+  define('movie.upload_presign', CONTENT, 'movie'),
+  define('movie.upload_multipart', CONTENT, 'movie'),
+  /**
+   * A chunked session opened for one BUNDLE file (POST /uploads/init with a
+   * relativePath) — one row per file, never per chunk; metadata has the
+   * uploadId, relativePath, object key and fileSize. The classic
+   * single-file session is not recorded here: its complete writes
+   * movie.upload.
+   */
+  define('movie.upload_chunked', CONTENT, 'movie'),
+  /** A replace opened (staging cleared) or abandoned (staging cleared) — the swap itself is movie.video_replace. */
+  define('movie.video_replace_begin', CONTENT, 'movie'),
+  define('movie.video_replace_cancel', CONTENT, 'movie'),
   define('movie.update', CONTENT, 'movie'),
   define('movie.publish', CONTENT, 'movie'),
   define('movie.unpublish', CONTENT, 'movie'),
@@ -93,6 +121,14 @@ export const AUDIT_ACTIONS = [
   /** Subtitle rows carry metadata.movieId + metadata.videoId. */
   define('subtitle.upload', CONTENT, 'subtitle'),
   define('subtitle.update', CONTENT, 'subtitle'),
+  /**
+   * The manual backfill / repair (POST /subtitles/:id/publish and
+   * POST /subtitles/publish?movieId=): rewrites the movie's HLS subtitle
+   * group from the current rows. Addressed by movie, targetId is null;
+   * metadata carries the outcome (`skipped` reason or the published /
+   * excluded counts and whether the master actually changed).
+   */
+  define('subtitle.publish', CONTENT, 'subtitle'),
   define('subtitle.set_default', CONTENT, 'subtitle'),
   define('subtitle.delete', CONTENT, 'subtitle'),
 
@@ -107,6 +143,9 @@ export const AUDIT_ACTIONS = [
   define('book.create', CONTENT, 'book'),
   define('book.update', CONTENT, 'book'),
   define('book.delete', CONTENT, 'book'),
+  /** The "book" direct-upload type (a chapter's source PDF) — same shape as the movie ones above. */
+  define('book.upload_presign', CONTENT, 'book'),
+  define('book.upload_multipart', CONTENT, 'book'),
 
   define('book_edition.create', CONTENT, 'book_edition'),
   define('book_edition.update', CONTENT, 'book_edition'),
@@ -134,6 +173,9 @@ export const AUDIT_ACTIONS = [
   define('book_section.delete', CONTENT, 'book_section'),
   define('book_section.reorder', CONTENT, 'book_section'),
 
+  /** POST /uploads/image: metadata has the purpose folder, the object key and the byte size. */
+  define('image.upload', CONTENT, 'image'),
+
   define('book_author.create', CONTENT, 'book_author'),
   define('book_author.update', CONTENT, 'book_author'),
   define('book_author.delete', CONTENT, 'book_author'),
@@ -141,6 +183,17 @@ export const AUDIT_ACTIONS = [
   define('book_category.create', CONTENT, 'book_category'),
   define('book_category.update', CONTENT, 'book_category'),
   define('book_category.delete', CONTENT, 'book_category'),
+
+  /**
+   * The admin "Home promos" page. create / update / delete carry the
+   * homePromoSnapshot; reorder is ONE row per drag (targetId null,
+   * metadata: kind + the id order before and after).
+   */
+  define('home_promo.create', CONTENT, 'home_promo'),
+  define('home_promo.update', CONTENT, 'home_promo'),
+  define('home_promo.delete', CONTENT, 'home_promo'),
+  define('home_promo.reorder', CONTENT, 'home_promo'),
+  define('home_settings.update', CONTENT, 'home_settings'),
 
   // --- USERS --------------------------------------------------------------
   define('user.status_change', USERS, 'user'),
@@ -254,6 +307,11 @@ export const AUDIT_ACTIONS = [
   /** Recorded only when the deleter is NOT the comment's owner. */
   define('comment.delete', SYSTEM, 'comment'),
   define('feedback.status_change', SYSTEM, 'feedback'),
+  /**
+   * A super admin cleared the device pin of the SMS gateway token
+   * (DELETE /sms-gateway/binding); before/after carry the pinned device id.
+   */
+  define('sms_gateway.binding_reset', SYSTEM, 'sms_gateway'),
 ] as const satisfies readonly AuditActionDefinition[];
 
 /** Every action key, as a literal union — a typo is a compile error. */

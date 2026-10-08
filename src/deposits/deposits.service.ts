@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -53,6 +54,7 @@ import {
 import {
   NO_BANK_TRANSACTION_AFTER_MS,
   type RiskReason,
+  amountsEqual,
   normalizeReasons,
   referenceTwinReasons,
   scoreVerification,
@@ -90,6 +92,25 @@ export const INACTIVE_PAYMENT_ACCOUNT_MESSAGE =
 
 const DUPLICATE_REFERENCE_MESSAGE =
   'A deposit with this transaction reference already exists';
+
+/**
+ * M-11/M-14: a staff member never moves money on their OWN account. Shown
+ * verbatim by the admin app's error toast.
+ */
+export const SELF_APPROVE_DEPOSIT_MESSAGE =
+  'You cannot approve a deposit into your own account';
+export const SELF_REJECT_DEPOSIT_MESSAGE =
+  'You cannot reject a deposit into your own account';
+export const SELF_MANUAL_DEPOSIT_MESSAGE =
+  'You cannot record a deposit into your own account';
+export const MANUAL_DEPOSIT_CUSTOMER_ONLY_MESSAGE =
+  'Manual deposits can only be recorded for customer accounts';
+
+/** M-15/M-7: the bank saw a different amount — an explicit decision is required. */
+export const AMOUNT_MISMATCH_OVERRIDE_REQUIRED_MESSAGE =
+  'The bank saw a different amount than the user typed. To approve, choose to credit the bank amount and give a reason.';
+export const AMOUNT_MISMATCH_REASON_REQUIRED_MESSAGE =
+  'A reason is required to credit the bank amount instead of the typed amount';
 
 function isUniqueViolation(error: unknown): boolean {
   return (
@@ -144,6 +165,8 @@ const BANK_EVENT_REASONS: readonly RiskReason[] = [
   'SUBMITTED_BEFORE_TRANSFER',
   'TIME_GAP_TOO_LARGE',
   'AMBIGUOUS_MATCH',
+  // M-16: compares the transfer's sender name — gone once the transfer is.
+  'COUNTERPARTY_MISMATCH',
 ];
 
 const ADMIN_USER_SELECT = {
@@ -732,13 +755,45 @@ export class DepositsService {
     const result = await this.prisma.$transaction(async (tx) => {
       const deposit = await tx.deposit.findUnique({ where: { id: depositId } });
       if (!deposit) throw new NotFoundException('Deposit not found');
+      // M-11/M-14: whoever approves is never the account being credited.
+      if (deposit.userId === admin.id) {
+        throw new ForbiddenException(SELF_APPROVE_DEPOSIT_MESSAGE);
+      }
 
+      // M-15/M-7: the bank's amount, when the phone saw one, is the money
+      // that really arrived. When it differs from what the user typed the
+      // approval needs an explicit, reasoned decision — and then it is the
+      // BANK amount that is credited, never the typed one. Decided before
+      // the claim, so a refused approval leaves the row PENDING untouched.
+      const bankAmount = deposit.receivingAmount;
+      const amountMismatch =
+        bankAmount !== null && !amountsEqual(bankAmount, deposit.amount);
+      const overrideReason = dto.overrideReason?.trim() ?? '';
+      if (amountMismatch) {
+        if (dto.creditBankAmount !== true) {
+          throw new ConflictException(
+            AMOUNT_MISMATCH_OVERRIDE_REQUIRED_MESSAGE,
+          );
+        }
+        if (overrideReason.length === 0) {
+          throw new BadRequestException(
+            AMOUNT_MISMATCH_REASON_REQUIRED_MESSAGE,
+          );
+        }
+      }
+      const creditedAmount: Prisma.Decimal =
+        amountMismatch && bankAmount !== null ? bankAmount : deposit.amount;
+
+      // The row's amount becomes the credited amount, so the wallet, the
+      // ledger, the user's own deposit history and the totals all tell the
+      // same story; the typed amount survives in the audit row's "before".
       const claim = await tx.deposit.updateMany({
         where: { id: depositId, status: DepositStatus.PENDING },
         data: {
           status: DepositStatus.APPROVED,
           approvedByUserId: admin.id,
           approvedAt: new Date(),
+          ...(amountMismatch && { amount: creditedAmount }),
         },
       });
       if (claim.count !== 1) {
@@ -746,6 +801,7 @@ export class DepositsService {
           'This deposit has already been approved or rejected',
         );
       }
+      const credited = { ...deposit, amount: creditedAmount };
 
       // Credits a payment account the moment this deposit is approved — no
       // separate admin step required. `dto.paymentAccountId` (an explicit
@@ -761,7 +817,7 @@ export class DepositsService {
           : deposit.declaredPaymentAccountId;
       await this.paymentAccountLedgerService.syncDepositLink(
         tx,
-        deposit,
+        credited,
         accountToCredit,
         deposit.reference,
         admin.id,
@@ -770,7 +826,7 @@ export class DepositsService {
       const creditedWallet = await this.walletService.creditWithinTransaction(
         tx,
         deposit.userId,
-        deposit.amount.toNumber(),
+        creditedAmount.toNumber(),
       );
 
       // Snapshot the wallet balance around this credit onto the deposit row,
@@ -780,7 +836,7 @@ export class DepositsService {
       await tx.deposit.update({
         where: { id: depositId },
         data: {
-          walletBalanceBefore: creditedWallet.balance.minus(deposit.amount),
+          walletBalanceBefore: creditedWallet.balance.minus(creditedAmount),
           walletBalanceAfter: creditedWallet.balance,
         },
       });
@@ -789,7 +845,7 @@ export class DepositsService {
         data: {
           userId: deposit.userId,
           type: TransactionType.DEPOSIT,
-          amount: deposit.amount,
+          amount: creditedAmount,
           status: 'COMPLETED',
         },
       });
@@ -799,8 +855,8 @@ export class DepositsService {
           userId: deposit.userId,
           type: NotificationType.DEPOSIT_APPROVED,
           title: 'Deposit approved',
-          message: `Your deposit of ${deposit.amount.toString()} Ks has been approved and your balance has been updated.`,
-          payload: { depositId: deposit.id, amount: deposit.amount.toNumber() },
+          message: `Your deposit of ${creditedAmount.toString()} Ks has been approved and your balance has been updated.`,
+          payload: { depositId: deposit.id, amount: creditedAmount.toNumber() },
         },
       });
 
@@ -834,6 +890,17 @@ export class DepositsService {
           matchStatus: updated.matchStatus,
           riskLevel: updated.riskLevel,
           riskReasons: updated.riskReasons,
+          // M-15/M-7: what was credited, and — on an override — the typed
+          // and bank amounts plus the staff member's reason, in the log
+          // itself: "the admin credited the bank amount because …" must be
+          // readable without a join.
+          creditedAmount: decimalToNumber(creditedAmount),
+          ...(amountMismatch && {
+            amountOverride: true,
+            declaredAmount: decimalToNumber(deposit.amount),
+            bankAmount: decimalToNumber(creditedAmount),
+            overrideReason,
+          }),
         },
         tx,
       });
@@ -934,6 +1001,11 @@ export class DepositsService {
    * (partial unique index → P2002), rolling back before any money moves.
    */
   async createManual(dto: CreateManualDepositDto, admin: AuthenticatedUser) {
+    // M-11/M-14: never into the recording staff member's own account —
+    // decided before anything is read or locked.
+    if (dto.userId === admin.id) {
+      throw new ForbiddenException(SELF_MANUAL_DEPOSIT_MESSAGE);
+    }
     const result = await this.prisma
       .$transaction(async (tx) => {
         // H-16: share-locked first (see lockAccountStatus), so an account its
@@ -944,6 +1016,17 @@ export class DepositsService {
         if (!status) throw new NotFoundException('User not found');
         if (status === UserStatus.CLOSED) {
           throw new ConflictException(CLOSED_ACCOUNT_MESSAGE);
+        }
+        // M-11/M-14: a manual deposit is money for a CUSTOMER. The picker
+        // (lookupUsersForManualDeposit) only ever offers role USER; this is
+        // the same rule on the write, so a hand-built request cannot pay a
+        // staff account (its own or a colleague's).
+        const target = await tx.user.findUnique({
+          where: { id: dto.userId },
+          select: { role: true },
+        });
+        if (!target || target.role !== Role.USER) {
+          throw new ForbiddenException(MANUAL_DEPOSIT_CUSTOMER_ONLY_MESSAGE);
         }
 
         // Same duplicate-reference rule create() enforces — without it, an
@@ -1127,7 +1210,17 @@ export class DepositsService {
     };
   }
 
-  /** Same atomic claim pattern as approve() — never touches the wallet or ledger. */
+  /**
+   * Same atomic claim pattern as approve() — never touches the wallet or
+   * ledger. M-17: a rejected row gives its bank evidence back in the same
+   * transaction — the bank columns are cleared exactly as the `unlink`
+   * review clears them (the event key included, or the next post would
+   * re-attach the transfer to this dead row) and the bank transaction that
+   * claimed it returns to UNMATCHED — so an honest resubmission under the
+   * same reference claims the real transfer at create time instead of
+   * drifting to "no bank transaction". The transaction row keeps its own
+   * screenshot; the audit row's "before" keeps the values this row had.
+   */
   async reject(
     depositId: string,
     admin: AuthenticatedUser,
@@ -1136,7 +1229,30 @@ export class DepositsService {
     const result = await this.prisma.$transaction(async (tx) => {
       const deposit = await tx.deposit.findUnique({ where: { id: depositId } });
       if (!deposit) throw new NotFoundException('Deposit not found');
+      // M-11/M-14: whoever rejects is never the account it belongs to.
+      if (deposit.userId === admin.id) {
+        throw new ForbiddenException(SELF_REJECT_DEPOSIT_MESSAGE);
+      }
 
+      const hadBankEvent = deposit.bankCheckedAt !== null;
+      const releasedBankValues: Prisma.DepositUpdateManyMutationInput =
+        hadBankEvent
+          ? {
+              receivingAmount: null,
+              receivingTransactionCode: null,
+              receivingTransactionTime: null,
+              receivingTransactionAt: null,
+              receivingEventKey: null,
+              receivingScreenshotKey: null,
+              bankCheckedAt: null,
+              ...scoreVerification(
+                normalizeReasons(deposit.riskReasons).filter(
+                  (reason) => !BANK_EVENT_REASONS.includes(reason),
+                ),
+                false,
+              ),
+            }
+          : {};
       const claim = await tx.deposit.updateMany({
         where: { id: depositId, status: DepositStatus.PENDING },
         data: {
@@ -1144,6 +1260,7 @@ export class DepositsService {
           rejectionReason: dto.reason,
           approvedByUserId: admin.id,
           approvedAt: new Date(),
+          ...releasedBankValues,
         },
       });
       if (claim.count !== 1) {
@@ -1151,6 +1268,9 @@ export class DepositsService {
           'This deposit has already been approved or rejected',
         );
       }
+      const unlinkedTransactionId = hadBankEvent
+        ? await unlinkByDeposit(tx, this.audit, admin, depositId)
+        : null;
 
       const notification = await tx.notification.create({
         data: {
@@ -1180,12 +1300,33 @@ export class DepositsService {
         },
         before: depositSnapshot(deposit),
         after: depositSnapshot(updated),
-        metadata: { reason: dto.reason },
+        metadata: {
+          reason: dto.reason,
+          ...(hadBankEvent && { unlinkedTransactionId }),
+        },
         tx,
       });
 
-      return { deposit: updated, notification };
+      return {
+        deposit: updated,
+        notification,
+        releasedBankEvent: hadBankEvent,
+        unlinkedTransactionId,
+      };
     });
+
+    // M-17, after commit: the admins' live rows learn that the bank values
+    // left this row — whenever they did, including a legacy row that had
+    // bank values but no bank_transactions link — and, when a transaction
+    // was given back, that it is open again.
+    if (result.releasedBankEvent) {
+      this.realtimeGateway.notifyAdminsDepositVerificationUpdated(
+        depositVerificationPayload(result.deposit),
+      );
+    }
+    if (result.unlinkedTransactionId) {
+      await this.pushBankTransactionUpdate(result.unlinkedTransactionId);
+    }
 
     this.realtimeGateway.notifyUserDepositUpdated(result.deposit.userId, {
       id: result.deposit.id,
@@ -1588,7 +1729,7 @@ export class DepositsService {
       riskLevel?: BankRiskLevel | null;
       riskReasons?: string[];
       declaredTransferAt?: Date | null;
-      bankTransaction?: { id: string } | null;
+      bankTransaction?: { id: string; counterparty?: string | null } | null;
     },
     now: Date = new Date(),
   ) {
@@ -1619,6 +1760,9 @@ export class DepositsService {
       // The stored phone notification that claimed it — one unique-index
       // probe per row, included on every admin read.
       bankTransactionId: deposit.bankTransaction?.id ?? null,
+      // M-16: the bank's "from" name, beside the depositor's own name in
+      // the verification dialog. Staff only — a user never sees it.
+      bankCounterparty: deposit.bankTransaction?.counterparty ?? null,
     };
   }
 }

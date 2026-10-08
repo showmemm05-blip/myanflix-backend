@@ -9,6 +9,7 @@ import { randomInt, randomUUID } from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { OtpCodeHasher } from '../src/otp/otp-code.hasher';
 import {
   AuditCategory,
   OtpPurpose,
@@ -36,6 +37,8 @@ describe('Account security (e2e: H-6, H-8, H-16, H-21)', () => {
   let prisma: PrismaService;
   let jwtService: JwtService;
   let configService: ConfigService;
+  /** M-1: otp_codes holds only a keyed hash — written and looked up through this. */
+  let otpHasher: OtpCodeHasher;
 
   const phone = `+959${randomInt(10_000_000, 99_999_999)}`;
   const phoneUsername = `user_${phone.replace(/\D/g, '')}`;
@@ -45,6 +48,8 @@ describe('Account security (e2e: H-6, H-8, H-16, H-21)', () => {
   const staffPhone = `+959${randomInt(10_000_000, 99_999_999)}`;
   const resetPhone = `+959${randomInt(10_000_000, 99_999_999)}`;
   const signInPhone = `+959${randomInt(10_000_000, 99_999_999)}`;
+  /** M-20: a phone whose synthesized username someone else already holds. */
+  const squattedPhone = `+959${randomInt(10_000_000, 99_999_999)}`;
   const otherUserIds: string[] = [];
   /** B4: the request address and device the audit trail must forget. */
   const CLIENT_IP = '203.0.113.77';
@@ -71,7 +76,7 @@ describe('Account security (e2e: H-6, H-8, H-16, H-21)', () => {
     await prisma.otpCode.create({
       data: {
         phone,
-        code,
+        codeHash: otpHasher.hash(phone, code),
         purpose,
         expiresAt: new Date(Date.now() + 5 * 60 * 1000),
       },
@@ -123,6 +128,7 @@ describe('Account security (e2e: H-6, H-8, H-16, H-21)', () => {
     prisma = app.get(PrismaService);
     jwtService = app.get(JwtService);
     configService = app.get(ConfigService);
+    otpHasher = OtpCodeHasher.fromConfig(configService);
 
     const superAdminRole = await prisma.appRole.findUniqueOrThrow({
       where: { key: Role.SUPER_ADMIN },
@@ -176,11 +182,70 @@ describe('Account security (e2e: H-6, H-8, H-16, H-21)', () => {
     await prisma.otpCode.deleteMany({
       where: {
         phone: {
-          in: [phone, unknownPhone, staffPhone, resetPhone, signInPhone],
+          in: [
+            phone,
+            unknownPhone,
+            staffPhone,
+            resetPhone,
+            signInPhone,
+            squattedPhone,
+          ],
         },
       },
     });
     await app.close();
+  });
+
+  it('M-20: a pre-claimed user_<digits> name does not block that phone from signing up', async () => {
+    // Any door that lets a caller pick a username (a Google e-mail spelt
+    // user_<digits>@…, a staff-created account) could hold the exact name
+    // the phone sign-up synthesizes. Seed that row directly.
+    const digits = squattedPhone.replace(/\D/g, '');
+    const squatter = await prisma.user.create({
+      data: {
+        username: `user_${digits}`,
+        password: await bcrypt.hash('squatter-password', 4),
+        email: `squatter-${suffix}@example.com`,
+        googleId: `squat-${suffix}`,
+      },
+    });
+    otherUserIds.push(squatter.id);
+    await prisma.wallet.create({ data: { userId: squatter.id, balance: 0 } });
+
+    await prisma.otpCode.create({
+      data: {
+        phone: squattedPhone,
+        codeHash: otpHasher.hash(squattedPhone, '424242'),
+        expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+      },
+    });
+    const res = await api()
+      .post('/api/auth/otp/verify')
+      .send({ phone: squattedPhone, code: '424242', password: 'victim-pass-1' })
+      .expect(200);
+    const created = res.body.data as {
+      user: { id: string; username: string };
+      accessToken: string;
+    };
+    otherUserIds.push(created.user.id);
+
+    // A real, separate account for the phone — not the squatter's.
+    expect(created.user.id).not.toBe(squatter.id);
+    expect(created.user.username).toMatch(
+      new RegExp(`^user_${digits}_[0-9a-f]{6}$`),
+    );
+    const row = await prisma.user.findUnique({
+      where: { id: created.user.id },
+    });
+    expect(row?.phone).toBe(squattedPhone);
+    expect(row?.googleId).toBeNull();
+    await me(created.accessToken).expect(200);
+    // The squatter's row is untouched.
+    const squatterRow = await prisma.user.findUnique({
+      where: { id: squatter.id },
+    });
+    expect(squatterRow?.phone).toBeNull();
+    expect(squatterRow?.username).toBe(`user_${digits}`);
   });
 
   it('H-6: /auth/login never opens a customer account, even with the right password', async () => {
@@ -200,7 +265,7 @@ describe('Account security (e2e: H-6, H-8, H-16, H-21)', () => {
     expect(res.body.message).toBe('Please enter your password again.');
 
     const code = await prisma.otpCode.findFirst({
-      where: { phone, code: '111111' },
+      where: { phone, codeHash: otpHasher.hash(phone, '111111') },
     });
     expect(code?.consumedAt).toBeNull();
     expect(code?.attemptCount).toBe(0);
@@ -250,7 +315,7 @@ describe('Account security (e2e: H-6, H-8, H-16, H-21)', () => {
     expect(res.body.message).toBe('Invalid or expired code');
 
     const code = await prisma.otpCode.findFirstOrThrow({
-      where: { phone, code: '212121' },
+      where: { phone, codeHash: otpHasher.hash(phone, '212121') },
     });
     expect(code.consumedAt).toBeNull();
     expect(code.attemptCount).toBe(0);
@@ -274,7 +339,7 @@ describe('Account security (e2e: H-6, H-8, H-16, H-21)', () => {
     expect(res.body.message).toBe('Invalid or expired code');
 
     const code = await prisma.otpCode.findFirstOrThrow({
-      where: { phone, code: '232323' },
+      where: { phone, codeHash: otpHasher.hash(phone, '232323') },
     });
     expect(code.consumedAt).toBeNull();
     expect(code.attemptCount).toBe(0);

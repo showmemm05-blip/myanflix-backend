@@ -31,7 +31,9 @@ describe('SubscriptionsService', () => {
   };
   let walletService: { debitWithinTransaction: jest.Mock };
   let realtimeGateway: { notifyUserBalanceUpdated: jest.Mock };
+  let audit: { record: jest.Mock };
   let tx: {
+    subscriptionPlan: { create: jest.Mock; update: jest.Mock };
     userSubscription: { findFirst: jest.Mock; create: jest.Mock };
     transaction: { create: jest.Mock };
     wallet: { findUniqueOrThrow: jest.Mock };
@@ -43,7 +45,20 @@ describe('SubscriptionsService', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
 
+    // Plan writes go through the interactive transaction (L-38); sharing the
+    // mocks with `prisma.subscriptionPlan` keeps every assertion below valid
+    // whichever client made the call.
+    const subscriptionPlan = {
+      findMany: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+      findUnique: jest.fn(),
+    };
     tx = {
+      subscriptionPlan: {
+        create: subscriptionPlan.create,
+        update: subscriptionPlan.update,
+      },
       userSubscription: {
         findFirst: jest.fn().mockResolvedValue(null),
         create: jest.fn().mockResolvedValue({ id: 'sub-1' }),
@@ -56,12 +71,7 @@ describe('SubscriptionsService', () => {
       },
     };
     prisma = {
-      subscriptionPlan: {
-        findMany: jest.fn(),
-        create: jest.fn(),
-        update: jest.fn(),
-        findUnique: jest.fn(),
-      },
+      subscriptionPlan,
       userSubscription: { findFirst: jest.fn() },
       $transaction: jest.fn(async (arg: unknown) =>
         typeof arg === 'function'
@@ -70,9 +80,13 @@ describe('SubscriptionsService', () => {
       ),
     };
     walletService = {
-      debitWithinTransaction: jest.fn().mockResolvedValue(undefined),
+      // The real method returns the wallet as it stands after the debit.
+      debitWithinTransaction: jest
+        .fn()
+        .mockResolvedValue({ balance: new Prisma.Decimal(0) }),
     };
     realtimeGateway = { notifyUserBalanceUpdated: jest.fn() };
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -80,10 +94,7 @@ describe('SubscriptionsService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: WalletService, useValue: walletService },
         { provide: RealtimeGateway, useValue: realtimeGateway },
-        {
-          provide: AuditService,
-          useValue: { record: jest.fn().mockResolvedValue(undefined) },
-        },
+        { provide: AuditService, useValue: audit },
       ],
     }).compile();
 
@@ -174,6 +185,62 @@ describe('SubscriptionsService', () => {
       });
       expect(result.durationDays).toBe(7);
     });
+
+    // L-38: the plan and its audit row commit together or not at all.
+    it('creates the plan and writes its audit row inside one transaction (audit gets the tx)', async () => {
+      tx.subscriptionPlan.create.mockResolvedValue({
+        id: 'plan-1',
+        name: 'Basic',
+        price: new Prisma.Decimal(5000),
+        durationDays: 30,
+        isActive: true,
+      });
+
+      const result = await service.createPlan(
+        { name: 'Basic', price: 5000 },
+        actor,
+      );
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'subscription_plan.create',
+          actor,
+          target: { type: 'subscription_plan', id: 'plan-1', label: 'Basic' },
+          tx,
+        }),
+      );
+      const txStarted = prisma.$transaction.mock.invocationCallOrder[0];
+      expect(
+        tx.subscriptionPlan.create.mock.invocationCallOrder[0],
+      ).toBeGreaterThan(txStarted);
+      expect(audit.record.mock.invocationCallOrder[0]).toBeGreaterThan(
+        tx.subscriptionPlan.create.mock.invocationCallOrder[0],
+      );
+      // Response shape unchanged: the row with price as a plain number.
+      expect(result).toEqual({
+        id: 'plan-1',
+        name: 'Basic',
+        price: 5000,
+        durationDays: 30,
+        isActive: true,
+      });
+    });
+
+    it('fails the create when the audit write fails, so the transaction rolls the plan back', async () => {
+      tx.subscriptionPlan.create.mockResolvedValue({
+        id: 'plan-1',
+        name: 'Basic',
+        price: new Prisma.Decimal(5000),
+        durationDays: 30,
+        isActive: true,
+      });
+      audit.record.mockRejectedValueOnce(new Error('audit table unavailable'));
+
+      await expect(
+        service.createPlan({ name: 'Basic', price: 5000 }, actor),
+      ).rejects.toThrow('audit table unavailable');
+    });
   });
 
   describe('updatePlan', () => {
@@ -231,6 +298,62 @@ describe('SubscriptionsService', () => {
         data: { durationDays: 90 },
       });
       expect(result.durationDays).toBe(90);
+    });
+
+    // L-38: the price change and its audit row commit together or not at all.
+    it('updates the plan and writes its audit row inside one transaction (audit gets the tx)', async () => {
+      const before = {
+        id: 'plan-1',
+        name: 'Premium',
+        price: new Prisma.Decimal(9000),
+        durationDays: 30,
+        isActive: true,
+      };
+      prisma.subscriptionPlan.findUnique.mockResolvedValue(before);
+      tx.subscriptionPlan.update.mockResolvedValue({
+        ...before,
+        price: new Prisma.Decimal(12000),
+      });
+
+      const result = await service.updatePlan(
+        'plan-1',
+        { price: 12000 },
+        actor,
+      );
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'subscription_plan.update',
+          actor,
+          target: { type: 'subscription_plan', id: 'plan-1', label: 'Premium' },
+          tx,
+        }),
+      );
+      const txStarted = prisma.$transaction.mock.invocationCallOrder[0];
+      expect(
+        tx.subscriptionPlan.update.mock.invocationCallOrder[0],
+      ).toBeGreaterThan(txStarted);
+      expect(audit.record.mock.invocationCallOrder[0]).toBeGreaterThan(
+        tx.subscriptionPlan.update.mock.invocationCallOrder[0],
+      );
+      expect(result.price).toBe(12000);
+    });
+
+    it('fails the update when the audit write fails, so the transaction rolls the price back', async () => {
+      prisma.subscriptionPlan.findUnique.mockResolvedValue({ id: 'plan-1' });
+      tx.subscriptionPlan.update.mockResolvedValue({
+        id: 'plan-1',
+        name: 'Premium',
+        price: new Prisma.Decimal(12000),
+        durationDays: 30,
+        isActive: true,
+      });
+      audit.record.mockRejectedValueOnce(new Error('audit table unavailable'));
+
+      await expect(
+        service.updatePlan('plan-1', { price: 12000 }, actor),
+      ).rejects.toThrow('audit table unavailable');
     });
   });
 
@@ -304,7 +427,7 @@ describe('SubscriptionsService', () => {
       const plan = activePlan(30);
       prisma.subscriptionPlan.findUnique.mockResolvedValue(plan);
       tx.userSubscription.findFirst.mockResolvedValue(null);
-      tx.wallet.findUniqueOrThrow.mockResolvedValue({
+      walletService.debitWithinTransaction.mockResolvedValue({
         balance: new Prisma.Decimal(4000),
       });
 
@@ -336,6 +459,8 @@ describe('SubscriptionsService', () => {
         'user-1',
         4000,
       );
+      // bam-11: the balance comes from the debit itself, not a second read.
+      expect(tx.wallet.findUniqueOrThrow).not.toHaveBeenCalled();
     });
 
     it('a 1-day plan with no active subscription expires one day from now', async () => {

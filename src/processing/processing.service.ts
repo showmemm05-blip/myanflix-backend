@@ -9,6 +9,10 @@ import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
 import { VideosService } from '../videos/videos.service';
 import { HlsSubtitlesService } from '../subtitles/hls-subtitles.service';
+import {
+  ConversionSlots,
+  videoTranscodeConcurrency,
+} from '../common/concurrency/slots';
 import { probeVideo, transcodeToHls } from './ffmpeg.util';
 import { approximateWidth, pickRenditions } from './rendition-tiers';
 
@@ -24,6 +28,21 @@ export class ProcessingService {
   // PROCESSING from before it started is unambiguously orphaned — no
   // timeout or heuristic needed to tell the difference.
   private readonly activeVideoIds = new Set<string>();
+
+  /**
+   * Process-wide: at most videoTranscodeConcurrency() pipelines (default 1)
+   * past markProcessing at once. activeVideoIds only stops the SAME video
+   * running twice; this stops N different videos finishing together from
+   * starting N ffmpeg encoders on the box that also runs the API and
+   * Postgres. A waiting video is already in activeVideoIds, so reprocess
+   * and replace still refuse it (409) while it waits.
+   */
+  private readonly slots = new ConversionSlots(videoTranscodeConcurrency);
+
+  /** How many transcodes are running and how many wait for a slot — for the spec and the log. */
+  get transcodeLoad(): { active: number; queued: number } {
+    return { active: this.slots.active, queued: this.slots.queued };
+  }
 
   constructor(
     private readonly videosService: VideosService,
@@ -83,7 +102,22 @@ export class ProcessingService {
   ): Promise<void> {
     await this.videosService.markProcessing(videoId);
 
+    // Set once the slot is held, so the finally never releases a slot this
+    // run did not take (e.g. markProcessing above threw first).
+    let taken = false;
     try {
+      // Wait for a process-wide transcode slot. The video already reads
+      // PROCESSING, so the admin sees it queued rather than idle. The
+      // per-tier ffmpeg timeout starts inside transcodeToHls, so time spent
+      // waiting here never counts against it.
+      if (this.slots.active >= videoTranscodeConcurrency()) {
+        this.logger.log(
+          `Video ${videoId} waiting for a transcode slot (${this.slots.active} running, ${this.slots.queued} queued)`,
+        );
+      }
+      await this.slots.acquire();
+      taken = true;
+
       const probe = await probeVideo(inputPath);
 
       // Archive the original upload too — same reasoning as the HLS output
@@ -270,6 +304,8 @@ export class ProcessingService {
       // harmless, since they're already durably in MinIO and the resume
       // check above works off MinIO, not local disk.
       await this.cleanupScratch(movieId, inputPath);
+    } finally {
+      if (taken) this.slots.release();
     }
   }
 

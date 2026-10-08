@@ -1,10 +1,11 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { NotFoundException } from '@nestjs/common';
+import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import {
   ClientPlatform,
   CommentStatus,
   FeedbackCategory,
   FeedbackStatus,
+  Prisma,
   Role,
 } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -16,6 +17,7 @@ import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { createRoleAwarePermissionResolver } from '../../test/seeded-permission-resolver';
 import {
   ACTIVE_USER_WINDOW_MS,
+  PII_FILTER_FORBIDDEN_MESSAGE,
   TrackingReadService,
   trackingDateRange,
 } from './tracking-read.service';
@@ -90,8 +92,9 @@ describe('TrackingReadService', () => {
     searchQuery: { findMany: jest.Mock; count: jest.Mock; groupBy: jest.Mock };
     watchActivity: { groupBy: jest.Mock };
     userSession: { findMany: jest.Mock; count: jest.Mock; groupBy: jest.Mock };
-    user: { findMany: jest.Mock; groupBy: jest.Mock };
+    user: { findMany: jest.Mock; groupBy: jest.Mock; count: jest.Mock };
     $transaction: jest.Mock;
+    $queryRaw: jest.Mock;
   };
   let gateway: { getActiveUsers: jest.Mock };
 
@@ -127,10 +130,12 @@ describe('TrackingReadService', () => {
       user: {
         findMany: jest.fn().mockResolvedValue([]),
         groupBy: jest.fn().mockResolvedValue([]),
+        count: jest.fn().mockResolvedValue(0),
       },
       $transaction: jest.fn((operations: Promise<unknown>[]) =>
         Promise.all(operations),
       ),
+      $queryRaw: jest.fn().mockResolvedValue([{ count: 0 }]),
     };
 
     gateway = { getActiveUsers: jest.fn().mockReturnValue([]) };
@@ -318,6 +323,135 @@ describe('TrackingReadService', () => {
     });
   });
 
+  // ------------------------------------------- PII filters without PII_VIEW
+
+  /**
+   * Security audit 2026-10-06, M-4. The response masks phones and IPs for a
+   * caller without TRACKING.PII_VIEW — but a filter that substring-matches
+   * the REAL column would still say, row by row, whether a guess at the
+   * hidden digits is right. So for such a caller the free-text search never
+   * touches the phone column, and the dedicated phone/IP filters are refused.
+   */
+  describe('PII filters for a caller without TRACKING.PII_VIEW', () => {
+    const sessionsFindMany = () =>
+      prisma.userSession.groupBy.mock.calls[0][0] as {
+        where: Record<string, unknown>;
+      };
+
+    it('does not let a partial phone narrow the comments search', async () => {
+      await service.comments(analyst, { search: '0925' });
+
+      const where = prisma.comment.findMany.mock.calls[0][0].where as {
+        OR: unknown[];
+      };
+      expect(where.OR).toEqual([
+        { body: { contains: '0925', mode: 'insensitive' } },
+        { user: { username: { contains: '0925', mode: 'insensitive' } } },
+        { user: { displayName: { contains: '0925', mode: 'insensitive' } } },
+      ]);
+      expect(JSON.stringify(where)).not.toContain('phone');
+    });
+
+    it('does not let a partial phone narrow the feedback search', async () => {
+      await service.feedback(analyst, { search: '0925' });
+
+      const where = prisma.feedback.findMany.mock.calls[0][0].where as {
+        OR: unknown[];
+      };
+      expect(where.OR).toEqual([
+        { message: { contains: '0925', mode: 'insensitive' } },
+        { user: { username: { contains: '0925', mode: 'insensitive' } } },
+        { user: { displayName: { contains: '0925', mode: 'insensitive' } } },
+      ]);
+      expect(JSON.stringify(where)).not.toContain('phone');
+    });
+
+    it('does not let a partial phone narrow the Phone/IP view search', async () => {
+      await service.sessions(analyst, { search: '0925' });
+
+      expect(sessionsFindMany().where).toEqual({
+        user: {
+          OR: [
+            { username: { contains: '0925', mode: 'insensitive' } },
+            { displayName: { contains: '0925', mode: 'insensitive' } },
+          ],
+        },
+      });
+    });
+
+    it('refuses the phone filter with a 403 rather than matching on the real column', async () => {
+      const call = service.sessions(analyst, { phone: '0925' });
+
+      await expect(call).rejects.toThrow(ForbiddenException);
+      await expect(call).rejects.toThrow(PII_FILTER_FORBIDDEN_MESSAGE);
+      expect(prisma.userSession.groupBy).not.toHaveBeenCalled();
+      expect(prisma.userSession.findMany).not.toHaveBeenCalled();
+    });
+
+    it('refuses the phone filter even for a complete number', async () => {
+      await expect(
+        service.sessions(analyst, { phone: '+95950495369' }),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.userSession.groupBy).not.toHaveBeenCalled();
+    });
+
+    it('refuses the IP filter with a 403, partial or complete', async () => {
+      await expect(
+        service.sessions(analyst, { ip: '203.0.113.' }),
+      ).rejects.toThrow(ForbiddenException);
+      await expect(
+        service.sessions(analyst, { ip: '203.0.113.7' }),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.userSession.groupBy).not.toHaveBeenCalled();
+    });
+
+    it('treats a whitespace-only phone/ip as absent, so the view still loads', async () => {
+      const result = await service.sessions(analyst, { phone: '  ', ip: ' ' });
+
+      expect(result).toEqual({ items: [], total: 0, page: 1, limit: 20 });
+      expect(sessionsFindMany().where).toEqual({});
+    });
+
+    it('keeps the phone/IP filters (substring) and the phone search branch for a PII_VIEW holder', async () => {
+      await service.sessions(investigator, {
+        phone: '0925',
+        ip: '203.0.113.',
+        search: 'bla',
+      });
+
+      expect(sessionsFindMany().where).toEqual({
+        ipAddress: { contains: '203.0.113.' },
+        user: {
+          phone: { contains: '0925' },
+          OR: [
+            { username: { contains: 'bla', mode: 'insensitive' } },
+            { displayName: { contains: 'bla', mode: 'insensitive' } },
+            { phone: { contains: 'bla' } },
+          ],
+        },
+      });
+    });
+
+    it('keeps the phone search branch on feedback for a PII_VIEW holder', async () => {
+      await service.feedback(investigator, { search: '0925' });
+
+      const where = prisma.feedback.findMany.mock.calls[0][0].where as {
+        OR: unknown[];
+      };
+      expect(where.OR).toContainEqual({
+        user: { phone: { contains: '0925' } },
+      });
+    });
+
+    it('a protected role holds PII_VIEW and may filter by phone', async () => {
+      await service.sessions(superAdmin, { phone: '0925' });
+
+      expect(sessionsFindMany().where).toEqual({
+        user: { phone: { contains: '0925' } },
+      });
+    });
+  });
+
   // ---------------------------------------------------------------- comments
 
   describe('comments', () => {
@@ -329,8 +463,8 @@ describe('TrackingReadService', () => {
       expect(result).toEqual({ items: [], total: 0, page: 1, limit: 20 });
     });
 
-    it('searches the body and the commenter identity together', async () => {
-      await service.comments(analyst, { search: '  blake ' });
+    it('searches the body and the commenter identity together (phone included for a PII_VIEW holder)', async () => {
+      await service.comments(investigator, { search: '  blake ' });
 
       const where = prisma.comment.findMany.mock.calls[0][0].where as {
         OR: unknown[];
@@ -1036,6 +1170,7 @@ describe('TrackingReadService', () => {
     });
 
     it('orders by count desc and totals the DISTINCT terms, not the rows', async () => {
+      prisma.$queryRaw.mockResolvedValue([{ count: 1 }]);
       const result = await service.topSearches({});
 
       expect(prisma.searchQuery.groupBy.mock.calls[0][0].orderBy).toEqual([
@@ -1043,6 +1178,69 @@ describe('TrackingReadService', () => {
         { _max: { createdAt: 'desc' } },
       ]);
       expect(result.total).toBe(1);
+      const [strings] = prisma.$queryRaw.mock.calls[0] as [
+        TemplateStringsArray,
+      ];
+      expect(strings.join('?')).toContain(
+        'count(DISTINCT "normalizedTerm")::int',
+      );
+    });
+
+    /** The count's SQL as text with `?` for each value, plus the values. */
+    function countQuery(): { sql: string; values: unknown[] } {
+      const [strings, ...values] = prisma.$queryRaw.mock.calls[0] as [
+        TemplateStringsArray,
+        ...unknown[],
+      ];
+      const parts = [strings.join('?')];
+      const flat: unknown[] = [];
+      for (const value of values) {
+        if (value instanceof Prisma.Sql) {
+          parts.push(value.sql);
+          flat.push(...value.values);
+        } else {
+          flat.push(value);
+        }
+      }
+      return { sql: parts.join(' | ').replace(/\s+/g, ' '), values: flat };
+    }
+
+    it('counts with no WHERE when no filter is set', async () => {
+      await service.topSearches({});
+
+      const { sql, values } = countQuery();
+      expect(sql).not.toContain('WHERE');
+      expect(values).toEqual([]);
+    });
+
+    it('counts with exactly the filters the page uses: platform, date range, normalised search', async () => {
+      await service.topSearches({
+        platform: ClientPlatform.MOBILE,
+        from: '2026-08-01',
+        to: '2026-08-20',
+        search: '  The   AVENGERS ',
+      });
+
+      expect(prisma.searchQuery.groupBy.mock.calls[0][0].where).toEqual({
+        platform: ClientPlatform.MOBILE,
+        createdAt: {
+          gte: new Date('2026-08-01'),
+          lte: new Date('2026-08-20T23:59:59.999Z'),
+        },
+        normalizedTerm: { contains: 'the avengers' },
+      });
+      const { sql, values } = countQuery();
+      expect(sql).toContain('"platform" = ?::"ClientPlatform"');
+      expect(sql).toContain('"createdAt" >= ?');
+      expect(sql).toContain('"createdAt" <= ?');
+      // The same unescaped LIKE that Prisma's `contains` sends for the list.
+      expect(sql).toContain(`"normalizedTerm"::text LIKE ('%' || ? || '%')`);
+      expect(values).toEqual([
+        ClientPlatform.MOBILE,
+        new Date('2026-08-01'),
+        new Date('2026-08-20T23:59:59.999Z'),
+        'the avengers',
+      ]);
     });
 
     it('normalises the search filter the same way the stored column is', async () => {
@@ -1053,10 +1251,11 @@ describe('TrackingReadService', () => {
       });
     });
 
-    it('never runs a per-term query — three grouped calls, whatever the page size', async () => {
+    it('never runs a per-term query — two grouped calls and one count, whatever the page size', async () => {
       await service.topSearches({ limit: 100 });
 
-      expect(prisma.searchQuery.groupBy).toHaveBeenCalledTimes(3);
+      expect(prisma.searchQuery.groupBy).toHaveBeenCalledTimes(2);
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
     });
 
     it('skips the spelling pass entirely when the page is empty', async () => {
@@ -1065,7 +1264,7 @@ describe('TrackingReadService', () => {
       const result = await service.topSearches({});
 
       expect(result.items).toEqual([]);
-      expect(prisma.searchQuery.groupBy).toHaveBeenCalledTimes(2);
+      expect(prisma.searchQuery.groupBy).toHaveBeenCalledTimes(1);
     });
 
     it('falls back to the normalised term when no raw spelling survives', async () => {
@@ -1219,6 +1418,47 @@ describe('TrackingReadService', () => {
       expect(result.items[0].sharedIp).toBe(false);
     });
 
+    it('totals the users with a matching session using the SAME filters as the page', async () => {
+      prisma.user.count.mockResolvedValue(7);
+
+      const result = await service.sessions(investigator, {
+        platform: ClientPlatform.WEB,
+        from: '2026-08-01',
+        to: '2026-08-20',
+        ip: '203.0.113.',
+        phone: '0925',
+        search: 'blake',
+      });
+
+      const pageWhere = prisma.userSession.groupBy.mock.calls[0][0].where as {
+        user: Record<string, unknown>;
+      } & Record<string, unknown>;
+      const { user: userFilter, ...sessionFilter } = pageWhere;
+      expect(prisma.user.count).toHaveBeenCalledWith({
+        where: { ...userFilter, sessions: { some: sessionFilter } },
+      });
+      expect(sessionFilter).toEqual({
+        platform: ClientPlatform.WEB,
+        lastSeenAt: {
+          gte: new Date('2026-08-01'),
+          lte: new Date('2026-08-20T23:59:59.999Z'),
+        },
+        ipAddress: { contains: '203.0.113.' },
+      });
+      expect(userFilter.phone).toEqual({ contains: '0925' });
+      expect(userFilter.OR).toBeDefined();
+      expect(result.total).toBe(7);
+    });
+
+    it('counts every user with any session when no filter is set', async () => {
+      await service.sessions(investigator, {});
+
+      expect(prisma.userSession.groupBy.mock.calls[0][0].where).toEqual({});
+      expect(prisma.user.count).toHaveBeenCalledWith({
+        where: { sessions: { some: {} } },
+      });
+    });
+
     it('derives sharedIp from ONE grouped query, not one per row', async () => {
       prisma.userSession.groupBy.mockImplementation(
         ({ by }: { by: string[] }) =>
@@ -1238,8 +1478,9 @@ describe('TrackingReadService', () => {
 
       await service.sessions(investigator, {});
 
-      // page groups + distinct groups + the one (ip, user) pass = 3.
-      expect(prisma.userSession.groupBy).toHaveBeenCalledTimes(3);
+      // page groups + the one (ip, user) pass = 2; the total is a count.
+      expect(prisma.userSession.groupBy).toHaveBeenCalledTimes(2);
+      expect(prisma.user.count).toHaveBeenCalledTimes(1);
       expect(prisma.userSession.findMany).toHaveBeenCalledTimes(1);
       const ipCall = prisma.userSession.groupBy.mock.calls.find(
         (call) => (call[0] as { by: string[] }).by.length === 2,
@@ -1340,8 +1581,8 @@ describe('TrackingReadService', () => {
       expect(result.items[0].user.phone).toBe('+9*****369');
     });
 
-    it('combines the phone, ip, search and platform filters into one where', async () => {
-      await service.sessions(analyst, {
+    it('combines the phone, ip, search and platform filters into one where (PII_VIEW holder)', async () => {
+      await service.sessions(investigator, {
         phone: ' 0950 ',
         ip: ' 203.0.113. ',
         search: ' blake ',

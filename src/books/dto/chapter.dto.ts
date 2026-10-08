@@ -11,6 +11,7 @@ import {
   MaxLength,
   MinLength,
 } from 'class-validator';
+import { IsBoundedDocument } from './document-limits';
 
 export class CreateBookChapterDto {
   @IsString()
@@ -29,6 +30,7 @@ export class CreateBookChapterDto {
    */
   @IsOptional()
   @IsObject()
+  @IsBoundedDocument()
   content?: Record<string, unknown>;
 
   /** Optional cover for the chapter — available to both book types. */

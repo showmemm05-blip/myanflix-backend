@@ -9,7 +9,12 @@ import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
 import { bookChapterSnapshot } from '../audit/audit-snapshots';
 import { AuditService } from '../audit/audit.service';
-import { probePdf, renderPdfPageToPng } from './pdf.util';
+import { ConversionSlots } from '../common/concurrency/slots';
+import {
+  describeBytes,
+  maxDocumentUploadBytes,
+} from '../uploads/upload-limits';
+import { probePdf, renderDpiForPage, renderPdfPageToPng } from './pdf.util';
 
 /**
  * Longest edge caps for the served WebPs. 1600px wide fills a desktop
@@ -29,6 +34,23 @@ const WEBP_QUALITY = 82;
  * a wide pool would starve everything else for no wall-clock win.
  */
 const PAGE_CONCURRENCY = 2;
+
+/**
+ * How many CHAPTERS may convert at the same time across the whole process
+ * (M-9). The per-chapter reservation only stops the same chapter starting
+ * twice; without this, N chapters started together ran N pdftoppm pools at
+ * once on the box that also serves the API and Postgres. Extra starts are
+ * accepted (the chapter goes PROCESSING right away) and simply wait their
+ * turn. BOOK_CONVERSION_CONCURRENCY overrides it.
+ */
+const DEFAULT_CONVERSION_CONCURRENCY = 2;
+
+export function conversionConcurrency(): number {
+  const raw = Number(process.env.BOOK_CONVERSION_CONCURRENCY);
+  return Number.isInteger(raw) && raw > 0
+    ? raw
+    : DEFAULT_CONVERSION_CONCURRENCY;
+}
 
 /**
  * The pages/v-<tag>/ folder one SOURCE file converts into (H-23). A pure
@@ -80,6 +102,14 @@ export class BookProcessingService {
   // entry here is unambiguously orphaned and safe to retry. Keyed by
   // CHAPTER — every chapter carries its own file and converts on its own.
   private readonly activeChapterIds = new Set<string>();
+
+  /** Process-wide: at most conversionConcurrency() pipelines past the download at once. */
+  private readonly slots = new ConversionSlots(conversionConcurrency);
+
+  /** How many chapters are converting right now and how many wait for a slot — for the spec and the log. */
+  get conversionLoad(): { active: number; queued: number } {
+    return { active: this.slots.active, queued: this.slots.queued };
+  }
 
   constructor(
     private readonly prisma: PrismaService,
@@ -145,6 +175,8 @@ export class BookProcessingService {
     // Page rows of an older source file this run removed (H-23) — reported
     // on the outcome audit event either way.
     let previousPagesRemoved = 0;
+    // Whether this run holds one of the process-wide conversion slots.
+    let holdsSlot = false;
 
     try {
       chapter = await this.prisma.bookChapter.findUnique({
@@ -176,6 +208,27 @@ export class BookProcessingService {
         data: { status: ChapterStatus.PROCESSING, processingError: null },
       });
 
+      // The object's size is checked from its HEAD before a byte of it is
+      // downloaded (M-24): a PDF over the document budget is failed here,
+      // never streamed to the scratch disk.
+      const stat = await this.minioService.objectStat(chapter.pdfKey);
+      if (!stat) {
+        throw new Error(
+          'No uploaded PDF found for this chapter — upload the file first',
+        );
+      }
+      const maxBytes = maxDocumentUploadBytes();
+      if (stat.size > maxBytes) {
+        throw new Error(
+          `The PDF is ${stat.size} bytes — a chapter PDF may be at most ${describeBytes(maxBytes)}`,
+        );
+      }
+
+      // Wait for a process-wide slot (M-9). The chapter already reads
+      // PROCESSING, so the admin's poll shows it queued rather than idle.
+      await this.slots.acquire();
+      holdsSlot = true;
+
       const scratchDir = join(
         this.storageService.bookScratchDir(bookId, editionId, chapterId),
         runId,
@@ -204,7 +257,7 @@ export class BookProcessingService {
         );
       }
 
-      const { pageCount } = await probePdf(localPdf);
+      const { pageCount, pageSizes } = await probePdf(localPdf);
 
       // Pages that already made it through a previous (partial) run of THIS
       // file — their rows only exist because their WebP upload succeeded, so
@@ -251,6 +304,7 @@ export class BookProcessingService {
             pageCount,
             sourceTag,
             scratchDir,
+            renderDpiForPage(pageSizes.get(pending[index])),
           );
         }
       };
@@ -326,6 +380,7 @@ export class BookProcessingService {
         }
       }
     } finally {
+      if (holdsSlot) this.slots.release();
       // Still null when the run bailed out before the chapter row resolved —
       // nothing was created, so there is nothing to remove.
       if (createdScratchDir) {
@@ -371,9 +426,18 @@ export class BookProcessingService {
     pageCount: number,
     sourceTag: string,
     scratchDir: string,
+    dpi: number,
   ): Promise<void> {
     const pngBase = join(scratchDir, `page-${pageNumber}`);
-    const pngPath = await renderPdfPageToPng(localPdf, pageNumber, pngBase);
+    // The DPI is bounded per page (see renderDpiForPage): an ordinary page
+    // renders at the standard 150, a poster-sized one lower, so the raw
+    // bitmap below can never be the multi-gigabyte image it used to be.
+    const pngPath = await renderPdfPageToPng(
+      localPdf,
+      pageNumber,
+      pngBase,
+      dpi,
+    );
 
     try {
       const { data, info } = await sharp(pngPath)
@@ -405,21 +469,27 @@ export class BookProcessingService {
       await this.minioService.uploadBuffer(imageKey, data);
 
       // Row AFTER upload — its existence is the resume marker (see the
-      // class doc comment), so it must never precede the bytes.
-      await this.prisma.bookPage.create({
-        data: {
-          chapterId: ids.chapterId,
-          pageNumber,
-          imageKey,
-          width: info.width,
-          height: info.height,
-          fileSize: data.length,
-        },
-      });
-      await this.prisma.bookChapter.update({
-        where: { id: ids.chapterId },
-        data: { processedPages: { increment: 1 } },
-      });
+      // class doc comment), so it must never precede the bytes. The row and
+      // the progress counter go in one transaction so they are atomic: the
+      // counter can never drift from the rows. (This is for correctness, not
+      // speed — through @prisma/adapter-pg a batch transaction is still sent
+      // as separate BEGIN / INSERT / UPDATE / COMMIT statements.)
+      await this.prisma.$transaction([
+        this.prisma.bookPage.create({
+          data: {
+            chapterId: ids.chapterId,
+            pageNumber,
+            imageKey,
+            width: info.width,
+            height: info.height,
+            fileSize: data.length,
+          },
+        }),
+        this.prisma.bookChapter.update({
+          where: { id: ids.chapterId },
+          data: { processedPages: { increment: 1 } },
+        }),
+      ]);
     } finally {
       await rm(pngPath, { force: true }).catch(() => {});
     }

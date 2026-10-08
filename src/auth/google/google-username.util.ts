@@ -12,6 +12,7 @@ const MAX_BASE_LENGTH = 24;
  *
  *   John.Doe@gmail.com → john.doe      a.b+tag@x.com → a.b_tag
  *   j@x.com → user_j                   ___@x.com / non-Latin → user
+ *   user_959123456789@x.com → g_959123456789  (never a phone account's name)
  */
 export function deriveUsernameBase(email: string): string {
   const local = email.split('@')[0].toLowerCase();
@@ -21,8 +22,19 @@ export function deriveUsernameBase(email: string): string {
     .slice(0, MAX_BASE_LENGTH)
     .replace(/^[_.]+|[_.]+$/g, '');
 
-  if (base.length < 3) {
-    return base ? `user_${base}` : 'user';
-  }
-  return base;
+  const padded = base.length < 3 ? (base ? `user_${base}` : 'user') : base;
+  return reserveFromPhoneShape(padded);
+}
+
+/**
+ * `user_<digits>` is the username a phone sign-up synthesizes for the phone
+ * with those digits (AuthService.verifyPhoneOtp), so a Google account whose
+ * e-mail local part spells `user_959123456789@…` must never be granted that
+ * exact name — it would pre-claim a stranger's phone account name (M-20).
+ * Those get `g_<digits>` instead (same length class, still a legal username,
+ * ≥ 3 characters since the digits are never empty).
+ */
+function reserveFromPhoneShape(base: string): string {
+  const match = /^user_(\d+)$/.exec(base);
+  return match ? `g_${match[1]}` : base;
 }

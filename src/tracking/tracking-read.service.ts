@@ -1,4 +1,8 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import {
   ClientPlatform,
   CommentStatus,
@@ -76,6 +80,37 @@ interface TrackedUserRow {
   username: string;
   displayName: string | null;
   phone: string | null;
+}
+
+/**
+ * Why the Phone/IP view's `phone` and `ip` filters are refused for a caller
+ * without `TRACKING.PII_VIEW`. Sent as the 403 body, so the admin page can
+ * show it verbatim.
+ */
+export const PII_FILTER_FORBIDDEN_MESSAGE =
+  'Filtering by phone number or IP address requires the TRACKING.PII_VIEW permission';
+
+/**
+ * The user-identity half of a free-text search: username and display name
+ * always, the phone column ONLY for a caller who may read phones in full.
+ *
+ * For anyone else the response masks the phone to `09*****369`, and a
+ * substring match on the real column would hand them a yes/no oracle:
+ * search "0925", then "09250", "09251"... and whichever guess keeps the row
+ * on screen is a hidden digit recovered. So the branch is simply absent —
+ * a masked caller's search cannot touch the column at all (security audit
+ * 2026-10-06, M-4).
+ */
+export function userIdentitySearch(
+  search: string,
+  canViewPii: boolean,
+): Prisma.UserWhereInput[] {
+  const terms: Prisma.UserWhereInput[] = [
+    { username: { contains: search, mode: 'insensitive' } },
+    { displayName: { contains: search, mode: 'insensitive' } },
+  ];
+  if (canViewPii) terms.push({ phone: { contains: search } });
+  return terms;
 }
 
 export interface TrackedUserView {
@@ -309,17 +344,18 @@ export class TrackingReadService {
     const createdAt = trackingDateRange(query.from, query.to);
     if (createdAt) where.createdAt = createdAt;
 
+    // Resolved BEFORE the where clause: it decides which columns the search
+    // may touch, not only how the rows are printed back.
+    const canViewPii = await this.canViewPii(actor);
+
     const search = query.search?.trim();
     if (search) {
       where.OR = [
         { body: { contains: search, mode: 'insensitive' } },
-        { user: { username: { contains: search, mode: 'insensitive' } } },
-        { user: { displayName: { contains: search, mode: 'insensitive' } } },
-        { user: { phone: { contains: search } } },
+        ...userIdentitySearch(search, canViewPii).map((user) => ({ user })),
       ];
     }
 
-    const canViewPii = await this.canViewPii(actor);
     const [rows, total] = await this.prisma.$transaction([
       this.prisma.comment.findMany({
         where,
@@ -427,17 +463,17 @@ export class TrackingReadService {
     const createdAt = trackingDateRange(query.from, query.to);
     if (createdAt) where.createdAt = createdAt;
 
+    // Resolved BEFORE the where clause — see comments().
+    const canViewPii = await this.canViewPii(actor);
+
     const search = query.search?.trim();
     if (search) {
       where.OR = [
         { message: { contains: search, mode: 'insensitive' } },
-        { user: { username: { contains: search, mode: 'insensitive' } } },
-        { user: { displayName: { contains: search, mode: 'insensitive' } } },
-        { user: { phone: { contains: search } } },
+        ...userIdentitySearch(search, canViewPii).map((user) => ({ user })),
       ];
     }
 
-    const canViewPii = await this.canViewPii(actor);
     const [rows, total] = await this.prisma.$transaction([
       this.prisma.feedback.findMany({
         where,
@@ -808,7 +844,7 @@ export class TrackingReadService {
     // Promise.all rather than $transaction: Prisma's aggregate result types
     // collapse into a union inside a transaction array, and these two are a
     // page and its group count, not a pair that has to see one snapshot.
-    const [groups, distinct] = await Promise.all([
+    const [groups, total] = await Promise.all([
       this.prisma.searchQuery.groupBy({
         by: ['normalizedTerm'],
         where,
@@ -822,7 +858,7 @@ export class TrackingReadService {
         skip: (page - 1) * limit,
         take: limit,
       }),
-      this.prisma.searchQuery.groupBy({ by: ['normalizedTerm'], where }),
+      this.countDistinctSearchTerms(query),
     ]);
 
     const terms = groups.map((group) => group.normalizedTerm);
@@ -865,7 +901,49 @@ export class TrackingReadService {
       platforms: [...(platforms.get(group.normalizedTerm) ?? [])],
     }));
 
-    return { items, total: distinct.length, page, limit };
+    return { items, total, page, limit };
+  }
+
+  /**
+   * How many distinct normalised terms match the report's filters — the
+   * page total. One number from Postgres instead of loading every distinct
+   * term just to take `.length` (db-10). The WHERE is built from the SAME
+   * parts as searchWhere (searchFilterParts), condition for condition:
+   * platform equals, createdAt within the range, and `normalizedTerm`
+   * containing the normalised search text. Prisma's `contains` becomes
+   * `LIKE ('%' || $1 || '%')` WITHOUT escaping `_`, `%` or `\` in the
+   * search text, so those act as wildcards in the page list. The count
+   * uses the very same LIKE so the total always matches the rows shown
+   * (a literal strpos() match would disagree for such search text).
+   */
+  private async countDistinctSearchTerms(
+    query: TrackingSearchQueryDto,
+  ): Promise<number> {
+    const { platform, createdAt, normalizedContains } =
+      this.searchFilterParts(query);
+    const conditions: Prisma.Sql[] = [];
+    if (platform) {
+      conditions.push(Prisma.sql`"platform" = ${platform}::"ClientPlatform"`);
+    }
+    if (createdAt?.gte) {
+      conditions.push(Prisma.sql`"createdAt" >= ${createdAt.gte}`);
+    }
+    if (createdAt?.lte) {
+      conditions.push(Prisma.sql`"createdAt" <= ${createdAt.lte}`);
+    }
+    if (normalizedContains !== undefined) {
+      conditions.push(
+        Prisma.sql`"normalizedTerm"::text LIKE ('%' || ${normalizedContains} || '%')`,
+      );
+    }
+    const whereSql = conditions.length
+      ? Prisma.sql`WHERE ${Prisma.join(conditions, ' AND ')}`
+      : Prisma.empty;
+    const rows = await this.prisma.$queryRaw<{ count: number }[]>`
+      SELECT count(DISTINCT "normalizedTerm")::int AS "count"
+      FROM "search_queries"
+      ${whereSql}`;
+    return rows[0]?.count ?? 0;
   }
 
   /**
@@ -920,18 +998,35 @@ export class TrackingReadService {
   private searchWhere(
     query: TrackingSearchQueryDto,
   ): Prisma.SearchQueryWhereInput {
+    const { platform, createdAt, normalizedContains } =
+      this.searchFilterParts(query);
     const where: Prisma.SearchQueryWhereInput = {};
-    if (query.platform) where.platform = query.platform;
-    const createdAt = trackingDateRange(query.from, query.to);
+    if (platform) where.platform = platform;
     if (createdAt) where.createdAt = createdAt;
-
-    const search = query.search?.trim();
-    if (search) {
-      // Normalised the same way the stored column is, so the filter matches
-      // the grouping key rather than fighting it.
-      where.normalizedTerm = { contains: normalizeSearchTerm(search) };
+    if (normalizedContains !== undefined) {
+      where.normalizedTerm = { contains: normalizedContains };
     }
     return where;
+  }
+
+  /**
+   * The search reports' filters, parsed once. searchWhere (Prisma) and
+   * countDistinctSearchTerms (SQL) are both built from this, so the two can
+   * never filter differently.
+   */
+  private searchFilterParts(query: TrackingSearchQueryDto): {
+    platform?: ClientPlatform;
+    createdAt?: { gte?: Date; lte?: Date };
+    normalizedContains?: string;
+  } {
+    const search = query.search?.trim();
+    return {
+      platform: query.platform || undefined,
+      createdAt: trackingDateRange(query.from, query.to),
+      // Normalised the same way the stored column is, so the filter matches
+      // the grouping key rather than fighting it.
+      normalizedContains: search ? normalizeSearchTerm(search) : undefined,
+    };
   }
 
   /**
@@ -978,27 +1073,31 @@ export class TrackingReadService {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
+    // Resolved BEFORE the where clause: the phone/IP filters below exist only
+    // for callers who may read those columns in full (see the DTO).
+    const canViewPii = await this.canViewPii(actor);
+    const ip = query.ip?.trim();
+    const phone = query.phone?.trim();
+    if (!canViewPii && (ip || phone)) {
+      throw new ForbiddenException(PII_FILTER_FORBIDDEN_MESSAGE);
+    }
+
     const where: Prisma.UserSessionWhereInput = {};
     if (query.platform) where.platform = query.platform;
     const lastSeenAt = trackingDateRange(query.from, query.to);
     if (lastSeenAt) where.lastSeenAt = lastSeenAt;
-    if (query.ip?.trim()) where.ipAddress = { contains: query.ip.trim() };
+    if (ip) where.ipAddress = { contains: ip };
 
     const user: Prisma.UserWhereInput = {};
-    if (query.phone?.trim()) user.phone = { contains: query.phone.trim() };
+    if (phone) user.phone = { contains: phone };
     const search = query.search?.trim();
-    if (search) {
-      user.OR = [
-        { username: { contains: search, mode: 'insensitive' } },
-        { displayName: { contains: search, mode: 'insensitive' } },
-        { phone: { contains: search } },
-      ];
-    }
+    if (search) user.OR = userIdentitySearch(search, canViewPii);
+    // The session-only filters, before the user filter is attached.
+    const sessionOnly: Prisma.UserSessionWhereInput = { ...where };
     if (Object.keys(user).length > 0) where.user = user;
 
-    const canViewPii = await this.canViewPii(actor);
     // See the note in topSearches on why this pair is not a $transaction.
-    const [groups, distinct] = await Promise.all([
+    const [groups, total] = await Promise.all([
       this.prisma.userSession.groupBy({
         by: ['userId'],
         where,
@@ -1008,7 +1107,15 @@ export class TrackingReadService {
         skip: (page - 1) * limit,
         take: limit,
       }),
-      this.prisma.userSession.groupBy({ by: ['userId'], where }),
+      // The page total: the users with at least one matching session — the
+      // same number as the distinct userIds of the matching sessions
+      // (userId is required and a foreign key), counted by Postgres instead
+      // of loading every distinct id just to take `.length` (db-10). The
+      // user filter (phone, and the PII-aware identity search) moves to the
+      // user side unchanged; the session filters stay on the session side.
+      this.prisma.user.count({
+        where: { ...user, sessions: { some: sessionOnly } },
+      }),
     ]);
 
     const userIds = groups.map((group) => group.userId);
@@ -1090,7 +1197,7 @@ export class TrackingReadService {
       });
     }
 
-    return { items, total: distinct.length, page, limit };
+    return { items, total, page, limit };
   }
 
   /** One user's own sessions, newest first — the row's details drawer. */

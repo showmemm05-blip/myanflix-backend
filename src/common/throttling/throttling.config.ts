@@ -9,7 +9,7 @@ import {
   type ThrottlerLimitDetail,
   type ThrottlerModuleOptions,
 } from '@nestjs/throttler';
-import { normalizeIp, resolveClientIp } from '../storage/request-host.context';
+import { trustedClientIp } from '../../config/trusted-proxies';
 import { normalizePhone } from '../utils/phone.util';
 
 /**
@@ -39,46 +39,31 @@ export const THROTTLER_TARGET = 'target';
 export const THROTTLE_OPT_IN_KEY = 'throttle:optIn';
 
 /**
- * Trusted reverse proxies, from TRUSTED_PROXIES (comma-separated IPs). Only
- * when the CONNECTING PEER is one of these is X-Forwarded-For believed —
- * otherwise the header is whatever the client typed, and every per-IP limit
- * could be dodged by varying it per request. Empty (the default) means the
- * API is reached directly and the socket peer is the truth.
- */
-let trustedCache: { raw: string | undefined; set: Set<string> } | null = null;
-function trustedProxies(): Set<string> {
-  const raw = process.env.TRUSTED_PROXIES;
-  if (trustedCache && trustedCache.raw === raw) return trustedCache.set;
-  const set = new Set(
-    (raw ?? '')
-      .split(',')
-      .map((v) => normalizeIp(v.trim()))
-      .filter((v): v is string => v !== null),
-  );
-  trustedCache = { raw, set };
-  return set;
-}
-
-/**
- * The client's IP for rate-limit keys. The socket peer, unless that peer is
- * a trusted proxy — then the first X-Forwarded-For hop it relayed (the same
- * resolution the tracking rows use). Never a client-controlled header on
- * its own.
+ * The client's IP for rate-limit keys: the socket peer, unless that peer is
+ * a trusted proxy (TRUSTED_PROXIES) — then the first X-Forwarded-For hop it
+ * relayed. One rule shared with the tracking rows and the socket gateway
+ * (config/trusted-proxies.ts); never a client-controlled header on its own.
  */
 export function clientIpOf(req: Record<string, unknown>): string {
   const headers = req.headers as
     Record<string, string | string[] | undefined> | undefined;
   const socket = req.socket as { remoteAddress?: string } | undefined;
-  const peer = normalizeIp(socket?.remoteAddress);
-  if (peer && trustedProxies().has(peer)) {
-    return resolveClientIp(headers?.['x-forwarded-for'], peer) ?? peer;
-  }
-  return peer ?? 'unknown';
+  return (
+    trustedClientIp(headers?.['x-forwarded-for'], socket?.remoteAddress) ??
+    'unknown'
+  );
 }
 
 /**
  * The credential a request is aimed at: the normalized phone (`phone`), else
- * the username (`username`, case-folded), else the client IP.
+ * the username (`username`, case-folded), else — on a signed-in route such
+ * as the withdrawal-code routes — the signed-in account (`account:<id>`),
+ * else the client IP.
+ *
+ * `req.user` is only there because JwtAuthGuard is registered as an
+ * APP_GUARD before AppThrottlerGuard (AppModule) and so has already run; an
+ * @Public route never has it, so the auth routes keep their phone /
+ * username / IP keying exactly as before.
  *
  * Guards run BEFORE pipes, so `req.body` here is the raw parsed JSON — the
  * DTO's @Transform(normalizePhone) has not happened yet. Normalizing here
@@ -110,6 +95,10 @@ export const credentialTargetTracker: ThrottlerGetTrackerFunction = (req) => {
     if (userText !== null) {
       return `user:${userText.toLowerCase()}`;
     }
+  }
+  const account = req.user as { id?: unknown } | undefined;
+  if (account && typeof account.id === 'string' && account.id) {
+    return `account:${account.id}`;
   }
   return `ip:${clientIpOf(req)}`;
 };
@@ -188,19 +177,23 @@ interface Bucket {
 
 /**
  * The per-route auth limits, by intent:
- *  - otpRequest: each SMS costs money — 4 codes per phone per 10 min, and
+ *  - otpRequest: each SMS costs money — 4 code requests per phone per 2 min
+ *    (window cut from 10 min on 2026-10-01: a user who hit it waited 600 s;
+ *    the 60 s cooldown and the 8/hour + 10/day caps per number still apply), and
  *    50 per IP per hour so one address cannot burn codes across many phones
  *    (raised from 3 and 20 on 2026-09-29: many users share one address on
  *    Wi-Fi and mobile-carrier NAT).
  *  - credential: anything that answers "is this password/code right?" —
- *    10 tries per phone/username per minute, 120 per IP per minute (raised
- *    from 60 on 2026-09-29 for the same shared-address reason).
+ *    10 tries per phone/username (signed-in routes: per account) per minute,
+ *    120 per IP per minute (raised from 60 on 2026-09-29 for the same
+ *    shared-address reason). Also on POST /withdrawals and the
+ *    withdrawal-code routes, which check the withdrawal code.
  *  - session: token/identity exchanges with no guessable secret in the body
  *    (google, refresh, register, logout) — 30 per IP per minute.
  */
 export const AUTH_THROTTLE_LIMITS = {
   otpRequest: {
-    [THROTTLER_TARGET]: { ttl: minutes(10), limit: 4 },
+    [THROTTLER_TARGET]: { ttl: minutes(2), limit: 4 },
     [THROTTLER_IP]: { ttl: hours(1), limit: 50 },
   },
   credential: {

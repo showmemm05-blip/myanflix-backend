@@ -14,6 +14,8 @@ import type {
   Deposit,
   Feedback,
   FinanceSettings,
+  HomePromo,
+  HomeSettings,
   Movie,
   PaymentAccount,
   PaymentMethodType,
@@ -470,6 +472,47 @@ export function subscriptionPlanSnapshot(
     price: money(plan.price),
     durationDays: nullIfUndefined(plan.durationDays),
     isActive: nullIfUndefined(plan.isActive),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Home page
+// ---------------------------------------------------------------------------
+
+/** Every editable field of a home promo — all short texts, no secrets. */
+export function homePromoSnapshot(promo: Partial<HomePromo>): Snapshot {
+  return {
+    kind: nullIfUndefined(promo.kind),
+    titleEn: nullIfUndefined(promo.titleEn),
+    titleMm: nullIfUndefined(promo.titleMm),
+    kickerEn: nullIfUndefined(promo.kickerEn),
+    kickerMm: nullIfUndefined(promo.kickerMm),
+    bodyEn: nullIfUndefined(promo.bodyEn),
+    bodyMm: nullIfUndefined(promo.bodyMm),
+    ctaLabelEn: nullIfUndefined(promo.ctaLabelEn),
+    ctaLabelMm: nullIfUndefined(promo.ctaLabelMm),
+    ctaTarget: nullIfUndefined(promo.ctaTarget),
+    targetId: nullIfUndefined(promo.targetId),
+    url: nullIfUndefined(promo.url),
+    artPreset: nullIfUndefined(promo.artPreset),
+    imageUrl: nullIfUndefined(promo.imageUrl),
+    dateText: nullIfUndefined(promo.dateText),
+    startsAt: nullIfUndefined(promo.startsAt),
+    endsAt: nullIfUndefined(promo.endsAt),
+    isActive: nullIfUndefined(promo.isActive),
+    sortOrder: nullIfUndefined(promo.sortOrder),
+  };
+}
+
+export function homeSettingsSnapshot(
+  settings: Partial<HomeSettings>,
+): Snapshot {
+  return {
+    webUrl: nullIfUndefined(settings.webUrl),
+    appStoreUrl: nullIfUndefined(settings.appStoreUrl),
+    playStoreUrl: nullIfUndefined(settings.playStoreUrl),
+    gamesTeaserEnabled: nullIfUndefined(settings.gamesTeaserEnabled),
+    gamesTeaserDateText: nullIfUndefined(settings.gamesTeaserDateText),
   };
 }
 

@@ -3,10 +3,24 @@ import {
   BadGatewayException,
   BadRequestException,
   ConflictException,
+  HttpException,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { access, readdir } from 'node:fs/promises';
-import { UploadsService } from './uploads.service';
+import {
+  access,
+  readdir,
+  rename,
+  rm,
+  stat,
+  statfs,
+  writeFile,
+} from 'node:fs/promises';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { PassThrough, Writable } from 'node:stream';
+import sharp from 'sharp';
+import { UploadsService, expectedChunkSize } from './uploads.service';
+import { DEFAULT_MAX_VIDEO_UPLOAD_BYTES } from './upload-limits';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
@@ -35,10 +49,53 @@ jest.mock('node:fs/promises', () => ({
   ...jest.requireActual('node:fs/promises'),
   access: jest.fn(),
   readdir: jest.fn(),
+  rename: jest.fn(),
+  rm: jest.fn(),
+  stat: jest.fn(),
+  statfs: jest.fn(),
+  writeFile: jest.fn(),
+}));
+// The merge streams every chunk file into the destination; the fakes below
+// (see fakeMergeStreams) stand in for the disk so a complete can run end to
+// end without one.
+jest.mock('node:fs', () => ({
+  ...jest.requireActual('node:fs'),
+  createReadStream: jest.fn(),
+  createWriteStream: jest.fn(),
 }));
 
 const accessMock = access as jest.Mock;
 const readdirMock = readdir as jest.Mock;
+const rmMock = rm as unknown as jest.Mock;
+const statfsMock = statfs as unknown as jest.Mock;
+const writeFileMock = writeFile as unknown as jest.Mock;
+const renameMock = rename as unknown as jest.Mock;
+const statMock = stat as unknown as jest.Mock;
+const createReadStreamMock = createReadStream as unknown as jest.Mock;
+const createWriteStreamMock = createWriteStream as unknown as jest.Mock;
+
+const GB = 1024 * 1024 * 1024;
+const MB = 1024 * 1024;
+/** statfs result for `bytes` free, in 4 KB blocks. */
+const freeBytes = (bytes: number) => ({
+  bavail: BigInt(Math.floor(bytes / 4096)),
+  bsize: 4096n,
+});
+
+/** Every chunk read yields one byte; the destination swallows everything and finishes on end(). */
+function fakeMergeStreams() {
+  createReadStreamMock.mockImplementation(() => {
+    const stream = new PassThrough();
+    process.nextTick(() => stream.end(Buffer.from('x')));
+    return stream;
+  });
+  createWriteStreamMock.mockImplementation(
+    () =>
+      new Writable({
+        write: (_chunk, _encoding, callback) => callback(),
+      }),
+  );
+}
 
 describe('UploadsService', () => {
   let service: UploadsService;
@@ -49,11 +106,15 @@ describe('UploadsService', () => {
     $transaction: jest.Mock;
     uploadSession: {
       findFirst: jest.Mock;
+      findUnique: jest.Mock;
+      count: jest.Mock;
       create: jest.Mock;
       update: jest.Mock;
     };
   };
   let storageService: {
+    root: string;
+    chunkPath?: jest.Mock;
     uploadSessionDir: jest.Mock;
     ensureDir: jest.Mock;
     videoDir: jest.Mock;
@@ -75,6 +136,7 @@ describe('UploadsService', () => {
     uploadBuffer: jest.Mock;
     publicUrl: jest.Mock;
     listKeys: jest.Mock;
+    listObjects: jest.Mock;
     copyObject: jest.Mock;
     deleteKeys: jest.Mock;
     deleteByPrefix: jest.Mock;
@@ -94,13 +156,18 @@ describe('UploadsService', () => {
     reserve: jest.Mock;
     release: jest.Mock;
   };
-  let subtitlesService: { createFromExistingKey: jest.Mock };
+  let subtitlesService: {
+    createFromExistingKey: jest.Mock;
+    publishQuietly: jest.Mock;
+  };
   let audit: { record: jest.Mock };
-  let resourceTypes: { resolve: jest.Mock };
+  let resourceTypes: { resolve: jest.Mock; assertFileSizeAllowed: jest.Mock };
 
   beforeEach(async () => {
     jest.clearAllMocks();
     audit = { record: jest.fn().mockResolvedValue(undefined) };
+    // A roomy scratch disk by default — 1 TB free in 4 KB blocks.
+    statfsMock.mockResolvedValue({ bavail: 268_435_456n, bsize: 4096n });
 
     prisma = {
       movie: {
@@ -123,14 +190,18 @@ describe('UploadsService', () => {
       $transaction: jest.fn(),
       uploadSession: {
         findFirst: jest.fn(),
+        findUnique: jest.fn(),
+        // No other session open for the movie unless a case says so.
+        count: jest.fn().mockResolvedValue(0),
         create: jest.fn(),
-        update: jest.fn(),
+        update: jest.fn().mockResolvedValue({}),
       },
     };
     prisma.$transaction.mockImplementation(
       async (fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma),
     );
     storageService = {
+      root: '/storage',
       videoKeyPrefix: jest.fn((movieId: string) => `videos/${movieId}`),
       subtitleSourcePrefix: jest.fn(
         (movieId: string) => `subtitles/${movieId}`,
@@ -178,6 +249,7 @@ describe('UploadsService', () => {
       uploadBuffer: jest.fn().mockResolvedValue(undefined),
       publicUrl: jest.fn((key: string) => `https://cdn.example/${key}`),
       listKeys: jest.fn().mockResolvedValue([]),
+      listObjects: jest.fn().mockResolvedValue([]),
       copyObject: jest.fn().mockResolvedValue(undefined),
       deleteKeys: jest.fn().mockResolvedValue(undefined),
       deleteByPrefix: jest.fn().mockResolvedValue(undefined),
@@ -201,6 +273,7 @@ describe('UploadsService', () => {
     };
     subtitlesService = {
       createFromExistingKey: jest.fn().mockResolvedValue({ id: 'subtitle-1' }),
+      publishQuietly: jest.fn().mockResolvedValue(true),
     };
     // Mirrors the real ResourceUploadTypeRegistry routing (asserted for real
     // in resource-upload-type.registry.spec.ts): every bundle file keeps the
@@ -212,6 +285,12 @@ describe('UploadsService', () => {
           relativePath.startsWith('subtitles/')
             ? `subtitles/${resourceId}/${relativePath.slice('subtitles/'.length)}`
             : `videos/${resourceId}/${relativePath}`,
+      }),
+      // The real budget is proven in resource-upload-type.registry.spec.ts;
+      // this mirrors its movie rule so initUpload's refusal is observable.
+      assertFileSizeAllowed: jest.fn((_type: string, filesize: number) => {
+        if (filesize > DEFAULT_MAX_VIDEO_UPLOAD_BYTES)
+          throw new BadRequestException('too big');
       }),
     };
 
@@ -243,16 +322,21 @@ describe('UploadsService', () => {
     it('throws NotFoundException when the movie does not exist', async () => {
       prisma.movie.findUnique.mockResolvedValue(null);
 
-      await expect(service.initUpload(dto)).rejects.toThrow(NotFoundException);
+      await expect(service.initUpload(ACTOR, dto)).rejects.toThrow(
+        NotFoundException,
+      );
     });
 
     it('creates a brand-new session when no in-progress one matches', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+      prisma.movie.findUnique.mockResolvedValue({
+        id: 'movie-1',
+        status: MovieStatus.DRAFT,
+      });
       prisma.uploadSession.findFirst.mockResolvedValue(null);
       prisma.uploadSession.create.mockResolvedValue({ id: 'session-1' });
       prisma.uploadSession.update.mockResolvedValue({});
 
-      const result = await service.initUpload(dto);
+      const result = await service.initUpload(ACTOR, dto);
 
       expect(prisma.uploadSession.create).toHaveBeenCalled();
       expect(result.uploadId).toBe('session-1');
@@ -263,7 +347,10 @@ describe('UploadsService', () => {
       'resumes an existing in-progress session for the same movie/filename/size instead of ' +
         'starting a new one — this is what lets a retry skip chunks it already sent',
       async () => {
-        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+        prisma.movie.findUnique.mockResolvedValue({
+          id: 'movie-1',
+          status: MovieStatus.DRAFT,
+        });
         prisma.uploadSession.findFirst.mockResolvedValue({
           id: 'session-existing',
           chunkSize: 5 * 1024 * 1024,
@@ -275,7 +362,7 @@ describe('UploadsService', () => {
         // completeUpload() attempt on this session and must be ignored.
         readdirMock.mockResolvedValue(['chunk_2', 'chunk_0', 'merged']);
 
-        const result = await service.initUpload(dto);
+        const result = await service.initUpload(ACTOR, dto);
 
         expect(prisma.uploadSession.create).not.toHaveBeenCalled();
         expect(result.uploadId).toBe('session-existing');
@@ -284,7 +371,10 @@ describe('UploadsService', () => {
     );
 
     it('reports no uploaded chunks yet when the session folder does not exist on disk (e.g. right after creation)', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+      prisma.movie.findUnique.mockResolvedValue({
+        id: 'movie-1',
+        status: MovieStatus.DRAFT,
+      });
       prisma.uploadSession.findFirst.mockResolvedValue({
         id: 'session-existing',
         chunkSize: 5 * 1024 * 1024,
@@ -294,18 +384,21 @@ describe('UploadsService', () => {
         Object.assign(new Error('ENOENT'), { code: 'ENOENT' }),
       );
 
-      const result = await service.initUpload(dto);
+      const result = await service.initUpload(ACTOR, dto);
 
       expect(result.uploadedChunks).toEqual([]);
     });
 
     it('only matches sessions with an exact filename+filesize match (a different file for the same movie starts fresh)', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+      prisma.movie.findUnique.mockResolvedValue({
+        id: 'movie-1',
+        status: MovieStatus.DRAFT,
+      });
       prisma.uploadSession.findFirst.mockResolvedValue(null); // Prisma's own where clause enforces the match
       prisma.uploadSession.create.mockResolvedValue({ id: 'session-2' });
       prisma.uploadSession.update.mockResolvedValue({});
 
-      await service.initUpload(dto);
+      await service.initUpload(ACTOR, dto);
 
       expect(prisma.uploadSession.findFirst).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -323,12 +416,16 @@ describe('UploadsService', () => {
       'includes relativePath (or null) in the resume-match — two files sharing a bare filename ' +
         '(every HLS rendition\'s playlist is "index.m3u8") must never resume against each other',
       async () => {
-        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+        // A bundle file only ever lands on a placeholder still being filled.
+        prisma.movie.findUnique.mockResolvedValue({
+          id: 'movie-1',
+          status: MovieStatus.UPLOADING,
+        });
         prisma.uploadSession.findFirst.mockResolvedValue(null);
         prisma.uploadSession.create.mockResolvedValue({ id: 'session-3' });
         prisma.uploadSession.update.mockResolvedValue({});
 
-        await service.initUpload({
+        await service.initUpload(ACTOR, {
           ...dto,
           filename: 'index.m3u8',
           relativePath: 'hls/720p/index.m3u8',
@@ -351,13 +448,332 @@ describe('UploadsService', () => {
       },
     );
 
+    describe('state gate — a direct upload only ever targets a title nobody can watch yet (M-22)', () => {
+      const session = () => {
+        prisma.uploadSession.findFirst.mockResolvedValue(null);
+        prisma.uploadSession.create.mockResolvedValue({ id: 'session-new' });
+        prisma.uploadSession.update.mockResolvedValue({});
+      };
+
+      it.each([
+        MovieStatus.PUBLISHED,
+        MovieStatus.READY_TO_PUBLISH,
+        MovieStatus.ARCHIVED,
+        MovieStatus.PROCESSING,
+      ])(
+        'refuses a classic upload for a %s movie with 409 pointing at movie-replace — no session, no directory',
+        async (status) => {
+          prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1', status });
+          session();
+
+          const attempt = service.initUpload(ACTOR, dto);
+          await expect(attempt).rejects.toThrow(ConflictException);
+          await expect(attempt).rejects.toThrow(/movie-replace/);
+          expect(prisma.uploadSession.create).not.toHaveBeenCalled();
+          expect(storageService.ensureDir).not.toHaveBeenCalled();
+        },
+      );
+
+      it.each([MovieStatus.DRAFT, MovieStatus.UPLOADING, MovieStatus.FAILED])(
+        'lets the classic flow start for a %s movie (DRAFT is where POST /movies leaves a new title)',
+        async (status) => {
+          prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1', status });
+          session();
+
+          await expect(service.initUpload(ACTOR, dto)).resolves.toMatchObject({
+            uploadId: 'session-new',
+          });
+        },
+      );
+
+      it.each([
+        MovieStatus.PUBLISHED,
+        MovieStatus.DRAFT,
+        MovieStatus.READY_TO_PUBLISH,
+      ])(
+        'refuses a BUNDLE file (relativePath) for a %s movie — it would land on the live keys',
+        async (status) => {
+          prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1', status });
+          session();
+
+          await expect(
+            service.initUpload(ACTOR, {
+              ...dto,
+              relativePath: 'hls/master.m3u8',
+            }),
+          ).rejects.toThrow(ConflictException);
+          expect(prisma.uploadSession.create).not.toHaveBeenCalled();
+        },
+      );
+
+      it.each([MovieStatus.UPLOADING, MovieStatus.FAILED])(
+        'lets a bundle file through for a %s movie',
+        async (status) => {
+          prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1', status });
+          session();
+
+          await expect(
+            service.initUpload(ACTOR, {
+              ...dto,
+              relativePath: 'hls/master.m3u8',
+            }),
+          ).resolves.toMatchObject({ uploadId: 'session-new' });
+        },
+      );
+    });
+
+    describe('size budget and disk room (M-23)', () => {
+      beforeEach(() => {
+        prisma.movie.findUnique.mockResolvedValue({
+          id: 'movie-1',
+          status: MovieStatus.DRAFT,
+        });
+        prisma.uploadSession.findFirst.mockResolvedValue(null);
+        prisma.uploadSession.create.mockResolvedValue({ id: 'session-new' });
+        prisma.uploadSession.update.mockResolvedValue({});
+      });
+
+      it('refuses a filesize over the video budget before any session exists — the chunk count can no longer run into the millions', async () => {
+        await expect(
+          service.initUpload(ACTOR, {
+            ...dto,
+            filesize: DEFAULT_MAX_VIDEO_UPLOAD_BYTES + 1,
+          }),
+        ).rejects.toThrow(BadRequestException);
+        expect(resourceTypes.assertFileSizeAllowed).toHaveBeenCalledWith(
+          'movie',
+          DEFAULT_MAX_VIDEO_UPLOAD_BYTES + 1,
+          'movie.mp4',
+        );
+        expect(prisma.uploadSession.create).not.toHaveBeenCalled();
+      });
+
+      it('refuses with 507 when the scratch disk could not hold the file plus the reserve', async () => {
+        // 1 GB free; the file is 500 MB and 2 GB must stay spare.
+        statfsMock.mockResolvedValue({ bavail: 262_144n, bsize: 4096n });
+
+        const attempt = service.initUpload(ACTOR, {
+          ...dto,
+          filesize: 500 * 1024 * 1024,
+        });
+        await expect(attempt).rejects.toThrow(HttpException);
+        await expect(attempt).rejects.toMatchObject({ status: 507 });
+        expect(statfsMock).toHaveBeenCalledWith('/storage');
+        expect(prisma.uploadSession.create).not.toHaveBeenCalled();
+      });
+
+      it('lets the session through when the disk has room for the file and the reserve', async () => {
+        // 3 GB free, 500 MB file, 2 GB reserve.
+        statfsMock.mockResolvedValue({ bavail: 786_432n, bsize: 4096n });
+
+        await expect(
+          service.initUpload(ACTOR, { ...dto, filesize: 500 * 1024 * 1024 }),
+        ).resolves.toMatchObject({ uploadId: 'session-new' });
+      });
+
+      it('checks the session PEAK — chunks plus the merged copy — so a file the disk could hold once but not twice is refused with 507', async () => {
+        // 3 GB free, 700 MB file: 700 MB + 2 GB fits, 2 x 700 MB + 2 GB does
+        // not. The chunks are still on disk while the merge writes its
+        // copy, so the single-size check used to pass this and then die
+        // with ENOSPC in the merge.
+        statfsMock.mockResolvedValue(freeBytes(3 * GB));
+
+        const attempt = service.initUpload(ACTOR, {
+          ...dto,
+          filesize: 700 * MB,
+        });
+        await expect(attempt).rejects.toMatchObject({ status: 507 });
+        expect(prisma.uploadSession.create).not.toHaveBeenCalled();
+      });
+
+      it('fails open (with a warning) when the free space cannot be read at all', async () => {
+        statfsMock.mockRejectedValue(
+          Object.assign(new Error('ENOENT'), { code: 'ENOENT' }),
+        );
+
+        await expect(service.initUpload(ACTOR, dto)).resolves.toMatchObject({
+          uploadId: 'session-new',
+        });
+      });
+
+      it('does not re-check the disk for a resumed session', async () => {
+        prisma.uploadSession.findFirst.mockResolvedValue({
+          id: 'session-existing',
+          chunkSize: 5 * 1024 * 1024,
+          totalChunks: 3,
+        });
+        readdirMock.mockResolvedValue([]);
+        statfsMock.mockResolvedValue({ bavail: 0n, bsize: 4096n });
+
+        await expect(service.initUpload(ACTOR, dto)).resolves.toMatchObject({
+          uploadId: 'session-existing',
+        });
+        expect(statfsMock).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('open-session cap per movie (M-23)', () => {
+      beforeEach(() => {
+        prisma.movie.findUnique.mockResolvedValue({
+          id: 'movie-1',
+          status: MovieStatus.UPLOADING,
+        });
+        prisma.uploadSession.findFirst.mockResolvedValue(null);
+        prisma.uploadSession.create.mockResolvedValue({ id: 'session-new' });
+      });
+
+      it('refuses the 33rd open session for one movie with 409 — before the disk is even looked at', async () => {
+        prisma.uploadSession.count.mockResolvedValue(32);
+
+        const attempt = service.initUpload(ACTOR, dto);
+        await expect(attempt).rejects.toThrow(ConflictException);
+        await expect(attempt).rejects.toThrow(/limit is 32/);
+        expect(prisma.uploadSession.count).toHaveBeenCalledWith({
+          where: {
+            movieId: 'movie-1',
+            status: UploadStatus.IN_PROGRESS,
+            createdAt: { gte: expect.any(Date) },
+          },
+        });
+        expect(statfsMock).not.toHaveBeenCalled();
+        expect(prisma.uploadSession.create).not.toHaveBeenCalled();
+      });
+
+      it('only counts sessions younger than the abandoned-session window (48 h) — an old IN_PROGRESS row never blocks a new upload', async () => {
+        prisma.uploadSession.count.mockResolvedValue(31);
+        const before = Date.now();
+
+        await expect(service.initUpload(ACTOR, dto)).resolves.toMatchObject({
+          uploadId: 'session-new',
+        });
+        const { gte } = prisma.uploadSession.count.mock.calls[0][0].where
+          .createdAt as { gte: Date };
+        const windowMs = before - gte.getTime();
+        expect(windowMs).toBeGreaterThanOrEqual(48 * 60 * 60 * 1000 - 1000);
+        expect(windowMs).toBeLessThanOrEqual(48 * 60 * 60 * 1000 + 5000);
+      });
+
+      it('can be raised or lowered through UPLOAD_MAX_OPEN_SESSIONS_PER_MOVIE', async () => {
+        const previous = process.env.UPLOAD_MAX_OPEN_SESSIONS_PER_MOVIE;
+        process.env.UPLOAD_MAX_OPEN_SESSIONS_PER_MOVIE = '2';
+        try {
+          prisma.uploadSession.count.mockResolvedValue(2);
+          await expect(service.initUpload(ACTOR, dto)).rejects.toThrow(
+            /limit is 2/,
+          );
+        } finally {
+          if (previous === undefined)
+            delete process.env.UPLOAD_MAX_OPEN_SESSIONS_PER_MOVIE;
+          else process.env.UPLOAD_MAX_OPEN_SESSIONS_PER_MOVIE = previous;
+        }
+      });
+
+      it('never applies to a RESUMED session — picking an upload back up opens nothing new', async () => {
+        prisma.uploadSession.findFirst.mockResolvedValue({
+          id: 'session-existing',
+          chunkSize: 5 * MB,
+          totalChunks: 3,
+        });
+        readdirMock.mockResolvedValue([]);
+        prisma.uploadSession.count.mockResolvedValue(999);
+
+        await expect(service.initUpload(ACTOR, dto)).resolves.toMatchObject({
+          uploadId: 'session-existing',
+        });
+        expect(prisma.uploadSession.count).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('a bundle-file session is recorded the moment it opens (M-22)', () => {
+      beforeEach(() => {
+        prisma.movie.findUnique.mockResolvedValue({
+          id: 'movie-1',
+          status: MovieStatus.UPLOADING,
+          title: 'Big Film',
+          seriesId: null,
+        });
+        prisma.uploadSession.findFirst.mockResolvedValue(null);
+        prisma.uploadSession.create.mockResolvedValue({ id: 'session-new' });
+      });
+
+      it('writes one movie.upload_chunked row per file — who, which title, which key — never per chunk', async () => {
+        await service.initUpload(ACTOR, {
+          ...dto,
+          filename: 'index.m3u8',
+          relativePath: 'hls/720p/index.m3u8',
+        });
+
+        expect(audit.record).toHaveBeenCalledTimes(1);
+        expect(audit.record).toHaveBeenCalledWith({
+          action: 'movie.upload_chunked',
+          actor: ACTOR,
+          target: { type: 'movie', id: 'movie-1', label: 'Big Film' },
+          metadata: {
+            uploadId: 'session-new',
+            relativePath: 'hls/720p/index.m3u8',
+            key: 'videos/movie-1/hls/720p/index.m3u8',
+            fileSize: dto.filesize,
+            totalChunks: 2,
+          },
+        });
+      });
+
+      it('carries the seriesId for an episode, like every other movie row', async () => {
+        prisma.movie.findUnique.mockResolvedValue({
+          id: 'movie-1',
+          status: MovieStatus.UPLOADING,
+          title: 'Ep 1',
+          seriesId: 'series-9',
+        });
+
+        await service.initUpload(ACTOR, {
+          ...dto,
+          relativePath: 'subtitles/english.vtt',
+        });
+
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({
+            metadata: expect.objectContaining({
+              seriesId: 'series-9',
+              key: 'subtitles/movie-1/english.vtt',
+            }),
+          }),
+        );
+      });
+
+      it('records nothing for a CLASSIC session — its row is movie.upload at complete, as before', async () => {
+        await service.initUpload(ACTOR, dto);
+
+        expect(audit.record).not.toHaveBeenCalled();
+      });
+
+      it('records nothing when an existing session is resumed — the row was written when it opened', async () => {
+        prisma.uploadSession.findFirst.mockResolvedValue({
+          id: 'session-existing',
+          chunkSize: 5 * MB,
+          totalChunks: 3,
+        });
+        readdirMock.mockResolvedValue([]);
+
+        await service.initUpload(ACTOR, {
+          ...dto,
+          relativePath: 'hls/720p/index.m3u8',
+        });
+
+        expect(audit.record).not.toHaveBeenCalled();
+      });
+    });
+
     it('classic single-file requests (no relativePath) match null, not undefined — unchanged behavior', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
+      prisma.movie.findUnique.mockResolvedValue({
+        id: 'movie-1',
+        status: MovieStatus.DRAFT,
+      });
       prisma.uploadSession.findFirst.mockResolvedValue(null);
       prisma.uploadSession.create.mockResolvedValue({ id: 'session-4' });
       prisma.uploadSession.update.mockResolvedValue({});
 
-      await service.initUpload(dto); // no relativePath
+      await service.initUpload(ACTOR, dto); // no relativePath
 
       expect(prisma.uploadSession.findFirst).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -367,128 +783,358 @@ describe('UploadsService', () => {
     });
   });
 
-  describe('validateExternalBundle', () => {
-    it('throws NotFoundException when the movie does not exist', async () => {
-      prisma.movie.findUnique.mockResolvedValue(null);
+  describe('saveChunk — every chunk must be exactly as long as the session says (M-23)', () => {
+    const chunkSize = 5 * 1024 * 1024;
+    const session = {
+      id: 'session-1',
+      status: UploadStatus.IN_PROGRESS,
+      fileSize: BigInt(2 * chunkSize + 1234),
+      chunkSize,
+      totalChunks: 3,
+    };
 
-      await expect(
-        service.validateExternalBundle('movie-1', {
-          relativePaths: ['original.mp4'],
-        }),
-      ).rejects.toThrow(NotFoundException);
-    });
-
-    it('reports every relativePath that is not actually present in MinIO', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
-      minioService.objectExists.mockImplementation(
-        async (key: string) => key !== 'videos/movie-1/hls/master.m3u8',
+    beforeEach(() => {
+      prisma.uploadSession.findUnique = jest.fn().mockResolvedValue(session);
+      storageService.chunkPath = jest.fn(
+        (id: string, n: number) => `/storage/temp/uploads/${id}/chunk_${n}`,
       );
-
-      const result = await service.validateExternalBundle('movie-1', {
-        relativePaths: [
-          'original.mp4',
-          'hls/master.m3u8',
-          'hls/720p/index.m3u8',
-        ],
-      });
-
-      expect(result).toEqual({
-        missing: ['hls/master.m3u8'],
-        structureErrors: [],
-        valid: false,
-      });
+      writeFileMock.mockResolvedValue(undefined);
     });
 
-    it('reports valid:true and an empty missing list when every file is present and the structure is complete', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
-      minioService.objectExists.mockResolvedValue(true);
-
-      const result = await service.validateExternalBundle('movie-1', {
-        relativePaths: [
-          'original.mp4',
-          'hls/master.m3u8',
-          'hls/720p/index.m3u8',
-        ],
-      });
-
-      expect(result).toEqual({ missing: [], structureErrors: [], valid: true });
+    it('rejects a 10 MB body for a 5 MB chunk — the disk can no longer hold more than the declared filesize', async () => {
+      await expect(
+        service.saveChunk('session-1', 0, Buffer.alloc(10 * 1024 * 1024)),
+      ).rejects.toThrow(/Chunk 0 is \d+ bytes — expected exactly 5242880/);
+      expect(writeFileMock).not.toHaveBeenCalled();
     });
 
-    it('reports structureErrors when the uploaded set itself is missing required files — not just a MinIO existence problem', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
-      minioService.objectExists.mockResolvedValue(true);
-
-      const result = await service.validateExternalBundle('movie-1', {
-        relativePaths: ['original.mp4'], // no master.m3u8, no rendition at all
-      });
-
-      expect(result.valid).toBe(false);
-      expect(result.structureErrors).toEqual([
-        'master.m3u8 is missing',
-        'no valid rendition folder (240p, 360p, 480p, 720p, or 1080p) with an index.m3u8 was found',
-      ]);
+    it('rejects a short middle chunk too — the merged file would be corrupt', async () => {
+      await expect(
+        service.saveChunk('session-1', 1, Buffer.alloc(chunkSize - 1)),
+      ).rejects.toThrow(BadRequestException);
     });
 
-    it(
-      'looks a subtitle source up where it was actually uploaded — subtitles/<movieId>/<filename>, ' +
-        'not beside the video assets',
-      async () => {
-        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
-        minioService.objectExists.mockResolvedValue(true);
+    it('accepts a full-size chunk and, for the LAST chunk, exactly the remainder', async () => {
+      await expect(
+        service.saveChunk('session-1', 0, Buffer.alloc(chunkSize)),
+      ).resolves.toBeUndefined();
+      await expect(
+        service.saveChunk('session-1', 2, Buffer.alloc(1234)),
+      ).resolves.toBeUndefined();
+      expect(writeFileMock).toHaveBeenCalledTimes(2);
+    });
 
-        await service.validateExternalBundle('movie-1', {
-          relativePaths: [
-            'original.mp4',
-            'hls/master.m3u8',
-            'hls/720p/index.m3u8',
-            'subtitles/english.vtt',
-          ],
+    it('rejects a last chunk that is longer than the remainder', async () => {
+      await expect(
+        service.saveChunk('session-1', 2, Buffer.alloc(1235)),
+      ).rejects.toThrow(/expected exactly 1234/);
+    });
+
+    describe('the disk is checked before EVERY chunk write (M-23)', () => {
+      it('refuses with 507 — nothing written — once the disk is down to the reserve, so sessions that each passed init cannot fill it between them', async () => {
+        // Five 20 GB sessions open while 100 GB is free: each one sees the
+        // same 100 GB and passes init (2 x 20 GB + 2 GB fits five times
+        // over). Before the fix their chunks could then write 100 GB of
+        // chunks against 100 GB of disk and take Postgres down with it.
+        prisma.movie.findUnique.mockResolvedValue({
+          id: 'movie-1',
+          status: MovieStatus.UPLOADING,
+          title: 'Big Film',
+          seriesId: null,
         });
+        prisma.uploadSession.findFirst.mockResolvedValue(null);
+        prisma.uploadSession.create.mockResolvedValue({ id: 'session-x' });
+        statfsMock.mockResolvedValue(freeBytes(100 * GB));
+        for (let i = 0; i < 5; i += 1) {
+          await expect(
+            service.initUpload(ACTOR, {
+              movieId: 'movie-1',
+              filename: `part-${i}.mkv`,
+              filesize: 20 * GB,
+              relativePath: `hls/1080p/part-${i}.ts`,
+            }),
+          ).resolves.toMatchObject({ uploadId: 'session-x' });
+        }
 
-        expect(minioService.objectExists).toHaveBeenCalledWith(
-          'subtitles/movie-1/english.vtt',
+        // Now the disk is at 2 GB + 4 MB free: a 5 MB chunk would eat into
+        // the 2 GB reserve.
+        statfsMock.mockResolvedValue(freeBytes(2 * GB + 4 * MB));
+
+        const attempt = service.saveChunk(
+          'session-1',
+          0,
+          Buffer.alloc(chunkSize),
         );
-        expect(minioService.objectExists).not.toHaveBeenCalledWith(
-          'videos/movie-1/subtitles/english.vtt',
+        await expect(attempt).rejects.toThrow(HttpException);
+        await expect(attempt).rejects.toMatchObject({ status: 507 });
+        expect(writeFileMock).not.toHaveBeenCalled();
+      });
+
+      it('writes the chunk while it still fits above the reserve — one statfs per chunk, nothing else', async () => {
+        statfsMock.mockResolvedValue(freeBytes(2 * GB + 6 * MB));
+
+        await expect(
+          service.saveChunk('session-1', 0, Buffer.alloc(chunkSize)),
+        ).resolves.toBeUndefined();
+        expect(statfsMock).toHaveBeenCalledTimes(1);
+        expect(statfsMock).toHaveBeenCalledWith('/storage');
+        expect(writeFileMock).toHaveBeenCalledTimes(1);
+      });
+
+      it('checks the disk only AFTER the length check — a tampered chunk never reaches statfs', async () => {
+        statfsMock.mockResolvedValue(freeBytes(0));
+
+        await expect(
+          service.saveChunk('session-1', 0, Buffer.alloc(chunkSize + 1)),
+        ).rejects.toThrow(BadRequestException);
+        expect(statfsMock).not.toHaveBeenCalled();
+      });
+
+      it('fails open (with a warning) when the free space cannot be read, exactly like init', async () => {
+        statfsMock.mockRejectedValue(
+          Object.assign(new Error('ENOENT'), { code: 'ENOENT' }),
         );
+
+        await expect(
+          service.saveChunk('session-1', 0, Buffer.alloc(chunkSize)),
+        ).resolves.toBeUndefined();
+        expect(writeFileMock).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    it('expectedChunkSize: the chunk size for all but the last, the remainder for the last', () => {
+      expect(expectedChunkSize(session, 0)).toBe(chunkSize);
+      expect(expectedChunkSize(session, 1)).toBe(chunkSize);
+      expect(expectedChunkSize(session, 2)).toBe(1234);
+      expect(
+        expectedChunkSize({ fileSize: 100, chunkSize, totalChunks: 1 }, 0),
+      ).toBe(100);
+    });
+  });
+
+  describe('completeUpload — the title is re-checked and the merge needs room (M-22, M-23)', () => {
+    const chunkSize = 5 * MB;
+    const fileSize = 2 * chunkSize + 1234;
+    const bundleSession = {
+      id: 'session-1',
+      status: UploadStatus.IN_PROGRESS,
+      movieId: 'movie-1',
+      filename: 'index.m3u8',
+      fileSize: BigInt(fileSize),
+      chunkSize,
+      totalChunks: 3,
+      relativePath: 'hls/720p/index.m3u8',
+    };
+    const classicSession = {
+      ...bundleSession,
+      filename: 'movie.mp4',
+      relativePath: null,
+    };
+    const movie = (status: MovieStatus) => ({
+      title: 'Big Film',
+      seriesId: null,
+      status,
+    });
+
+    beforeEach(() => {
+      prisma.uploadSession.findUnique.mockResolvedValue(bundleSession);
+      // The merged file is the size the session was opened for.
+      statMock.mockResolvedValue({ size: fileSize });
+      readdirMock.mockResolvedValue(['chunk_0', 'chunk_1', 'chunk_2']);
+      rmMock.mockResolvedValue(undefined);
+      storageService.chunkPath = jest.fn(
+        (id: string, n: number) => `/storage/temp/uploads/${id}/chunk_${n}`,
+      );
+      fakeMergeStreams();
+    });
+
+    it.each([
+      MovieStatus.PUBLISHED,
+      MovieStatus.READY_TO_PUBLISH,
+      MovieStatus.DRAFT,
+    ])(
+      'refuses a BUNDLE complete with 409 when the movie is %s by now — nothing merged, nothing uploaded, the session failed and its chunks removed',
+      async (status) => {
+        prisma.movie.findUnique.mockResolvedValue(movie(status));
+
+        const attempt = service.completeUpload('session-1', ACTOR);
+        await expect(attempt).rejects.toThrow(ConflictException);
+        await expect(attempt).rejects.toThrow(/movie-replace/);
+        expect(createWriteStreamMock).not.toHaveBeenCalled();
+        expect(minioService.uploadFile).not.toHaveBeenCalled();
+        expect(prisma.uploadSession.update).toHaveBeenCalledWith({
+          where: { id: 'session-1' },
+          data: { status: UploadStatus.FAILED },
+        });
+        expect(rmMock).toHaveBeenCalledWith('/storage/temp/uploads/session-1', {
+          recursive: true,
+          force: true,
+        });
       },
     );
 
-    it(
-      'rejects a bundle whose subtitle files share a filename — both would be stored at the same ' +
-        'key, so the second would silently overwrite the first',
-      async () => {
-        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
-        minioService.objectExists.mockResolvedValue(true);
+    it('refuses a CLASSIC complete with 409 when the movie went live since init — no Video row, no transcode started', async () => {
+      prisma.uploadSession.findUnique.mockResolvedValue(classicSession);
+      prisma.movie.findUnique.mockResolvedValue(movie(MovieStatus.PUBLISHED));
 
-        const result = await service.validateExternalBundle('movie-1', {
-          relativePaths: [
-            'original.mp4',
-            'hls/master.m3u8',
-            'hls/720p/index.m3u8',
-            'subtitles/english.vtt',
-            'subtitles/extra/English.vtt',
-          ],
-        });
+      await expect(service.completeUpload('session-1', ACTOR)).rejects.toThrow(
+        ConflictException,
+      );
+      expect(videosService.create).not.toHaveBeenCalled();
+      expect(processingService.processVideo).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+    });
 
-        expect(result.valid).toBe(false);
-        expect(result.structureErrors).toEqual([
-          'subtitle filenames must be unique — "subtitles/extra/English.vtt" and "subtitles/english.vtt" would both be stored as english.vtt',
-        ]);
-      },
-    );
+    it('refuses the merge with 507 — and keeps the session resumable — while the merged copy would eat into the reserve', async () => {
+      prisma.movie.findUnique.mockResolvedValue(movie(MovieStatus.UPLOADING));
+      // 2 GB + 1 MB free for a ~10 MB merged copy on top of a 2 GB reserve.
+      statfsMock.mockResolvedValue(freeBytes(2 * GB + 1 * MB));
+
+      const attempt = service.completeUpload('session-1', ACTOR);
+      await expect(attempt).rejects.toMatchObject({ status: 507 });
+      expect(createWriteStreamMock).not.toHaveBeenCalled();
+      expect(minioService.uploadFile).not.toHaveBeenCalled();
+      expect(prisma.uploadSession.update).not.toHaveBeenCalled();
+      expect(rmMock).not.toHaveBeenCalled();
+    });
+
+    it('completes a bundle file for a movie still UPLOADING: merges, uploads to the bundle key, marks COMPLETED, removes the chunks — no second audit row', async () => {
+      prisma.movie.findUnique.mockResolvedValue(movie(MovieStatus.UPLOADING));
+
+      await expect(service.completeUpload('session-1', ACTOR)).resolves.toEqual(
+        {
+          relativePath: 'hls/720p/index.m3u8',
+          status: UploadStatus.COMPLETED,
+        },
+      );
+      expect(statfsMock).toHaveBeenCalledTimes(1);
+      expect(createReadStreamMock).toHaveBeenCalledTimes(3);
+      expect(minioService.uploadFile).toHaveBeenCalledWith(
+        'videos/movie-1/hls/720p/index.m3u8',
+        '/storage/temp/uploads/session-1/merged',
+      );
+      expect(prisma.uploadSession.update).toHaveBeenCalledWith({
+        where: { id: 'session-1' },
+        data: { status: UploadStatus.COMPLETED },
+      });
+      expect(rmMock).toHaveBeenCalledWith('/storage/temp/uploads/session-1', {
+        recursive: true,
+        force: true,
+      });
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
+    it('completes a classic upload for a DRAFT movie as before: Video row, transcode kicked off, movie.upload recorded with the title', async () => {
+      prisma.uploadSession.findUnique.mockResolvedValue(classicSession);
+      prisma.movie.findUnique.mockResolvedValue(movie(MovieStatus.DRAFT));
+      videosService.create.mockResolvedValue({
+        id: 'video-1',
+        status: VideoStatus.UPLOADING,
+      });
+
+      await expect(service.completeUpload('session-1', ACTOR)).resolves.toEqual(
+        { videoId: 'video-1', status: VideoStatus.UPLOADING },
+      );
+      expect(videosService.create).toHaveBeenCalledWith({
+        movieId: 'movie-1',
+        originalFilename: 'movie.mp4',
+        originalPath: '/storage/temp/videos/movie-1/original.mp4',
+      });
+      expect(processingService.processVideo).toHaveBeenCalledWith(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'movie.upload',
+          actor: ACTOR,
+          target: { type: 'movie', id: 'movie-1', label: 'Big Film' },
+          metadata: expect.objectContaining({ flow: 'classic', fileSize }),
+        }),
+      );
+    });
+  });
+
+  // The structure rules validate-external used to report are enforced by
+  // finalize itself (the validate-external route was removed as unused —
+  // perf audit 2026-10-07); these keep every rule covered.
+  describe('bundle structure rules — enforced by finalize', () => {
+    const uploadingMovie = {
+      id: 'movie-1',
+      status: MovieStatus.UPLOADING,
+      title: 'Big Film',
+      seriesId: null,
+    };
+    beforeEach(() => {
+      prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+      minioService.objectExists.mockResolvedValue(true);
+    });
+
+    it('refuses a bundle missing its master and every rendition', async () => {
+      await expect(
+        service.finalizeExternalUpload(
+          'movie-1',
+          { relativePaths: ['original.mp4'] },
+          ACTOR,
+        ),
+      ).rejects.toThrow(
+        'master.m3u8 is missing; no valid rendition folder (240p, 360p, 480p, 720p, or 1080p) with an index.m3u8 was found',
+      );
+      expect(videosService.create).not.toHaveBeenCalled();
+    });
+
+    it('refuses subtitle files that share a filename — both would be stored at the same key', async () => {
+      await expect(
+        service.finalizeExternalUpload(
+          'movie-1',
+          {
+            relativePaths: [
+              'original.mp4',
+              'hls/master.m3u8',
+              'hls/720p/index.m3u8',
+              'subtitles/english.vtt',
+              'subtitles/extra/English.vtt',
+            ],
+          },
+          ACTOR,
+        ),
+      ).rejects.toThrow(
+        'subtitle filenames must be unique — "subtitles/extra/English.vtt" and "subtitles/english.vtt" would both be stored as english.vtt',
+      );
+    });
 
     it('reports a missing original whatever container the operator used', async () => {
-      prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1' });
-      minioService.objectExists.mockResolvedValue(true);
+      await expect(
+        service.finalizeExternalUpload(
+          'movie-1',
+          { relativePaths: ['hls/master.m3u8', 'hls/720p/index.m3u8'] },
+          ACTOR,
+        ),
+      ).rejects.toThrow('original.<ext> is missing from the bundle root');
+    });
 
-      const result = await service.validateExternalBundle('movie-1', {
-        relativePaths: ['hls/master.m3u8', 'hls/720p/index.m3u8'],
-      });
+    it('looks a subtitle source up where it was actually uploaded — subtitles/<movieId>/<filename>', async () => {
+      videosService.findLatestForMovie.mockResolvedValue(null);
+      await service.finalizeExternalUpload(
+        'movie-1',
+        {
+          relativePaths: [
+            'original.mp4',
+            'hls/master.m3u8',
+            'hls/720p/index.m3u8',
+            'subtitles/english.vtt',
+          ],
+        },
+        ACTOR,
+      );
 
-      expect(result.structureErrors).toEqual([
-        'original.<ext> is missing from the bundle root',
-      ]);
+      expect(minioService.objectExists).toHaveBeenCalledWith(
+        'subtitles/movie-1/english.vtt',
+      );
+      expect(minioService.objectExists).not.toHaveBeenCalledWith(
+        'videos/movie-1/subtitles/english.vtt',
+      );
     });
   });
 
@@ -666,20 +1312,53 @@ describe('UploadsService', () => {
 
       await service.finalizeExternalUpload('movie-1', dto, ACTOR);
 
-      expect(subtitlesService.createFromExistingKey).toHaveBeenCalledWith({
-        videoId: 'video-1',
-        language: 'en',
-        label: 'English',
-        format: 'VTT',
-        objectKey: 'subtitles/movie-1/english.vtt',
-      });
-      expect(subtitlesService.createFromExistingKey).toHaveBeenCalledWith({
-        videoId: 'video-1',
-        language: 'my',
-        label: 'Myanmar',
-        format: 'VTT',
-        objectKey: 'subtitles/movie-1/myanmar.vtt',
-      });
+      expect(subtitlesService.createFromExistingKey).toHaveBeenCalledWith(
+        {
+          videoId: 'video-1',
+          language: 'en',
+          label: 'English',
+          format: 'VTT',
+          objectKey: 'subtitles/movie-1/english.vtt',
+        },
+        { publish: false },
+      );
+      expect(subtitlesService.createFromExistingKey).toHaveBeenCalledWith(
+        {
+          videoId: 'video-1',
+          language: 'my',
+          label: 'Myanmar',
+          format: 'VTT',
+          objectKey: 'subtitles/movie-1/myanmar.vtt',
+        },
+        { publish: false },
+      );
+      // ONE publish after both rows exist, not one per track.
+      expect(subtitlesService.publishQuietly).toHaveBeenCalledTimes(1);
+      expect(subtitlesService.publishQuietly).toHaveBeenCalledWith('video-1');
+      expect(
+        subtitlesService.publishQuietly.mock.invocationCallOrder[0],
+      ).toBeGreaterThan(
+        subtitlesService.createFromExistingKey.mock.invocationCallOrder[1],
+      );
+    });
+
+    it('does not publish when the bundle carries no subtitles (same as before)', async () => {
+      prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+      minioService.objectExists.mockResolvedValue(true);
+
+      await service.finalizeExternalUpload(
+        'movie-1',
+        {
+          relativePaths: [
+            'original.mp4',
+            'hls/master.m3u8',
+            'hls/720p/index.m3u8',
+          ],
+        },
+        ACTOR,
+      );
+
+      expect(subtitlesService.publishQuietly).not.toHaveBeenCalled();
     });
 
     it(
@@ -1447,6 +2126,20 @@ describe('UploadsService', () => {
             ? oldSubtitleKeys
             : [],
       );
+      stageFiles(replacePaths);
+    };
+
+    /** What the ONE listing of the staging prefix returns: these files, each with a size. */
+    const stageFiles = (relativePaths: string[]) => {
+      minioService.listObjects.mockImplementation(async (prefix: string) =>
+        prefix === STAGING
+          ? relativePaths.map((relativePath, i) => ({
+              key: `${STAGING}${relativePath}`,
+              lastModified: undefined,
+              size: 1000 + i,
+            }))
+          : [],
+      );
     };
 
     /** Nothing about the title — objects, Video, Subtitle, Movie — was written. */
@@ -1459,14 +2152,21 @@ describe('UploadsService', () => {
       expect(subtitlesService.createFromExistingKey).not.toHaveBeenCalled();
       expect(prisma.movie.update).not.toHaveBeenCalled();
       expect(prisma.movie.updateMany).not.toHaveBeenCalled();
-      expect(audit.record).not.toHaveBeenCalled();
+      // Opening or abandoning a replace is itself recorded (M-22); what must
+      // NOT exist is a swap row — nothing was replaced.
+      expect(
+        audit.record.mock.calls.filter(
+          ([input]) =>
+            (input as { action: string }).action === 'movie.video_replace',
+        ),
+      ).toHaveLength(0);
     };
 
     describe('beginReplace', () => {
       it('throws NotFoundException when the movie does not exist', async () => {
         prisma.movie.findUnique.mockResolvedValue(null);
 
-        await expect(service.beginReplace('movie-1')).rejects.toThrow(
+        await expect(service.beginReplace('movie-1', ACTOR)).rejects.toThrow(
           NotFoundException,
         );
         expect(minioService.deleteByPrefix).not.toHaveBeenCalled();
@@ -1481,7 +2181,7 @@ describe('UploadsService', () => {
         async (status) => {
           liveTitle(status);
 
-          const result = await service.beginReplace('movie-1');
+          const result = await service.beginReplace('movie-1', ACTOR);
 
           expect(result).toEqual({
             movieId: 'movie-1',
@@ -1501,7 +2201,7 @@ describe('UploadsService', () => {
       ])('refuses with ConflictException for a %s movie', async (status) => {
         liveTitle(status);
 
-        await expect(service.beginReplace('movie-1')).rejects.toThrow(
+        await expect(service.beginReplace('movie-1', ACTOR)).rejects.toThrow(
           ConflictException,
         );
         expect(minioService.deleteByPrefix).not.toHaveBeenCalled();
@@ -1511,7 +2211,7 @@ describe('UploadsService', () => {
         liveTitle();
         processingService.isActivelyProcessing.mockReturnValue(true);
 
-        await expect(service.beginReplace('movie-1')).rejects.toThrow(
+        await expect(service.beginReplace('movie-1', ACTOR)).rejects.toThrow(
           ConflictException,
         );
         expect(processingService.isActivelyProcessing).toHaveBeenCalledWith(
@@ -1524,9 +2224,36 @@ describe('UploadsService', () => {
         prisma.movie.findUnique.mockResolvedValue(publishedMovie);
         videosService.findLatestForMovie.mockResolvedValue(null);
 
-        await expect(service.beginReplace('movie-1')).resolves.toMatchObject({
+        await expect(
+          service.beginReplace('movie-1', ACTOR),
+        ).resolves.toMatchObject({
           resourceType: 'movie-replace',
         });
+      });
+
+      it('records who opened the replace on which title (M-22) — nothing is recorded on a refusal', async () => {
+        liveTitle();
+
+        await service.beginReplace('movie-1', ACTOR);
+
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: 'movie.video_replace_begin',
+            actor: ACTOR,
+            target: { type: 'movie', id: 'movie-1', label: 'Movie 1' },
+            metadata: expect.objectContaining({
+              flow: 'replace',
+              stagingPrefix: STAGING,
+            }),
+          }),
+        );
+
+        audit.record.mockClear();
+        liveTitle(MovieStatus.DRAFT);
+        await expect(service.beginReplace('movie-1', ACTOR)).rejects.toThrow(
+          ConflictException,
+        );
+        expect(audit.record).not.toHaveBeenCalled();
       });
     });
 
@@ -1534,16 +2261,30 @@ describe('UploadsService', () => {
       it('deletes only the staging prefix', async () => {
         liveTitle();
 
-        await service.cancelReplace('movie-1');
+        await service.cancelReplace('movie-1', ACTOR);
 
         expect(minioService.deleteByPrefix).toHaveBeenCalledWith(STAGING);
         expectOldTitleUntouched();
       });
 
+      it('records the abandoned attempt against the staff member (M-22)', async () => {
+        liveTitle();
+
+        await service.cancelReplace('movie-1', ACTOR);
+
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: 'movie.video_replace_cancel',
+            actor: ACTOR,
+            target: { type: 'movie', id: 'movie-1', label: 'Movie 1' },
+          }),
+        );
+      });
+
       it('throws NotFoundException when the movie does not exist', async () => {
         prisma.movie.findUnique.mockResolvedValue(null);
 
-        await expect(service.cancelReplace('movie-1')).rejects.toThrow(
+        await expect(service.cancelReplace('movie-1', ACTOR)).rejects.toThrow(
           NotFoundException,
         );
       });
@@ -1614,24 +2355,19 @@ describe('UploadsService', () => {
           'leaves the old video untouched — the client is never trusted about what it uploaded',
         async () => {
           liveTitle();
-          minioService.objectExists.mockImplementation(
-            async (key: string) =>
-              key !== 'temp/video-replace/movie-1/hls/480p/index.m3u8',
+          stageFiles(
+            replacePaths.filter((path) => path !== 'hls/480p/index.m3u8'),
           );
 
           await expect(
             service.finalizeReplace('movie-1', dto, ACTOR),
           ).rejects.toThrow('missing staged files: hls/480p/index.m3u8');
 
-          // Every check is against the staging, never the live keys.
-          for (const key of minioService.objectExists.mock.calls.map(
-            ([k]) => k as string,
-          )) {
-            expect(key.startsWith(STAGING)).toBe(true);
-          }
-          expect(minioService.objectExists).toHaveBeenCalledWith(
-            'temp/video-replace/movie-1/subtitles/english.vtt',
-          );
+          // The check is ONE listing of the staging, never the live keys,
+          // and no per-file HEAD.
+          expect(minioService.listObjects).toHaveBeenCalledTimes(1);
+          expect(minioService.listObjects).toHaveBeenCalledWith(STAGING);
+          expect(minioService.objectExists).not.toHaveBeenCalled();
           expect(minioService.deleteByPrefix).toHaveBeenCalledWith(STAGING);
           expect(minioService.listKeys).not.toHaveBeenCalled();
           expectOldTitleUntouched();
@@ -1652,10 +2388,20 @@ describe('UploadsService', () => {
         it('copies the HLS package into a FRESH hls/v-<tag>/ folder and the rest to the key a fresh upload would get, with the master strictly LAST', async () => {
           await service.finalizeReplace('movie-1', dto, ACTOR);
 
-          const copies = minioService.copyObject.mock.calls as [
+          const copies = (
+            minioService.copyObject.mock.calls as [string, string, number][]
+          ).map(([src, dst]) => [src, dst]);
+          // Every copy carries the size from the staging listing, so
+          // copyObject sends no HEAD of its own.
+          for (const [src, , size] of minioService.copyObject.mock.calls as [
             string,
             string,
-          ][];
+            number,
+          ][]) {
+            expect(size).toBe(
+              1000 + replacePaths.indexOf(src.slice(STAGING.length)),
+            );
+          }
           expect(copies).toHaveLength(replacePaths.length);
           // Staged key -> final key. hls/** is re-rooted under the versioned
           // package (the cache servers hold the OLD segment keys for 7 days,
@@ -1858,16 +2604,29 @@ describe('UploadsService', () => {
           expect(subtitlesService.createFromExistingKey).toHaveBeenCalledTimes(
             1,
           );
-          expect(subtitlesService.createFromExistingKey).toHaveBeenCalledWith({
-            videoId: 'video-1',
-            language: 'en',
-            label: 'English',
-            format: 'VTT',
-            objectKey: 'subtitles/movie-1/english.vtt',
-          });
+          expect(subtitlesService.createFromExistingKey).toHaveBeenCalledWith(
+            {
+              videoId: 'video-1',
+              language: 'en',
+              label: 'English',
+              format: 'VTT',
+              objectKey: 'subtitles/movie-1/english.vtt',
+            },
+            { publish: false },
+          );
           expect(
             prisma.subtitle.deleteMany.mock.invocationCallOrder[0],
           ).toBeLessThan(
+            subtitlesService.createFromExistingKey.mock.invocationCallOrder[0],
+          );
+          // The new master is published ONCE, after every track exists.
+          expect(subtitlesService.publishQuietly).toHaveBeenCalledTimes(1);
+          expect(subtitlesService.publishQuietly).toHaveBeenCalledWith(
+            'video-1',
+          );
+          expect(
+            subtitlesService.publishQuietly.mock.invocationCallOrder[0],
+          ).toBeGreaterThan(
             subtitlesService.createFromExistingKey.mock.invocationCallOrder[0],
           );
         });
@@ -2019,6 +2778,7 @@ describe('UploadsService', () => {
         prisma.movie.findUnique.mockResolvedValue(publishedMovie);
         videosService.findLatestForMovie.mockResolvedValue(null);
         minioService.listKeys.mockResolvedValue([]);
+        stageFiles(replacePaths);
 
         const result = await service.finalizeReplace('movie-1', dto, ACTOR);
 
@@ -2037,6 +2797,10 @@ describe('UploadsService', () => {
         });
         expect(subtitlesService.createFromExistingKey).toHaveBeenCalledWith(
           expect.objectContaining({ videoId: 'video-new' }),
+          { publish: false },
+        );
+        expect(subtitlesService.publishQuietly).toHaveBeenCalledWith(
+          'video-new',
         );
         expect(result.videoId).toBe('video-new');
         expect(minioService.deleteKeys).toHaveBeenCalledWith([]);
@@ -2163,6 +2927,7 @@ describe('UploadsService', () => {
         'actor',
         'portrait.png',
         Buffer.from('bytes'),
+        ACTOR,
       );
 
       expect(storageService.imageObjectKey).toHaveBeenCalledWith(
@@ -2178,7 +2943,12 @@ describe('UploadsService', () => {
     });
 
     it('keeps every purpose in its own folder', async () => {
-      await service.saveImage('payment', 'kbzpay.webp', Buffer.from('bytes'));
+      await service.saveImage(
+        'payment',
+        'kbzpay.webp',
+        Buffer.from('bytes'),
+        ACTOR,
+      );
 
       expect(minioService.uploadBuffer).toHaveBeenCalledWith(
         expect.stringContaining('images/payment/'),
@@ -2186,14 +2956,323 @@ describe('UploadsService', () => {
       );
     });
 
+    it('records the upload against the staff member with the purpose, key and size (M-22)', async () => {
+      await service.saveImage(
+        'actor',
+        'portrait.png',
+        Buffer.alloc(321),
+        ACTOR,
+      );
+
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'image.upload',
+          actor: ACTOR,
+          target: expect.objectContaining({ type: 'image', id: null }),
+          metadata: expect.objectContaining({
+            purpose: 'actor',
+            key: expect.stringMatching(/^images\/actor\/[0-9a-f-]{36}\.png$/),
+            originalFilename: 'portrait.png',
+            fileSize: 321,
+          }),
+        }),
+      );
+    });
+
     it('falls back to .jpg only for the EXTENSION when the uploaded filename has none', async () => {
-      await service.saveImage('movie', 'poster', Buffer.from('bytes'));
+      await service.saveImage('movie', 'poster', Buffer.from('bytes'), ACTOR);
 
       expect(storageService.imageObjectKey).toHaveBeenCalledWith(
         'movie',
         expect.any(String),
         '.jpg',
       );
+    });
+  });
+
+  describe('saveImage — artwork is shrunk to a display size before it is stored', () => {
+    /** A real encoded image of the given size, made with sharp itself. */
+    const makeImage = (
+      width: number,
+      height: number,
+      format: 'jpeg' | 'png' | 'webp',
+    ) =>
+      sharp({
+        create: {
+          width,
+          height,
+          channels: 3,
+          background: { r: 200, g: 40, b: 40 },
+        },
+      })
+        .toFormat(format)
+        .toBuffer();
+    const stored = () => minioService.uploadBuffer.mock.calls[0][1] as Buffer;
+
+    beforeEach(() => {
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    });
+
+    it('a 4000 px wide portrait JPEG poster comes out at most 1300 px wide (phone title page width) and still JPEG, at the same key and URL', async () => {
+      const original = await makeImage(4000, 6000, 'jpeg');
+
+      const url = await service.saveImage(
+        'movie',
+        'poster.jpg',
+        original,
+        ACTOR,
+      );
+
+      const meta = await sharp(stored()).metadata();
+      expect(meta.format).toBe('jpeg');
+      expect(meta.width).toBe(1300);
+      expect(meta.height).toBe(1950);
+      expect(stored().length).toBeLessThan(original.length);
+      const [key] = minioService.uploadBuffer.mock.calls[0] as [string];
+      expect(key).toMatch(/^images\/movie\/[0-9a-f-]{36}\.jpg$/);
+      expect(url).toBe(`https://cdn.example/${key}`);
+      // The audit row keeps both sizes.
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            fileSize: stored().length,
+            originalSize: original.length,
+          }),
+        }),
+      );
+    });
+
+    it('a square 5000 px WebP poster becomes 1300 x 1300 WebP', async () => {
+      await service.saveImage(
+        'series',
+        'poster.webp',
+        await makeImage(5000, 5000, 'webp'),
+        ACTOR,
+      );
+
+      const meta = await sharp(stored()).metadata();
+      expect(meta).toMatchObject({ format: 'webp', width: 1300, height: 1300 });
+    });
+
+    it('a landscape cover keeps up to 1920 px (it fills a desktop hero), and PNG stays PNG', async () => {
+      await service.saveImage(
+        'movie',
+        'cover.png',
+        await makeImage(3840, 2160, 'png'),
+        ACTOR,
+      );
+
+      const meta = await sharp(stored()).metadata();
+      expect(meta).toMatchObject({ format: 'png', width: 1920, height: 1080 });
+    });
+
+    it('a 4000 px wide portrait actor photo still stops at 1000 px (shown small / blurred, never edge to edge)', async () => {
+      await service.saveImage(
+        'actor',
+        'headshot.jpg',
+        await makeImage(4000, 6000, 'jpeg'),
+        ACTOR,
+      );
+
+      const meta = await sharp(stored()).metadata();
+      expect(meta).toMatchObject({ format: 'jpeg', width: 1000, height: 1500 });
+    });
+
+    it('stores an image that is already small enough byte-for-byte as uploaded', async () => {
+      const original = await makeImage(800, 1200, 'jpeg');
+
+      await service.saveImage('movie', 'poster.jpg', original, ACTOR);
+
+      expect(stored()).toBe(original);
+    });
+
+    it('falls back to the original bytes when sharp cannot read the image (broken file)', async () => {
+      const broken = Buffer.concat([
+        Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
+        Buffer.from('definitely not the rest of a jpeg'),
+      ]);
+
+      await expect(
+        service.saveImage('movie', 'poster.jpg', broken, ACTOR),
+      ).resolves.toMatch(/^https:\/\/cdn\.example\/images\/movie\//);
+
+      expect(stored()).toBe(broken);
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            fileSize: broken.length,
+            originalSize: broken.length,
+          }),
+        }),
+      );
+    });
+
+    it('never touches a purpose that is not artwork (payment logos and QR codes keep every pixel)', async () => {
+      const original = await makeImage(3000, 3000, 'png');
+
+      await service.saveImage('payment', 'qr.png', original, ACTOR);
+
+      expect(stored()).toBe(original);
+    });
+
+    it('leaves formats other than JPEG / PNG / WebP alone (e.g. GIF)', async () => {
+      const gif = await makeImage(3000, 3000, 'png').then((png) =>
+        sharp(png).gif().toBuffer(),
+      );
+
+      await service.saveImage('movie', 'poster.gif', gif, ACTOR);
+
+      expect(stored()).toBe(gif);
+    });
+  });
+
+  describe('chunk files are written atomically and the merge is size-checked (media-14)', () => {
+    const chunkSize = 5 * MB;
+    const fileSize = 2 * chunkSize + 1234;
+    const session = {
+      id: 'session-1',
+      status: UploadStatus.IN_PROGRESS,
+      movieId: 'movie-1',
+      filename: 'movie.mp4',
+      fileSize: BigInt(fileSize),
+      chunkSize,
+      totalChunks: 3,
+      relativePath: null as string | null,
+    };
+
+    beforeEach(() => {
+      prisma.uploadSession.findUnique.mockResolvedValue(session);
+      storageService.chunkPath = jest.fn(
+        (id: string, n: number) => `/storage/temp/uploads/${id}/chunk_${n}`,
+      );
+      statfsMock.mockResolvedValue(freeBytes(100 * GB));
+      writeFileMock.mockResolvedValue(undefined);
+      renameMock.mockResolvedValue(undefined);
+      rmMock.mockResolvedValue(undefined);
+      prisma.movie.findUnique.mockResolvedValue({
+        title: 'Big Film',
+        seriesId: null,
+        status: MovieStatus.DRAFT,
+      });
+    });
+
+    const PART =
+      /^\/storage\/temp\/uploads\/session-1\/chunk_1\.[0-9a-f-]{36}\.part$/;
+
+    it('writes chunk_<n>.<id>.part first and renames it to chunk_<n> only after the write finished', async () => {
+      await service.saveChunk('session-1', 1, Buffer.alloc(chunkSize));
+
+      const [partPath] = writeFileMock.mock.calls[0] as [string];
+      expect(partPath).toMatch(PART);
+      expect(renameMock).toHaveBeenCalledWith(
+        partPath,
+        '/storage/temp/uploads/session-1/chunk_1',
+      );
+      expect(writeFileMock.mock.invocationCallOrder[0]).toBeLessThan(
+        renameMock.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('two overlapping requests for the same chunk each use their own temporary file (no rename race)', async () => {
+      await Promise.all([
+        service.saveChunk('session-1', 1, Buffer.alloc(chunkSize)),
+        service.saveChunk('session-1', 1, Buffer.alloc(chunkSize)),
+      ]);
+
+      const parts = writeFileMock.mock.calls.map(([p]) => p as string);
+      expect(parts).toHaveLength(2);
+      expect(parts[0]).toMatch(PART);
+      expect(parts[1]).toMatch(PART);
+      expect(parts[0]).not.toBe(parts[1]);
+      expect(renameMock.mock.calls.map(([from]) => from as string)).toEqual(
+        parts,
+      );
+    });
+
+    it('a write that fails half-way never becomes a received chunk (no rename) and its temporary file is removed', async () => {
+      writeFileMock.mockRejectedValue(new Error('EIO'));
+
+      await expect(
+        service.saveChunk('session-1', 1, Buffer.alloc(chunkSize)),
+      ).rejects.toThrow('EIO');
+      expect(renameMock).not.toHaveBeenCalled();
+      const [partPath] = writeFileMock.mock.calls[0] as [string];
+      expect(rmMock).toHaveBeenCalledWith(partPath, { force: true });
+    });
+
+    it('a leftover .part file does not count as received — the upload is still incomplete', async () => {
+      readdirMock.mockResolvedValue([
+        'chunk_0',
+        'chunk_1',
+        'chunk_2.0b5e7c1a-3d2f-4e8a-9b6c-1f2e3d4c5b6a.part',
+      ]);
+
+      await expect(service.completeUpload('session-1', ACTOR)).rejects.toThrow(
+        'Upload incomplete: 2/3 chunks received',
+      );
+    });
+
+    it('refuses a merged file whose size is not the declared size: 400, session FAILED, files removed, nothing uploaded or transcoded', async () => {
+      readdirMock.mockResolvedValue(['chunk_0', 'chunk_1', 'chunk_2']);
+      fakeMergeStreams();
+      statMock.mockResolvedValue({ size: fileSize - 100 });
+
+      await expect(service.completeUpload('session-1', ACTOR)).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(prisma.uploadSession.update).toHaveBeenCalledWith({
+        where: { id: 'session-1' },
+        data: { status: UploadStatus.FAILED },
+      });
+      expect(rmMock).toHaveBeenCalledWith(
+        '/storage/temp/videos/movie-1/original.mp4',
+        { force: true },
+      );
+      expect(rmMock).toHaveBeenCalledWith('/storage/temp/uploads/session-1', {
+        recursive: true,
+        force: true,
+      });
+      expect(videosService.create).not.toHaveBeenCalled();
+      expect(processingService.processVideo).not.toHaveBeenCalled();
+    });
+
+    it('refuses a short merged BUNDLE file before it is pushed to storage', async () => {
+      prisma.uploadSession.findUnique.mockResolvedValue({
+        ...session,
+        relativePath: 'hls/720p/index.m3u8',
+      });
+      prisma.movie.findUnique.mockResolvedValue({
+        title: 'Big Film',
+        seriesId: null,
+        status: MovieStatus.UPLOADING,
+      });
+      readdirMock.mockResolvedValue(['chunk_0', 'chunk_1', 'chunk_2']);
+      fakeMergeStreams();
+      statMock.mockResolvedValue({ size: 3 });
+
+      await expect(service.completeUpload('session-1', ACTOR)).rejects.toThrow(
+        /a piece of it was damaged/,
+      );
+      expect(minioService.uploadFile).not.toHaveBeenCalled();
+    });
+
+    it('closes the destination file when a chunk cannot be read during the merge', async () => {
+      readdirMock.mockResolvedValue(['chunk_0', 'chunk_1', 'chunk_2']);
+      const output = new Writable({
+        write: (_chunk, _encoding, callback) => callback(),
+      });
+      const destroy = jest.spyOn(output, 'destroy');
+      createWriteStreamMock.mockReturnValue(output);
+      createReadStreamMock.mockImplementation(() => {
+        const stream = new PassThrough();
+        process.nextTick(() => stream.destroy(new Error('ENOENT chunk')));
+        return stream;
+      });
+
+      await expect(service.completeUpload('session-1', ACTOR)).rejects.toThrow(
+        'ENOENT chunk',
+      );
+      expect(destroy).toHaveBeenCalled();
     });
   });
 });

@@ -73,7 +73,7 @@ describe('UsersController — self-service "me" routes (profile, password, avata
   let prisma: {
     user: { findUnique: jest.Mock; update: jest.Mock };
     wallet: { findUnique: jest.Mock };
-    transaction: { aggregate: jest.Mock };
+    transaction: { groupBy: jest.Mock };
     userSubscription: { findFirst: jest.Mock };
     $transaction: jest.Mock;
   };
@@ -111,7 +111,8 @@ describe('UsersController — self-service "me" routes (profile, password, avata
       },
       wallet: { findUnique: jest.fn().mockResolvedValue(null) },
       transaction: {
-        aggregate: jest.fn().mockResolvedValue({ _sum: { amount: null } }),
+        // getWalletSummary: one grouped read of the spent/deposited totals.
+        groupBy: jest.fn().mockResolvedValue([]),
       },
       userSubscription: { findFirst: jest.fn().mockResolvedValue(null) },
       $transaction: jest.fn(),

@@ -32,8 +32,10 @@ export class FeedbackService {
    *
    * Rate-limited by counting the caller's own rows inside a rolling hour —
    * no in-memory counter, so the limit survives a restart and holds across
-   * every instance. Over the limit is a 429 with a message the client can
-   * show verbatim.
+   * every instance. The count and the insert run in one transaction under a
+   * per-user advisory lock, so simultaneous requests cannot all slip past
+   * the check. Over the limit is a 429 with a message the client can show
+   * verbatim.
    */
   async create(userId: string, dto: CreateFeedbackDto) {
     const message = (dto.message ?? '').trim();
@@ -48,34 +50,42 @@ export class FeedbackService {
       );
     }
 
-    const windowStart = new Date(Date.now() - FEEDBACK_RATE_WINDOW_MS);
-    const recentCount = await this.prisma.feedback.count({
-      where: { userId, createdAt: { gte: windowStart } },
-    });
-    if (recentCount >= FEEDBACK_MAX_PER_HOUR) {
-      throw new HttpException(
-        `You have reached the limit of ${FEEDBACK_MAX_PER_HOUR} feedback submissions per hour. Please try again later.`,
-        HttpStatus.TOO_MANY_REQUESTS,
-      );
-    }
-
     const { ip, platform } = requestClientContext();
 
-    const created = await this.prisma.feedback.create({
-      data: {
-        userId,
-        category: dto.category,
-        message,
-        platform,
-        ipAddress: ip,
-      },
-      select: {
-        id: true,
-        category: true,
-        message: true,
-        status: true,
-        createdAt: true,
-      },
+    // Count and insert happen under one per-user advisory lock inside one
+    // transaction, so parallel requests from the same account queue up and
+    // the limit holds exactly. The lock is released on commit, and on the
+    // rollback that a 429 thrown in here causes.
+    const created = await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('feedback.create'), hashtext(${userId}))`;
+
+      const windowStart = new Date(Date.now() - FEEDBACK_RATE_WINDOW_MS);
+      const recentCount = await tx.feedback.count({
+        where: { userId, createdAt: { gte: windowStart } },
+      });
+      if (recentCount >= FEEDBACK_MAX_PER_HOUR) {
+        throw new HttpException(
+          `You have reached the limit of ${FEEDBACK_MAX_PER_HOUR} feedback submissions per hour. Please try again later.`,
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+
+      return tx.feedback.create({
+        data: {
+          userId,
+          category: dto.category,
+          message,
+          platform,
+          ipAddress: ip,
+        },
+        select: {
+          id: true,
+          category: true,
+          message: true,
+          status: true,
+          createdAt: true,
+        },
+      });
     });
 
     return created;

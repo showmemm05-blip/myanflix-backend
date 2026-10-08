@@ -192,22 +192,12 @@ const GUARDED_ROUTES: GuardedRoute[] = [
     granular: 'MEDIA.UPLOAD',
   },
   {
-    route: 'GET /uploads/:uploadId/status',
-    legacy: 'VIDEO_UPLOAD',
-    granular: 'MEDIA.UPLOAD',
-  },
-  {
     route: 'POST /uploads/:uploadId/complete',
     legacy: 'VIDEO_UPLOAD',
     granular: 'MEDIA.UPLOAD',
   },
   {
     route: 'POST /uploads/:movieId/reprocess',
-    legacy: 'VIDEO_UPLOAD',
-    granular: 'MEDIA.UPLOAD',
-  },
-  {
-    route: 'POST /uploads/:movieId/validate-external',
     legacy: 'VIDEO_UPLOAD',
     granular: 'MEDIA.UPLOAD',
   },
@@ -723,6 +713,49 @@ const POST_RBAC_GUARDED_ROUTES: PostRbacRoute[] = [
     granular: ['WITHDRAWALS.VIEW'],
     allowed: STAFF_ONLY,
   },
+  // home promos (home_promos). ADMIN is granted both actions by the
+  // migration; CONTENT_UPLOADER neither. GET /home/showcase is NOT here: it
+  // is the public home page read, open to guests (@OptionalAuth).
+  {
+    route: 'GET /home/promos',
+    granular: ['HOME.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /home/promos/:id',
+    granular: ['HOME.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /home/promos',
+    granular: ['HOME.MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'PATCH /home/promos/reorder',
+    granular: ['HOME.MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'PATCH /home/promos/:id',
+    granular: ['HOME.MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'DELETE /home/promos/:id',
+    granular: ['HOME.MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /home/settings',
+    granular: ['HOME.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'PUT /home/settings',
+    granular: ['HOME.MANAGE'],
+    allowed: STAFF_ONLY,
+  },
 ];
 
 const seedFor = (role: Role) => {
@@ -787,17 +820,19 @@ describe('System role seeds', () => {
    * screenshot shows the business account balance, so a super admin grants
    * it explicitly in the roles matrix. Bank transactions (bank_transactions)
    * added BANK_TRANSACTIONS.VIEW and .BANK_EVIDENCE (78 -> 80), once more
-   * to no seeded role.
+   * to no seeded role. HOME (home_promos) added HOME.VIEW and HOME.MANAGE
+   * (80 -> 82), INSERTed for ADMIN only (46 -> 48): the home page's promos
+   * are operations, not content ingestion.
    */
-  it('has the expected seed sizes (80 / 46 / 24 / 0, matching the migrations)', () => {
+  it('has the expected seed sizes (82 / 48 / 24 / 0, matching the migrations)', () => {
     expect({
       SUPER_ADMIN: seedFor(Role.SUPER_ADMIN).permissions.length,
       ADMIN: seedFor(Role.ADMIN).permissions.length,
       CONTENT_UPLOADER: seedFor(Role.CONTENT_UPLOADER).permissions.length,
       USER: seedFor(Role.USER).permissions.length,
     }).toEqual({
-      SUPER_ADMIN: 80,
-      ADMIN: 46,
+      SUPER_ADMIN: 82,
+      ADMIN: 48,
       CONTENT_UPLOADER: 24,
       USER: 0,
     });
@@ -841,15 +876,18 @@ describe('System role seeds — access parity with the pre-RBAC ROLE_PERMISSIONS
    * + 5 MultipartUploadController routes gated by ResourceUploadTypeRegistry
    * = 79 routes, 76 of them permission-gated,
    * - 2 /analytics reads H-26 deliberately re-gated (now in the second table)
-   * = 77 routes, 74 of them permission-gated.
+   * = 77 routes, 74 of them permission-gated,
+   * - 2 unused /uploads routes removed (GET :uploadId/status and POST
+   *   :movieId/validate-external — no app called them; perf audit 2026-10-07)
+   * = 75 routes, 72 of them permission-gated.
    *
    * Routes added since the migration are counted in
    * POST_RBAC_GUARDED_ROUTES instead — this number is frozen at what the
    * migration had to preserve.
    */
   it('covers every permission-gated route in the backend', () => {
-    expect(GUARDED_ROUTES).toHaveLength(77);
-    expect(GUARDED_ROUTES.filter((r) => r.granular !== null)).toHaveLength(74);
+    expect(GUARDED_ROUTES).toHaveLength(75);
+    expect(GUARDED_ROUTES.filter((r) => r.granular !== null)).toHaveLength(72);
     expect(GUARDED_ROUTES.filter((r) => r.granular === null)).toHaveLength(3);
   });
 });
@@ -895,17 +933,21 @@ describe('System role seeds — routes added after the RBAC migration', () => {
    * +  2 Dashboard stats — the two /analytics reads, moved here from the
    *   parity table when H-26 re-gated them on DASHBOARD.VIEW.
    * +  2 Queue totals — GET /deposits/stats and /withdrawals/stats (H-24).
+   * +  8 Home promos — list, one, create, reorder, edit, delete (promos) and
+   *   read/replace (settings). The public GET /home/showcase is ungated.
    */
   it('covers every post-migration permission-gated route', () => {
-    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(42);
+    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(50);
     expect(
       POST_RBAC_GUARDED_ROUTES.filter((r) => r.granular.length > 1),
     ).toHaveLength(2);
   });
 
-  it('leaves the backend with 119 routes in the two tables, 116 permission-gated', () => {
+  // 117 / 114 since the two unused /uploads routes were removed (perf audit
+  // 2026-10-07); 125 / 122 with the eight home-promos routes (2026-10-08).
+  it('leaves the backend with 125 routes in the two tables, 122 permission-gated', () => {
     const gatedLegacy = GUARDED_ROUTES.filter((r) => r.granular !== null);
-    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(116);
-    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(119);
+    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(122);
+    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(125);
   });
 });

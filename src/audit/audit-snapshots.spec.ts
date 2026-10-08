@@ -4,6 +4,9 @@ import {
   ChapterStatus,
   CommentStatus,
   FeedbackStatus,
+  HomePromoArtPreset,
+  HomePromoCtaTarget,
+  HomePromoKind,
   MovieStatus,
   Prisma,
   Role,
@@ -17,6 +20,8 @@ import {
   commentSnapshot,
   depositSnapshot,
   feedbackSnapshot,
+  homePromoSnapshot,
+  homeSettingsSnapshot,
   levelSnapshot,
   movieSnapshot,
   paymentAccountSnapshot,
@@ -261,6 +266,52 @@ describe('audit snapshot pickers', () => {
       feedbackSnapshot({ status: FeedbackStatus.NEW, handledByUserId: null })
         .handledBy,
     ).toBeNull();
+  });
+
+  it('homePromoSnapshot keeps the editable fields and drops bookkeeping', () => {
+    const snapshot = homePromoSnapshot({
+      id: 'p1',
+      kind: HomePromoKind.HERO,
+      titleEn: 'Go Premium',
+      titleMm: 'Premium ယူပါ',
+      ctaTarget: HomePromoCtaTarget.SUBSCRIBE,
+      artPreset: HomePromoArtPreset.PREMIUM,
+      isActive: true,
+      sortOrder: 2,
+      createdById: 'staff-1',
+      createdAt: new Date('2026-10-08T00:00:00Z'),
+    });
+    expect(snapshot).toMatchObject({
+      kind: 'HERO',
+      titleEn: 'Go Premium',
+      titleMm: 'Premium ယူပါ',
+      ctaTarget: 'SUBSCRIBE',
+      artPreset: 'PREMIUM',
+      isActive: true,
+      sortOrder: 2,
+      url: null,
+      targetId: null,
+    });
+    expect(snapshot).not.toHaveProperty('id');
+    expect(snapshot).not.toHaveProperty('createdById');
+    expect(snapshot).not.toHaveProperty('createdAt');
+  });
+
+  it('homeSettingsSnapshot reports the five settings only', () => {
+    expect(
+      homeSettingsSnapshot({
+        id: 's1',
+        webUrl: 'https://myanflix.example',
+        gamesTeaserEnabled: false,
+        updatedByUserId: 'staff-1',
+      }),
+    ).toEqual({
+      webUrl: 'https://myanflix.example',
+      appStoreUrl: null,
+      playStoreUrl: null,
+      gamesTeaserEnabled: false,
+      gamesTeaserDateText: null,
+    });
   });
 
   it('textPreview collapses whitespace and trims to the limit', () => {

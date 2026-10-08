@@ -1,4 +1,8 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+} from '@nestjs/common';
 import {
   NotificationType,
   Prisma,
@@ -22,6 +26,10 @@ import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { CreateWalletAdjustmentDto } from './dto/create-wallet-adjustment.dto';
 import { WalletService } from './wallet.service';
+
+/** M-11/M-14: a staff member never adjusts their OWN wallet. Shown verbatim by the admin app. */
+export const SELF_WALLET_ADJUST_MESSAGE =
+  'You cannot adjust your own wallet balance';
 
 type AdjustmentWithPerformer = WalletAdjustment & {
   performedBy: {
@@ -75,6 +83,11 @@ export class WalletAdjustmentsService {
     dto: CreateWalletAdjustmentDto,
     admin: AuthenticatedUser,
   ) {
+    // M-11/M-14: decided before the idempotency probe — a replay of one's
+    // own key is refused the same way, and nothing is read.
+    if (userId === admin.id) {
+      throw new ForbiddenException(SELF_WALLET_ADJUST_MESSAGE);
+    }
     let result: AdjustTransactionResult;
     try {
       result = await this.prisma.$transaction(

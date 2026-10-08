@@ -85,12 +85,12 @@ function makeUser(id: string, role: Role) {
 
 describe('RealtimeGateway — concurrent USER peak tracking', () => {
   let gateway: RealtimeGateway;
-  let usersService: { findByIdOrThrow: jest.Mock };
+  let usersService: { findAuthSubject: jest.Mock };
   let peakUsersService: { recordConcurrent: jest.Mock };
   let jwtService: { verify: jest.Mock };
 
   beforeEach(async () => {
-    usersService = { findByIdOrThrow: jest.fn() };
+    usersService = { findAuthSubject: jest.fn() };
     peakUsersService = {
       recordConcurrent: jest.fn().mockResolvedValue(undefined),
     };
@@ -119,7 +119,7 @@ describe('RealtimeGateway — concurrent USER peak tracking', () => {
     role: Role,
   ): Promise<void> {
     jwtService.verify.mockReturnValueOnce({ sub: userId });
-    usersService.findByIdOrThrow.mockResolvedValueOnce(makeUser(userId, role));
+    usersService.findAuthSubject.mockResolvedValueOnce(makeUser(userId, role));
     await gateway.handleConnection(socket);
   }
 
@@ -164,6 +164,33 @@ describe('RealtimeGateway — concurrent USER peak tracking', () => {
     expect(peakUsersService.recordConcurrent).toHaveBeenLastCalledWith(1);
   });
 
+  it('keeps a user counted until their LAST socket closes', async () => {
+    const tab1 = makeSocket('s1');
+    const tab2 = makeSocket('s2');
+    await connectAs(tab1, 'user-1', Role.USER);
+    await connectAs(tab2, 'user-1', Role.USER);
+
+    gateway.handleDisconnect(tab1);
+    await connectAs(makeSocket('s3'), 'user-2', Role.USER);
+    expect(peakUsersService.recordConcurrent).toHaveBeenLastCalledWith(2);
+
+    gateway.handleDisconnect(tab2);
+    gateway.handleDisconnect(tab2); // a repeated disconnect changes nothing
+    await connectAs(makeSocket('s4'), 'user-3', Role.USER);
+    expect(peakUsersService.recordConcurrent).toHaveBeenLastCalledWith(2);
+  });
+
+  it('refuses the socket when the account no longer exists', async () => {
+    const socket = makeSocket('s1');
+    jwtService.verify.mockReturnValueOnce({ sub: 'gone' });
+    usersService.findAuthSubject.mockResolvedValueOnce(null);
+
+    await gateway.handleConnection(socket);
+
+    expect(socket.disconnect).toHaveBeenCalledWith(true);
+    expect(peakUsersService.recordConcurrent).not.toHaveBeenCalled();
+  });
+
   it('is fire-and-forget — a recordConcurrent failure never breaks the connection', async () => {
     peakUsersService.recordConcurrent.mockRejectedValueOnce(
       new Error('db down'),
@@ -185,11 +212,11 @@ describe('RealtimeGateway — concurrent USER peak tracking', () => {
 
 describe('RealtimeGateway — live presence (getActiveUsers)', () => {
   let gateway: RealtimeGateway;
-  let usersService: { findByIdOrThrow: jest.Mock };
+  let usersService: { findAuthSubject: jest.Mock };
   let jwtService: { verify: jest.Mock };
 
   beforeEach(async () => {
-    usersService = { findByIdOrThrow: jest.fn() };
+    usersService = { findAuthSubject: jest.fn() };
     jwtService = { verify: jest.fn() };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -220,7 +247,7 @@ describe('RealtimeGateway — live presence (getActiveUsers)', () => {
     role: Role = Role.USER,
   ): Promise<void> {
     jwtService.verify.mockReturnValueOnce({ sub: userId });
-    usersService.findByIdOrThrow.mockResolvedValueOnce(makeUser(userId, role));
+    usersService.findAuthSubject.mockResolvedValueOnce(makeUser(userId, role));
     await gateway.handleConnection(socket);
   }
 
@@ -313,17 +340,42 @@ describe('RealtimeGateway — live presence (getActiveUsers)', () => {
     expect(gateway.getActiveUsers()[0].platform).toBe(ClientPlatform.UNKNOWN);
   });
 
-  it('prefers the forwarded client IP over the proxy socket address', async () => {
-    await connectAs(
-      makeSocket('s1', {
-        platform: 'WEB',
-        address: '172.18.0.5',
-        headers: { 'x-forwarded-for': '203.0.113.7, 172.18.0.5' },
-      }),
-      'user-1',
-    );
+  it('M-5: ignores X-Forwarded-For from a peer that is not a trusted proxy', async () => {
+    const original = process.env.TRUSTED_PROXIES;
+    delete process.env.TRUSTED_PROXIES;
+    try {
+      await connectAs(
+        makeSocket('s1', {
+          platform: 'WEB',
+          address: '198.51.100.4',
+          headers: { 'x-forwarded-for': '203.0.113.7' },
+        }),
+        'user-1',
+      );
+      expect(gateway.getActiveUsers()[0].ip).toBe('198.51.100.4');
+    } finally {
+      if (original === undefined) delete process.env.TRUSTED_PROXIES;
+      else process.env.TRUSTED_PROXIES = original;
+    }
+  });
 
-    expect(gateway.getActiveUsers()[0].ip).toBe('203.0.113.7');
+  it('prefers the forwarded client IP when the socket peer is a trusted proxy', async () => {
+    const original = process.env.TRUSTED_PROXIES;
+    process.env.TRUSTED_PROXIES = '172.18.0.5';
+    try {
+      await connectAs(
+        makeSocket('s1', {
+          platform: 'WEB',
+          address: '172.18.0.5',
+          headers: { 'x-forwarded-for': '203.0.113.7, 172.18.0.5' },
+        }),
+        'user-1',
+      );
+      expect(gateway.getActiveUsers()[0].ip).toBe('203.0.113.7');
+    } finally {
+      if (original === undefined) delete process.env.TRUSTED_PROXIES;
+      else process.env.TRUSTED_PROXIES = original;
+    }
   });
 
   it('normalises an IPv4-mapped socket address', async () => {
@@ -358,7 +410,7 @@ describe('RealtimeGateway — machine (phone-monitor) sockets', () => {
   const MACHINE_TOKEN = 'm'.repeat(48);
   let gateway: RealtimeGateway;
   let jwtService: { verify: jest.Mock };
-  let usersService: { findByIdOrThrow: jest.Mock };
+  let usersService: { findAuthSubject: jest.Mock };
   let peakUsersService: { recordConcurrent: jest.Mock };
   let env: Record<string, string | undefined>;
 
@@ -378,7 +430,7 @@ describe('RealtimeGateway — machine (phone-monitor) sockets', () => {
   beforeEach(async () => {
     env = { JWT_SECRET: 'test-secret', BANK_EVENTS_TOKEN: MACHINE_TOKEN };
     jwtService = { verify: jest.fn() };
-    usersService = { findByIdOrThrow: jest.fn() };
+    usersService = { findAuthSubject: jest.fn() };
     peakUsersService = {
       recordConcurrent: jest.fn().mockResolvedValue(undefined),
     };
@@ -412,7 +464,7 @@ describe('RealtimeGateway — machine (phone-monitor) sockets', () => {
     expect(socket.data.machine).toBe('phone-monitor');
     expect(socket.data.userId).toBeUndefined();
     expect(jwtService.verify).not.toHaveBeenCalled();
-    expect(usersService.findByIdOrThrow).not.toHaveBeenCalled();
+    expect(usersService.findAuthSubject).not.toHaveBeenCalled();
     expect(peakUsersService.recordConcurrent).not.toHaveBeenCalled();
     expect(gateway.getActiveUsers()).toEqual([]);
   });
@@ -468,6 +520,7 @@ describe('RealtimeGateway — machine (phone-monitor) sockets', () => {
       bankCheckedAt: new Date(),
       hasBankScreenshot: false,
       bankTransactionId: 'tx-1',
+      bankCounterparty: null,
     };
     gateway.notifyAdminsDepositVerificationUpdated(payload);
     expect(to).toHaveBeenLastCalledWith('perm:DEPOSITS.VIEW');
@@ -636,7 +689,7 @@ describe('RealtimeGateway — machine (phone-monitor) sockets', () => {
 describe('RealtimeGateway — permission rooms (H-3)', () => {
   let gateway: RealtimeGateway;
   let jwtService: { verify: jest.Mock };
-  let usersService: { findByIdOrThrow: jest.Mock; findById: jest.Mock };
+  let usersService: { findAuthSubject: jest.Mock; findById: jest.Mock };
   let access: ReturnType<typeof accessProviders>;
 
   /** Custom roles the audit named: a narrow content role, and a finance clerk. */
@@ -682,7 +735,7 @@ describe('RealtimeGateway — permission rooms (H-3)', () => {
     payload: Record<string, unknown> = {},
   ): Promise<void> {
     jwtService.verify.mockReturnValueOnce({ sub: user.id, ...payload });
-    usersService.findByIdOrThrow.mockResolvedValueOnce(user);
+    usersService.findAuthSubject.mockResolvedValueOnce(user);
     await gateway.handleConnection(socket);
   }
 
@@ -691,7 +744,7 @@ describe('RealtimeGateway — permission rooms (H-3)', () => {
 
   beforeEach(async () => {
     jwtService = { verify: jest.fn() };
-    usersService = { findByIdOrThrow: jest.fn(), findById: jest.fn() };
+    usersService = { findAuthSubject: jest.fn(), findById: jest.fn() };
     access = accessProviders(ROWS);
 
     const module: TestingModule = await Test.createTestingModule({

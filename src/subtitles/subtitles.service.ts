@@ -24,6 +24,26 @@ export const EXTENSION_TO_FORMAT: Record<string, SubtitleFormat> = {
   '.ass': SubtitleFormat.ASS,
 };
 
+/**
+ * What a manual republish did, for its audit row (L-42): the reason it was a
+ * no-op, or how many tracks went into / stayed out of the manifest and
+ * whether the master actually changed. Never the track list itself — the
+ * row is a record of the act, not a copy of the manifest.
+ */
+function publishOutcome(result: SubtitlePublishResult): {
+  skipped: string | null;
+  masterUpdated: boolean;
+  publishedCount: number;
+  excludedCount: number;
+} {
+  return {
+    skipped: result.skipped ?? null,
+    masterUpdated: result.masterUpdated,
+    publishedCount: result.published.length,
+    excludedCount: result.excluded.length,
+  };
+}
+
 @Injectable()
 export class SubtitlesService {
   private readonly logger = new Logger(SubtitlesService.name);
@@ -120,14 +140,22 @@ export class SubtitlesService {
    * create() writes into, so both ingest paths land in one namespace and
    * remove() below can delete either of them without knowing which flow
    * produced it.
+   *
+   * `publish: false` skips the manifest publish for a caller that records
+   * several tracks in a row (bundle finalize / finalize-replace): it then
+   * calls publishQuietly() ONCE after the loop, so the master is rebuilt
+   * once with the complete set instead of once per track.
    */
-  async createFromExistingKey(data: {
-    videoId: string;
-    language: string;
-    label: string;
-    format: SubtitleFormat;
-    objectKey: string;
-  }) {
+  async createFromExistingKey(
+    data: {
+      videoId: string;
+      language: string;
+      label: string;
+      format: SubtitleFormat;
+      objectKey: string;
+    },
+    options: { publish?: boolean } = {},
+  ) {
     const subtitle = await this.prisma.subtitle.create({
       data: {
         videoId: data.videoId,
@@ -139,7 +167,7 @@ export class SubtitlesService {
       },
     });
 
-    await this.publishQuietly(data.videoId);
+    if (options.publish !== false) await this.publishQuietly(data.videoId);
 
     return subtitle;
   }
@@ -285,14 +313,47 @@ export class SubtitlesService {
    * the same routine the write paths use rather than a one-off script, and
    * safe to call repeatedly (the master rewrite is idempotent).
    */
-  async republish(id: string): Promise<SubtitlePublishResult> {
+  async republish(
+    id: string,
+    actor: AuthenticatedUser,
+  ): Promise<SubtitlePublishResult> {
     const subtitle = await this.assertExists(id);
-    return this.hlsSubtitlesService.publishForVideo(subtitle.videoId);
+    const result = await this.hlsSubtitlesService.publishForVideo(
+      subtitle.videoId,
+    );
+
+    await this.audit.record({
+      action: 'subtitle.publish',
+      actor,
+      target: { type: 'subtitle', id, label: subtitle.label },
+      metadata: {
+        ...(await this.ownerIds(subtitle.videoId)),
+        ...publishOutcome(result),
+      },
+    });
+
+    return result;
   }
 
   /** Same backfill, addressed by movie — useful when no subtitle id is at hand. */
-  republishForMovie(movieId: string): Promise<SubtitlePublishResult> {
-    return this.hlsSubtitlesService.publishForMovie(movieId);
+  async republishForMovie(
+    movieId: string,
+    actor: AuthenticatedUser,
+  ): Promise<SubtitlePublishResult> {
+    const result = await this.hlsSubtitlesService.publishForMovie(movieId);
+
+    await this.audit.record({
+      action: 'subtitle.publish',
+      actor,
+      target: { type: 'subtitle', id: null, label: null },
+      metadata: {
+        movieId,
+        videoId: result.videoId || null,
+        ...publishOutcome(result),
+      },
+    });
+
+    return result;
   }
 
   /**
@@ -304,8 +365,11 @@ export class SubtitlesService {
    * Returns whether the manifest is now known to reflect the database, which
    * `remove()` needs before it is safe to delete the published objects. A
    * `skipped` publish still counts: it means no master advertises them.
+   *
+   * Public for the bundle flows, which record several tracks with
+   * `createFromExistingKey(..., { publish: false })` and publish once.
    */
-  private async publishQuietly(videoId: string): Promise<boolean> {
+  async publishQuietly(videoId: string): Promise<boolean> {
     try {
       const result = await this.hlsSubtitlesService.publishForVideo(videoId);
       if (result.skipped) {

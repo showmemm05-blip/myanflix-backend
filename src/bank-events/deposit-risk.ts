@@ -219,7 +219,7 @@ export function depositVerificationPayload(
     | 'receivingTransactionCode'
     | 'receivingTransactionAt'
     | 'receivingScreenshotKey'
-  > & { bankTransaction?: { id: string } | null },
+  > & { bankTransaction?: { id: string; counterparty?: string | null } | null },
   now: Date = new Date(),
 ): DepositVerificationPayload {
   const view = verificationView(row, now);
@@ -235,10 +235,16 @@ export function depositVerificationPayload(
     bankCheckedAt: row.bankCheckedAt,
     hasBankScreenshot: row.receivingScreenshotKey !== null,
     bankTransactionId: row.bankTransaction?.id ?? null,
+    bankCounterparty: row.bankTransaction?.counterparty ?? null,
   };
 }
 
-/** The one-column include every admin deposit/withdrawal read adds — a probe of the unique link index per row. */
+/**
+ * The include every admin deposit/withdrawal read adds — a probe of the
+ * unique link index per row. `counterparty` rides along for the deposit
+ * verification dialog's "sender name" (M-16); it is one column of the
+ * same row, never a second query.
+ */
 export const BANK_TRANSACTION_LINK_INCLUDE = {
-  bankTransaction: { select: { id: true } },
+  bankTransaction: { select: { id: true, counterparty: true } },
 } as const;

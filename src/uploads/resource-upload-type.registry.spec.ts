@@ -6,10 +6,16 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MovieStatus } from '../generated/prisma/client';
+import { BadRequestException } from '@nestjs/common';
 import {
+  DIRECT_UPLOAD_MOVIE_STATUSES,
   REPLACEABLE_MOVIE_STATUSES,
   ResourceUploadTypeRegistry,
 } from './resource-upload-type.registry';
+import {
+  DEFAULT_MAX_DOCUMENT_UPLOAD_BYTES,
+  DEFAULT_MAX_VIDEO_UPLOAD_BYTES,
+} from './upload-limits';
 import { PrismaService } from '../prisma/prisma.service';
 import { PermissionResolverService } from '../roles/permission-resolver.service';
 import { StorageService } from '../common/storage/storage.service';
@@ -92,6 +98,126 @@ describe('ResourceUploadTypeRegistry', () => {
       // signed HLS prefix — only a root-level "subtitles/" path is a source.
       expect(key('hls/subs/track-1.m3u8')).toBe(
         'videos/movie-1/hls/subs/track-1.m3u8',
+      );
+    });
+  });
+
+  describe('assertExists — movie (a DIRECT upload onto the live keys, M-22)', () => {
+    it.each([MovieStatus.UPLOADING, MovieStatus.FAILED])(
+      'lets a %s movie take a direct upload — a placeholder still being filled, or a rejected bundle being retried',
+      async (status) => {
+        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1', status });
+        await expect(
+          registry.resolve('movie').assertExists('movie-1'),
+        ).resolves.toBeUndefined();
+      },
+    );
+
+    it.each([
+      MovieStatus.PUBLISHED,
+      MovieStatus.READY_TO_PUBLISH,
+      MovieStatus.DRAFT,
+      MovieStatus.PROCESSING,
+      MovieStatus.ARCHIVED,
+    ])(
+      'refuses a %s movie with 409 that points at the movie-replace flow — presign-batch / multipart/init / chunked init all reject before a byte lands',
+      async (status) => {
+        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1', status });
+        const attempt = registry.resolve('movie').assertExists('movie-1');
+        await expect(attempt).rejects.toThrow(ConflictException);
+        await expect(attempt).rejects.toThrow(/movie-replace/);
+        await expect(attempt).rejects.toThrow(new RegExp(status));
+      },
+    );
+
+    it('is exactly the two states finalize acts on', () => {
+      expect([...DIRECT_UPLOAD_MOVIE_STATUSES]).toEqual([
+        MovieStatus.UPLOADING,
+        MovieStatus.FAILED,
+      ]);
+    });
+  });
+
+  describe('assertFileSizeAllowed — the per-type size budget (M-23)', () => {
+    const ORIGINAL_ENV = { ...process.env };
+    afterEach(() => {
+      process.env = { ...ORIGINAL_ENV };
+    });
+
+    it('accepts a video right at 60 GB and refuses one byte more', () => {
+      expect(() =>
+        registry.assertFileSizeAllowed(
+          'movie',
+          DEFAULT_MAX_VIDEO_UPLOAD_BYTES,
+          'original.mkv',
+        ),
+      ).not.toThrow();
+      expect(() =>
+        registry.assertFileSizeAllowed(
+          'movie',
+          DEFAULT_MAX_VIDEO_UPLOAD_BYTES + 1,
+          'original.mkv',
+        ),
+      ).toThrow(BadRequestException);
+      expect(() =>
+        registry.assertFileSizeAllowed(
+          'movie',
+          DEFAULT_MAX_VIDEO_UPLOAD_BYTES + 1,
+          'original.mkv',
+        ),
+      ).toThrow(
+        /"original.mkv" is \d+ bytes — the limit for a movie upload is 60 GB/,
+      );
+    });
+
+    it('gives a replacement bundle the same video budget', () => {
+      expect(() =>
+        registry.assertFileSizeAllowed(
+          'movie-replace',
+          DEFAULT_MAX_VIDEO_UPLOAD_BYTES + 1,
+        ),
+      ).toThrow(BadRequestException);
+      expect(() =>
+        registry.assertFileSizeAllowed(
+          'movie-replace',
+          DEFAULT_MAX_VIDEO_UPLOAD_BYTES,
+        ),
+      ).not.toThrow();
+    });
+
+    it('caps a book PDF at 500 MB', () => {
+      expect(() =>
+        registry.assertFileSizeAllowed(
+          'book',
+          DEFAULT_MAX_DOCUMENT_UPLOAD_BYTES,
+        ),
+      ).not.toThrow();
+      expect(() =>
+        registry.assertFileSizeAllowed(
+          'book',
+          DEFAULT_MAX_DOCUMENT_UPLOAD_BYTES + 1,
+        ),
+      ).toThrow(/the limit for a book upload is 500 MB/);
+    });
+
+    it('can be raised or lowered through the environment without a code change', () => {
+      process.env.UPLOAD_MAX_DOCUMENT_BYTES = '1000';
+      expect(() => registry.assertFileSizeAllowed('book', 1001)).toThrow(
+        BadRequestException,
+      );
+      expect(() => registry.assertFileSizeAllowed('book', 1000)).not.toThrow();
+    });
+
+    it('ignores a nonsense environment value and keeps the default', () => {
+      process.env.UPLOAD_MAX_VIDEO_BYTES = 'lots';
+      expect(() =>
+        registry.assertFileSizeAllowed('movie', DEFAULT_MAX_VIDEO_UPLOAD_BYTES),
+      ).not.toThrow();
+    });
+
+    it('rejects an unknown resourceType like resolve() does', () => {
+      expect(() => registry.assertFileSizeAllowed('podcast', 1)).toThrow(
+        NotFoundException,
       );
     });
   });

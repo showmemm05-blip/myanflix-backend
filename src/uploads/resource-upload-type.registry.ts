@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -13,6 +14,11 @@ import {
   PermissionResolverService,
   type PermissionSubject,
 } from '../roles/permission-resolver.service';
+import {
+  describeBytes,
+  maxDocumentUploadBytes,
+  maxVideoUploadBytes,
+} from './upload-limits';
 
 /**
  * The relativePath prefix that marks a bundle file as a subtitle SOURCE
@@ -45,8 +51,36 @@ export const REPLACEABLE_MOVIE_STATUSES: readonly MovieStatus[] = [
   MovieStatus.FAILED,
 ];
 
+/**
+ * The only movie states a DIRECT upload (presign-batch, multipart/init or
+ * the chunked bundle flow with resourceType "movie") may write to (M-22):
+ * a bulk placeholder still collecting its files, or one whose finalize was
+ * rejected and is being retried. The direct flows write straight onto the
+ * title's live keys (videos/<movieId>/...), so a title in any other state —
+ * PUBLISHED above all, but also READY_TO_PUBLISH, DRAFT, PROCESSING and
+ * ARCHIVED — is refused with 409: its files only ever change through the
+ * versioned, audited replace flow (REPLACEABLE_MOVIE_STATUSES above).
+ * Same list as UploadsService's FINALIZABLE_MOVIE_STATUSES, on purpose: what
+ * can be uploaded to is exactly what finalize will act on.
+ */
+export const DIRECT_UPLOAD_MOVIE_STATUSES: readonly MovieStatus[] = [
+  MovieStatus.UPLOADING,
+  MovieStatus.FAILED,
+];
+
+/** The 409 every direct-upload route answers for a movie outside DIRECT_UPLOAD_MOVIE_STATUSES. */
+export function directUploadRefusalMessage(status: MovieStatus): string {
+  return `Cannot upload files directly to a ${status} movie — only a title that is still UPLOADING or FAILED accepts a direct upload; to change the video of a live title use the movie-replace flow (POST /uploads/:movieId/replace-begin)`;
+}
+
 export interface ResourceUploadType {
   permission: Permission;
+  /**
+   * Largest single file (bytes) this type accepts, enforced by every direct
+   * upload route before a session or URL is issued (M-23). Read at call time
+   * so the environment override (see upload-limits.ts) takes effect.
+   */
+  maxFileSize(): number;
   /** Confirms the owning row actually exists before a multipart session/presigned URL is issued against it. */
   assertExists(resourceId: string): Promise<void>;
   /**
@@ -94,12 +128,21 @@ export class ResourceUploadTypeRegistry {
     this.types = {
       movie: {
         permission: 'MEDIA.UPLOAD',
+        maxFileSize: maxVideoUploadBytes,
+        // Existence AND state: this entry's keys are the title's LIVE keys,
+        // so a movie that viewers could be watching is never a valid
+        // target here (M-22) — see DIRECT_UPLOAD_MOVIE_STATUSES.
         assertExists: async (resourceId) => {
           const movie = await this.prisma.movie.findUnique({
             where: { id: resourceId },
-            select: { id: true },
+            select: { id: true, status: true },
           });
           if (!movie) throw new NotFoundException('Movie not found');
+          if (!DIRECT_UPLOAD_MOVIE_STATUSES.includes(movie.status)) {
+            throw new ConflictException(
+              directUploadRefusalMessage(movie.status),
+            );
+          }
         },
         // A subtitle source is flattened to its BASENAME on purpose: the
         // bundle's own "subtitles/" folder disappears into the key's
@@ -125,6 +168,7 @@ export class ResourceUploadTypeRegistry {
       // through the "movie" entry above, never here.
       [MOVIE_REPLACE_RESOURCE_TYPE]: {
         permission: 'MEDIA.UPLOAD',
+        maxFileSize: maxVideoUploadBytes,
         assertExists: async (resourceId) => {
           const movie = await this.prisma.movie.findUnique({
             where: { id: resourceId },
@@ -145,6 +189,7 @@ export class ResourceUploadTypeRegistry {
         // attach its PDF, and the books module has no other reason to grant
         // the movie-pipeline's upload permission.
         permission: 'BOOKS.EDIT',
+        maxFileSize: maxDocumentUploadBytes,
         assertExists: async (resourceId) => {
           const book = await this.prisma.book.findUnique({
             where: { id: resourceId },
@@ -163,6 +208,24 @@ export class ResourceUploadTypeRegistry {
     if (!type)
       throw new NotFoundException(`Unknown resourceType "${resourceType}"`);
     return type;
+  }
+
+  /**
+   * 400 when `filesize` is over the type's budget. Called by every direct
+   * upload route before it creates a session or signs a URL, so the size a
+   * staff browser declares is checked once, in one place, for all of them.
+   */
+  assertFileSizeAllowed(
+    resourceType: string,
+    filesize: number,
+    relativePath?: string,
+  ): void {
+    const limit = this.resolve(resourceType).maxFileSize();
+    if (filesize > limit) {
+      throw new BadRequestException(
+        `${relativePath ? `"${relativePath}" is` : 'The file is'} ${filesize} bytes — the limit for a ${resourceType} upload is ${describeBytes(limit)}`,
+      );
+    }
   }
 
   /**

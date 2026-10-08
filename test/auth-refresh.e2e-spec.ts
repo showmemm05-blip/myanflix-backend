@@ -4,9 +4,10 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import request from 'supertest';
 import type { App } from 'supertest/types';
-import { randomInt, randomUUID } from 'node:crypto';
+import { randomInt } from 'node:crypto';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { OtpCodeHasher } from '../src/otp/otp-code.hasher';
 import type { RefreshPayload } from '../src/auth/types/jwt-payload.type';
 
 /**
@@ -26,7 +27,19 @@ describe('Auth refresh rotation (e2e)', () => {
   let refreshToken: string;
 
   const otpPhone = `+959${randomInt(10_000_000, 99_999_999)}`;
+  /** The account the rotation tests run on — signed up by phone (M-20: there is no username sign-up). */
+  const refreshPhone = `+959${randomInt(10_000_000, 99_999_999)}`;
   const OTP_CODE = '123456';
+  let otpHasher: OtpCodeHasher;
+
+  const giveCode = (phone: string, code: string) =>
+    prisma.otpCode.create({
+      data: {
+        phone,
+        codeHash: otpHasher.hash(phone, code),
+        expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+      },
+    });
 
   function postRefresh(token: string) {
     return request(app.getHttpServer())
@@ -63,11 +76,19 @@ describe('Auth refresh rotation (e2e)', () => {
     jwtService = app.get(JwtService);
     configService = app.get(ConfigService);
 
-    const suffix = randomUUID().slice(0, 8);
+    otpHasher = OtpCodeHasher.fromConfig(configService);
+
+    // A brand-new phone signs up through the real flow: code + chosen
+    // password (the only customer sign-up there is).
+    await giveCode(refreshPhone, '100000');
     const registered = await request(app.getHttpServer())
-      .post('/api/auth/register')
-      .send({ username: `qa_rt_${suffix}`, password: 'qa-refresh-password' })
-      .expect(201);
+      .post('/api/auth/otp/verify')
+      .send({
+        phone: refreshPhone,
+        code: '100000',
+        password: 'qa-refresh-password',
+      })
+      .expect(200);
 
     userId = registered.body.data.user.id;
     refreshToken = registered.body.data.refreshToken;
@@ -84,7 +105,9 @@ describe('Auth refresh rotation (e2e)', () => {
     );
     await prisma.wallet.deleteMany({ where: { userId: { in: userIds } } });
     await prisma.user.deleteMany({ where: { id: { in: userIds } } });
-    await prisma.otpCode.deleteMany({ where: { phone: otpPhone } });
+    await prisma.otpCode.deleteMany({
+      where: { phone: { in: [otpPhone, refreshPhone] } },
+    });
     await app.close();
   });
 
@@ -154,13 +177,7 @@ describe('Auth refresh rotation (e2e)', () => {
   });
 
   it('parallel OTP verifies with one code: exactly one 200', async () => {
-    await prisma.otpCode.create({
-      data: {
-        phone: otpPhone,
-        code: OTP_CODE,
-        expiresAt: new Date(Date.now() + 5 * 60 * 1000),
-      },
-    });
+    await giveCode(otpPhone, OTP_CODE);
 
     const responses = await Promise.all(
       Array.from({ length: 4 }, () =>

@@ -46,6 +46,7 @@ describe('SubtitlesService — publishing on write', () => {
     publishForMovie: jest.Mock;
     unpublishSubtitle: jest.Mock;
   };
+  let audit: { record: jest.Mock };
 
   const existingRow = {
     id: SUBTITLE_ID,
@@ -97,6 +98,7 @@ describe('SubtitlesService — publishing on write', () => {
         .mockResolvedValue({ published: [], excluded: [] }),
       unpublishSubtitle: jest.fn().mockResolvedValue(undefined),
     };
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -112,10 +114,7 @@ describe('SubtitlesService — publishing on write', () => {
           useValue: new StorageService(new ConfigService()),
         },
         { provide: HlsSubtitlesService, useValue: hlsSubtitlesService },
-        {
-          provide: AuditService,
-          useValue: { record: jest.fn().mockResolvedValue(undefined) },
-        },
+        { provide: AuditService, useValue: audit },
       ],
     }).compile();
 
@@ -271,6 +270,30 @@ describe('SubtitlesService — publishing on write', () => {
     expect(hlsSubtitlesService.publishForVideo).toHaveBeenCalledWith(VIDEO_ID);
   });
 
+  it('skips the publish with { publish: false } (a bundle flow publishes once after its loop)', async () => {
+    await service.createFromExistingKey(
+      {
+        videoId: VIDEO_ID,
+        language: 'en',
+        label: 'English',
+        format: 'SRT',
+        objectKey: `subtitles/${MOVIE_ID}/english.srt`,
+      },
+      { publish: false },
+    );
+
+    expect(prisma.subtitle.create).toHaveBeenCalledTimes(1);
+    expect(hlsSubtitlesService.publishForVideo).not.toHaveBeenCalled();
+  });
+
+  it('publishQuietly swallows a publish failure and reports it as false', async () => {
+    hlsSubtitlesService.publishForVideo.mockRejectedValueOnce(
+      new Error('storage down'),
+    );
+
+    await expect(service.publishQuietly(VIDEO_ID)).resolves.toBe(false);
+  });
+
   it('publishes after a metadata edit, because label/language are the manifest NAME/LANGUAGE', async () => {
     await service.update(SUBTITLE_ID, { label: 'English (CC)' }, ACTOR);
 
@@ -351,7 +374,7 @@ describe('SubtitlesService — publishing on write', () => {
   });
 
   it('exposes an idempotent backfill for one subtitle', async () => {
-    await service.republish(SUBTITLE_ID);
+    await service.republish(SUBTITLE_ID, ACTOR);
 
     expect(prisma.subtitle.findUnique).toHaveBeenCalledWith({
       where: { id: SUBTITLE_ID },
@@ -360,8 +383,134 @@ describe('SubtitlesService — publishing on write', () => {
   });
 
   it('exposes the same backfill addressed by movie', async () => {
-    await service.republishForMovie(MOVIE_ID);
+    await service.republishForMovie(MOVIE_ID, ACTOR);
 
     expect(hlsSubtitlesService.publishForMovie).toHaveBeenCalledWith(MOVIE_ID);
+  });
+
+  /**
+   * L-42(c): the two manual republish routes used to be the only subtitle
+   * writes with no audit row. Each now records who ran it, which movie /
+   * video it hit, and what the publish did — the no-op reason or the counts.
+   */
+  describe('audit row for a manual republish', () => {
+    it('records subtitle.publish for the by-id route, with the outcome', async () => {
+      hlsSubtitlesService.publishForVideo.mockResolvedValue({
+        videoId: VIDEO_ID,
+        movieId: MOVIE_ID,
+        masterKey: `videos/${MOVIE_ID}/hls/master.m3u8`,
+        masterUpdated: true,
+        published: [{ id: SUBTITLE_ID }],
+        excluded: [{ id: 'other' }, { id: 'another' }],
+      });
+
+      const result = await service.republish(SUBTITLE_ID, ACTOR);
+
+      expect(audit.record).toHaveBeenCalledTimes(1);
+      expect(audit.record).toHaveBeenCalledWith({
+        action: 'subtitle.publish',
+        actor: ACTOR,
+        target: { type: 'subtitle', id: SUBTITLE_ID, label: 'English' },
+        metadata: {
+          movieId: MOVIE_ID,
+          videoId: VIDEO_ID,
+          skipped: null,
+          masterUpdated: true,
+          publishedCount: 1,
+          excludedCount: 2,
+        },
+      });
+      // The caller still gets the publisher's result, untouched.
+      expect(result.published).toHaveLength(1);
+    });
+
+    it('records the skipped reason when the by-id publish was a no-op', async () => {
+      hlsSubtitlesService.publishForVideo.mockResolvedValue({
+        videoId: VIDEO_ID,
+        movieId: MOVIE_ID,
+        masterKey: null,
+        masterUpdated: false,
+        published: [],
+        excluded: [],
+        skipped: 'video is not READY',
+      });
+
+      await service.republish(SUBTITLE_ID, ACTOR);
+
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'subtitle.publish',
+          metadata: expect.objectContaining({
+            skipped: 'video is not READY',
+            masterUpdated: false,
+            publishedCount: 0,
+            excludedCount: 0,
+          }),
+        }),
+      );
+    });
+
+    it('records subtitle.publish for the by-movie route, addressed by movie', async () => {
+      hlsSubtitlesService.publishForMovie.mockResolvedValue({
+        videoId: VIDEO_ID,
+        movieId: MOVIE_ID,
+        masterKey: `videos/${MOVIE_ID}/hls/master.m3u8`,
+        masterUpdated: false,
+        published: [{ id: SUBTITLE_ID }],
+        excluded: [],
+      });
+
+      await service.republishForMovie(MOVIE_ID, ACTOR);
+
+      expect(audit.record).toHaveBeenCalledTimes(1);
+      expect(audit.record).toHaveBeenCalledWith({
+        action: 'subtitle.publish',
+        actor: ACTOR,
+        target: { type: 'subtitle', id: null, label: null },
+        metadata: {
+          movieId: MOVIE_ID,
+          videoId: VIDEO_ID,
+          skipped: null,
+          masterUpdated: false,
+          publishedCount: 1,
+          excludedCount: 0,
+        },
+      });
+    });
+
+    it('records a null videoId when the movie has no video to publish for', async () => {
+      hlsSubtitlesService.publishForMovie.mockResolvedValue({
+        videoId: '',
+        movieId: MOVIE_ID,
+        masterKey: null,
+        masterUpdated: false,
+        published: [],
+        excluded: [],
+        skipped: 'no video for movie',
+      });
+
+      await service.republishForMovie(MOVIE_ID, ACTOR);
+
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            movieId: MOVIE_ID,
+            videoId: null,
+            skipped: 'no video for movie',
+          }),
+        }),
+      );
+    });
+
+    it('writes no row when the publish itself throws (the request fails as before)', async () => {
+      hlsSubtitlesService.publishForVideo.mockRejectedValue(
+        new Error('storage down'),
+      );
+
+      await expect(service.republish(SUBTITLE_ID, ACTOR)).rejects.toThrow(
+        'storage down',
+      );
+      expect(audit.record).not.toHaveBeenCalled();
+    });
   });
 });

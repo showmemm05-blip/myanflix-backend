@@ -23,7 +23,6 @@ import { ActorsService } from './actors.service';
 import { ActorQueryDto, CreateActorDto, UpdateActorDto } from './dto/actor.dto';
 import { ActorResponseDto } from './dto/actor-response.dto';
 import type { ImageUrlResolver } from '../movies/dto/movie-response.dto';
-import { MovieResponseDto } from '../movies/dto/movie-response.dto';
 
 /**
  * Reads are open to any authenticated caller — the cast of a film is public
@@ -76,18 +75,6 @@ export class ActorsController {
     const viewerRole = user?.role ?? Role.USER;
     const actor = await this.actorsService.findByIdOrThrow(id, viewerRole);
     return ActorResponseDto.fromEntity(actor, this.resolveImageUrl);
-  }
-
-  /** Everything this person appears in — published films only for a regular viewer. */
-  @Get(':id/movies')
-  async getMovies(
-    @Param('id', ParseUUIDPipe) id: string,
-    @CurrentUser() user: AuthenticatedUser,
-  ) {
-    const movies = await this.actorsService.getMovies(id, user.role);
-    return movies.map((m) =>
-      MovieResponseDto.fromEntity(m, this.resolveImageUrl),
-    );
   }
 
   @Post()

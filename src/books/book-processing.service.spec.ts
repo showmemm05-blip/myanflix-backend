@@ -6,14 +6,16 @@ import {
   BookProcessingService,
   pagesFolderTag,
 } from './book-processing.service';
+import { ConversionSlots } from '../common/concurrency/slots';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
 import { AuditService } from '../audit/audit.service';
-import { probePdf, renderPdfPageToPng } from './pdf.util';
+import { probePdf, renderPdfPageToPng, PDF_RENDER_DPI } from './pdf.util';
 import { BookType, ChapterStatus } from '../generated/prisma/client';
 
 jest.mock('./pdf.util', () => ({
+  ...jest.requireActual<typeof import('./pdf.util')>('./pdf.util'),
   probePdf: jest.fn(),
   renderPdfPageToPng: jest.fn(),
 }));
@@ -65,6 +67,7 @@ describe('BookProcessingService', () => {
     $transaction: jest.Mock;
   };
   let minioService: {
+    objectStat: jest.Mock;
     downloadFile: jest.Mock;
     uploadBuffer: jest.Mock;
     deleteByPrefix: jest.Mock;
@@ -111,6 +114,8 @@ describe('BookProcessingService', () => {
       $transaction: jest.fn((ops: Promise<unknown>[]) => Promise.all(ops)),
     };
     minioService = {
+      // A small PDF by default; the size-cap case overrides it.
+      objectStat: jest.fn().mockResolvedValue({ size: 1000, etag: 'etag-new' }),
       downloadFile: jest.fn().mockResolvedValue({ etag: 'etag-new' }),
       uploadBuffer: jest.fn().mockImplementation((key: string) => {
         events.push(`upload:${key}`);
@@ -162,7 +167,7 @@ describe('BookProcessingService', () => {
       return chain;
     });
     audit = { record: jest.fn().mockResolvedValue(undefined) };
-    probePdfMock.mockResolvedValue({ pageCount: 0 });
+    probePdfMock.mockResolvedValue({ pageCount: 0, pageSizes: new Map() });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -314,7 +319,7 @@ describe('BookProcessingService', () => {
       prisma.bookPage.findMany.mockResolvedValue(
         [1, 2, 3].map((pageNumber) => ({ pageNumber })),
       );
-      probePdfMock.mockResolvedValue({ pageCount: 2 });
+      probePdfMock.mockResolvedValue({ pageCount: 2, pageSizes: new Map() });
 
       await service.processChapter(CHAPTER_ID);
 
@@ -323,7 +328,9 @@ describe('BookProcessingService', () => {
       });
       // The counters reset in the SAME transaction as the rows, so the
       // admin never sees processedPages > pageCount.
-      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      // One transaction for the clear, then one per converted page (its
+      // row + the progress counter together).
+      expect(prisma.$transaction).toHaveBeenCalledTimes(3);
       expect(prisma.bookChapter.update).toHaveBeenCalledWith({
         where: { id: CHAPTER_ID },
         data: { pageCount: 0, processedPages: 0, pagesSourceEtag: null },
@@ -363,6 +370,23 @@ describe('BookProcessingService', () => {
       );
     });
 
+    it('writes each page row and its progress increment in ONE transaction', async () => {
+      probePdfMock.mockResolvedValue({ pageCount: 2, pageSizes: new Map() });
+
+      await service.processChapter(CHAPTER_ID);
+
+      // The clear of the old pages, then one per page.
+      expect(prisma.$transaction).toHaveBeenCalledTimes(3);
+      expect(prisma.bookPage.deleteMany).toHaveBeenCalledTimes(1);
+      expect(prisma.bookPage.create).toHaveBeenCalledTimes(2);
+      const increments = prisma.bookChapter.update.mock.calls.filter(
+        ([arg]) =>
+          JSON.stringify((arg as { data: unknown }).data) ===
+          JSON.stringify({ processedPages: { increment: 1 } }),
+      );
+      expect(increments).toHaveLength(2);
+    });
+
     it('a retry of the SAME file resumes: nothing is cleared and only the missing pages are converted', async () => {
       prisma.bookChapter.findUnique.mockResolvedValue({
         ...convertedChapter('etag-same'),
@@ -372,7 +396,7 @@ describe('BookProcessingService', () => {
       });
       minioService.downloadFile.mockResolvedValue({ etag: 'etag-same' });
       prisma.bookPage.findMany.mockResolvedValue([{ pageNumber: 1 }]);
-      probePdfMock.mockResolvedValue({ pageCount: 3 });
+      probePdfMock.mockResolvedValue({ pageCount: 3, pageSizes: new Map() });
 
       await service.processChapter(CHAPTER_ID);
 
@@ -398,7 +422,7 @@ describe('BookProcessingService', () => {
       prisma.bookPage.findMany.mockResolvedValue(
         [1, 2, 3].map((pageNumber) => ({ pageNumber })),
       );
-      probePdfMock.mockResolvedValue({ pageCount: 3 });
+      probePdfMock.mockResolvedValue({ pageCount: 3, pageSizes: new Map() });
 
       await service.processChapter(CHAPTER_ID);
 
@@ -410,7 +434,7 @@ describe('BookProcessingService', () => {
     it('a server that reports no ETag can never resume — every run starts clean', async () => {
       prisma.bookChapter.findUnique.mockResolvedValue(convertedChapter(null));
       minioService.downloadFile.mockResolvedValue({ etag: null });
-      probePdfMock.mockResolvedValue({ pageCount: 1 });
+      probePdfMock.mockResolvedValue({ pageCount: 1, pageSizes: new Map() });
 
       await service.processChapter(CHAPTER_ID);
 
@@ -426,7 +450,7 @@ describe('BookProcessingService', () => {
         convertedChapter('etag-old'),
       );
       minioService.deleteByPrefix.mockRejectedValue(new Error('minio down'));
-      probePdfMock.mockResolvedValue({ pageCount: 2 });
+      probePdfMock.mockResolvedValue({ pageCount: 2, pageSizes: new Map() });
 
       await service.processChapter(CHAPTER_ID);
 
@@ -448,7 +472,7 @@ describe('BookProcessingService', () => {
       prisma.bookChapter.findUnique.mockResolvedValue(
         convertedChapter('etag-old'),
       );
-      probePdfMock.mockResolvedValue({ pageCount: 3 });
+      probePdfMock.mockResolvedValue({ pageCount: 3, pageSizes: new Map() });
       renderMock.mockImplementation(
         (_pdf: string, page: number, base: string) =>
           page === 2
@@ -491,7 +515,7 @@ describe('BookProcessingService', () => {
         convertedChapter('etag-old'),
       );
       prisma.bookPage.deleteMany.mockResolvedValue({ count: 3 });
-      probePdfMock.mockResolvedValue({ pageCount: 0 });
+      probePdfMock.mockResolvedValue({ pageCount: 0, pageSizes: new Map() });
 
       await service.processChapter(CHAPTER_ID);
 
@@ -512,6 +536,153 @@ describe('BookProcessingService', () => {
       expect(pagesFolderTag('etag-a')).toMatch(/^[0-9a-f]{16}$/);
       // No ETag: a one-off folder, never shared with another run.
       expect(pagesFolderTag(null)).not.toBe(pagesFolderTag(null));
+    });
+  });
+
+  describe('input caps and the process-wide conversion limit (M-9 / M-24)', () => {
+    const ORIGINAL_ENV = { ...process.env };
+    afterEach(() => {
+      process.env = { ...ORIGINAL_ENV };
+    });
+
+    it('fails a PDF over the document budget from its HEAD alone — nothing is downloaded, no page renders', async () => {
+      minioService.objectStat.mockResolvedValue({
+        size: 500 * 1024 * 1024 + 1,
+        etag: 'etag-huge',
+      });
+
+      await service.processChapter(CHAPTER_ID);
+
+      expect(minioService.downloadFile).not.toHaveBeenCalled();
+      expect(renderMock).not.toHaveBeenCalled();
+      expect(prisma.bookChapter.update).toHaveBeenCalledWith({
+        where: { id: CHAPTER_ID },
+        data: {
+          status: ChapterStatus.FAILED,
+          processingError: expect.stringMatching(
+            /a chapter PDF may be at most 500 MB/,
+          ),
+        },
+      });
+      expect(service.conversionLoad).toEqual({ active: 0, queued: 0 });
+    });
+
+    it('fails a chapter whose PDF is gone from storage without downloading', async () => {
+      minioService.objectStat.mockResolvedValue(null);
+
+      await service.processChapter(CHAPTER_ID);
+
+      expect(minioService.downloadFile).not.toHaveBeenCalled();
+      expect(prisma.bookChapter.update).toHaveBeenCalledWith({
+        where: { id: CHAPTER_ID },
+        data: {
+          status: ChapterStatus.FAILED,
+          processingError: expect.stringMatching(/No uploaded PDF/),
+        },
+      });
+    });
+
+    it('fails the chapter (and renders nothing) when the probe refuses the page count', async () => {
+      probePdfMock.mockRejectedValue(
+        new Error('The PDF has 2001 pages — a chapter may have at most 2000'),
+      );
+
+      await service.processChapter(CHAPTER_ID);
+
+      expect(renderMock).not.toHaveBeenCalled();
+      expect(prisma.bookChapter.update).toHaveBeenCalledWith({
+        where: { id: CHAPTER_ID },
+        data: {
+          status: ChapterStatus.FAILED,
+          processingError: expect.stringMatching(/at most 2000/),
+        },
+      });
+    });
+
+    it('renders an ordinary page at the standard DPI and a poster-sized page lower, per page', async () => {
+      probePdfMock.mockResolvedValue({
+        pageCount: 2,
+        pageSizes: new Map([
+          [1, { widthPt: 612, heightPt: 792 }],
+          [2, { widthPt: 5760, heightPt: 5760 }],
+        ]),
+      });
+
+      await service.processChapter(CHAPTER_ID);
+
+      const dpiByPage = new Map(
+        renderMock.mock.calls.map(
+          ([, page, , dpi]) => [page as number, dpi as number] as const,
+        ),
+      );
+      expect(dpiByPage.get(1)).toBe(PDF_RENDER_DPI);
+      expect(dpiByPage.get(2)).toBe(50);
+    });
+
+    it('lets only BOOK_CONVERSION_CONCURRENCY chapters past the download at once; the rest wait and then run', async () => {
+      process.env.BOOK_CONVERSION_CONCURRENCY = '1';
+      // Each run blocks inside the download until the test lets it go.
+      const gates: Array<() => void> = [];
+      minioService.downloadFile.mockImplementation(
+        () =>
+          new Promise<{ etag: string }>((resolve) =>
+            gates.push(() => resolve({ etag: 'etag-new' })),
+          ),
+      );
+      prisma.bookChapter.findUnique.mockImplementation(
+        ({ where }: { where: { id: string } }) =>
+          Promise.resolve({ ...chapterRow(), id: where.id }),
+      );
+
+      const first = service.processChapter('chapter-a');
+      const second = service.processChapter('chapter-b');
+      await new Promise((r) => setImmediate(r));
+
+      // One past the slot (downloading), one queued behind it.
+      expect(service.conversionLoad).toEqual({ active: 1, queued: 1 });
+      expect(minioService.downloadFile).toHaveBeenCalledTimes(1);
+
+      gates.shift()!();
+      await first;
+      await new Promise((r) => setImmediate(r));
+      expect(service.conversionLoad).toEqual({ active: 1, queued: 0 });
+      expect(minioService.downloadFile).toHaveBeenCalledTimes(2);
+
+      gates.shift()!();
+      await second;
+      expect(service.conversionLoad).toEqual({ active: 0, queued: 0 });
+    });
+
+    it('gives its slot back when the run fails, so the next chapter is not stuck behind a dead one', async () => {
+      process.env.BOOK_CONVERSION_CONCURRENCY = '1';
+      probePdfMock.mockRejectedValue(new Error('pdfinfo blew up'));
+
+      await service.processChapter(CHAPTER_ID);
+
+      expect(service.conversionLoad).toEqual({ active: 0, queued: 0 });
+    });
+  });
+
+  describe('ConversionSlots', () => {
+    it('hands out `limit` slots at once and queues the rest in order', async () => {
+      const slots = new ConversionSlots(() => 2);
+      await slots.acquire();
+      await slots.acquire();
+      const order: string[] = [];
+      const third = slots.acquire().then(() => order.push('third'));
+      const fourth = slots.acquire().then(() => order.push('fourth'));
+      await new Promise((r) => setImmediate(r));
+      expect(slots.active).toBe(2);
+      expect(slots.queued).toBe(2);
+
+      slots.release();
+      await third;
+      expect(order).toEqual(['third']);
+      slots.release();
+      await fourth;
+      expect(order).toEqual(['third', 'fourth']);
+      expect(slots.active).toBe(2);
+      expect(slots.queued).toBe(0);
     });
   });
 });

@@ -14,6 +14,7 @@ import {
   GetObjectCommand,
   HeadBucketCommand,
   HeadObjectCommand,
+  type HeadObjectCommandOutput,
   ListMultipartUploadsCommand,
   ListObjectsV2Command,
   ListPartsCommand,
@@ -45,9 +46,10 @@ const UPLOAD_QUEUE_SIZE = 4; // parts uploaded concurrently within one file
 const DIRECTORY_UPLOAD_CONCURRENCY = 4;
 
 // Lifetime of a signed playback link when STREAM_URL_TTL_SECONDS is unset:
-// 12 hours — longer than any sitting, short enough that a shared link is
-// dead by the next day. Mirrors the default in config/env.validation.ts.
-const DEFAULT_STREAM_URL_TTL_SECONDS = 43_200;
+// 4 hours (M-21) — longer than any one sitting, short enough that a link
+// pasted into a chat group dies the same afternoon; the players already
+// fetch a fresh link on 410. Mirrors the default in config/env.validation.ts.
+const DEFAULT_STREAM_URL_TTL_SECONDS = 14_400;
 
 // Without these, the AWS SDK's default HTTP handler has no timeout at all —
 // a stalled connection to MinIO (a dropped packet, a brief network blip)
@@ -65,6 +67,12 @@ const MAX_ATTEMPTS = 3;
 // generous even on a slow connection with several retries, not a ceiling on
 // how long an upload as a whole can take.
 const PRESIGNED_URL_EXPIRY_SECONDS = 60 * 60;
+
+// readText() exists for playlists and subtitle sources — a few KB, a few
+// hundred KB at the outside. 16 MB is far above any real one and far below
+// what would hurt the API container if a staff upload put something huge at
+// a key the finalize path reads whole (M-24).
+export const READ_TEXT_MAX_BYTES = 16 * 1024 * 1024;
 
 // Backstop beneath the application-level cleanup cron (see
 // UploadCleanupService) — if that cron is ever down or buggy, MinIO itself
@@ -203,10 +211,6 @@ export class MinioService {
       requestChecksumCalculation: 'WHEN_REQUIRED',
       responseChecksumValidation: 'WHEN_REQUIRED',
     });
-  }
-
-  get bucketName(): string {
-    return this.bucket;
   }
 
   /**
@@ -421,11 +425,26 @@ export class MinioService {
    * written back is a few hundred bytes, and a local temp file for it would
    * be pure ceremony.
    */
-  async readText(key: string): Promise<string> {
+  async readText(
+    key: string,
+    maxBytes: number = READ_TEXT_MAX_BYTES,
+  ): Promise<string> {
     const response = await this.client.send(
       new GetObjectCommand({ Bucket: this.bucket, Key: key }),
     );
     if (!response.Body) throw new Error(`Object "${key}" has no body`);
+    // A playlist or subtitle source is kilobytes; anything near the cap is
+    // not one. Refused BEFORE the body is buffered, so a staff-uploaded
+    // multi-hundred-MB "subtitle" can never be pulled whole into memory.
+    if (
+      typeof response.ContentLength === 'number' &&
+      response.ContentLength > maxBytes
+    ) {
+      (response.Body as Readable).destroy();
+      throw new Error(
+        `Object "${key}" is ${response.ContentLength} bytes — larger than the ${maxBytes}-byte limit for a text object`,
+      );
+    }
     return response.Body.transformToString('utf-8');
   }
 
@@ -489,7 +508,10 @@ export class MinioService {
    * multipart threshold (HLS playlists, subtitles, segments). No server-side
    * state is created; the browser either lands the object or it doesn't.
    */
-  async getPresignedPutUrl(key: string): Promise<string> {
+  async getPresignedPutUrl(
+    key: string,
+    contentLength?: number,
+  ): Promise<string> {
     await this.ensureBucket();
     return getSignedUrl(
       this.presignClient,
@@ -497,6 +519,12 @@ export class MinioService {
         Bucket: this.bucket,
         Key: key,
         ContentType: this.contentTypeForKey(key),
+        // Signed into the URL (X-Amz-SignedHeaders gains content-length), so
+        // MinIO refuses a PUT whose body is not exactly this long: the size
+        // the staff browser declared is the size that can land (M-23).
+        ...(contentLength !== undefined
+          ? { ContentLength: contentLength }
+          : {}),
       }),
       { expiresIn: PRESIGNED_URL_EXPIRY_SECONDS },
     );
@@ -522,6 +550,7 @@ export class MinioService {
     key: string,
     minioUploadId: string,
     partNumber: number,
+    contentLength?: number,
   ): Promise<string> {
     return getSignedUrl(
       this.presignClient,
@@ -530,6 +559,11 @@ export class MinioService {
         Key: key,
         UploadId: minioUploadId,
         PartNumber: partNumber,
+        // Same signed-length rule as getPresignedPutUrl: one part can only
+        // ever be as long as the session's part size says (M-23).
+        ...(contentLength !== undefined
+          ? { ContentLength: contentLength }
+          : {}),
       }),
       { expiresIn: PRESIGNED_URL_EXPIRY_SECONDS },
     );
@@ -645,30 +679,51 @@ export class MinioService {
     return uploads;
   }
 
-  /** Whether `key` already exists — lets a reprocess/retry skip re-uploading bytes that are already archived. */
-  async objectExists(key: string): Promise<boolean> {
+  /** One HEAD on `key`: its metadata, or null when the object does not exist. */
+  private async headObject(
+    key: string,
+  ): Promise<HeadObjectCommandOutput | null> {
     try {
-      await this.client.send(
+      return await this.client.send(
         new HeadObjectCommand({ Bucket: this.bucket, Key: key }),
       );
-      return true;
-    } catch (error) {
-      if (error instanceof NotFound) return false;
-      throw error;
-    }
-  }
-
-  /** Size in bytes of `key`, or null when it doesn't exist — used to record a book PDF's size after its browser-direct upload lands. */
-  async objectSize(key: string): Promise<number | null> {
-    try {
-      const head = await this.client.send(
-        new HeadObjectCommand({ Bucket: this.bucket, Key: key }),
-      );
-      return head.ContentLength ?? null;
     } catch (error) {
       if (error instanceof NotFound) return null;
       throw error;
     }
+  }
+
+  /** Whether `key` already exists — lets a reprocess/retry skip re-uploading bytes that are already archived. */
+  async objectExists(key: string): Promise<boolean> {
+    return (await this.headObject(key)) !== null;
+  }
+
+  /**
+   * Size in bytes of `key`, or null when it doesn't exist OR the HEAD
+   * carries no Content-Length — used to record a book PDF's size after its
+   * browser-direct upload lands. (Kept exactly as it always behaved;
+   * objectStat below reports a missing length as 0 instead.)
+   */
+  async objectSize(key: string): Promise<number | null> {
+    const head = await this.headObject(key);
+    return head?.ContentLength ?? null;
+  }
+
+  /**
+   * Size and ETag of `key` from one HEAD, or null when it doesn't exist.
+   * The ETag is what lets the book conversion tell "the same PDF again"
+   * from "a new file at the same key" BEFORE it downloads anything (M-9) —
+   * downloadFile() returns the same value, so the two can be compared.
+   */
+  async objectStat(
+    key: string,
+  ): Promise<{ size: number; etag: string | null } | null> {
+    const head = await this.headObject(key);
+    if (!head) return null;
+    return {
+      size: head.ContentLength ?? 0,
+      etag: head.ETag?.replace(/"/g, '') || null,
+    };
   }
 
   /** Deletes a single object — a no-op (not an error) if it's already gone, matching S3-compatible delete semantics. */
@@ -720,15 +775,25 @@ export class MinioService {
   }
 
   /**
-   * Every object key under `prefix`, with its last-modified stamp — the
-   * listing half of deleteByPrefix(), paginated the same way. Used by the
-   * video-replace swap to snapshot a title's current keys before anything is
-   * written, and by the cleanup sweep to age abandoned staging objects.
+   * Every object key under `prefix`, with its last-modified stamp and size
+   * in bytes — the listing half of deleteByPrefix(), paginated the same way
+   * (one request per 1,000 keys). Used by the video-replace swap to snapshot
+   * a title's current keys before anything is written and to check (and
+   * size) every staged file in one walk instead of a HEAD per file, and by
+   * the cleanup sweep to age abandoned staging objects.
    */
-  async listObjects(
-    prefix: string,
-  ): Promise<{ key: string; lastModified: Date | undefined }[]> {
-    const objects: { key: string; lastModified: Date | undefined }[] = [];
+  async listObjects(prefix: string): Promise<
+    {
+      key: string;
+      lastModified: Date | undefined;
+      size: number | undefined;
+    }[]
+  > {
+    const objects: {
+      key: string;
+      lastModified: Date | undefined;
+      size: number | undefined;
+    }[] = [];
     let continuationToken: string | undefined;
     do {
       const page = await this.client.send(
@@ -740,7 +805,11 @@ export class MinioService {
       );
       for (const object of page.Contents ?? []) {
         if (!object.Key) continue;
-        objects.push({ key: object.Key, lastModified: object.LastModified });
+        objects.push({
+          key: object.Key,
+          lastModified: object.LastModified,
+          size: object.Size,
+        });
       }
       continuationToken = page.IsTruncated
         ? page.NextContinuationToken
@@ -782,9 +851,18 @@ export class MinioService {
    * a staged file lands with the same type a direct upload would have given
    * it. Throws when the source does not exist — the swap must never
    * "succeed" by copying nothing.
+   *
+   * `knownSize` is the source's size when the caller already has it (the
+   * replace swap reads every staged size from one listing) — it skips the
+   * HEAD this would otherwise send first. A source that vanished since
+   * still fails: the CopyObject / GetObject itself answers 404.
    */
-  async copyObject(sourceKey: string, destinationKey: string): Promise<void> {
-    const size = await this.objectSize(sourceKey);
+  async copyObject(
+    sourceKey: string,
+    destinationKey: string,
+    knownSize?: number,
+  ): Promise<void> {
+    const size = knownSize ?? (await this.objectSize(sourceKey));
     if (size === null) {
       throw new Error(`Object "${sourceKey}" does not exist`);
     }
@@ -883,8 +961,20 @@ export class MinioService {
     );
   }
 
+  /**
+   * The bucket check runs once per process and is shared by every caller.
+   * A FAILED check is not remembered: the cached promise is dropped on
+   * rejection, so the next upload retries instead of every upload failing
+   * until the API restarts (a storage hiccup right after a deploy used to
+   * break uploads for good).
+   */
   private ensureBucket(): Promise<void> {
-    if (!this.bucketReady) this.bucketReady = this.initializeBucket();
+    if (!this.bucketReady) {
+      this.bucketReady = this.initializeBucket().catch((error: unknown) => {
+        this.bucketReady = null;
+        throw error;
+      });
+    }
     return this.bucketReady;
   }
 
@@ -965,8 +1055,12 @@ export class MinioService {
     try {
       await this.client.send(new HeadBucketCommand({ Bucket: this.bucket }));
       return;
-    } catch {
-      // Doesn't exist yet — fall through and create it.
+    } catch (error) {
+      // Only a real "no such bucket" falls through to CreateBucket. Anything
+      // else (MinIO unreachable, a timeout, 403) is rethrown as itself
+      // rather than masked by a CreateBucket error, and ensureBucket() then
+      // lets the next call retry.
+      if (!isBucketMissing(error)) throw error;
     }
 
     await this.client.send(new CreateBucketCommand({ Bucket: this.bucket }));
@@ -984,4 +1078,19 @@ export class MinioService {
       `Created bucket "${this.bucket}" (no anonymous policy — see storage-server/policies/)`,
     );
   }
+}
+
+/** Whether a HeadBucket error means the bucket does not exist (404 / NotFound / NoSuchBucket). */
+function isBucketMissing(error: unknown): boolean {
+  if (error instanceof NotFound) return true;
+  if (typeof error !== 'object' || error === null) return false;
+  const { name, $metadata } = error as {
+    name?: unknown;
+    $metadata?: { httpStatusCode?: unknown };
+  };
+  return (
+    name === 'NotFound' ||
+    name === 'NoSuchBucket' ||
+    $metadata?.httpStatusCode === 404
+  );
 }

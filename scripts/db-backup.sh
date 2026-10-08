@@ -24,6 +24,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# A dump holds every user's phone number, password hash and wallet history:
+# readable by this account only (0600), from the first byte of the partial
+# file on. Existing dumps in the folder are tightened the same way below.
+umask 077
+
+# Default: ./backups, which git and the Docker build both ignore (.gitignore,
+# .dockerignore). Set BACKUP_DIR to keep dumps outside the repo entirely; the
+# restore scripts honour the same variable.
 BACKUP_DIR="${BACKUP_DIR:-./backups}"
 # Enough history to survive "the bad data was there yesterday too" without
 # quietly filling a disk. Dumps are small (~150 KB) — this is about noticing,
@@ -53,6 +61,9 @@ if [[ -z "$container" ]]; then
 fi
 
 mkdir -p "$BACKUP_DIR"
+# The folder too: umask only shapes a folder this run creates, and the usual
+# one already existed as 0755 (listable by every account on the machine).
+chmod 700 "$BACKUP_DIR"
 stamp="$(date +%F-%H%M%S)"
 out="$BACKUP_DIR/myanflix-$stamp.pgc"
 # Written under a name the pruning, the restore script and the off-site copy
@@ -76,6 +87,9 @@ if ! docker exec -i "$container" pg_restore --list < "$partial" > /dev/null 2>&1
   exit 1
 fi
 mv "$partial" "$out"
+chmod 600 "$out"
+# Dumps made before this script set the mode keep their 0644 otherwise.
+chmod 600 "$BACKUP_DIR"/myanflix-*.pgc 2>/dev/null || true
 
 tables="$(docker exec -i "$container" pg_restore --list < "$out" | grep -c 'TABLE DATA' || true)"
 echo "✅ $out ($(du -h "$out" | cut -f1), $tables tables)"

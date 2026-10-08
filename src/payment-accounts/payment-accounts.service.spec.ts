@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import { PaymentAccountsService } from './payment-accounts.service';
+import { PaymentAccountEvents } from './payment-account-events';
 import { PaymentAccountLedgerService } from './payment-account-ledger.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
@@ -42,12 +43,17 @@ describe('PaymentAccountsService', () => {
     paymentAccountTransaction: {
       count: jest.Mock;
       findMany: jest.Mock;
+      findFirst: jest.Mock;
     };
     bankTransaction: { findFirst: jest.Mock };
     $transaction: jest.Mock;
   };
   let paymentAccountLedgerService: { recordManualEntry: jest.Mock };
-  let realtimeGateway: { notifyAdminsPaymentAccountUpdated: jest.Mock };
+  let accountEvents: { emitChanged: jest.Mock };
+  let realtimeGateway: {
+    notifyAdminsPaymentAccountUpdated: jest.Mock;
+    notifyPaymentAccountsChanged: jest.Mock;
+  };
   let minio: {
     playbackUrl: jest.Mock;
     imageUrl: jest.Mock;
@@ -94,6 +100,8 @@ describe('PaymentAccountsService', () => {
       paymentAccountTransaction: {
         count: jest.fn(),
         findMany: jest.fn(),
+        // remove()'s ledger-history guard: no history by default.
+        findFirst: jest.fn().mockResolvedValue(null),
       },
       // remove()'s second guard (Q-BT9): a phone's stored notifications
       // block deletion like ledger history does. None by default.
@@ -106,9 +114,12 @@ describe('PaymentAccountsService', () => {
           : Promise.all(arg as Promise<unknown>[]),
       ),
     };
+    accountEvents = { emitChanged: jest.fn() };
     paymentAccountLedgerService = { recordManualEntry: jest.fn() };
-    realtimeGateway = { notifyAdminsPaymentAccountUpdated: jest.fn(),
-      notifyPaymentAccountsChanged: jest.fn() };
+    realtimeGateway = {
+      notifyAdminsPaymentAccountUpdated: jest.fn(),
+      notifyPaymentAccountsChanged: jest.fn(),
+    };
     minio = {
       playbackUrl: jest.fn(
         (key: string) => `http://cache.test:8080/movies/${key}`,
@@ -155,6 +166,7 @@ describe('PaymentAccountsService', () => {
           provide: AuditService,
           useValue: { record: jest.fn().mockResolvedValue(undefined) },
         },
+        { provide: PaymentAccountEvents, useValue: accountEvents },
       ],
     }).compile();
 
@@ -713,6 +725,7 @@ describe('PaymentAccountsService', () => {
         }),
       );
       expect(result.subname).toBe(adminRow.subname);
+      expect(accountEvents.emitChanged).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -724,6 +737,7 @@ describe('PaymentAccountsService', () => {
         service.update('nope', { isActive: false }, actor),
       ).rejects.toThrow(NotFoundException);
       expect(prisma.paymentAccount.update).not.toHaveBeenCalled();
+      expect(accountEvents.emitChanged).not.toHaveBeenCalled();
     });
 
     it('stamps updatedByUserId on every edit, including a plain activate/deactivate toggle', async () => {
@@ -749,6 +763,8 @@ describe('PaymentAccountsService', () => {
         }),
       );
       expect(result.isActive).toBe(false);
+      // Saved: bank-event ingestion is told to forget its cached flag (bam-16).
+      expect(accountEvents.emitChanged).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -764,14 +780,17 @@ describe('PaymentAccountsService', () => {
 
     it('deletes a known account with no transaction history', async () => {
       prisma.paymentAccount.findUnique.mockResolvedValue({ id: 'acct-1' });
-      prisma.paymentAccountTransaction.count.mockResolvedValue(0);
       prisma.paymentAccount.delete.mockResolvedValue(adminRow);
 
       const result = await service.remove('acct-1', actor);
 
-      expect(prisma.paymentAccountTransaction.count).toHaveBeenCalledWith({
+      // db-12: an existence check that stops at the first row, never a count.
+      expect(prisma.paymentAccountTransaction.findFirst).toHaveBeenCalledWith({
         where: { paymentAccountId: 'acct-1' },
+        select: { id: true },
       });
+      expect(prisma.paymentAccountTransaction.count).not.toHaveBeenCalled();
+      expect(accountEvents.emitChanged).toHaveBeenCalledTimes(1);
       expect(prisma.bankTransaction.findFirst).toHaveBeenCalledWith({
         where: { paymentAccountId: 'acct-1' },
         orderBy: { occurredAt: 'desc' },
@@ -785,17 +804,22 @@ describe('PaymentAccountsService', () => {
 
     it("blocks deletion (and never deletes) when the account has ledger history, mirroring removeType()'s in-use guard", async () => {
       prisma.paymentAccount.findUnique.mockResolvedValue({ id: 'acct-1' });
-      prisma.paymentAccountTransaction.count.mockResolvedValue(3);
+      prisma.paymentAccountTransaction.findFirst.mockResolvedValue({
+        id: 'pat-1',
+      });
 
+      await expect(service.remove('acct-1', actor)).rejects.toThrow(
+        'This account has transaction history and cannot be deleted. Deactivate it instead.',
+      );
       await expect(service.remove('acct-1', actor)).rejects.toThrow(
         ConflictException,
       );
       expect(prisma.paymentAccount.delete).not.toHaveBeenCalled();
+      expect(accountEvents.emitChanged).not.toHaveBeenCalled();
     });
 
     it('blocks deletion when a phone has stored bank transactions against the account (the FK is RESTRICT — a 409, not a 500)', async () => {
       prisma.paymentAccount.findUnique.mockResolvedValue({ id: 'acct-1' });
-      prisma.paymentAccountTransaction.count.mockResolvedValue(0);
       prisma.bankTransaction.findFirst.mockResolvedValue({ id: 'tx-1' });
 
       await expect(service.remove('acct-1', actor)).rejects.toThrow(

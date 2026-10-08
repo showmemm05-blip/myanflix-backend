@@ -78,6 +78,23 @@ export class SeriesQueryDto extends PaginationQueryDto {
   @IsUUID('4', { each: true })
   actorIds?: string[];
 
+  /** Only series in this category (mirrors GET /movies?categoryId). */
+  @IsOptional()
+  @IsUUID('4')
+  categoryId?: string;
+
+  /**
+   * Only these series (e.g. the phone's saved favourites). Narrows the list
+   * and nothing else: a guest/user still gets PUBLISHED series only. Capped
+   * at 100 — the page-size cap.
+   */
+  @IsOptional()
+  @ToStringArray()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @IsUUID('4', { each: true })
+  ids?: string[];
+
   @IsOptional()
   @Type(() => Number)
   @IsInt()

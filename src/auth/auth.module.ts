@@ -6,6 +6,7 @@ import { OtpModule } from '../otp/otp.module';
 import { TrackingModule } from '../tracking/tracking.module';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
+import { RefreshTokenSweeperService } from './refresh-token-sweeper.service';
 import { JwtStrategy } from './strategies/jwt.strategy';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { GoogleAuthController } from './google/google-auth.controller';
@@ -32,6 +33,8 @@ import { GoogleTokenVerifier } from './google/google-token.verifier';
     GoogleTokenVerifier,
     JwtStrategy,
     JwtAuthGuard,
+    // Nightly delete of long-expired refresh_tokens rows (bam-04).
+    RefreshTokenSweeperService,
   ],
   exports: [JwtAuthGuard],
 })

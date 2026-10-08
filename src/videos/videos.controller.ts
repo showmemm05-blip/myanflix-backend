@@ -72,6 +72,20 @@ export class VideosController {
     return this.videosService.getStreamInfo(movieId, user.id, user.role);
   }
 
+  /**
+   * The caller's own saved position for one title ({ position, progress,
+   * updatedAt }, or null) — what the players resume from. Same guards as the
+   * PATCH below (signed-in, default throttling); the user comes from the
+   * access token only, never from the request.
+   */
+  @Get(':movieId/watch-progress')
+  getWatchProgress(
+    @Param('movieId', ParseUUIDPipe) movieId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.videosService.getWatchProgress(user.id, movieId);
+  }
+
   @Patch(':movieId/watch-progress')
   @HttpCode(HttpStatus.OK)
   async updateWatchProgress(
@@ -84,6 +98,7 @@ export class VideosController {
       movieId,
       dto.progress,
       dto.lastPosition,
+      user.role,
     );
   }
 }

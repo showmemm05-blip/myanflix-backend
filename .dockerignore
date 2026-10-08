@@ -8,3 +8,7 @@ test
 .env.*
 !.env.example
 *.log
+# Database dumps (npm run db:backup) hold every user's phone number, password
+# hash and wallet history. They must never enter a build context or an image.
+backups
+*.pgc

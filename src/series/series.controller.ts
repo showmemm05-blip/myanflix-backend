@@ -72,12 +72,6 @@ export class SeriesController {
     return this.seriesService.getFacets();
   }
 
-  /** Registered before ':id' so "me" is never parsed as a series UUID. */
-  @Get('me/purchases')
-  getMyPurchases(@CurrentUser() user: AuthenticatedUser) {
-    return this.seriesService.getPurchasesForUser(user.id);
-  }
-
   /**
    * Cross-series episode listing for the admin's Series > Ready to Publish
    * tab, filterable by series/season/status. Registered before ':id' so

@@ -18,13 +18,13 @@ function makeUser(overrides: Record<string, unknown> = {}) {
 
 describe('JwtStrategy — presence touch', () => {
   let strategy: JwtStrategy;
-  let usersService: { findById: jest.Mock };
+  let usersService: { findAuthSubject: jest.Mock };
   let trackingService: { touchLastSeen: jest.Mock; fireAndForget: jest.Mock };
 
   beforeEach(() => {
     jest.clearAllMocks();
 
-    usersService = { findById: jest.fn().mockResolvedValue(makeUser()) };
+    usersService = { findAuthSubject: jest.fn().mockResolvedValue(makeUser()) };
     trackingService = {
       touchLastSeen: jest.fn().mockResolvedValue(undefined),
       // Matches the real helper: run it, swallow failures into a log.
@@ -84,7 +84,7 @@ describe('JwtStrategy — presence touch', () => {
   });
 
   it('rejects a suspended account without recording it as present', async () => {
-    usersService.findById.mockResolvedValue(
+    usersService.findAuthSubject.mockResolvedValue(
       makeUser({ status: UserStatus.SUSPENDED }),
     );
 
@@ -95,7 +95,7 @@ describe('JwtStrategy — presence touch', () => {
   });
 
   it('H-16: rejects a closed (self-deleted) account', async () => {
-    usersService.findById.mockResolvedValue(
+    usersService.findAuthSubject.mockResolvedValue(
       makeUser({ status: UserStatus.CLOSED }),
     );
 
@@ -109,7 +109,7 @@ describe('JwtStrategy — presence touch', () => {
     const revokedSecond = Math.floor(revokedAt.getTime() / 1000);
 
     beforeEach(() => {
-      usersService.findById.mockResolvedValue(
+      usersService.findAuthSubject.mockResolvedValue(
         makeUser({ sessionsRevokedAt: revokedAt }),
       );
     });
@@ -146,7 +146,7 @@ describe('JwtStrategy — presence touch', () => {
     });
 
     it('accepts any token when the account was never revoked', async () => {
-      usersService.findById.mockResolvedValue(
+      usersService.findAuthSubject.mockResolvedValue(
         makeUser({ sessionsRevokedAt: null }),
       );
       await expect(
@@ -168,7 +168,7 @@ describe('JwtStrategy — presence touch', () => {
   });
 
   it('rejects a token for an account that no longer exists with 401, not 404', async () => {
-    usersService.findById.mockResolvedValue(null);
+    usersService.findAuthSubject.mockResolvedValue(null);
 
     await expect(strategy.validate({ sub: 'gone' })).rejects.toThrow(
       UnauthorizedException,

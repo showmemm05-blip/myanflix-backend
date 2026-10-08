@@ -3,9 +3,11 @@ import { INestApplication } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import request from 'supertest';
 import type { App } from 'supertest/types';
-import { randomUUID } from 'node:crypto';
+import { ConfigService } from '@nestjs/config';
+import { randomInt, randomUUID } from 'node:crypto';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { OtpCodeHasher } from '../src/otp/otp-code.hasher';
 import { SessionRevocationService } from '../src/auth/session-revocation.service';
 import { AuditService } from '../src/audit/audit.service';
 import * as accountStatusLock from '../src/users/account-status-lock';
@@ -32,6 +34,7 @@ describe('Account races (e2e: B2 refresh vs revoke, B3 deposit vs close)', () =>
 
   const suffix = randomUUID().slice(0, 8);
   const userIds: string[] = [];
+  const phones: string[] = [];
 
   const api = () => request(app.getHttpServer());
   const postRefresh = (refreshToken: string) =>
@@ -39,11 +42,26 @@ describe('Account races (e2e: B2 refresh vs revoke, B3 deposit vs close)', () =>
   const me = (accessToken: string) =>
     api().get('/api/users/me').set('Authorization', `Bearer ${accessToken}`);
 
+  /**
+   * Signs a brand-new phone up through the real flow (code + chosen
+   * password): M-20 removed the username sign-up. `name` only labels the
+   * caller; the account's username is the synthesized user_<digits>.
+   */
   async function registerCustomer(name: string) {
+    const phone = `+959${randomInt(10_000_000, 99_999_999)}`;
+    phones.push(phone);
+    const otpHasher = OtpCodeHasher.fromConfig(app.get(ConfigService));
+    await prisma.otpCode.create({
+      data: {
+        phone,
+        codeHash: otpHasher.hash(phone, '100000'),
+        expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+      },
+    });
     const res = await api()
-      .post('/api/auth/register')
-      .send({ username: `race_${name}_${suffix}`, password: 'race-password-1' })
-      .expect(201);
+      .post('/api/auth/otp/verify')
+      .send({ phone, code: '100000', password: `race-password-1-${name}` })
+      .expect(200);
     const body = res.body.data as {
       user: { id: string };
       accessToken: string;
@@ -121,6 +139,7 @@ describe('Account races (e2e: B2 refresh vs revoke, B3 deposit vs close)', () =>
     await prisma.wallet.deleteMany({ where: { userId: { in: userIds } } });
     await prisma.userSession.deleteMany({ where: { userId: { in: userIds } } });
     await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    await prisma.otpCode.deleteMany({ where: { phone: { in: phones } } });
     await app.close();
   });
 

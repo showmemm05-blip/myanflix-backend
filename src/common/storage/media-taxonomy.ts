@@ -391,6 +391,10 @@ export const MEDIA_CLASSES: readonly MediaClass[] = [
  * `user` is absent on purpose: avatars are written only by UsersService,
  * which hard-codes AVATAR_IMAGE_PURPOSE, so no staff upload can ever land in
  * a user's folder.
+ *
+ * `promo` holds the artwork of the admin "Home promos" page (hero slides,
+ * the spotlight, coming-soon cards — HomePromo.imageUrl). Public by key like
+ * every images/ folder, which is right: a promo is shown to guests.
  */
 export const IMAGE_PURPOSES = [
   'actor',
@@ -401,6 +405,7 @@ export const IMAGE_PURPOSES = [
   'category',
   'payment',
   'music',
+  'promo',
   'other',
 ] as const;
 

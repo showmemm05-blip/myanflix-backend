@@ -15,8 +15,8 @@ export type ImageUrlResolver = (
 
 type EditionWithCounts = BookEdition & {
   _count: { chapters: number };
-  /** Only the READY ones — see BooksService's CATALOG_INCLUDE. */
-  chapters: { id: string }[];
+  /** Only the READY ones — see BooksService.readyChapterCounts. */
+  readyChapterCount: number;
 };
 
 /** The slice of the author row a book carries — see BooksService's CATALOG_INCLUDE. */
@@ -65,8 +65,11 @@ export interface SectionSummary {
   endPage: number | null;
 }
 
+/** A section row without its document — all a summary needs. */
+type SectionSummaryRow = Omit<BookSection, 'content'>;
+
 export function toSectionSummary(
-  section: NumberedSection<BookSection>,
+  section: NumberedSection<SectionSummaryRow>,
 ): SectionSummary {
   return {
     id: section.id,
@@ -94,8 +97,17 @@ export function toSectionDetail(section: NumberedSection<BookSection>) {
  * book-numbering with its derived `number` and numbered `sections`. Both are
  * optional so a bare Prisma row still maps (tests pass bare rows) — the
  * defaults, String(order) and [], are exactly right for a part-less book.
+ *
+ * The summary needs no documents, so the list routes read their rows
+ * without `content` (chapter or section); the detail keeps the full rows.
  */
-export type ChapterRowWithHierarchy = BookChapter & {
+export type ChapterRowWithHierarchy = Omit<BookChapter, 'content'> & {
+  number?: string;
+  sections?: NumberedSection<SectionSummaryRow>[];
+};
+
+/** The full row, documents included — what toChapterDetail needs. */
+export type ChapterDetailRowWithHierarchy = BookChapter & {
   number?: string;
   sections?: NumberedSection<BookSection>[];
 };
@@ -134,7 +146,7 @@ export function toChapterSummary(
  * bug only ever showed on PDF chapters.
  */
 export function toChapterDetail(
-  chapter: ChapterRowWithHierarchy,
+  chapter: ChapterDetailRowWithHierarchy,
   resolveImageUrl: ImageUrlResolver,
 ) {
   return {
@@ -150,9 +162,7 @@ export function toChapterDetail(
 }
 
 export class BookPartResponseDto {
-  static fromEntity(
-    part: BookPart & { number: number; chapterCount: number },
-  ) {
+  static fromEntity(part: BookPart & { number: number; chapterCount: number }) {
     return {
       id: part.id,
       editionId: part.editionId,
@@ -172,7 +182,7 @@ export class BookPartResponseDto {
  * so a TOC row and a list row can never disagree.
  */
 export function toContentsResponse(
-  tree: ContentsTree<BookChapter, BookSection>,
+  tree: ContentsTree<Omit<BookChapter, 'content'>, SectionSummaryRow>,
   bookType: BookType,
   editionId: string,
   resolveImageUrl: ImageUrlResolver,
@@ -206,13 +216,16 @@ export class BookEditionResponseDto {
       chapterCount: edition._count.chapters,
       // What makes a language publishable, and what the review queue is
       // filtering on.
-      readyChapterCount: edition.chapters.length,
+      readyChapterCount: edition.readyChapterCount,
     };
   }
 }
 
 export class BookResponseDto {
-  static fromEntity(book: BookWithRelations, resolveImageUrl: ImageUrlResolver) {
+  static fromEntity(
+    book: BookWithRelations,
+    resolveImageUrl: ImageUrlResolver,
+  ) {
     return {
       id: book.id,
       title: book.title,
@@ -238,17 +251,6 @@ export class BookResponseDto {
       // reader could pick.
       editions: book.editions.map((e) => BookEditionResponseDto.fromEntity(e)),
       languages: book.editions.map((e) => e.language),
-    };
-  }
-
-  static fromDetail(
-    book: BookWithRelations,
-    chapters: BookChapter[],
-    resolveImageUrl: ImageUrlResolver,
-  ) {
-    return {
-      ...BookResponseDto.fromEntity(book, resolveImageUrl),
-      chapters: chapters.map((c) => toChapterSummary(c, resolveImageUrl)),
     };
   }
 }

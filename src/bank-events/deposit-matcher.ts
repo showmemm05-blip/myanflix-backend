@@ -25,6 +25,7 @@ import {
 import {
   type RiskReason,
   amountsEqual,
+  counterpartyReasons,
   depositTimingReasons,
   normalizeReasons,
   reasonsEqual,
@@ -135,13 +136,23 @@ export async function findOpenDepositByReference(
 
 /**
  * Every rule that applies to a row the event is about to be written onto:
- * amount, timing, reference twins, velocity, plus whatever the caller
- * already knows. Pure apart from the two indexed reads it needs (Q4, Q5).
+ * amount, timing, reference twins, velocity, the sender's name, plus
+ * whatever the caller already knows. Pure apart from the three indexed
+ * reads it needs (Q4, Q5, and the depositor's name by primary key).
+ *
+ * M-16: the bank's "from" name against the depositor's registered display
+ * name — a SOFT reason only (the phone's parse is best effort and a
+ * customer's bank name is not always their app name), so whoever submits
+ * a stolen code first no longer gets a clean green badge when the bank
+ * says the money came from someone else. Nothing on the deposit itself
+ * names the sender (Deposit.accountName is OUR account the user picked),
+ * so the user's own profile name is the name compared.
  */
 async function evaluateCandidate(
   tx: Prisma.TransactionClient,
   row: OpenDepositRow,
   event: NormalizedBankEvent,
+  counterparty: string | null,
   extra: readonly RiskReason[],
 ) {
   const reasons: RiskReason[] = [...extra];
@@ -151,6 +162,13 @@ async function evaluateCandidate(
   reasons.push(...referenceTwinReasons(row, twins));
   const recent = await countRecentDepositsByUser(tx, row.userId, row.createdAt);
   reasons.push(...velocityReasons(recent));
+  if (counterparty !== null) {
+    const depositor = await tx.user.findUnique({
+      where: { id: row.userId },
+      select: { displayName: true },
+    });
+    reasons.push(...counterpartyReasons(counterparty, depositor?.displayName));
+  }
   return { score: scoreVerification(reasons, true), twins };
 }
 
@@ -191,7 +209,13 @@ export async function claimDepositWithTransaction(
   trigger: LinkTrigger,
 ): Promise<DepositClaimOutcome> {
   const event = eventFromTransaction(transaction);
-  const { score, twins } = await evaluateCandidate(tx, row, event, extra);
+  const { score, twins } = await evaluateCandidate(
+    tx,
+    row,
+    event,
+    transaction.counterparty ?? null,
+    extra,
+  );
   const before = await tx.deposit.findUniqueOrThrow({ where: { id: row.id } });
 
   const claim = await tx.deposit.updateMany({
@@ -403,6 +427,3 @@ export async function applyReceivedEvent(
     transactionChanged,
   };
 }
-
-/** Re-exported so the service can type the rows it pushes over the socket. */
-export type MatchedDeposit = Deposit;

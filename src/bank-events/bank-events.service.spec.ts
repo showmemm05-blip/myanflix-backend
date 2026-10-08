@@ -11,6 +11,7 @@ import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
 import { BankEventsService } from './bank-events.service';
+import { PaymentAccountEvents } from '../payment-accounts/payment-account-events';
 import type { BankEventDto } from './dto/bank-event-batch.dto';
 
 const KEY = 'd'.repeat(64);
@@ -66,6 +67,7 @@ function storedRow(overrides: Record<string, unknown> = {}) {
 
 describe('BankEventsService', () => {
   let service: BankEventsService;
+  let accountEvents: PaymentAccountEvents;
   let prisma: {
     paymentAccount: { findUnique: jest.Mock; findMany: jest.Mock };
     deposit: {
@@ -149,10 +151,14 @@ describe('BankEventsService', () => {
               `documents/bank-screenshots/${kind}/${id}/${key}.png`,
           },
         },
+        PaymentAccountEvents,
       ],
     }).compile();
+    // Runs onModuleInit, which subscribes to payment-account changes.
+    await module.init();
 
     service = module.get(BankEventsService);
+    accountEvents = module.get(PaymentAccountEvents);
   });
 
   describe('processBatch — permanent rejections happen before any transaction', () => {
@@ -183,6 +189,54 @@ describe('BankEventsService', () => {
         (await service.processBatch({ events: [event()] })).results[0].reason,
       ).toBe('INACTIVE_PAYMENT_ACCOUNT');
       expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('forgets the cached account the moment an admin changes a payment account (bam-16)', async () => {
+      prisma.paymentAccount.findUnique.mockResolvedValueOnce({
+        isActive: true,
+      });
+      await service.processBatch({ events: [event()] });
+      expect(prisma.paymentAccount.findUnique).toHaveBeenCalledTimes(1);
+
+      // Deactivated and saved: PaymentAccountsService emits the change.
+      prisma.paymentAccount.findUnique.mockResolvedValueOnce({
+        isActive: false,
+      });
+      accountEvents.emitChanged();
+
+      const { results } = await service.processBatch({
+        events: [event({ idempotencyKey: 'f'.repeat(64) })],
+      });
+      expect(prisma.paymentAccount.findUnique).toHaveBeenCalledTimes(2);
+      expect(results[0].reason).toBe('INACTIVE_PAYMENT_ACCOUNT');
+    });
+
+    it('does not cache a lookup that was in flight when a payment account changed', async () => {
+      let finishRead!: (value: { isActive: boolean }) => void;
+      prisma.paymentAccount.findUnique.mockImplementationOnce(
+        () =>
+          new Promise<{ isActive: boolean }>((resolve) => {
+            finishRead = resolve;
+          }),
+      );
+      const first = service.processBatch({ events: [event()] });
+      while (prisma.paymentAccount.findUnique.mock.calls.length === 0) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+
+      // The admin deactivates the account while that read is still running.
+      accountEvents.emitChanged();
+      finishRead({ isActive: true });
+      await first;
+
+      prisma.paymentAccount.findUnique.mockResolvedValueOnce({
+        isActive: false,
+      });
+      const { results } = await service.processBatch({
+        events: [event({ idempotencyKey: 'e'.repeat(64) })],
+      });
+      expect(prisma.paymentAccount.findUnique).toHaveBeenCalledTimes(2);
+      expect(results[0].reason).toBe('INACTIVE_PAYMENT_ACCOUNT');
     });
 
     it('caches the account lookup so a batch from one phone costs one query', async () => {

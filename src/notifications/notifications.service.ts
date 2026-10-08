@@ -1,8 +1,4 @@
-import {
-  ForbiddenException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { Notification } from '../generated/prisma/client';
@@ -33,20 +29,22 @@ export class NotificationsService {
   }
 
   async markAsRead(id: string, userId: string): Promise<Notification> {
-    const notification = await this.prisma.notification.findUnique({
-      where: { id },
-    });
-    if (!notification) throw new NotFoundException('Notification not found');
-    if (notification.userId !== userId) {
-      throw new ForbiddenException(
-        'You do not have access to this notification',
-      );
-    }
-
-    return this.prisma.notification.update({
-      where: { id },
+    // Scoped to the caller: an id that exists but belongs to someone else is
+    // indistinguishable from one that does not exist, so the response never
+    // confirms whether a notification id is real.
+    const { count } = await this.prisma.notification.updateMany({
+      where: { id, userId },
       data: { isRead: true },
     });
+    if (count === 0) throw new NotFoundException('Notification not found');
+
+    // Re-read scoped to the caller as well, so every query in this service
+    // carries the userId and nothing is ever fetched by id alone.
+    const notification = await this.prisma.notification.findFirst({
+      where: { id, userId },
+    });
+    if (!notification) throw new NotFoundException('Notification not found');
+    return notification;
   }
 
   async markAllAsRead(userId: string): Promise<void> {

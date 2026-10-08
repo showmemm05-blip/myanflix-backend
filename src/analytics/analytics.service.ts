@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import { TransactionType } from '../generated/prisma/client';
+import { processTimeZone } from '../finance/finance.service';
 
 /** Revenue-bearing transaction types — purchases (historical) and subscriptions (current). */
 const REVENUE_TRANSACTION_TYPES = [
@@ -101,18 +102,33 @@ export class AnalyticsService {
       1,
     );
 
-    const [usersInRange, activeBeforeRange] = await Promise.all([
-      this.prisma.user.findMany({
-        where: { createdAt: { gte: start } },
-        select: { createdAt: true },
-      }),
+    // be-cat-19: Postgres counts sign-ups per month (at most monthsBack
+    // rows) instead of sending every new user's createdAt here. The month
+    // is taken in this process's timezone — the same local month the
+    // JavaScript getFullYear()/getMonth() bucketing used (UTC in the
+    // backend container). month is 0-based to match getMonth().
+    const [monthCounts, activeBeforeRange] = await Promise.all([
+      this.prisma.$queryRaw<{ year: number; month: number; count: number }[]>`
+        SELECT
+          extract(year FROM "localCreatedAt")::int AS "year",
+          extract(month FROM "localCreatedAt")::int - 1 AS "month",
+          count(*)::int AS "count"
+        FROM (
+          SELECT ("createdAt" AT TIME ZONE 'UTC') AT TIME ZONE ${processTimeZone()} AS "localCreatedAt"
+          FROM "users"
+          WHERE "createdAt" >= ${start}
+        ) AS "inRange"
+        GROUP BY 1, 2`,
       this.prisma.user.count({ where: { createdAt: { lt: start } } }),
     ]);
 
     const newUsersByMonthKey = new Map<string, number>();
-    for (const user of usersInRange) {
-      const key = `${user.createdAt.getFullYear()}-${user.createdAt.getMonth()}`;
-      newUsersByMonthKey.set(key, (newUsersByMonthKey.get(key) ?? 0) + 1);
+    for (const row of monthCounts) {
+      const key = `${row.year}-${row.month}`;
+      newUsersByMonthKey.set(
+        key,
+        (newUsersByMonthKey.get(key) ?? 0) + row.count,
+      );
     }
 
     let runningTotal = activeBeforeRange;

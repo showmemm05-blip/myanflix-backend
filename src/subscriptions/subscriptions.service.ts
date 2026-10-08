@@ -35,18 +35,30 @@ export class SubscriptionsService {
     return plans.map((p) => ({ ...p, price: decimalToNumber(p.price) }));
   }
 
+  /**
+   * Plan writes and their audit rows commit together or not at all (L-38):
+   * a price change that could not be logged is not saved.
+   */
   async createPlan(dto: CreatePlanDto, actor: AuthenticatedUser) {
-    const plan = await this.prisma.subscriptionPlan.create({
-      data: {
-        ...dto,
-        durationDays: dto.durationDays ?? DEFAULT_PLAN_DURATION_DAYS,
-      },
-    });
-    await this.audit.record({
-      action: 'subscription_plan.create',
-      actor,
-      target: { type: 'subscription_plan', id: plan.id, label: plan.name },
-      after: subscriptionPlanSnapshot(plan),
+    const plan = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.subscriptionPlan.create({
+        data: {
+          ...dto,
+          durationDays: dto.durationDays ?? DEFAULT_PLAN_DURATION_DAYS,
+        },
+      });
+      await this.audit.record({
+        action: 'subscription_plan.create',
+        actor,
+        target: {
+          type: 'subscription_plan',
+          id: created.id,
+          label: created.name,
+        },
+        after: subscriptionPlanSnapshot(created),
+        tx,
+      });
+      return created;
     });
     return { ...plan, price: decimalToNumber(plan.price) };
   }
@@ -59,16 +71,20 @@ export class SubscriptionsService {
     });
     if (!before) throw new NotFoundException('Subscription plan not found');
 
-    const plan = await this.prisma.subscriptionPlan.update({
-      where: { id },
-      data: dto,
-    });
-    await this.audit.record({
-      action: 'subscription_plan.update',
-      actor,
-      target: { type: 'subscription_plan', id, label: plan.name },
-      before: subscriptionPlanSnapshot(before),
-      after: subscriptionPlanSnapshot(plan),
+    const plan = await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.subscriptionPlan.update({
+        where: { id },
+        data: dto,
+      });
+      await this.audit.record({
+        action: 'subscription_plan.update',
+        actor,
+        target: { type: 'subscription_plan', id, label: updated.name },
+        before: subscriptionPlanSnapshot(before),
+        after: subscriptionPlanSnapshot(updated),
+        tx,
+      });
+      return updated;
     });
     return { ...plan, price: decimalToNumber(plan.price) };
   }
@@ -105,7 +121,11 @@ export class SubscriptionsService {
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
-      await this.walletService.debitWithinTransaction(
+      // The wallet as it stands after the debit. Nothing below touches the
+      // wallet again, and this transaction holds its row lock from the
+      // debit until commit, so this balance is the final one (bam-11: it
+      // used to be read a second time at the end).
+      const wallet = await this.walletService.debitWithinTransaction(
         tx,
         userId,
         plan.price.toNumber(),
@@ -132,7 +152,6 @@ export class SubscriptionsService {
           status: 'COMPLETED',
         },
       });
-      const wallet = await tx.wallet.findUniqueOrThrow({ where: { userId } });
       return { subscription, balance: wallet.balance };
     });
 

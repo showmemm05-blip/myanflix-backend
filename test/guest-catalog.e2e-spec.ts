@@ -71,6 +71,7 @@ describe('Guest catalogue (e2e)', () => {
   let episodeId: string;
   let hiddenEpisodeId: string;
   let actorId: string;
+  let categoryId: string;
 
   const movieBase = {
     description: 'guest catalogue fixture',
@@ -120,6 +121,11 @@ describe('Guest catalogue (e2e)', () => {
     });
     actorId = actor.id;
 
+    const category = await prisma.category.create({
+      data: { name: `Guest Category ${suffix}` },
+    });
+    categoryId = category.id;
+
     const published = await prisma.movie.create({
       data: {
         ...movieBase,
@@ -147,6 +153,7 @@ describe('Guest catalogue (e2e)', () => {
         language: movieBase.language,
         releaseYear: 2026,
         status: SeriesStatus.PUBLISHED,
+        categories: { connect: { id: categoryId } },
       },
     });
     publishedSeriesId = publishedSeries.id;
@@ -159,6 +166,7 @@ describe('Guest catalogue (e2e)', () => {
         language: movieBase.language,
         releaseYear: 2026,
         status: SeriesStatus.DRAFT,
+        categories: { connect: { id: categoryId } },
       },
     });
     draftSeriesId = draftSeries.id;
@@ -204,6 +212,7 @@ describe('Guest catalogue (e2e)', () => {
       where: { id: { in: [publishedSeriesId, draftSeriesId] } },
     });
     await prisma.actor.deleteMany({ where: { id: actorId } });
+    await prisma.category.deleteMany({ where: { id: categoryId } });
     await prisma.user.deleteMany({ where: { id: adminId } });
     await app.close();
   });
@@ -243,6 +252,24 @@ describe('Guest catalogue (e2e)', () => {
         .get('/api/movies')
         .set('Authorization', 'Bearer not-a-real-token')
         .expect(401);
+    });
+
+    it('?ids= narrows only: a guest gets the PUBLISHED standalone movie, never the draft or the episode', async () => {
+      const res = await api()
+        .get('/api/movies')
+        .query({ ids: [publishedMovieId, draftMovieId, episodeId].join(',') });
+      expect(res.status).toBe(200);
+
+      const body = res.body as Envelope<{ items: MovieItem[]; total: number }>;
+      expect(body.data.items.map((m) => m.id)).toEqual([publishedMovieId]);
+      expect(body.data.total).toBe(1);
+    });
+
+    it('?ids= with a value that is not a uuid: 400', async () => {
+      await api()
+        .get('/api/movies')
+        .query({ ids: `${publishedMovieId},not-a-uuid` })
+        .expect(400);
     });
 
     it('facets and most-purchased are open to guests', async () => {
@@ -299,10 +326,6 @@ describe('Guest catalogue (e2e)', () => {
       await api().get('/api/videos/me/watch-history').expect(401);
     });
 
-    it('GET /movies/me/purchases without a token: 401', async () => {
-      await api().get('/api/movies/me/purchases').expect(401);
-    });
-
     it('GET /series/:id/player-episodes without a token: 401', async () => {
       await api()
         .get(`/api/series/${publishedSeriesId}/player-episodes`)
@@ -324,6 +347,44 @@ describe('Guest catalogue (e2e)', () => {
 
     it('facets are open to guests', async () => {
       await api().get('/api/series/facets').expect(200);
+    });
+
+    it('?categoryId= returns that category only, and still PUBLISHED only for a guest', async () => {
+      const res = await api().get('/api/series').query({ categoryId });
+      expect(res.status).toBe(200);
+
+      const body = res.body as Envelope<{
+        items: { id: string; categories: { id: string }[] }[];
+        total: number;
+      }>;
+      expect(body.data.items.map((s) => s.id)).toEqual([publishedSeriesId]);
+      expect(body.data.total).toBe(1);
+
+      // Staff see the draft in the same category too.
+      const staff = await api()
+        .get('/api/series')
+        .query({ categoryId })
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      const staffBody = staff.body as Envelope<{ items: { id: string }[] }>;
+      expect(staffBody.data.items.map((s) => s.id).sort()).toEqual(
+        [publishedSeriesId, draftSeriesId].sort(),
+      );
+    });
+
+    it('?ids= narrows only: a guest never gets the DRAFT series', async () => {
+      const res = await api()
+        .get('/api/series')
+        .query({ ids: `${publishedSeriesId},${draftSeriesId}` });
+      expect(res.status).toBe(200);
+
+      const body = res.body as Envelope<{ items: { id: string }[] }>;
+      expect(body.data.items.map((s) => s.id)).toEqual([publishedSeriesId]);
+    });
+
+    it('?categoryId= or ?ids= that is not a uuid: 400', async () => {
+      await api().get('/api/series').query({ categoryId: 'drama' }).expect(400);
+      await api().get('/api/series').query({ ids: 'nope' }).expect(400);
     });
 
     it('/:id without a token: PUBLISHED is 200, DRAFT is 404', async () => {
@@ -368,10 +429,6 @@ describe('Guest catalogue (e2e)', () => {
           'updatedAt',
         ].sort(),
       );
-    });
-
-    it('/:id/movies stays as it was (token required)', async () => {
-      await api().get(`/api/actors/${actorId}/movies`).expect(401);
     });
   });
 });

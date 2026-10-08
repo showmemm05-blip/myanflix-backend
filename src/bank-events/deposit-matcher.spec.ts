@@ -81,14 +81,18 @@ describe('applyReceivedEvent', () => {
       update: jest.Mock;
     };
     bankTransaction: { updateMany: jest.Mock };
+    user: { findUnique: jest.Mock };
   };
   let audit: { record: jest.Mock };
   let twins: unknown[];
   let recentCount: number;
+  /** The depositor's registered display name (M-16); null = never set one. */
+  let displayName: string | null;
 
   beforeEach(() => {
     twins = [];
     recentCount = 1;
+    displayName = null;
     tx = {
       $queryRaw: jest.fn().mockResolvedValue([]),
       deposit: {
@@ -108,6 +112,9 @@ describe('applyReceivedEvent', () => {
       },
       bankTransaction: {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+      user: {
+        findUnique: jest.fn(() => Promise.resolve({ displayName })),
       },
     };
     audit = { record: jest.fn().mockResolvedValue(undefined) };
@@ -263,6 +270,62 @@ describe('applyReceivedEvent', () => {
         }),
       }),
     );
+  });
+
+  describe("M-16: the bank's sender name against the depositor's display name", () => {
+    it('a different name adds COUNTERPARTY_MISMATCH — soft: PENDING_REVIEW / LOW, bank values still written, the row still linked', async () => {
+      displayName = 'Ko Ko Aung';
+      tx.$queryRaw.mockResolvedValueOnce([openRow()]);
+
+      const outcome = await run(
+        makeTransaction({ counterparty: 'MAUNG MAUNG' }),
+      );
+
+      expect(outcome.result.outcome).toBe('matched');
+      expect(outcome.result.matchStatus).toBe(BankMatchStatus.PENDING_REVIEW);
+      expect(tx.user.findUnique).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        select: { displayName: true },
+      });
+      expect(tx.deposit.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            receivingAmount: new Prisma.Decimal(50000),
+            riskReasons: ['COUNTERPARTY_MISMATCH'],
+            riskLevel: BankRiskLevel.LOW,
+          }),
+        }),
+      );
+      expect(tx.bankTransaction.updateMany).toHaveBeenCalledTimes(1);
+    });
+
+    it('a sender name that contains the display name (honorific, case, spacing ignored) is a clean MATCHED', async () => {
+      displayName = 'Ko Ko Aung';
+      tx.$queryRaw.mockResolvedValueOnce([openRow()]);
+
+      const outcome = await run(
+        makeTransaction({ counterparty: 'U KO KO AUNG' }),
+      );
+
+      expect(outcome.result.matchStatus).toBe(BankMatchStatus.MATCHED);
+    });
+
+    it('no display name on the account, or no sender name on the record: nothing to compare, no flag, no user read when the bank gave no name', async () => {
+      displayName = null;
+      tx.$queryRaw.mockResolvedValueOnce([openRow()]);
+      expect(
+        (await run(makeTransaction({ counterparty: 'MAUNG MAUNG' }))).result
+          .matchStatus,
+      ).toBe(BankMatchStatus.MATCHED);
+
+      displayName = 'Ko Ko Aung';
+      tx.user.findUnique.mockClear();
+      tx.$queryRaw.mockResolvedValueOnce([openRow()]);
+      expect(
+        (await run(makeTransaction({ counterparty: null }))).result.matchStatus,
+      ).toBe(BankMatchStatus.MATCHED);
+      expect(tx.user.findUnique).not.toHaveBeenCalled();
+    });
   });
 
   it('flags SUBMITTED_BEFORE_TRANSFER when the deposit predates the bank time by more than the skew', async () => {

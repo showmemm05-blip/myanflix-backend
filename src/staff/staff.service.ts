@@ -113,15 +113,19 @@ export class StaffService {
       );
     }
 
+    // F3 / M-19: a Super Admin-tier account is only another Super Admin's
+    // to change — ANY field, the username included. A rename alone used to
+    // skip this (it sat inside the role-change branch below), so STAFF.EDIT
+    // was enough to change the owner's login name and lock them out.
+    if (await this.authority.isSuperAdminTier(target)) {
+      await this.authority.assertActorIsSuperAdmin(currentUser);
+    }
+
     const assignment = changesRole
       ? await this.resolveAssignment(dto.appRoleId, dto.role, target.role)
       : null;
 
     if (assignment) {
-      // F3: a Super Admin's role is only another Super Admin's to change.
-      if (await this.authority.isSuperAdminTier(target)) {
-        await this.authority.assertActorIsSuperAdmin(currentUser);
-      }
       // F1/P1 + P2: you cannot hand out a tier or a permission set you lack —
       // nor (F-004) take away one you lack by moving the account off it.
       await this.authority.assertCanAssignRole(currentUser, assignment, {

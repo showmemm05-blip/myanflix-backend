@@ -1,5 +1,9 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, ConflictException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+} from '@nestjs/common';
 import {
   NotificationType,
   Prisma,
@@ -152,6 +156,30 @@ describe('WalletAdjustmentsService', () => {
     walletService.creditWithinTransaction.mockResolvedValue(wallet);
     walletService.debitWithinTransaction.mockResolvedValue(wallet);
   }
+
+  describe("adjust — M-11/M-14: a staff member's own wallet", () => {
+    it('is refused with 403 before the idempotency probe, and nothing is read or written', async () => {
+      await expect(
+        service.adjust(
+          'admin-1',
+          {
+            direction: WalletAdjustmentDirection.CREDIT,
+            amount: 1000,
+            reason: 'me',
+            idempotencyKey: 'self-1',
+          },
+          admin,
+        ),
+      ).rejects.toThrow(
+        new ForbiddenException('You cannot adjust your own wallet balance'),
+      );
+      expect(prisma.walletAdjustment.findUnique).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+      expect(gateway.notifyUserBalanceUpdated).not.toHaveBeenCalled();
+    });
+  });
 
   describe('adjust — CREDIT', () => {
     it('credits via WalletService and derives balanceBefore/After from the just-written balance', async () => {

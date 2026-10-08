@@ -20,7 +20,6 @@ import { seriesSnapshot } from '../audit/audit-snapshots';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
-import { decimalToNumber } from '../common/utils/decimal.util';
 import { computeTwoTierSlice } from '../common/utils/two-tier-page.util';
 import {
   facetStringFilter,
@@ -80,6 +79,10 @@ export function buildSeriesWhere(
 ): Prisma.SeriesWhereInput {
   const where: Prisma.SeriesWhereInput = {};
   if (query.accessType) where.accessType = query.accessType;
+  if (query.categoryId) where.categories = { some: { id: query.categoryId } };
+  // Only narrows: the USER-only PUBLISHED rule below still applies, so an
+  // unpublished id is simply not returned to a viewer.
+  if (query.ids?.length) where.id = { in: query.ids };
 
   // Regular users can only ever browse PUBLISHED series — any status
   // filter they pass is ignored, not honored. Staff see everything by
@@ -398,6 +401,26 @@ export class SeriesService {
   }
 
   /**
+   * The visibility rule of findViewableOrThrow without loading the show:
+   * one `status` read instead of the series + categories + cast and the
+   * image re-hosting. Same NotFoundException for a bogus id and for an
+   * unpublished show seen by a regular user, so nothing leaks. For the
+   * sub-routes (episodes, player-episodes, seasons) that only need the gate.
+   */
+  private async assertViewable(id: string, viewerRole: Role): Promise<void> {
+    const series = await this.prisma.series.findUnique({
+      where: { id },
+      select: { status: true },
+    });
+    if (
+      !series ||
+      (viewerRole === Role.USER && series.status !== SeriesStatus.PUBLISHED)
+    ) {
+      throw new NotFoundException('Series not found');
+    }
+  }
+
+  /**
    * findByIdOrThrow plus the show-level visibility rule: a series that is
    * not PUBLISHED simply does not exist for regular users — the same
    * NotFoundException as a bogus id, so an unpublished show's presence
@@ -682,7 +705,7 @@ export class SeriesService {
 
   /** Distinct season numbers + per-season episode counts, e.g. [{seasonNumber: 1, episodeCount: 8}]. */
   async getSeasons(seriesId: string, viewerRole: Role) {
-    await this.findViewableOrThrow(seriesId, viewerRole);
+    await this.assertViewable(seriesId, viewerRole);
     const grouped = await this.prisma.movie.groupBy({
       by: ['seasonNumber'],
       where: { seriesId, seasonNumber: { not: null } },
@@ -701,7 +724,7 @@ export class SeriesService {
    * the movies catalog enforces.
    */
   async getEpisodes(seriesId: string, viewerRole: Role, seasonNumber?: number) {
-    await this.findViewableOrThrow(seriesId, viewerRole);
+    await this.assertViewable(seriesId, viewerRole);
 
     const where: Prisma.MovieWhereInput = { seriesId };
     if (seasonNumber !== undefined) where.seasonNumber = seasonNumber;
@@ -727,7 +750,7 @@ export class SeriesService {
    * + a Map for O(1) lookup while assembling the response).
    */
   async getPlayerEpisodes(seriesId: string, userId: string, viewerRole: Role) {
-    await this.findViewableOrThrow(seriesId, viewerRole);
+    await this.assertViewable(seriesId, viewerRole);
 
     const where: Prisma.MovieWhereInput = { seriesId };
     if (viewerRole === Role.USER) where.status = MovieStatus.PUBLISHED;
@@ -853,24 +876,5 @@ export class SeriesService {
     search?: string;
   }): Promise<number> {
     return this.prisma.movie.count({ where: this.buildEpisodeWhere(filters) });
-  }
-
-  /** The caller's owned series — historical purchase records from before the subscription model. */
-  async getPurchasesForUser(userId: string) {
-    const purchases = await this.prisma.seriesPurchase.findMany({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
-      include: {
-        series: { select: { id: true, title: true, posterUrl: true } },
-      },
-    });
-    return purchases.map((p) => ({
-      id: p.id,
-      seriesId: p.seriesId,
-      seriesTitle: p.series.title,
-      posterUrl: this.minioService.imageUrl(p.series.posterUrl),
-      amount: decimalToNumber(p.amount),
-      createdAt: p.createdAt,
-    }));
   }
 }

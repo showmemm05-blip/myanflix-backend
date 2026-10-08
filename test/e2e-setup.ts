@@ -42,6 +42,16 @@ process.env.MINIO_SECRET_KEY = 'test';
 process.env.STREAM_PUBLIC_BASE_URL = 'http://localhost:8080';
 process.env.STREAM_SIGNING_SECRET =
   'e2e-test-stream-signing-secret-not-for-production';
+// Withdrawal codes are hashed the way production should: mixed with a
+// server pepper first (WithdrawalCodeHasher).
+process.env.WITHDRAWAL_CODE_PEPPER =
+  'e2e-test-withdrawal-code-pepper-not-for-production';
+// No e2e spec depends on whatever SMS provider backend/.env names: nothing
+// is sent. sms-gateway.e2e-spec.ts switches its own copy to phone-gateway.
+process.env.SMS_PROVIDER = 'log';
+// Real codes in every spec, even when backend/.env switches the local dev
+// shortcut on. otp-dev-code.e2e-spec.ts sets its own value after this runs.
+process.env.OTP_DEV_CODE = '';
 
 function e2eDatabaseUrl(url: string | undefined): string {
   if (!url) {

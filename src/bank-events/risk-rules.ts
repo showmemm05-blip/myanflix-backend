@@ -101,6 +101,7 @@ export const RISK_REASONS = [
   'TIME_GAP_TOO_LARGE',
   'NO_BANK_TRANSACTION',
   'VELOCITY',
+  'COUNTERPARTY_MISMATCH',
 ] as const;
 
 export type RiskReason = (typeof RISK_REASONS)[number];
@@ -122,6 +123,7 @@ export const RISK_REASON_WEIGHTS: Readonly<Record<RiskReason, number>> = {
   TIME_GAP_TOO_LARGE: 30,
   NO_BANK_TRANSACTION: 30,
   VELOCITY: 20,
+  COUNTERPARTY_MISMATCH: 20,
 };
 
 export const HARD_REASONS: ReadonlySet<RiskReason> = new Set<RiskReason>([
@@ -370,6 +372,40 @@ export function referenceTwinReasons(
 /** `recentCount` includes the row itself when it is inside the window. */
 export function velocityReasons(recentCount: number): RiskReason[] {
   return recentCount >= VELOCITY_LIMIT ? ['VELOCITY'] : [];
+}
+
+/** Letters and digits only, lower-cased — "U Ko Ko." and "u ko ko" are one name. */
+function normalizeName(value: string): string {
+  return value.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+/**
+ * Does the bank's "from" name look like the depositor's registered name?
+ * Either side containing the other counts ("Ko Ko" inside "KO KO AUNG",
+ * or "Ko Ko Aung" inside "u ko ko aung"); honorifics, spaces and
+ * punctuation are ignored. True whenever a side is missing — no name is
+ * not a mismatch. The bank text is best-effort parsing from a phone
+ * notification, so this only ever feeds a SOFT reason (M-16).
+ */
+export function counterpartyMatches(
+  counterparty: string | null | undefined,
+  name: string | null | undefined,
+): boolean {
+  if (!counterparty || !name) return true;
+  const bank = normalizeName(counterparty);
+  const ours = normalizeName(name);
+  if (bank.length === 0 || ours.length === 0) return true;
+  return bank.includes(ours) || ours.includes(bank);
+}
+
+/** COUNTERPARTY_MISMATCH — a "look at this", never a block (M-16). */
+export function counterpartyReasons(
+  counterparty: string | null | undefined,
+  name: string | null | undefined,
+): RiskReason[] {
+  return counterpartyMatches(counterparty, name)
+    ? []
+    : ['COUNTERPARTY_MISMATCH'];
 }
 
 // ---------------------------------------------------------------------------

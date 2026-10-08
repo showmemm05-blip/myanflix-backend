@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -17,6 +18,7 @@ import { AuditService } from '../audit/audit.service';
 import { withdrawalSnapshot } from '../audit/audit-snapshots';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
+import { WithdrawalCodeService } from '../withdrawal-code/withdrawal-code.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import {
   VERIFICATION_FILTERS,
@@ -76,6 +78,15 @@ import type { CreateWithdrawalDto } from './dto/create-withdrawal.dto';
 import type { RejectWithdrawalDto } from './dto/reject-withdrawal.dto';
 import type { UpdateTransferAccountDto } from './dto/update-transfer-account.dto';
 import type { WithdrawalQueryDto } from './dto/withdrawal-query.dto';
+
+/**
+ * M-11/M-14: a staff member never settles their OWN payout. Shown verbatim
+ * by the admin app's error toast.
+ */
+export const SELF_APPROVE_WITHDRAWAL_MESSAGE =
+  'You cannot approve a withdrawal from your own account';
+export const SELF_REJECT_WITHDRAWAL_MESSAGE =
+  'You cannot reject a withdrawal from your own account';
 
 /**
  * The reasons that describe a withdrawal's relation to a bank record — what
@@ -174,6 +185,7 @@ export class WithdrawalsService {
     private readonly audit: AuditService,
     private readonly minioService: MinioService,
     private readonly storageService: StorageService,
+    private readonly withdrawalCodeService: WithdrawalCodeService,
   ) {}
 
   /** Admins-room realtime push for rows whose verification state changed — after commit only. */
@@ -330,6 +342,13 @@ export class WithdrawalsService {
    * the guarantee (a lost race answers 400 'Insufficient wallet balance'
    * and writes nothing). Approve finalises the hold, reject gives it back.
    * Self-service, so no audit row — the ledger row is the record.
+   *
+   * Withdrawal code (2026-10-05): after the amount checks (so a bad amount
+   * never uses up a try) and BEFORE the hold transaction, the account's
+   * 6-digit code must be right — WithdrawalCodeService throws
+   * WITHDRAWAL_CODE_NOT_SET (409), _REQUIRED / _INVALID_FORMAT / _WRONG
+   * (400, with triesLeft) or _LOCKED (423, with lockedUntil), and then
+   * nothing is held, written or announced. The code is never stored here.
    */
   async create(userId: string, dto: CreateWithdrawalDto) {
     const { minWithdrawalAmount, maxWithdrawalAmount } =
@@ -346,6 +365,11 @@ export class WithdrawalsService {
         'Withdrawal amount exceeds your available wallet balance',
       );
     }
+
+    await this.withdrawalCodeService.assertValidForWithdrawal(
+      userId,
+      dto.withdrawalCode,
+    );
 
     const { withdrawal, balance } = await this.prisma.$transaction(
       async (tx) => {
@@ -664,6 +688,10 @@ export class WithdrawalsService {
         where: { id: withdrawalId },
       });
       if (!withdrawal) throw new NotFoundException('Withdrawal not found');
+      // M-11/M-14: the approver is never the payee.
+      if (withdrawal.userId === admin.id) {
+        throw new ForbiddenException(SELF_APPROVE_WITHDRAWAL_MESSAGE);
+      }
 
       const claim = await tx.withdrawal.updateMany({
         where: { id: withdrawalId, status: WithdrawalStatus.PENDING },
@@ -818,6 +846,10 @@ export class WithdrawalsService {
         where: { id: withdrawalId },
       });
       if (!withdrawal) throw new NotFoundException('Withdrawal not found');
+      // M-11/M-14: whoever rejects is never the account it belongs to.
+      if (withdrawal.userId === admin.id) {
+        throw new ForbiddenException(SELF_REJECT_WITHDRAWAL_MESSAGE);
+      }
 
       const claim = await tx.withdrawal.updateMany({
         where: { id: withdrawalId, status: WithdrawalStatus.PENDING },

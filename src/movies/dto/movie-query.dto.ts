@@ -120,6 +120,19 @@ export class MovieQueryDto extends PaginationQueryDto {
   @MaxLength(120, { each: true })
   directors?: string[];
 
+  /**
+   * Only these titles (e.g. the phone's saved favourites). Narrows the list
+   * and nothing else: every other rule still applies, so a guest/user still
+   * gets PUBLISHED standalone films only. Capped at 100 — the page-size cap —
+   * so it cannot be used to pull more rows than one normal page.
+   */
+  @IsOptional()
+  @ToStringArray()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @IsUUID('4', { each: true })
+  ids?: string[];
+
   @IsOptional()
   @ToStringArray()
   @IsArray()

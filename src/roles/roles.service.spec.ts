@@ -29,7 +29,7 @@ describe('RolesService', () => {
       delete: jest.Mock;
     };
     appRolePermission: { deleteMany: jest.Mock; createMany: jest.Mock };
-    user: { count: jest.Mock };
+    user: { count: jest.Mock; groupBy: jest.Mock };
     $transaction: jest.Mock;
   };
   let resolver: ReturnType<typeof createRoleAwarePermissionResolver>;
@@ -121,7 +121,10 @@ describe('RolesService', () => {
         deleteMany: jest.fn().mockReturnValue('deleteMany-op'),
         createMany: jest.fn().mockReturnValue('createMany-op'),
       },
-      user: { count: jest.fn().mockResolvedValue(0) },
+      user: {
+        count: jest.fn().mockResolvedValue(0),
+        groupBy: jest.fn().mockResolvedValue([]),
+      },
       // Interactive form: the callback runs against the same mocked client.
       $transaction: jest.fn((run: (tx: unknown) => Promise<unknown>) =>
         run(prisma),
@@ -168,11 +171,11 @@ describe('RolesService', () => {
   });
 
   describe('getCatalogue', () => {
-    it('returns all 21 modules and all 80 permissions for the matrix UI', () => {
+    it('returns all 22 modules and all 82 permissions for the matrix UI', () => {
       const catalogue = service.getCatalogue();
 
-      expect(catalogue.modules).toHaveLength(21);
-      expect(catalogue.permissions).toHaveLength(80);
+      expect(catalogue.modules).toHaveLength(22);
+      expect(catalogue.permissions).toHaveLength(82);
       expect(catalogue.modules[0]).toEqual({
         key: 'DASHBOARD',
         label: 'Dashboard',
@@ -184,7 +187,13 @@ describe('RolesService', () => {
   describe('findAll', () => {
     it('returns each role with its permissions and a user count', async () => {
       prisma.appRole.findMany.mockResolvedValue([customRole]);
-      prisma.user.count.mockResolvedValue(3);
+      prisma.user.groupBy.mockImplementation(({ by }: { by: string[] }) =>
+        Promise.resolve(
+          by[0] === 'appRoleId'
+            ? [{ appRoleId: 'role-custom', _count: { _all: 3 } }]
+            : [],
+        ),
+      );
 
       const { items } = await service.findAll();
 
@@ -204,14 +213,78 @@ describe('RolesService', () => {
 
     it('counts NULL-appRoleId accounts against the matching system role', async () => {
       prisma.appRole.findMany.mockResolvedValue([superAdminRole]);
-      prisma.user.count.mockResolvedValueOnce(1).mockResolvedValueOnce(4);
+      prisma.user.groupBy.mockImplementation(({ by }: { by: string[] }) =>
+        Promise.resolve(
+          by[0] === 'appRoleId'
+            ? [{ appRoleId: superAdminRole.id, _count: { _all: 1 } }]
+            : [
+                { role: Role.SUPER_ADMIN, _count: { _all: 4 } },
+                { role: Role.USER, _count: { _all: 900 } },
+              ],
+        ),
+      );
 
       const { items } = await service.findAll();
 
       expect(items[0].userCount).toBe(5);
-      expect(prisma.user.count).toHaveBeenNthCalledWith(2, {
-        where: { appRoleId: null, role: Role.SUPER_ADMIN },
+      expect(prisma.user.groupBy).toHaveBeenCalledWith({
+        by: ['role'],
+        where: { appRoleId: null },
+        _count: { _all: true },
       });
+    });
+
+    it('lists every role in two grouped queries, matching countUsers role for role (bam-11)', async () => {
+      const roles = [
+        superAdminRole,
+        customRole,
+        { ...customRole, id: 'role-empty', key: 'EMPTY' },
+      ];
+      prisma.appRole.findMany.mockResolvedValue(roles);
+      prisma.appRole.findUnique.mockImplementation(
+        ({ where }: { where: { id: string } }) =>
+          Promise.resolve(roles.find((role) => role.id === where.id)),
+      );
+      const explicit: Record<string, number> = {
+        [superAdminRole.id]: 2,
+        'role-custom': 7,
+      };
+      const fallback: Record<string, number> = {
+        [Role.SUPER_ADMIN]: 3,
+        [Role.USER]: 50,
+      };
+      prisma.user.groupBy.mockImplementation(({ by }: { by: string[] }) =>
+        Promise.resolve(
+          by[0] === 'appRoleId'
+            ? Object.entries(explicit).map(([appRoleId, n]) => ({
+                appRoleId,
+                _count: { _all: n },
+              }))
+            : Object.entries(fallback).map(([role, n]) => ({
+                role,
+                _count: { _all: n },
+              })),
+        ),
+      );
+      // countUsers (the one-role path) over the same data.
+      prisma.user.count.mockImplementation(
+        ({ where }: { where: { appRoleId: string | null; role?: string } }) =>
+          Promise.resolve(
+            where.appRoleId === null
+              ? (fallback[where.role ?? ''] ?? 0)
+              : (explicit[where.appRoleId] ?? 0),
+          ),
+      );
+
+      const { items } = await service.findAll();
+
+      expect(prisma.user.groupBy).toHaveBeenCalledTimes(2);
+      expect(prisma.user.count).not.toHaveBeenCalled();
+      for (const item of items) {
+        const one = await service.findOne(item.id);
+        expect(item.userCount).toBe(one.userCount);
+      }
+      expect(items.map((item) => item.userCount)).toEqual([5, 7, 0]);
     });
 
     it('always reports the protected role as holding every permission', async () => {

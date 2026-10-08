@@ -86,6 +86,12 @@ export interface StoredBankTransaction {
   occurredAt: Date;
   screenshotKey: string | null;
   state: BankTransactionState;
+  /**
+   * The bank's "from" name as the phone parsed it (best effort, may be
+   * null). Optional: only the deposit matcher reads it (M-16), and a row
+   * built without it simply skips the name check.
+   */
+  counterparty?: string | null;
 }
 
 /** The audit-metadata shape every system row about a transaction carries. */
@@ -169,6 +175,8 @@ function toStoredRow(raw: Record<string, unknown>): StoredBankTransaction {
     screenshotKey:
       typeof raw.screenshotKey === 'string' ? raw.screenshotKey : null,
     state: BankTransactionState.UNMATCHED,
+    counterparty:
+      typeof raw.counterparty === 'string' ? raw.counterparty : null,
   };
 }
 
@@ -188,7 +196,7 @@ export async function findOpenReceivedTransactions(
   txCodeLast6: string,
 ): Promise<StoredBankTransaction[]> {
   const rows = await tx.$queryRaw<Record<string, unknown>[]>(
-    Prisma.sql`SELECT id, "idempotencyKey", "deviceSerial", "paymentAccountId", amount, "txCode", "txCodeLast6", "occurredAt", "screenshotKey"
+    Prisma.sql`SELECT id, "idempotencyKey", "deviceSerial", "paymentAccountId", amount, "txCode", "txCodeLast6", "occurredAt", "screenshotKey", counterparty
       FROM bank_transactions
       WHERE "paymentAccountId" = ${paymentAccountId}
         AND "txCodeLast6" = ${txCodeLast6}

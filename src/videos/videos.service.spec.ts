@@ -24,7 +24,14 @@ describe('VideosService — recordWatchProgress', () => {
     jest.clearAllMocks();
 
     prisma = {
-      movie: { findUnique: jest.fn().mockResolvedValue({ id: 'movie-1' }) },
+      movie: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'movie-1',
+          status: MovieStatus.PUBLISHED,
+          seriesId: null,
+          series: null,
+        }),
+      },
       watchHistory: {
         findUnique: jest.fn().mockResolvedValue(null),
         upsert: jest.fn().mockResolvedValue({
@@ -58,6 +65,7 @@ describe('VideosService — recordWatchProgress', () => {
       'movie-1',
       40,
       240,
+      Role.USER,
     );
 
     expect(prisma.watchHistory.upsert).toHaveBeenCalledWith({
@@ -78,7 +86,7 @@ describe('VideosService — recordWatchProgress', () => {
   it('derives the watch delta from the STORED previous position, never the client', async () => {
     prisma.watchHistory.findUnique.mockResolvedValue({ lastPosition: 225 });
 
-    await service.recordWatchProgress('user-1', 'movie-1', 40, 240);
+    await service.recordWatchProgress('user-1', 'movie-1', 40, 240, Role.USER);
 
     expect(trackingService.recordWatchActivity).toHaveBeenCalledWith({
       userId: 'user-1',
@@ -99,7 +107,7 @@ describe('VideosService — recordWatchProgress', () => {
       return Promise.resolve({});
     });
 
-    await service.recordWatchProgress('user-1', 'movie-1', 40, 240);
+    await service.recordWatchProgress('user-1', 'movie-1', 40, 240, Role.USER);
 
     expect(order).toEqual(['read', 'write']);
   });
@@ -107,7 +115,7 @@ describe('VideosService — recordWatchProgress', () => {
   it('treats a first-ever heartbeat as starting from 0', async () => {
     prisma.watchHistory.findUnique.mockResolvedValue(null);
 
-    await service.recordWatchProgress('user-1', 'movie-1', 2, 8);
+    await service.recordWatchProgress('user-1', 'movie-1', 2, 8, Role.USER);
 
     expect(trackingService.recordWatchActivity).toHaveBeenCalledWith(
       expect.objectContaining({ previousPosition: 0, nextPosition: 8 }),
@@ -118,7 +126,7 @@ describe('VideosService — recordWatchProgress', () => {
     prisma.movie.findUnique.mockResolvedValue(null);
 
     await expect(
-      service.recordWatchProgress('user-1', 'movie-1', 40, 240),
+      service.recordWatchProgress('user-1', 'movie-1', 40, 240, Role.USER),
     ).rejects.toThrow(NotFoundException);
     expect(prisma.watchHistory.upsert).not.toHaveBeenCalled();
     expect(trackingService.recordWatchActivity).not.toHaveBeenCalled();
@@ -128,9 +136,107 @@ describe('VideosService — recordWatchProgress', () => {
     trackingService.recordWatchActivity.mockRejectedValue(new Error('db down'));
 
     await expect(
-      service.recordWatchProgress('user-1', 'movie-1', 40, 240),
+      service.recordWatchProgress('user-1', 'movie-1', 40, 240, Role.USER),
     ).resolves.toEqual(expect.objectContaining({ id: 'history-1' }));
     expect(prisma.watchHistory.upsert).toHaveBeenCalled();
+  });
+
+  /**
+   * L-45: a heartbeat is held to the same publish rule as /stream. A regular
+   * viewer gets the SAME 404 as a missing id — so the route is neither a
+   * write path for titles they cannot play nor an oracle for hidden ids —
+   * while staff keep recording progress on their draft previews.
+   */
+  describe('publish visibility (same rule as getStreamInfo)', () => {
+    const expectNothingTouched = () => {
+      expect(prisma.watchHistory.findUnique).not.toHaveBeenCalled();
+      expect(prisma.watchHistory.upsert).not.toHaveBeenCalled();
+      expect(trackingService.recordWatchActivity).not.toHaveBeenCalled();
+    };
+
+    it.each([MovieStatus.DRAFT, MovieStatus.ARCHIVED])(
+      'answers a USER the "missing" 404 for a %s title and writes nothing',
+      async (status) => {
+        prisma.movie.findUnique.mockResolvedValue({
+          id: 'movie-1',
+          status,
+          seriesId: null,
+          series: null,
+        });
+
+        await expect(
+          service.recordWatchProgress('user-1', 'movie-1', 40, 240, Role.USER),
+        ).rejects.toThrow(new NotFoundException('Movie not found'));
+        expectNothingTouched();
+      },
+    );
+
+    it('answers a USER 404 for a PUBLISHED episode whose series is not PUBLISHED', async () => {
+      prisma.movie.findUnique.mockResolvedValue({
+        id: 'movie-1',
+        status: MovieStatus.PUBLISHED,
+        seriesId: 'series-1',
+        series: { status: SeriesStatus.DRAFT },
+      });
+
+      await expect(
+        service.recordWatchProgress('user-1', 'movie-1', 40, 240, Role.USER),
+      ).rejects.toThrow(new NotFoundException('Movie not found'));
+      expectNothingTouched();
+    });
+
+    it('records a USER heartbeat for a PUBLISHED episode of a PUBLISHED series', async () => {
+      prisma.movie.findUnique.mockResolvedValue({
+        id: 'movie-1',
+        status: MovieStatus.PUBLISHED,
+        seriesId: 'series-1',
+        series: { status: SeriesStatus.PUBLISHED },
+      });
+
+      await expect(
+        service.recordWatchProgress('user-1', 'movie-1', 40, 240, Role.USER),
+      ).resolves.toEqual(expect.objectContaining({ id: 'history-1' }));
+      expect(prisma.watchHistory.upsert).toHaveBeenCalled();
+      expect(trackingService.recordWatchActivity).toHaveBeenCalled();
+    });
+
+    it.each([Role.ADMIN, Role.SUPER_ADMIN])(
+      'keeps recording a %s staff preview of a DRAFT title, exactly as before',
+      async (role) => {
+        prisma.movie.findUnique.mockResolvedValue({
+          id: 'movie-1',
+          status: MovieStatus.DRAFT,
+          seriesId: 'series-1',
+          series: { status: SeriesStatus.DRAFT },
+        });
+
+        await expect(
+          service.recordWatchProgress('user-1', 'movie-1', 40, 240, role),
+        ).resolves.toEqual(expect.objectContaining({ id: 'history-1' }));
+        expect(prisma.watchHistory.upsert).toHaveBeenCalled();
+        expect(trackingService.recordWatchActivity).toHaveBeenCalled();
+      },
+    );
+
+    it('asks the database for the publish state it decides on', async () => {
+      await service.recordWatchProgress(
+        'user-1',
+        'movie-1',
+        40,
+        240,
+        Role.USER,
+      );
+
+      expect(prisma.movie.findUnique).toHaveBeenCalledWith({
+        where: { id: 'movie-1' },
+        select: {
+          id: true,
+          status: true,
+          seriesId: true,
+          series: { select: { status: true } },
+        },
+      });
+    });
   });
 });
 
@@ -157,6 +263,8 @@ describe('VideosService — getStreamInfo', () => {
     id: 'video-1',
     status: VideoStatus.READY,
     hlsMasterPath: MASTER_KEY,
+    // Loaded in the same query as the video (include: { subtitles: true }).
+    subtitles: [] as Array<Record<string, unknown>>,
   };
 
   beforeEach(async () => {
@@ -396,24 +504,27 @@ describe('VideosService — getStreamInfo', () => {
 
   it('signs the playlist AND every subtitle url — nothing plain leaks out', async () => {
     prisma.userSubscription.findFirst.mockResolvedValue({ id: 'sub-1' });
-    prisma.subtitle.findMany.mockResolvedValue([
-      {
-        id: 'sub-en',
-        language: 'en',
-        label: 'English',
-        format: 'SRT',
-        isDefault: true,
-        objectKey: `subtitles/${MOVIE_ID}/sub-en.srt`,
-      },
-      {
-        id: 'sub-my',
-        language: 'my',
-        label: 'Myanmar',
-        format: 'VTT',
-        isDefault: false,
-        objectKey: `subtitles/${MOVIE_ID}/sub-my.vtt`,
-      },
-    ]);
+    prisma.video.findFirst.mockResolvedValue({
+      ...readyVideo,
+      subtitles: [
+        {
+          id: 'sub-en',
+          language: 'en',
+          label: 'English',
+          format: 'SRT',
+          isDefault: true,
+          objectKey: `subtitles/${MOVIE_ID}/sub-en.srt`,
+        },
+        {
+          id: 'sub-my',
+          language: 'my',
+          label: 'Myanmar',
+          format: 'VTT',
+          isDefault: false,
+          objectKey: `subtitles/${MOVIE_ID}/sub-my.vtt`,
+        },
+      ],
+    });
 
     const result = await service.getStreamInfo(MOVIE_ID, 'user-1', Role.USER);
 
@@ -436,10 +547,47 @@ describe('VideosService — getStreamInfo', () => {
         }),
       ],
     });
-    expect(prisma.subtitle.findMany).toHaveBeenCalledWith({
-      where: { videoId: 'video-1' },
+    // The latest video and its subtitles come back in ONE query; the old
+    // separate subtitle lookup is gone.
+    expect(prisma.video.findFirst).toHaveBeenCalledWith({
+      where: { movieId: MOVIE_ID },
+      orderBy: { createdAt: 'desc' },
+      include: { subtitles: true },
     });
+    expect(prisma.subtitle.findMany).not.toHaveBeenCalled();
     expect(minioService.playbackUrl).not.toHaveBeenCalled();
+  });
+
+  it('reads only the movie and series fields the checks need (no whole rows)', async () => {
+    prisma.userSubscription.findFirst.mockResolvedValue({ id: 'sub-1' });
+
+    await service.getStreamInfo(MOVIE_ID, 'user-1', Role.USER);
+
+    expect(prisma.movie.findUnique).toHaveBeenCalledWith({
+      where: { id: MOVIE_ID },
+      select: {
+        status: true,
+        accessType: true,
+        seriesId: true,
+        series: { select: { status: true, accessType: true } },
+      },
+    });
+  });
+
+  it('keeps the order: visibility 404, then the subscription 403, and only then the video is loaded and signed', async () => {
+    // A USER without a subscription on a SUBSCRIPTION title: the video is
+    // never even read.
+    await expect(
+      service.getStreamInfo(MOVIE_ID, 'user-1', Role.USER),
+    ).rejects.toThrow(ForbiddenException);
+    expect(prisma.video.findFirst).not.toHaveBeenCalled();
+
+    // With a subscription: subscription check strictly before the video read.
+    prisma.userSubscription.findFirst.mockResolvedValue({ id: 'sub-1' });
+    await service.getStreamInfo(MOVIE_ID, 'user-1', Role.USER);
+    expect(
+      prisma.userSubscription.findFirst.mock.invocationCallOrder.at(-1)!,
+    ).toBeLessThan(prisma.video.findFirst.mock.invocationCallOrder[0]);
   });
 
   /**
@@ -455,9 +603,18 @@ describe('VideosService — getStreamInfo', () => {
       // Ascending, the order the bulk-upload path writes — the response must
       // not echo it.
       renditions: [
-        { resolution: '240p', playlistPath: `videos/${MOVIE_ID}/hls/240p/index.m3u8` },
-        { resolution: '720p', playlistPath: `videos/${MOVIE_ID}/hls/720p/index.m3u8` },
-        { resolution: '480p', playlistPath: `videos/${MOVIE_ID}/hls/480p/index.m3u8` },
+        {
+          resolution: '240p',
+          playlistPath: `videos/${MOVIE_ID}/hls/240p/index.m3u8`,
+        },
+        {
+          resolution: '720p',
+          playlistPath: `videos/${MOVIE_ID}/hls/720p/index.m3u8`,
+        },
+        {
+          resolution: '480p',
+          playlistPath: `videos/${MOVIE_ID}/hls/480p/index.m3u8`,
+        },
       ],
     });
 
@@ -493,8 +650,14 @@ describe('VideosService — getStreamInfo', () => {
         null,
         { resolution: '720p' },
         { playlistPath: `videos/${MOVIE_ID}/hls/480p/index.m3u8` },
-        { resolution: '', playlistPath: `videos/${MOVIE_ID}/hls/360p/index.m3u8` },
-        { resolution: '240p', playlistPath: `videos/${MOVIE_ID}/hls/240p/index.m3u8` },
+        {
+          resolution: '',
+          playlistPath: `videos/${MOVIE_ID}/hls/360p/index.m3u8`,
+        },
+        {
+          resolution: '240p',
+          playlistPath: `videos/${MOVIE_ID}/hls/240p/index.m3u8`,
+        },
       ],
     });
 
@@ -518,7 +681,10 @@ describe('VideosService — getStreamInfo', () => {
       ...readyVideo,
       renditions: [
         { resolution: '720p', playlistPath: LOCAL_PATH },
-        { resolution: '480p', playlistPath: `videos/${MOVIE_ID}/hls/480p/index.m3u8` },
+        {
+          resolution: '480p',
+          playlistPath: `videos/${MOVIE_ID}/hls/480p/index.m3u8`,
+        },
       ],
     });
 
@@ -592,5 +758,49 @@ describe('VideosService — getLatestStatusForMovie', () => {
     await expect(service.getLatestStatusForMovie('movie-1')).rejects.toThrow(
       NotFoundException,
     );
+  });
+});
+
+describe('VideosService — getWatchProgress', () => {
+  let service: VideosService;
+  let prisma: { watchHistory: { findUnique: jest.Mock } };
+
+  beforeEach(async () => {
+    prisma = { watchHistory: { findUnique: jest.fn() } };
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        VideosService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: MinioService, useValue: {} },
+        { provide: TrackingService, useValue: {} },
+      ],
+    }).compile();
+    service = module.get(VideosService);
+  });
+
+  it("returns the caller's own row as { position, progress, updatedAt } from ONE keyed lookup", async () => {
+    const updatedAt = new Date('2026-10-07T10:00:00Z');
+    prisma.watchHistory.findUnique.mockResolvedValue({
+      lastPosition: 1234,
+      progress: 41.5,
+      updatedAt,
+    });
+
+    await expect(
+      service.getWatchProgress('user-1', 'movie-1'),
+    ).resolves.toEqual({ position: 1234, progress: 41.5, updatedAt });
+    expect(prisma.watchHistory.findUnique).toHaveBeenCalledTimes(1);
+    expect(prisma.watchHistory.findUnique).toHaveBeenCalledWith({
+      where: { userId_movieId: { userId: 'user-1', movieId: 'movie-1' } },
+      select: { lastPosition: true, progress: true, updatedAt: true },
+    });
+  });
+
+  it('returns null when the caller has never watched the title', async () => {
+    prisma.watchHistory.findUnique.mockResolvedValue(null);
+
+    await expect(
+      service.getWatchProgress('user-1', 'movie-1'),
+    ).resolves.toBeNull();
   });
 });

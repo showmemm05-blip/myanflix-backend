@@ -15,7 +15,6 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { AuditService } from '../audit/audit.service';
 import { actorSnapshot } from '../audit/audit-snapshots';
-import { CATALOG_INCLUDE } from '../movies/movies.service';
 import { seriesCastWhere } from '../series/series.service';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import type {
@@ -172,28 +171,6 @@ export class ActorsService {
     }));
   }
 
-  /**
-   * The movies this person is in — the payoff of a row per actor. A regular
-   * viewer gets the catalogue's own rule (PUBLISHED standalone films, as
-   * GET /movies lists them): the route is open to every signed-in user, so
-   * it must never hand out the ids of draft, archived or unreleased titles,
-   * or of episodes (H-7). Staff see every credit.
-   */
-  async getMovies(id: string, viewerRole: Role) {
-    await this.assertExists(id);
-    return this.prisma.movie.findMany({
-      where: publishedOnlyFor(viewerRole)
-        ? {
-            actors: { some: { id } },
-            seriesId: null,
-            status: MovieStatus.PUBLISHED,
-          }
-        : { actors: { some: { id } } },
-      include: CATALOG_INCLUDE,
-      orderBy: { releaseYear: 'desc' },
-    });
-  }
-
   async create(dto: CreateActorDto, actor: AuthenticatedUser) {
     await this.assertNameAvailable(dto.name);
     const created = await this.prisma.actor.create({
@@ -294,14 +271,6 @@ export class ActorsService {
         `Failed to clean up the headshot for actor ${actorId}: ${(error as Error).message}`,
       );
     }
-  }
-
-  private async assertExists(id: string): Promise<void> {
-    const exists = await this.prisma.actor.findUnique({
-      where: { id },
-      select: { id: true },
-    });
-    if (!exists) throw new NotFoundException('Actor not found');
   }
 
   /**

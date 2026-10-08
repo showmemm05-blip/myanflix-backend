@@ -459,6 +459,61 @@ describe('StaffService — role assignment', () => {
       ).rejects.toThrow('At least one active Super Admin must remain.');
     });
 
+    it('M-19: refuses to rename a Super Admin without holding the role — a username-only PATCH is no loophole', async () => {
+      prisma.user.findUnique.mockResolvedValue(superAdminRow);
+
+      await expect(
+        service.updateStaffFields(
+          'staff-1',
+          { username: 'owner_old' },
+          staffManager,
+        ),
+      ).rejects.toThrow(
+        'Only a Super Admin can create or change a Super Admin account.',
+      );
+      expect(prisma.user.update).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
+    it('M-19: an empty PATCH of a Super Admin by a non-Super-Admin is refused too (no field of the account is theirs to touch)', async () => {
+      prisma.user.findUnique.mockResolvedValue(superAdminRow);
+
+      await expect(
+        service.updateStaffFields('staff-1', {}, staffManager),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('M-19: still lets a Super Admin rename a Super Admin', async () => {
+      prisma.user.findUnique.mockResolvedValue(superAdminRow);
+      prisma.user.update.mockResolvedValue({
+        ...superAdminRow,
+        username: 'owner_new',
+      });
+
+      await service.updateStaffFields(
+        'staff-1',
+        { username: 'owner_new' },
+        actor,
+      );
+
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { username: 'owner_new' } }),
+      );
+    });
+
+    it('M-19: still lets a non-Super-Admin rename ordinary staff', async () => {
+      await service.updateStaffFields(
+        'staff-1',
+        { username: 'renamed' },
+        staffManager,
+      );
+
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { username: 'renamed' } }),
+      );
+    });
+
     it("F3: refuses to change a Super Admin's role without holding it (P2)", async () => {
       prisma.user.findUnique.mockResolvedValue(superAdminRow);
 

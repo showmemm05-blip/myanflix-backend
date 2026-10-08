@@ -53,13 +53,15 @@ describe('Auth rate limiting', () => {
   let app: INestApplication<App>;
   let service: Record<string, jest.Mock>;
 
-  async function boot(env: Record<string, string> = {}, trustedProxies = '127.0.0.1') {
+  async function boot(
+    env: Record<string, string> = {},
+    trustedProxies = '127.0.0.1',
+  ) {
     // supertest always connects from loopback; trusting it lets the tests
     // simulate distinct clients through X-Forwarded-For. The spoofing tests
     // boot with NO trusted proxy to prove the header is then ignored.
     process.env.TRUSTED_PROXIES = trustedProxies;
     service = {
-      register: jest.fn().mockResolvedValue({ accessToken: 'a' }),
       login: jest.fn().mockResolvedValue({ accessToken: 'a' }),
       checkPhoneExists: jest.fn().mockResolvedValue({ exists: false }),
       verifyPhonePassword: jest.fn().mockResolvedValue({ ok: true }),
@@ -104,7 +106,7 @@ describe('Auth rate limiting', () => {
     return ip ? req.set('x-forwarded-for', ip) : req;
   };
 
-  describe('POST /auth/otp/request (4 per phone / 10 min, 50 per IP / hour)', () => {
+  describe('POST /auth/otp/request (4 per phone / 2 min, 50 per IP / hour)', () => {
     beforeEach(() => boot());
 
     it('answers the 5th request for one phone with the 429 envelope and Retry-After', async () => {
@@ -119,7 +121,7 @@ describe('Auth rate limiting', () => {
       });
       const retryAfter = Number(blocked.headers['retry-after']);
       expect(retryAfter).toBeGreaterThan(0);
-      expect(retryAfter).toBeLessThanOrEqual(600);
+      expect(retryAfter).toBeLessThanOrEqual(120);
       expect(service.requestPhoneOtp).toHaveBeenCalledTimes(4);
     });
 

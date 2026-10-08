@@ -3,7 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma, TransactionType } from '../generated/prisma/client';
+import { Prisma } from '../generated/prisma/client';
 import type { Wallet } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
@@ -54,28 +54,6 @@ export class WalletService {
       page,
       limit,
     };
-  }
-
-  /** Adds funds to a user's wallet and records a DEPOSIT transaction. */
-  async deposit(userId: string, amount: number): Promise<Wallet> {
-    if (amount <= 0)
-      throw new BadRequestException('Deposit amount must be positive');
-
-    return this.prisma.$transaction(async (tx) => {
-      const wallet = await tx.wallet.update({
-        where: { userId },
-        data: { balance: { increment: amount } },
-      });
-      await tx.transaction.create({
-        data: {
-          userId,
-          type: TransactionType.DEPOSIT,
-          amount,
-          status: 'COMPLETED',
-        },
-      });
-      return wallet;
-    });
   }
 
   /**

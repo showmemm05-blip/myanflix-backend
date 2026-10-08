@@ -149,14 +149,20 @@ export class LevelsService {
     await this.assertNameAvailable(dto.name);
     await this.assertThresholdAvailable(dto.threshold);
     const order = dto.order ?? (await this.nextOrder());
-    const level = await this.prisma.userLevel.create({
-      data: { ...dto, order },
-    });
-    await this.audit.record({
-      action: 'level.create',
-      actor,
-      target: { type: 'level', id: level.id, label: level.name },
-      after: levelSnapshot(level),
+    // Every level write below commits together with its audit row or not
+    // at all (L-38): a threshold change that could not be logged is not saved.
+    const level = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.userLevel.create({
+        data: { ...dto, order },
+      });
+      await this.audit.record({
+        action: 'level.create',
+        actor,
+        target: { type: 'level', id: created.id, label: created.name },
+        after: levelSnapshot(created),
+        tx,
+      });
+      return created;
     });
     return this.toResponse(level);
   }
@@ -171,16 +177,20 @@ export class LevelsService {
     if (dto.threshold !== undefined) {
       await this.assertThresholdAvailable(dto.threshold, id);
     }
-    const level = await this.prisma.userLevel.update({
-      where: { id },
-      data: dto,
-    });
-    await this.audit.record({
-      action: 'level.update',
-      actor,
-      target: { type: 'level', id, label: level.name },
-      before: levelSnapshot(before),
-      after: levelSnapshot(level),
+    const level = await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.userLevel.update({
+        where: { id },
+        data: dto,
+      });
+      await this.audit.record({
+        action: 'level.update',
+        actor,
+        target: { type: 'level', id, label: updated.name },
+        before: levelSnapshot(before),
+        after: levelSnapshot(updated),
+        tx,
+      });
+      return updated;
     });
     return this.toResponse(level);
   }
@@ -191,12 +201,15 @@ export class LevelsService {
    */
   async remove(id: string, actor: AuthenticatedUser): Promise<void> {
     const before = await this.findByIdOrThrow(id);
-    await this.prisma.userLevel.delete({ where: { id } });
-    await this.audit.record({
-      action: 'level.delete',
-      actor,
-      target: { type: 'level', id, label: before.name },
-      before: levelSnapshot(before),
+    await this.prisma.$transaction(async (tx) => {
+      await tx.userLevel.delete({ where: { id } });
+      await this.audit.record({
+        action: 'level.delete',
+        actor,
+        target: { type: 'level', id, label: before.name },
+        before: levelSnapshot(before),
+        tx,
+      });
     });
   }
 
@@ -215,25 +228,26 @@ export class LevelsService {
     if (existing.length !== new Set(ids).size) {
       throw new NotFoundException('Level not found');
     }
-    await this.prisma.$transaction(
-      dto.items.map((item) =>
-        this.prisma.userLevel.update({
+    await this.prisma.$transaction(async (tx) => {
+      for (const item of dto.items) {
+        await tx.userLevel.update({
           where: { id: item.id },
           data: { order: item.order },
-        }),
-      ),
-    );
-    // One row for the whole bulk move: ids in old order → ids in new order.
-    await this.audit.record({
-      action: 'level.reorder',
-      actor,
-      target: { type: 'level', id: null, label: `${ids.length} levels` },
-      metadata: {
-        before: existing.map((level) => level.id),
-        after: [...dto.items]
-          .sort((a, b) => a.order - b.order)
-          .map((item) => item.id),
-      },
+        });
+      }
+      // One row for the whole bulk move: ids in old order → ids in new order.
+      await this.audit.record({
+        action: 'level.reorder',
+        actor,
+        target: { type: 'level', id: null, label: `${ids.length} levels` },
+        metadata: {
+          before: existing.map((level) => level.id),
+          after: [...dto.items]
+            .sort((a, b) => a.order - b.order)
+            .map((item) => item.id),
+        },
+        tx,
+      });
     });
     return this.findAll();
   }

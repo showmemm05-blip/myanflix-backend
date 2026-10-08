@@ -12,6 +12,7 @@ import {
 } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Public } from '../common/decorators/public.decorator';
+import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { CommentQueryDto } from './dto/comment-query.dto';
 import { CreateCommentDto } from './dto/create-comment.dto';
@@ -30,6 +31,16 @@ export class CommentsController {
   @Get()
   findForTitle(@Query() query: CommentQueryDto) {
     return this.commentsService.findForTitle(query);
+  }
+
+  /** The replies beyond the first REPLY_PREVIEW_LIMIT a thread read carries. */
+  @Public()
+  @Get(':id/replies')
+  findReplies(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() pagination: PaginationQueryDto,
+  ) {
+    return this.commentsService.findReplies(id, pagination);
   }
 
   @Post()

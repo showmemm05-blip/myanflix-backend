@@ -15,7 +15,6 @@ import {
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { OptionalAuth } from '../common/decorators/optional-auth.decorator';
 import { MinioService } from '../common/storage/minio.service';
-import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { MovieStatus, Role } from '../generated/prisma/client';
 import { AuthorityService } from '../roles/authority.service';
@@ -75,15 +74,6 @@ export class MoviesController {
       page,
       limit,
     };
-  }
-
-  /** Registered before ':id' so "me" is never parsed as a movie UUID. */
-  @Get('me/purchases')
-  getMyPurchases(
-    @CurrentUser() user: AuthenticatedUser,
-    @Query() pagination: PaginationQueryDto,
-  ) {
-    return this.moviesService.getPurchasesForUser(user.id, pagination);
   }
 
   /**

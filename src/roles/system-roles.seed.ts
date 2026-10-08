@@ -90,6 +90,11 @@ export const SYSTEM_ROLE_SEEDS: SystemRoleSeed[] = [
       'TRACKING.COMMENTS_MODERATE',
       'TRACKING.FEEDBACK_MANAGE',
       'TRACKING.PII_VIEW',
+      // Added by the `home_promos` migration, which INSERTs exactly these
+      // two rows for this role — the home page's promos and settings are
+      // day-to-day operations, like subscription plans.
+      'HOME.VIEW',
+      'HOME.MANAGE',
     ],
   },
   {

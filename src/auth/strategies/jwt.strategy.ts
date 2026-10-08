@@ -32,7 +32,9 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     // A well-formed token for an account that no longer exists is just an
     // invalid token — 401 like every other failure here, so clients take
     // their normal refresh/sign-out path instead of seeing a stray 404.
-    const user = await this.usersService.findById(payload.sub);
+    // Narrow read (no password or withdrawal-code hash), still fresh on every
+    // request — never cached, see the doc comment above.
+    const user = await this.usersService.findAuthSubject(payload.sub);
 
     if (!user || user.status !== UserStatus.ACTIVE) {
       throw new UnauthorizedException('This account is no longer active');

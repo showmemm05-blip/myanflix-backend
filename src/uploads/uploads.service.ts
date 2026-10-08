@@ -2,14 +2,25 @@ import {
   BadGatewayException,
   BadRequestException,
   ConflictException,
+  HttpException,
+  HttpStatus,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { access, readdir, rm, writeFile } from 'node:fs/promises';
+import {
+  access,
+  readdir,
+  rename,
+  rm,
+  stat,
+  statfs,
+  writeFile,
+} from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { basename, extname, join } from 'node:path';
+import sharp from 'sharp';
 import {
   MovieStatus,
   UploadStatus,
@@ -30,11 +41,19 @@ import {
   EXTENSION_TO_FORMAT,
 } from '../subtitles/subtitles.service';
 import {
+  DIRECT_UPLOAD_MOVIE_STATUSES,
   MOVIE_REPLACE_RESOURCE_TYPE,
   REPLACEABLE_MOVIE_STATUSES,
   ResourceUploadTypeRegistry,
   SUBTITLE_RELATIVE_PREFIX,
+  directUploadRefusalMessage,
 } from './resource-upload-type.registry';
+import {
+  describeBytes,
+  maxOpenSessionsPerMovie,
+  minFreeDiskBytes,
+} from './upload-limits';
+import { ABANDONED_SESSION_AGE_MS } from './multipart-upload.service';
 import type { InitUploadDto } from './dto/init-upload.dto';
 import type { ValidateExternalBundleDto } from './dto/validate-external-bundle.dto';
 
@@ -71,6 +90,61 @@ const FINALIZABLE_MOVIE_STATUSES: MovieStatus[] = [
   MovieStatus.UPLOADING,
   MovieStatus.FAILED,
 ];
+
+// The movie states the CLASSIC single-file flow (no relativePath: one
+// original, transcoded here by ffmpeg) may start an upload for. A movie
+// born through POST /movies is DRAFT until its transcode publishes it, and
+// a failed transcode puts it back to DRAFT — so DRAFT is this flow's
+// working state the way UPLOADING is the bundle flow's. Anything live
+// (PUBLISHED, READY_TO_PUBLISH) or ARCHIVED is refused: a new video for a
+// live title goes through the audited replace flow (M-22).
+const CLASSIC_UPLOAD_MOVIE_STATUSES: readonly MovieStatus[] = [
+  MovieStatus.DRAFT,
+  MovieStatus.UPLOADING,
+  MovieStatus.FAILED,
+];
+
+/**
+ * Widest an uploaded ARTWORK image is stored at, per image purpose (see
+ * UploadsService.downscaleArtwork). The purpose names the owner, not the
+ * slot, so the image's own shape picks the cap: portrait or square art
+ * (posters, headshots) is mostly shown small, landscape art (covers,
+ * backdrops, episode thumbnails) can fill a desktop hero. Film and series
+ * posters get 1300: the phone's title page (mobile TitleHero) draws the
+ * poster edge to edge, which is about 1170-1290 real pixels on current
+ * phones, so 1000 would be stretched there. "book" also carries chapter
+ * and inline reading images, so it gets the PDF page width (1600) for any
+ * shape. Purposes left out — payment logos/QR codes, category, other — are
+ * always stored exactly as uploaded.
+ */
+const ARTWORK_MAX_WIDTH: Partial<
+  Record<ImagePurpose, { portrait: number; landscape: number }>
+> = {
+  movie: { portrait: 1300, landscape: 1920 },
+  series: { portrait: 1300, landscape: 1920 },
+  music: { portrait: 1000, landscape: 1920 },
+  actor: { portrait: 1000, landscape: 1000 },
+  bookauthor: { portrait: 1000, landscape: 1000 },
+  book: { portrait: 1600, landscape: 1600 },
+  // Home promo art fills the full-bleed home hero on desktop, like a
+  // movie backdrop, and a phone-width poster slot otherwise.
+  promo: { portrait: 1300, landscape: 1920 },
+};
+
+/** The exact byte length chunk `chunkNumber` of a session must have: the chunk size, or the remainder for the last one. */
+export function expectedChunkSize(
+  session: {
+    fileSize: bigint | number;
+    chunkSize: number;
+    totalChunks: number;
+  },
+  chunkNumber: number,
+): number {
+  if (chunkNumber < session.totalChunks - 1) return session.chunkSize;
+  return (
+    Number(session.fileSize) - (session.totalChunks - 1) * session.chunkSize
+  );
+}
 
 // Filenames the other PC is expected to use for its subtitle tracks (e.g.
 // "english.vtt", "myanmar.vtt") — mapped to ISO codes where recognized, else
@@ -168,12 +242,33 @@ export class UploadsService {
    * one — reuse it and hand back what's already been received so the caller
    * can skip those chunks, instead of silently starting over from zero every
    * time and abandoning whatever was already sent.
+   *
+   * `actor` is the staff member on the request: a bundle-file session is
+   * recorded under their name the moment it opens (M-22), the same way
+   * MultipartUploadService.initMultipart records its sessions.
    */
-  async initUpload(dto: InitUploadDto) {
+  async initUpload(actor: AuthenticatedUser, dto: InitUploadDto) {
     const movie = await this.prisma.movie.findUnique({
       where: { id: dto.movieId },
     });
     if (!movie) throw new NotFoundException('Movie not found');
+
+    // State gate (M-22): a bundle file (relativePath) lands on the title's
+    // live keys, so only a placeholder still being filled may take one; the
+    // classic flow additionally accepts the DRAFT a fresh movie is born in.
+    const allowedStatuses = dto.relativePath
+      ? DIRECT_UPLOAD_MOVIE_STATUSES
+      : CLASSIC_UPLOAD_MOVIE_STATUSES;
+    if (!allowedStatuses.includes(movie.status)) {
+      throw new ConflictException(directUploadRefusalMessage(movie.status));
+    }
+    // Size budget (M-23): the same ceiling the presigned and multipart
+    // routes apply, so no flow is the one without a limit.
+    this.resourceTypes.assertFileSizeAllowed(
+      MOVIE_RESOURCE_TYPE,
+      dto.filesize,
+      dto.relativePath ?? dto.filename,
+    );
 
     // relativePath is part of the match — without this, two different files
     // in an externally-transcoded bundle sharing a bare filename (every
@@ -201,6 +296,21 @@ export class UploadsService {
       };
     }
 
+    // One login opening sessions by the hundred is the only way to get past
+    // the per-write disk checks' intent (each session would still be
+    // refused chunk by chunk, but the rows and folders pile up) — a movie
+    // never legitimately has more than a few open at once (M-23).
+    await this.assertOpenSessionCapNotReached(dto.movieId);
+
+    // The chunks and the merged file both land on THIS host's disk (the one
+    // Postgres shares) and are on it TOGETHER at the merge (the chunks are
+    // only deleted afterwards), so the session's peak is twice the file. A
+    // session the disk could not hold at that peak is refused before its
+    // first chunk rather than failing with ENOSPC halfway (M-23). This is
+    // the room at THIS moment; saveChunk and the merge check again, so
+    // sessions opened side by side cannot overdraw it between them.
+    await this.assertScratchDiskHasRoom(2 * dto.filesize);
+
     const totalChunks = Math.ceil(dto.filesize / DEFAULT_CHUNK_SIZE);
 
     const session = await this.prisma.uploadSession.create({
@@ -221,6 +331,26 @@ export class UploadsService {
       where: { id: session.id },
       data: { tempDir },
     });
+
+    // A bundle file lands on the title's live keys with no further staff
+    // step until finalize, so the session itself is the act worth a row —
+    // one per file, never per chunk (M-22). The classic flow's row is
+    // movie.upload at complete, where its Video row is born.
+    if (dto.relativePath) {
+      await this.audit.record({
+        action: 'movie.upload_chunked',
+        actor,
+        target: { type: 'movie', id: dto.movieId, label: movie.title },
+        metadata: {
+          uploadId: session.id,
+          relativePath: dto.relativePath,
+          key: this.bundleKey(dto.movieId, dto.relativePath),
+          fileSize: dto.filesize,
+          totalChunks,
+          ...(movie.seriesId ? { seriesId: movie.seriesId } : {}),
+        },
+      });
+    }
 
     return {
       uploadId: session.id,
@@ -243,28 +373,103 @@ export class UploadsService {
       );
     }
 
-    await writeFile(
-      this.storageService.chunkPath(uploadId, chunkNumber),
-      buffer,
-    );
-  }
+    // Every chunk is exactly chunkSize long except the last, which is the
+    // remainder — so the bytes on disk can never add up to more than the
+    // filesize the session was opened for (M-23). The admin slices the file
+    // with the chunkSize initUpload() returned, so a real client always
+    // matches; only a tampered or buggy request does not.
+    const expected = expectedChunkSize(session, chunkNumber);
+    if (buffer.length !== expected) {
+      throw new BadRequestException(
+        `Chunk ${chunkNumber} is ${buffer.length} bytes — expected exactly ${expected}`,
+      );
+    }
 
-  async getStatus(uploadId: string) {
-    const session = await this.getSessionOrThrow(uploadId);
-    const uploadedChunks = await this.listUploadedChunks(uploadId);
-    const remainingChunks = session.totalChunks - uploadedChunks.length;
+    // The room initUpload saw is not reserved: every other open session
+    // (and ffmpeg, and Postgres) has been writing to the same disk since.
+    // One statfs per chunk keeps every write above the reserve, so N
+    // sessions that each passed init cannot fill the disk between them —
+    // the write that would is refused with 507 instead (M-23).
+    await this.assertScratchDiskHasRoom(buffer.length);
 
-    return {
-      uploadedChunks,
-      remainingChunks,
-      totalChunks: session.totalChunks,
-      status: session.status,
-    };
+    // Written under a temporary name and renamed into place only once the
+    // write has finished. A crash, restart or I/O error mid-write leaves a
+    // `chunk_<n>.<id>.part`, which listUploadedChunks() ignores
+    // ("<n>.<id>.part" is not a number), so a resume re-sends that chunk
+    // instead of trusting a short file. The rename is atomic on one
+    // filesystem. The temporary name is unique per request: two overlapping
+    // requests for the same chunk (a retry after a timeout while the first
+    // is still writing) each write and rename their own file, and the last
+    // rename simply replaces the first — the same bytes, no ENOENT.
+    const finalPath = this.storageService.chunkPath(uploadId, chunkNumber);
+    const partPath = `${finalPath}.${randomUUID()}.part`;
+    try {
+      await writeFile(partPath, buffer);
+      await rename(partPath, finalPath);
+    } catch (error) {
+      await rm(partPath, { force: true }).catch(() => undefined);
+      throw error;
+    }
   }
 
   /**
-   * The chunk files a completed `writeFile` in `saveChunk` already leaves on
-   * disk ARE the record of what's been received — no separate bookkeeping
+   * 507 when the scratch disk could not take `bytes` more and still keep
+   * UPLOAD_MIN_FREE_DISK_BYTES spare. Measured at STORAGE_PATH, the volume
+   * every chunk and merged file is written to, at the moment of the call —
+   * which is why it runs before every write that matters (init for the
+   * session's peak, each chunk, the merge), not once. Fail-open when the
+   * space cannot be read at all (a missing directory on a fresh checkout,
+   * an unsupported filesystem): that is a logged oddity, not a reason to
+   * block every upload — the ENOSPC such a write would hit is the same one
+   * it always hit.
+   */
+  private async assertScratchDiskHasRoom(bytes: number): Promise<void> {
+    let free: number;
+    try {
+      const stats = await statfs(this.storageService.root);
+      free = Number(stats.bavail) * Number(stats.bsize);
+    } catch (error) {
+      this.logger.warn(
+        `Could not read the free space under ${this.storageService.root}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return;
+    }
+    const reserve = minFreeDiskBytes();
+    if (free < bytes + reserve) {
+      throw new HttpException(
+        `Not enough free disk space on the server to write ${bytes} more bytes (${free} bytes free, ${describeBytes(reserve)} must stay spare) — contact an administrator`,
+        HttpStatus.INSUFFICIENT_STORAGE,
+      );
+    }
+  }
+
+  /**
+   * 409 when `movieId` already has UPLOAD_MAX_OPEN_SESSIONS_PER_MOVIE
+   * chunked sessions open. Only sessions younger than the abandoned-session
+   * window count: an older IN_PROGRESS row is one whose chunks the cleanup
+   * sweep has (or will have) removed, and it never resumes.
+   */
+  private async assertOpenSessionCapNotReached(movieId: string): Promise<void> {
+    const cap = maxOpenSessionsPerMovie();
+    const open = await this.prisma.uploadSession.count({
+      where: {
+        movieId,
+        status: UploadStatus.IN_PROGRESS,
+        createdAt: { gte: new Date(Date.now() - ABANDONED_SESSION_AGE_MS) },
+      },
+    });
+    if (open >= cap) {
+      throw new ConflictException(
+        `This movie already has ${open} uploads in progress (the limit is ${cap}) — finish or wait for them before starting another`,
+      );
+    }
+  }
+
+  /**
+   * The chunk files a completed `writeFile` + rename in `saveChunk` already
+   * leaves on disk ARE the record of what's been received — no separate bookkeeping
    * needed. This replaced a Postgres `Int[]` column that used to get pushed
    * to on every single chunk: each push rewrote the entire (growing) array
    * for the row, making every chunk progressively more expensive than the
@@ -336,12 +541,40 @@ export class UploadsService {
       );
     }
 
+    // The state gate again, at the moment the bytes would actually land
+    // (M-22): a session lives up to 48 h, and the title can have been
+    // finalized or published since init. A late complete would otherwise
+    // write onto live keys (bundle) or start a transcode over a live
+    // package (classic). Such a session is dead — its chunks go too.
+    const movie = await this.prisma.movie.findUnique({
+      where: { id: session.movieId },
+      select: { title: true, seriesId: true, status: true },
+    });
+    const allowedStatuses = session.relativePath
+      ? DIRECT_UPLOAD_MOVIE_STATUSES
+      : CLASSIC_UPLOAD_MOVIE_STATUSES;
+    if (!movie || !allowedStatuses.includes(movie.status)) {
+      await this.prisma.uploadSession.update({
+        where: { id: uploadId },
+        data: { status: UploadStatus.FAILED },
+      });
+      await this.cleanupChunks(uploadId);
+      if (!movie) throw new NotFoundException('Movie not found');
+      throw new ConflictException(directUploadRefusalMessage(movie.status));
+    }
+
+    // The merge writes a second copy of the whole file next to the chunks
+    // (they are removed only afterwards) — refuse it while that copy would
+    // eat into the reserve, instead of letting ENOSPC do it (M-23).
+    await this.assertScratchDiskHasRoom(Number(session.fileSize));
+
     if (session.relativePath) {
       return this.completeExternalAssetUpload(
         uploadId,
         session.movieId,
         session.relativePath,
         session.totalChunks,
+        session.fileSize,
       );
     }
 
@@ -354,6 +587,7 @@ export class UploadsService {
       this.storageService.videoDir(session.movieId),
     );
     await this.mergeChunks(uploadId, session.totalChunks, originalPath);
+    await this.assertMergedSize(uploadId, originalPath, session.fileSize);
 
     const video = await this.videosService.create({
       movieId: session.movieId,
@@ -371,17 +605,13 @@ export class UploadsService {
     // The "movie uploaded" moment of the classic flow: the file is whole and
     // its Video row exists. The publish that follows the transcode is a
     // separate SYSTEM row written by ProcessingService.
-    const movie = await this.prisma.movie.findUnique({
-      where: { id: session.movieId },
-      select: { title: true, seriesId: true },
-    });
     await this.audit.record({
       action: 'movie.upload',
       actor,
       target: {
         type: 'movie',
         id: session.movieId,
-        label: movie?.title ?? null,
+        label: movie.title,
       },
       metadata: {
         flow: 'classic',
@@ -389,7 +619,7 @@ export class UploadsService {
         videoId: video.id,
         filename: session.filename,
         fileSize: Number(session.fileSize),
-        ...(movie?.seriesId ? { seriesId: movie.seriesId } : {}),
+        ...(movie.seriesId ? { seriesId: movie.seriesId } : {}),
       },
     });
 
@@ -408,12 +638,14 @@ export class UploadsService {
     movieId: string,
     relativePath: string,
     totalChunks: number,
+    fileSize: bigint | number,
   ): Promise<{ relativePath: string; status: UploadStatus }> {
     const tempPath = join(
       this.storageService.uploadSessionDir(uploadId),
       'merged',
     );
     await this.mergeChunks(uploadId, totalChunks, tempPath);
+    await this.assertMergedSize(uploadId, tempPath, fileSize);
 
     await this.minioService.uploadFile(
       this.bundleKey(movieId, relativePath),
@@ -427,44 +659,6 @@ export class UploadsService {
     await this.cleanupChunks(uploadId);
 
     return { relativePath, status: UploadStatus.COMPLETED };
-  }
-
-  /**
-   * Cross-checks the admin frontend's own checklist of uploaded files
-   * against what's actually in MinIO before allowing Publish — a real
-   * server-side check, not a rubber stamp on the client's word — and also
-   * confirms the bundle matches the fixed folder-structure contract (see
-   * parseBundleStructure()), so a missing original/master/rendition is
-   * caught here rather than surfacing as a confusing failure at publish.
-   */
-  async validateExternalBundle(
-    movieId: string,
-    dto: ValidateExternalBundleDto,
-  ) {
-    const movie = await this.prisma.movie.findUnique({
-      where: { id: movieId },
-    });
-    if (!movie) throw new NotFoundException('Movie not found');
-
-    const results = await Promise.all(
-      dto.relativePaths.map(async (relativePath) => ({
-        relativePath,
-        exists: await this.minioService.objectExists(
-          this.bundleKey(movieId, relativePath),
-        ),
-      })),
-    );
-    const missing = results.filter((r) => !r.exists).map((r) => r.relativePath);
-
-    const { errors: structureErrors } = this.parseBundleStructure(
-      dto.relativePaths,
-    );
-
-    return {
-      missing,
-      structureErrors,
-      valid: missing.length === 0 && structureErrors.length === 0,
-    };
   }
 
   /**
@@ -650,14 +844,24 @@ export class UploadsService {
       const language = code ?? stem.toLowerCase();
       const label = stem.charAt(0).toUpperCase() + stem.slice(1).toLowerCase();
 
-      const created = await this.subtitlesService.createFromExistingKey({
-        videoId: video.id,
-        language,
-        label,
-        format: EXTENSION_TO_FORMAT[extension],
-        objectKey: this.bundleKey(movieId, relativePath),
-      });
+      // { publish: false }: the master is rebuilt ONCE below, with every
+      // track, instead of once per track.
+      const created = await this.subtitlesService.createFromExistingKey(
+        {
+          videoId: video.id,
+          language,
+          label,
+          format: EXTENSION_TO_FORMAT[extension],
+          objectKey: this.bundleKey(movieId, relativePath),
+        },
+        { publish: false },
+      );
       createdSubtitles.push({ id: created.id, language, label });
+    }
+    // Errors are logged and swallowed inside, exactly as the per-track
+    // publish always did.
+    if (subtitlePaths.length > 0) {
+      await this.subtitlesService.publishQuietly(video.id);
     }
 
     // Compare-and-set on the status read at the start: if an admin moved
@@ -717,7 +921,7 @@ export class UploadsService {
   // ---------------------------------------------------------------------
   // REPLACE — a new transcoder bundle for a title that already has a video.
   //
-  // Three routes, deliberately separate from validate-external/finalize:
+  // Three routes, deliberately separate from finalize:
   // finalize's status guard ("a live title is never unpublished or failed
   // from here") and its single-flight stay untouched, and a "replace" flag
   // on finalize would have had to bypass that very guard. The invariants
@@ -774,14 +978,17 @@ export class UploadsService {
    * this one. Nothing durable changes (no Movie/Video write, no status
    * change), so nothing is audited — the audit row belongs to the swap.
    */
-  async beginReplace(movieId: string): Promise<{
+  async beginReplace(
+    movieId: string,
+    actor: AuthenticatedUser,
+  ): Promise<{
     movieId: string;
     resourceType: string;
     stagingPrefix: string;
   }> {
     const movie = await this.prisma.movie.findUnique({
       where: { id: movieId },
-      select: { id: true, status: true },
+      select: { id: true, status: true, title: true, seriesId: true },
     });
     if (!movie) throw new NotFoundException('Movie not found');
     this.assertReplaceable(movie);
@@ -794,6 +1001,19 @@ export class UploadsService {
     this.logger.log(
       `Video replace opened for movie ${movieId} (${movie.status}) — staging ${stagingPrefix}`,
     );
+    // Who opened a replace on which title — the one trace of an attempt
+    // that is later abandoned instead of swapped (M-22).
+    await this.audit.record({
+      action: 'movie.video_replace_begin',
+      actor,
+      target: { type: 'movie', id: movieId, label: movie.title },
+      metadata: {
+        flow: 'replace',
+        movieStatus: movie.status,
+        stagingPrefix,
+        ...(movie.seriesId ? { seriesId: movie.seriesId } : {}),
+      },
+    });
     return {
       movieId,
       resourceType: MOVIE_REPLACE_RESOURCE_TYPE,
@@ -806,13 +1026,27 @@ export class UploadsService {
    * folder or closes the dialog mid-upload. Only the staging goes; the
    * title's real files were never touched.
    */
-  async cancelReplace(movieId: string): Promise<void> {
+  async cancelReplace(
+    movieId: string,
+    actor: AuthenticatedUser,
+  ): Promise<void> {
     const movie = await this.prisma.movie.findUnique({
       where: { id: movieId },
-      select: { id: true },
+      select: { id: true, title: true, seriesId: true },
     });
     if (!movie) throw new NotFoundException('Movie not found');
-    await this.minioService.deleteByPrefix(this.stagingPrefix(movieId));
+    const stagingPrefix = this.stagingPrefix(movieId);
+    await this.minioService.deleteByPrefix(stagingPrefix);
+    await this.audit.record({
+      action: 'movie.video_replace_cancel',
+      actor,
+      target: { type: 'movie', id: movieId, label: movie.title },
+      metadata: {
+        flow: 'replace',
+        stagingPrefix,
+        ...(movie.seriesId ? { seriesId: movie.seriesId } : {}),
+      },
+    });
   }
 
   /** Single-flight per movie, exactly like finalizingMovies. */
@@ -877,8 +1111,10 @@ export class UploadsService {
     // never trusted, same as finalize; and checking the segments here, not
     // in the copy, is what keeps step 4 from starting a swap it cannot
     // finish (a missing segment used to surface as a copy failure halfway,
-    // the one path that leaves old and new files mixed). Bounded, not
-    // Promise.all: a bundle can list thousands of segments.
+    // the one path that leaves old and new files mixed). ONE listing of the
+    // staging prefix (one request per 1,000 keys) answers "is it there" for
+    // every file and carries each size for the copy in step 4 — instead of
+    // a HEAD per file here and another inside every copy.
     const toCheck = Array.from(
       new Set([
         originalPath,
@@ -888,14 +1124,16 @@ export class UploadsService {
         ...dto.relativePaths,
       ]),
     );
-    const missing: string[] = [];
-    await runPool(toCheck, REPLACE_COPY_CONCURRENCY, async (relativePath) => {
-      const exists = await this.minioService.objectExists(
-        this.stagingKey(movieId, relativePath),
-      );
-      if (!exists) missing.push(relativePath);
-    });
-    missing.sort();
+    const stagedSizes = new Map<string, number | undefined>();
+    for (const object of await this.minioService.listObjects(stagingPrefix)) {
+      stagedSizes.set(object.key, object.size);
+    }
+    const missing = toCheck
+      .filter(
+        (relativePath) =>
+          !stagedSizes.has(this.stagingKey(movieId, relativePath)),
+      )
+      .sort();
     if (missing.length > 0) {
       await this.minioService.deleteByPrefix(stagingPrefix);
       throw new BadRequestException(
@@ -962,10 +1200,14 @@ export class UploadsService {
         relativePath,
         versionTag,
       );
+      const sourceKey = this.stagingKey(movieId, relativePath);
       try {
+        // The size from step 2's listing saves copyObject its own HEAD; a
+        // listing without a size (never expected) falls back to that HEAD.
         await this.minioService.copyObject(
-          this.stagingKey(movieId, relativePath),
+          sourceKey,
           destination,
+          stagedSizes.get(sourceKey),
         );
       } catch (error) {
         throw new ReplaceCopyError(destination, error);
@@ -1086,9 +1328,9 @@ export class UploadsService {
       return row;
     });
 
-    // 8. New Subtitle rows, derived exactly as finalize derives them. Each
-    // create republishes the (new) master with the subtitle group, writing
-    // the renditions BESIDE it — videos/<id>/hls/v-<tag>/subs/<newId>.{vtt,
+    // 8. New Subtitle rows, derived exactly as finalize derives them. Once
+    // they all exist, ONE publish rewrites the (new) master with the
+    // subtitle group, writing the renditions BESIDE it — videos/<id>/hls/v-<tag>/subs/<newId>.{vtt,
     // m3u8} — because HlsSubtitlesService derives their keys from the row's
     // hlsMasterPath just written in step 7, and the master names them by
     // the relative URI `subs/<id>.m3u8`.
@@ -1105,14 +1347,22 @@ export class UploadsService {
       const language = code ?? stem.toLowerCase();
       const label = stem.charAt(0).toUpperCase() + stem.slice(1).toLowerCase();
 
-      const created = await this.subtitlesService.createFromExistingKey({
-        videoId: savedVideo.id,
-        language,
-        label,
-        format: EXTENSION_TO_FORMAT[extension],
-        objectKey: this.bundleKey(movieId, relativePath),
-      });
+      const created = await this.subtitlesService.createFromExistingKey(
+        {
+          videoId: savedVideo.id,
+          language,
+          label,
+          format: EXTENSION_TO_FORMAT[extension],
+          objectKey: this.bundleKey(movieId, relativePath),
+        },
+        { publish: false },
+      );
       createdSubtitles.push({ id: created.id, language, label });
+    }
+    // One publish with the complete set, so the live master is never
+    // rewritten with a partial subtitle list. Errors are swallowed inside.
+    if (subtitlePaths.length > 0) {
+      await this.subtitlesService.publishQuietly(savedVideo.id);
     }
 
     // 9. Movie.duration, guarded by `duration = 0` in the predicate exactly
@@ -1222,11 +1472,6 @@ export class UploadsService {
     ].filter((phase) => phase.length > 0);
   }
 
-  /**
-   * The tag naming one replace's package folder, minted ONCE per
-   * finalize-replace: 8 lowercase hex characters from the CSPRNG. An
-   * instance method rather than a free function so a test can pin it.
-   */
   /** Deletes a replace's `hls/v-<tag>/` package when `hlsMasterPath` points into one; a no-op for the un-versioned layout. */
   private async sweepVersionedPackage(
     hlsMasterPath: string | null,
@@ -1242,6 +1487,11 @@ export class UploadsService {
     }
   }
 
+  /**
+   * The tag naming one replace's package folder, minted ONCE per
+   * finalize-replace: 8 lowercase hex characters from the CSPRNG. An
+   * instance method rather than a free function so a test can pin it.
+   */
   private hlsVersionTag(): string {
     return randomBytes(HLS_VERSION_TAG_BYTES).toString('hex');
   }
@@ -1387,6 +1637,7 @@ export class UploadsService {
     purpose: ImagePurpose,
     originalFilename: string,
     buffer: Buffer,
+    actor: AuthenticatedUser,
   ): Promise<string> {
     const extension = extname(originalFilename) || '.jpg';
     const key = this.storageService.imageObjectKey(
@@ -1394,8 +1645,84 @@ export class UploadsService {
       randomUUID(),
       extension,
     );
-    await this.minioService.uploadBuffer(key, buffer);
+    // Artwork is shrunk to a sensible display size before it is stored;
+    // anything else (and anything sharp cannot read) is stored exactly as
+    // uploaded, as it always was. Same key, same URL, same response.
+    const stored = await this.downscaleArtwork(purpose, buffer);
+    await this.minioService.uploadBuffer(key, stored);
+    // No owner row exists yet (the image is uploaded before the movie /
+    // actor / category it belongs to is created), so the row names the
+    // purpose folder and the key — enough to find the object again (M-22).
+    await this.audit.record({
+      action: 'image.upload',
+      actor,
+      target: { type: 'image', id: null, label: basename(key) },
+      metadata: {
+        purpose,
+        key,
+        originalFilename,
+        // What is stored; originalSize is what was uploaded.
+        fileSize: stored.length,
+        originalSize: buffer.length,
+      },
+    });
     return this.minioService.publicUrl(key);
+  }
+
+  /**
+   * Shrinks an artwork image that is wider than its purpose needs, keeping
+   * its own format (so the key's extension stays truthful) and its aspect
+   * ratio. Every client loads images at full stored size (the website's
+   * image optimiser is off), so a 5000 px poster shown on a 168 px card
+   * used to cost ~100 MB of decoded memory per card on a phone.
+   *
+   * Only JPEG, PNG and WebP that are wider than the cap are touched; an
+   * animated image, any other format, or anything sharp refuses (corrupt
+   * data, or over sharp's default input-pixel limit — the decompression
+   * bomb guard, deliberately left at its default) is returned unchanged,
+   * which is exactly what was stored before this existed.
+   */
+  private async downscaleArtwork(
+    purpose: ImagePurpose,
+    buffer: Buffer,
+  ): Promise<Buffer> {
+    const rule = ARTWORK_MAX_WIDTH[purpose];
+    if (!rule) return buffer;
+    try {
+      const meta = await sharp(buffer).metadata();
+      const format = meta.format;
+      if (format !== 'jpeg' && format !== 'png' && format !== 'webp') {
+        return buffer;
+      }
+      if ((meta.pages ?? 1) > 1) return buffer; // animated: keep every frame
+      if (!meta.width || !meta.height) return buffer;
+      // EXIF orientations 5-8 swap the axes once .rotate() applies them.
+      const swapped = (meta.orientation ?? 1) >= 5;
+      const width = swapped ? meta.height : meta.width;
+      const height = swapped ? meta.width : meta.height;
+      // Posters, portraits and square art are shown small; covers and
+      // backdrops (landscape) fill a desktop hero.
+      const maxWidth = width > height ? rule.landscape : rule.portrait;
+      if (width <= maxWidth) return buffer;
+
+      const pipeline = sharp(buffer)
+        .rotate()
+        .resize({ width: maxWidth, withoutEnlargement: true });
+      const out =
+        format === 'jpeg'
+          ? pipeline.jpeg({ quality: 82, mozjpeg: true })
+          : format === 'png'
+            ? pipeline.png()
+            : pipeline.webp({ quality: 80 });
+      return await out.toBuffer();
+    } catch (error) {
+      this.logger.warn(
+        `Could not resize a ${purpose} image (${buffer.length} bytes) — storing it as uploaded: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return buffer;
+    }
   }
 
   /**
@@ -1554,13 +1881,46 @@ export class UploadsService {
         const chunkStream = createReadStream(
           this.storageService.chunkPath(uploadId, index),
         );
-        chunkStream.on('error', rejectPromise);
+        chunkStream.on('error', (error) => {
+          // Release the destination's file handle too — otherwise a missing
+          // or unreadable chunk left it open until garbage collection.
+          output.destroy();
+          rejectPromise(error);
+        });
         chunkStream.on('end', () => appendChunk(index + 1));
         chunkStream.pipe(output, { end: false });
       };
 
       appendChunk(0);
     });
+  }
+
+  /**
+   * The merged file must be exactly the size the session was opened for
+   * before it is uploaded or transcoded. Every chunk was length-checked on
+   * arrival, so a mismatch means a chunk file changed on disk afterwards
+   * (a truncated file from a crash, disk trouble) — refuse it clearly
+   * instead of shipping a corrupt original. Resuming cannot fix it (every
+   * chunk already counts as received), so the session is closed as FAILED
+   * and its files removed; the admin starts the upload again.
+   */
+  private async assertMergedSize(
+    uploadId: string,
+    path: string,
+    expected: bigint | number,
+  ): Promise<void> {
+    const { size } = await stat(path);
+    if (size === Number(expected)) return;
+
+    await rm(path, { force: true }).catch(() => undefined);
+    await this.prisma.uploadSession.update({
+      where: { id: uploadId },
+      data: { status: UploadStatus.FAILED },
+    });
+    await this.cleanupChunks(uploadId);
+    throw new BadRequestException(
+      `The joined file is ${size} bytes but the upload was opened for ${Number(expected)} bytes — a piece of it was damaged on the server. Start this upload again.`,
+    );
   }
 
   private async cleanupChunks(uploadId: string): Promise<void> {

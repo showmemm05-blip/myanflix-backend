@@ -8,7 +8,7 @@ import {
 } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
 import { randomBytes } from 'node:crypto';
-import type { User } from '../generated/prisma/client';
+import type { Prisma, User } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { PASSWORD_SALT_ROUNDS } from '../auth/password.constants';
 import { SessionRevocationService } from '../auth/session-revocation.service';
@@ -28,6 +28,7 @@ import {
 import { AuditService } from '../audit/audit.service';
 import { userSnapshot } from '../audit/audit-snapshots';
 import { CLOSED_ACCOUNT_MESSAGE } from './account-status-lock';
+import { redactSmsForClosedAccount } from '../sms-gateway/sms-redaction';
 
 export interface CreateUserInput {
   username: string;
@@ -113,6 +114,64 @@ export interface WalletSummary {
   subscriptionExpiresAt: Date | null;
 }
 
+/**
+ * The only columns an authentication check reads: JwtStrategy on every HTTP
+ * request and the socket handshake. Deliberately narrow — the password and
+ * withdrawal-code hashes, phone and e-mail never need to leave the database
+ * for a request to be authenticated.
+ */
+const AUTH_SUBJECT_SELECT = {
+  id: true,
+  username: true,
+  role: true,
+  appRoleId: true,
+  status: true,
+  sessionsRevokedAt: true,
+} as const satisfies Prisma.UserSelect;
+
+export type AuthSubject = Pick<
+  User,
+  'id' | 'username' | 'role' | 'appRoleId' | 'status' | 'sessionsRevokedAt'
+>;
+
+/** Transaction types that count as money SPENT (the "Total spent" figure). */
+const SPENT_TRANSACTION_TYPES: TransactionType[] = [
+  TransactionType.PURCHASE,
+  TransactionType.SUBSCRIPTION,
+];
+
+/** Every type either wallet total needs, read in ONE grouped query. */
+const WALLET_TOTAL_TRANSACTION_TYPES: TransactionType[] = [
+  ...SPENT_TRANSACTION_TYPES,
+  TransactionType.DEPOSIT,
+];
+
+/**
+ * Folds per-type COMPLETED sums into the two wallet totals. The per-type
+ * sums are added as Decimals and only then turned into a number, so the
+ * result is exactly what one SUM over both spent types used to return
+ * (adding two JavaScript numbers could differ in the last digit).
+ */
+export function walletTotalsFromTypeSums(
+  rows: { type: TransactionType; _sum: { amount: Prisma.Decimal | null } }[],
+): { totalSpent: number; totalDeposited: number } {
+  let spent: Prisma.Decimal | null = null;
+  let deposited: Prisma.Decimal | null = null;
+  for (const row of rows) {
+    const amount = row._sum.amount;
+    if (amount === null) continue;
+    if (SPENT_TRANSACTION_TYPES.includes(row.type)) {
+      spent = spent === null ? amount : spent.plus(amount);
+    } else if (row.type === TransactionType.DEPOSIT) {
+      deposited = deposited === null ? amount : deposited.plus(amount);
+    }
+  }
+  return {
+    totalSpent: decimalToNumber(spent),
+    totalDeposited: decimalToNumber(deposited),
+  };
+}
+
 @Injectable()
 export class UsersService {
   private readonly logger = new Logger(UsersService.name);
@@ -163,6 +222,18 @@ export class UsersService {
 
   async findById(id: string): Promise<User | null> {
     return this.prisma.user.findUnique({ where: { id } });
+  }
+
+  /**
+   * The narrow row an authentication check needs (see AUTH_SUBJECT_SELECT).
+   * Still one fresh read per call, never cached: that is what makes a
+   * suspension or a session revocation take effect at once (H-21).
+   */
+  async findAuthSubject(id: string): Promise<AuthSubject | null> {
+    return this.prisma.user.findUnique({
+      where: { id },
+      select: AUTH_SUBJECT_SELECT,
+    });
   }
 
   async findByIdOrThrow(id: string): Promise<User> {
@@ -218,24 +289,14 @@ export class UsersService {
   ): Promise<Map<string, WalletSummary>> {
     if (userIds.length === 0) return new Map();
 
-    const [wallets, spent, deposited, activeSubscriptions] = await Promise.all([
+    const [wallets, typeSums, activeSubscriptions] = await Promise.all([
       this.prisma.wallet.findMany({ where: { userId: { in: userIds } } }),
+      // One grouped read for both totals (spent and deposited) instead of two.
       this.prisma.transaction.groupBy({
-        by: ['userId'],
+        by: ['userId', 'type'],
         where: {
           userId: { in: userIds },
-          type: {
-            in: [TransactionType.PURCHASE, TransactionType.SUBSCRIPTION],
-          },
-          status: 'COMPLETED',
-        },
-        _sum: { amount: true },
-      }),
-      this.prisma.transaction.groupBy({
-        by: ['userId'],
-        where: {
-          userId: { in: userIds },
-          type: TransactionType.DEPOSIT,
+          type: { in: WALLET_TOTAL_TRANSACTION_TYPES },
           status: 'COMPLETED',
         },
         _sum: { amount: true },
@@ -249,12 +310,12 @@ export class UsersService {
     const balanceById = new Map(
       wallets.map((w) => [w.userId, decimalToNumber(w.balance)]),
     );
-    const spentById = new Map(
-      spent.map((s) => [s.userId, decimalToNumber(s._sum.amount)]),
-    );
-    const depositedById = new Map(
-      deposited.map((d) => [d.userId, decimalToNumber(d._sum.amount)]),
-    );
+    const typeSumsById = new Map<string, typeof typeSums>();
+    for (const row of typeSums) {
+      const rows = typeSumsById.get(row.userId);
+      if (rows) rows.push(row);
+      else typeSumsById.set(row.userId, [row]);
+    }
     // findMany is ordered by expiresAt desc, so the first row seen per user
     // is their latest-expiring active subscription.
     const subscriptionExpiresAtById = new Map<string, Date>();
@@ -265,16 +326,21 @@ export class UsersService {
     }
 
     return new Map(
-      userIds.map((id) => [
-        id,
-        {
-          balance: balanceById.get(id) ?? 0,
-          totalDeposited: depositedById.get(id) ?? 0,
-          totalSpent: spentById.get(id) ?? 0,
-          isSubscribed: subscriptionExpiresAtById.has(id),
-          subscriptionExpiresAt: subscriptionExpiresAtById.get(id) ?? null,
-        },
-      ]),
+      userIds.map((id) => {
+        const { totalSpent, totalDeposited } = walletTotalsFromTypeSums(
+          typeSumsById.get(id) ?? [],
+        );
+        return [
+          id,
+          {
+            balance: balanceById.get(id) ?? 0,
+            totalDeposited,
+            totalSpent,
+            isSubscribed: subscriptionExpiresAtById.has(id),
+            subscriptionExpiresAt: subscriptionExpiresAtById.get(id) ?? null,
+          },
+        ];
+      }),
     );
   }
 
@@ -513,8 +579,9 @@ export class UsersService {
    * transaction, the account is anonymised and CLOSED — never deleted, so
    * every money record (ledger, deposits, withdrawals, purchases) stays
    * intact and still adds up (H-22) — every session is revoked, the traces
-   * that identify the person (codes sent to the phone, IP addresses, the
-   * name, IP address and user agent in the audit trail) are scrubbed, and a
+   * that identify the person (codes sent to the phone and the SMS that
+   * carried them, IP addresses, the name, IP address and user agent in the
+   * audit trail) are scrubbed, and a
    * `user.account_delete` row is written with the owner as actor, already
    * under the anonymised name and scrubbed with the rest.
    *
@@ -588,6 +655,12 @@ export class UsersService {
           displayName: null,
           avatar: null,
           lastIpAddress: null,
+          // Nothing can be withdrawn from a closed account; drop its
+          // withdrawal code (a hash) and lock state with the rest.
+          withdrawalCodeHash: null,
+          withdrawalCodeSetAt: null,
+          withdrawalCodeFailedCount: 0,
+          withdrawalCodeLockedUntil: null,
           status: UserStatus.CLOSED,
         },
       });
@@ -595,6 +668,9 @@ export class UsersService {
 
       if (user.phone) {
         await tx.otpCode.deleteMany({ where: { phone: user.phone } });
+        // The SMS that carried those codes: number and body redacted, any
+        // still QUEUED cancelled so the gateway phone never sends it.
+        await redactSmsForClosedAccount(tx, user.phone);
       }
       await tx.userSession.updateMany({
         where: { userId: user.id },
@@ -733,33 +809,29 @@ export class UsersService {
 
   /** Balance/spend summary shown on both the admin User Profile page and a user's own dashboard. */
   async getWalletSummary(userId: string): Promise<WalletSummary> {
-    const [wallet, spentAgg, depositedAgg, activeSubscription] =
-      await Promise.all([
-        this.prisma.wallet.findUnique({ where: { userId } }),
-        this.prisma.transaction.aggregate({
-          where: {
-            userId,
-            type: {
-              in: [TransactionType.PURCHASE, TransactionType.SUBSCRIPTION],
-            },
-            status: 'COMPLETED',
-          },
-          _sum: { amount: true },
-        }),
-        this.prisma.transaction.aggregate({
-          where: { userId, type: TransactionType.DEPOSIT, status: 'COMPLETED' },
-          _sum: { amount: true },
-        }),
-        this.prisma.userSubscription.findFirst({
-          where: { userId, expiresAt: { gt: new Date() } },
-          orderBy: { expiresAt: 'desc' },
-        }),
-      ]);
+    const [wallet, typeSums, activeSubscription] = await Promise.all([
+      this.prisma.wallet.findUnique({ where: { userId } }),
+      // One grouped read for both totals (spent and deposited) instead of two.
+      this.prisma.transaction.groupBy({
+        by: ['type'],
+        where: {
+          userId,
+          type: { in: WALLET_TOTAL_TRANSACTION_TYPES },
+          status: 'COMPLETED',
+        },
+        _sum: { amount: true },
+      }),
+      this.prisma.userSubscription.findFirst({
+        where: { userId, expiresAt: { gt: new Date() } },
+        orderBy: { expiresAt: 'desc' },
+      }),
+    ]);
+    const { totalSpent, totalDeposited } = walletTotalsFromTypeSums(typeSums);
 
     return {
       balance: decimalToNumber(wallet?.balance),
-      totalDeposited: decimalToNumber(depositedAgg._sum.amount),
-      totalSpent: decimalToNumber(spentAgg._sum.amount),
+      totalDeposited,
+      totalSpent,
       isSubscribed: Boolean(activeSubscription),
       subscriptionExpiresAt: activeSubscription?.expiresAt ?? null,
     };

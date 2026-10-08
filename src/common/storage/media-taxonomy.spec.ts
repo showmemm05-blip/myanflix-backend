@@ -15,7 +15,7 @@ import {
  * or reordered in a way the rest of the system has not been told about.
  */
 describe('IMAGE_PURPOSES', () => {
-  it('is the nine purpose folders, all lowercase and unique', () => {
+  it('is the ten purpose folders, all lowercase and unique', () => {
     expect([...IMAGE_PURPOSES]).toEqual([
       'actor',
       'movie',
@@ -25,6 +25,7 @@ describe('IMAGE_PURPOSES', () => {
       'category',
       'payment',
       'music',
+      'promo',
       'other',
     ]);
     expect(new Set(IMAGE_PURPOSES).size).toBe(IMAGE_PURPOSES.length);

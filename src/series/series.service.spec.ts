@@ -549,26 +549,6 @@ describe('SeriesService', () => {
         posterUrl: null,
       });
     });
-
-    it('re-hosts the poster on owned-series purchase history', async () => {
-      prisma.seriesPurchase.findMany.mockResolvedValue([
-        {
-          id: 'sp-1',
-          seriesId: 'series-1',
-          amount: 5000,
-          createdAt: new Date('2026-01-01T00:00:00.000Z'),
-          series: {
-            id: 'series-1',
-            title: 'A Show',
-            posterUrl: stale('poster'),
-          },
-        },
-      ]);
-
-      const result = await service.getPurchasesForUser('user-1');
-
-      expect(result[0].posterUrl).toBe(fresh('poster'));
-    });
   });
 
   describe('getForViewer', () => {
@@ -1246,6 +1226,80 @@ describe('SeriesService', () => {
       );
       expect(result.seasons).toEqual([]);
     });
+
+    /**
+     * The gate only needs the show's status, so it must not load the series
+     * with its categories and cast (and re-host every image) three times per
+     * series page view.
+     */
+    it.each([
+      ['getSeasons', () => service.getSeasons('series-1', Role.USER)],
+      ['getEpisodes', () => service.getEpisodes('series-1', Role.USER)],
+      [
+        'getPlayerEpisodes',
+        () => service.getPlayerEpisodes('series-1', 'user-1', Role.USER),
+      ],
+    ])('%s: the gate reads only the status', async (_name, call) => {
+      prisma.series.findUnique.mockResolvedValue({
+        status: SeriesStatus.PUBLISHED,
+      });
+      prisma.movie.groupBy.mockResolvedValue([]);
+      prisma.movie.findMany.mockResolvedValue([]);
+
+      await call();
+
+      expect(prisma.series.findUnique).toHaveBeenCalledTimes(1);
+      expect(prisma.series.findUnique).toHaveBeenCalledWith({
+        where: { id: 'series-1' },
+        select: { status: true },
+      });
+      expect(minioService.imageUrl).not.toHaveBeenCalled();
+    });
+
+    it.each([Role.USER, Role.ADMIN])(
+      'an unknown series is the same 404 for %s',
+      async (role) => {
+        prisma.series.findUnique.mockResolvedValue(null);
+        await expect(
+          service.getPlayerEpisodes('nope', 'user-1', role),
+        ).rejects.toThrow('Series not found');
+        await expect(service.getEpisodes('nope', role)).rejects.toThrow(
+          'Series not found',
+        );
+        expect(prisma.movie.findMany).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  describe('findAll — categoryId and ids narrow, never widen', () => {
+    beforeEach(() => {
+      prisma.series.findMany.mockResolvedValue([]);
+      prisma.series.count.mockResolvedValue(0);
+    });
+
+    it('a USER asking for a category still gets PUBLISHED series only', async () => {
+      const categoryId = '11111111-1111-4111-8111-111111111111';
+      await service.findAll({ categoryId }, Role.USER);
+
+      const where = prisma.series.findMany.mock.calls[0][0].where;
+      expect(where.categories).toEqual({ some: { id: categoryId } });
+      expect(where.status).toBe(SeriesStatus.PUBLISHED);
+      expect(prisma.series.count.mock.calls[0][0].where).toEqual(where);
+    });
+
+    it('a USER asking for ids (incl. an unpublished one) still gets PUBLISHED only', async () => {
+      const ids = [
+        '22222222-2222-4222-8222-222222222222',
+        '33333333-3333-4333-8333-333333333333',
+      ];
+      await service.findAll({ ids, status: SeriesStatus.DRAFT }, Role.USER);
+
+      const where = prisma.series.findMany.mock.calls[0][0].where;
+      expect(where.id).toEqual({ in: ids });
+      // The DRAFT the caller asked for is ignored; the database never
+      // returns an unpublished id to a viewer.
+      expect(where.status).toBe(SeriesStatus.PUBLISHED);
+    });
   });
 });
 
@@ -1304,6 +1358,28 @@ describe('buildSeriesWhere', () => {
 
   it('an empty actorIds list adds nothing', () => {
     expect(buildSeriesWhere({ actorIds: [] }, Role.USER).AND).toBeUndefined();
+  });
+
+  it('categoryId filters by category and keeps the USER-only PUBLISHED rule', () => {
+    expect(buildSeriesWhere({ categoryId: 'c1' }, Role.USER)).toEqual({
+      categories: { some: { id: 'c1' } },
+      status: SeriesStatus.PUBLISHED,
+    });
+    // Staff keep their full view (no forced status), still narrowed.
+    expect(buildSeriesWhere({ categoryId: 'c1' }, Role.ADMIN)).toEqual({
+      categories: { some: { id: 'c1' } },
+    });
+  });
+
+  it('ids narrows to those series and keeps the USER-only PUBLISHED rule', () => {
+    expect(buildSeriesWhere({ ids: ['s1', 's2'] }, Role.USER)).toEqual({
+      id: { in: ['s1', 's2'] },
+      status: SeriesStatus.PUBLISHED,
+    });
+  });
+
+  it('an empty ids list adds nothing', () => {
+    expect(buildSeriesWhere({ ids: [] }, Role.USER).id).toBeUndefined();
   });
 });
 

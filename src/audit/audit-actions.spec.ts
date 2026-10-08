@@ -49,6 +49,11 @@ describe('audit action catalogue', () => {
       'movie.publish',
       'movie.reprocess',
       'movie.video_replace',
+      'movie.upload_presign',
+      'movie.upload_multipart',
+      'movie.upload_chunked',
+      'movie.video_replace_begin',
+      'movie.video_replace_cancel',
       'movie.unpublish',
       'movie.status_change',
       'movie.delete',
@@ -61,6 +66,7 @@ describe('audit action catalogue', () => {
       'series.delete',
       'subtitle.upload',
       'subtitle.update',
+      'subtitle.publish',
       'subtitle.set_default',
       'subtitle.delete',
       'category.create',
@@ -72,6 +78,8 @@ describe('audit action catalogue', () => {
       'book.create',
       'book.update',
       'book.delete',
+      'book.upload_presign',
+      'book.upload_multipart',
       'book_edition.create',
       'book_edition.update',
       'book_edition.publish',
@@ -92,12 +100,18 @@ describe('audit action catalogue', () => {
       'book_section.update',
       'book_section.delete',
       'book_section.reorder',
+      'image.upload',
       'book_author.create',
       'book_author.update',
       'book_author.delete',
       'book_category.create',
       'book_category.update',
       'book_category.delete',
+      'home_promo.create',
+      'home_promo.update',
+      'home_promo.delete',
+      'home_promo.reorder',
+      'home_settings.update',
       // USERS
       'user.status_change',
       'user.role_change',
@@ -156,6 +170,7 @@ describe('audit action catalogue', () => {
       'comment.moderate',
       'comment.delete',
       'feedback.status_change',
+      'sms_gateway.binding_reset',
     ];
     expect([...AUDIT_ACTION_KEYS].sort()).toEqual([...expected].sort());
   });
@@ -165,6 +180,8 @@ describe('audit action catalogue', () => {
       AUDIT_ACTIONS.find((a) => a.key === key)?.category;
     expect(categoryOf('movie.update')).toBe(AuditCategory.CONTENT);
     expect(categoryOf('book_category.delete')).toBe(AuditCategory.CONTENT);
+    expect(categoryOf('home_promo.reorder')).toBe(AuditCategory.CONTENT);
+    expect(categoryOf('home_settings.update')).toBe(AuditCategory.CONTENT);
     expect(categoryOf('user.wallet_adjust')).toBe(AuditCategory.USERS);
     expect(categoryOf('user.password_reset')).toBe(AuditCategory.USERS);
     expect(categoryOf('user.account_delete')).toBe(AuditCategory.USERS);
@@ -176,6 +193,7 @@ describe('audit action catalogue', () => {
     expect(categoryOf('peak_users.update')).toBe(AuditCategory.SYSTEM);
     expect(categoryOf('comment.delete')).toBe(AuditCategory.SYSTEM);
     expect(categoryOf('feedback.status_change')).toBe(AuditCategory.SYSTEM);
+    expect(categoryOf('sms_gateway.binding_reset')).toBe(AuditCategory.SYSTEM);
   });
 
   it('isAuditAction / getAuditActionDefinition agree with the list', () => {

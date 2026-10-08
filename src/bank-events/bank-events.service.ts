@@ -4,7 +4,10 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  OnModuleDestroy,
+  OnModuleInit,
 } from '@nestjs/common';
+import type { Subscription } from 'rxjs';
 import { Prisma } from '../generated/prisma/client';
 import type { BankTransaction } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -12,6 +15,7 @@ import { AuditService } from '../audit/audit.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
+import { PaymentAccountEvents } from '../payment-accounts/payment-account-events';
 import {
   pushBankTransactionChange,
   storeTransaction,
@@ -82,9 +86,12 @@ interface ProcessedEvent {
  * race each other for a row.
  */
 @Injectable()
-export class BankEventsService {
+export class BankEventsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(BankEventsService.name);
   private readonly accountCache = new Map<string, CachedAccount>();
+  /** Bumped on every invalidation, so a read already in flight is not cached. */
+  private accountCacheGeneration = 0;
+  private accountChanges?: Subscription;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -92,7 +99,23 @@ export class BankEventsService {
     private readonly realtimeGateway: RealtimeGateway,
     private readonly minioService: MinioService,
     private readonly storageService: StorageService,
+    private readonly paymentAccountEvents: PaymentAccountEvents,
   ) {}
+
+  /**
+   * bam-16: an admin's create, edit or delete of a payment account clears
+   * the account cache at once, so a deactivated account is refused from the
+   * very next bank event instead of up to ACCOUNT_CACHE_TTL_MS later.
+   */
+  onModuleInit(): void {
+    this.accountChanges = this.paymentAccountEvents.changes.subscribe(() =>
+      this.invalidateAccountCache(),
+    );
+  }
+
+  onModuleDestroy(): void {
+    this.accountChanges?.unsubscribe();
+  }
 
   async processBatch(
     dto: BankEventBatchDto,
@@ -259,6 +282,7 @@ export class BankEventsService {
     const now = Date.now();
     const cached = this.accountCache.get(id);
     if (cached && cached.expiresAt > now) return cached;
+    const generation = this.accountCacheGeneration;
     const account = await this.prisma.paymentAccount.findUnique({
       where: { id },
       select: { isActive: true },
@@ -267,12 +291,17 @@ export class BankEventsService {
       isActive: account ? account.isActive : null,
       expiresAt: now + ACCOUNT_CACHE_TTL_MS,
     };
-    this.accountCache.set(id, entry);
+    // An account change cleared the cache while this read was in flight:
+    // the value may be from before the change, so use it but do not keep it.
+    if (generation === this.accountCacheGeneration) {
+      this.accountCache.set(id, entry);
+    }
     return entry;
   }
 
-  /** Forget cached account state (tests, or after an account edit). */
+  /** Forget cached account state — after every payment account change (see onModuleInit). */
   invalidateAccountCache(): void {
+    this.accountCacheGeneration += 1;
     this.accountCache.clear();
   }
 

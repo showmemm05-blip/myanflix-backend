@@ -7,12 +7,12 @@ import {
 } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
 import { randomBytes } from 'node:crypto';
-import { Prisma } from '../../generated/prisma/client';
 import type { User } from '../../generated/prisma/client';
 import { UsersService } from '../../users/users.service';
 import { AuthService } from '../auth.service';
 import type { AuthTokens } from '../auth.service';
 import type { AuthenticatedUser } from '../types/authenticated-user.type';
+import { isUniqueViolation } from '../unique-violation.util';
 import { PASSWORD_SALT_ROUNDS } from '../password.constants';
 import { EXACTLY_ONE_MESSAGE } from './dto/google-login.dto';
 import { GoogleTokenVerifier } from './google-token.verifier';
@@ -45,13 +45,6 @@ const MAX_RESOLVE_ATTEMPTS = 3;
 export function normalizeDisplayName(name: string | null): string | null {
   const trimmed = (name ?? '').trim();
   return trimmed ? trimmed.slice(0, DISPLAY_NAME_MAX_LENGTH) : null;
-}
-
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    error instanceof Prisma.PrismaClientKnownRequestError &&
-    error.code === 'P2002'
-  );
 }
 
 /**

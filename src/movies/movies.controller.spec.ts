@@ -105,14 +105,12 @@ describe('MoviesController — publish/unpublish gate (F11)', () => {
       }),
     };
     videoDurationService = {
-      backfill: jest
-        .fn()
-        .mockResolvedValue({
-          scanned: 0,
-          updated: 0,
-          failed: [],
-          remaining: 0,
-        }),
+      backfill: jest.fn().mockResolvedValue({
+        scanned: 0,
+        updated: 0,
+        failed: [],
+        remaining: 0,
+      }),
     };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -511,7 +509,6 @@ describe('MoviesController — guest catalogue (@OptionalAuth)', () => {
     findByIdOrThrow: jest.Mock;
     getFacets: jest.Mock;
     getMostPurchased: jest.Mock;
-    getPurchasesForUser: jest.Mock;
   };
   let passportCanActivate: jest.SpyInstance;
 
@@ -568,9 +565,6 @@ describe('MoviesController — guest catalogue (@OptionalAuth)', () => {
         years: null,
       }),
       getMostPurchased: jest.fn().mockResolvedValue([]),
-      getPurchasesForUser: jest
-        .fn()
-        .mockResolvedValue({ items: [], total: 0, page: 1, limit: 20 }),
     };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -662,16 +656,5 @@ describe('MoviesController — guest catalogue (@OptionalAuth)', () => {
       .expect(401);
 
     expect(moviesService.findAll).not.toHaveBeenCalled();
-  });
-
-  it('GET /movies/me/purchases stays protected: no token is a 401', async () => {
-    passportCanActivate.mockImplementation(() => {
-      throw new UnauthorizedException();
-    });
-
-    await request(app.getHttpServer()).get('/movies/me/purchases').expect(401);
-
-    expect(passportCanActivate).toHaveBeenCalledTimes(1);
-    expect(moviesService.getPurchasesForUser).not.toHaveBeenCalled();
   });
 });

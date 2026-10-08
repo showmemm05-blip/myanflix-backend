@@ -6,13 +6,25 @@ import {
 } from './permission-catalogue';
 
 describe('permission catalogue', () => {
-  it('declares 21 modules and 80 MODULE.ACTION permissions', () => {
+  it('declares 22 modules and 82 MODULE.ACTION permissions', () => {
     // 76 + DEPOSITS.BANK_EVIDENCE + WITHDRAWALS.BANK_EVIDENCE (bank
     // verification: the balance-revealing screenshot streams) + the
     // BANK_TRANSACTIONS module (VIEW, BANK_EVIDENCE) for the phone-monitor's
-    // stored notifications.
-    expect(PERMISSION_CATALOGUE).toHaveLength(21);
-    expect(ALL_PERMISSIONS).toHaveLength(80);
+    // stored notifications + the HOME module (VIEW, MANAGE) for the
+    // "Home promos" admin page.
+    expect(PERMISSION_CATALOGUE).toHaveLength(22);
+    expect(ALL_PERMISSIONS).toHaveLength(82);
+  });
+
+  it('declares the HOME module with exactly VIEW and MANAGE', () => {
+    const home = getPermissionCatalogue().find(
+      (module) => module.key === 'HOME',
+    );
+    expect(home?.label).toBe('Home promos');
+    expect(home?.actions.map((action) => action.permission)).toEqual([
+      'HOME.VIEW',
+      'HOME.MANAGE',
+    ]);
   });
 
   it('generates every permission as MODULE.ACTION with no duplicates', () => {

@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import {
   CopyObjectCommand,
   GetObjectCommand,
+  HeadBucketCommand,
   HeadObjectCommand,
   NotFound,
   S3Client,
@@ -323,7 +324,7 @@ describe('MinioService.signedPlaybackUrl', () => {
     );
   });
 
-  it('expires 12 h from the current hour boundary by default, hour-quantised', async () => {
+  it('expires 4 h from the current hour boundary by default, hour-quantised (M-21)', async () => {
     const service = await buildService({});
     const now = Math.floor(Date.now() / 1000);
 
@@ -331,10 +332,10 @@ describe('MinioService.signedPlaybackUrl', () => {
       SIGNED.exec(service.signedPlaybackUrl(masterKey))![2],
     );
 
-    expect(expires).toBe(quantizedExpiry(now, 43_200));
+    expect(expires).toBe(quantizedExpiry(now, 14_400));
     expect(expires % 3600).toBe(0);
-    expect(expires - now).toBeGreaterThan(43_200 - 3600);
-    expect(expires - now).toBeLessThanOrEqual(43_200);
+    expect(expires - now).toBeGreaterThan(14_400 - 3600);
+    expect(expires - now).toBeLessThanOrEqual(14_400);
   });
 
   it('honours STREAM_URL_TTL_SECONDS', async () => {
@@ -498,6 +499,107 @@ describe('MinioService object helpers', () => {
     });
   });
 
+  describe('copyObject with a size the caller already knows', () => {
+    it('skips the HEAD and sends only the CopyObject', async () => {
+      send.mockImplementation(async (command: { constructor: unknown }) => {
+        if (command.constructor === CopyObjectCommand) return {};
+        throw new Error(`unexpected ${command.constructor}`);
+      });
+
+      await service.copyObject(
+        'temp/video-replace/m1/hls/720p/segment_000.ts',
+        'videos/m1/hls/v-t/720p/segment_000.ts',
+        1234,
+      );
+
+      expect(sent().map((c) => c.name)).toEqual(['CopyObjectCommand']);
+    });
+
+    it('still takes the streamed branch for a known size at or above 5 GiB', async () => {
+      const body = { pipe: jest.fn() };
+      send.mockImplementation(async (command: { constructor: unknown }) => {
+        if (command.constructor === GetObjectCommand) return { Body: body };
+        throw new Error(`unexpected ${command.constructor}`);
+      });
+
+      await service.copyObject(
+        'temp/video-replace/m1/original.mkv',
+        'videos/m1/original.mkv',
+        6 * GIB,
+      );
+
+      expect(sent().map((c) => c.name)).toEqual(['GetObjectCommand']);
+      expect(Upload).toHaveBeenCalled();
+    });
+
+    it('fails when the source vanished after the listing (the CopyObject itself 404s)', async () => {
+      send.mockRejectedValue(new NotFound({ message: 'gone', $metadata: {} }));
+
+      await expect(
+        service.copyObject(
+          'temp/video-replace/m1/gone.ts',
+          'videos/m1/x.ts',
+          10,
+        ),
+      ).rejects.toThrow();
+    });
+  });
+
+  describe('bucket check (ensureBucket)', () => {
+    it('does not remember a failed first check: the next upload retries and succeeds once MinIO is back', async () => {
+      const offline = Object.assign(new Error('connect ECONNREFUSED'), {
+        name: 'Error',
+        $metadata: {},
+      });
+      let storageUp = false;
+      send.mockImplementation(async (command: { constructor: unknown }) => {
+        if (!storageUp) throw offline;
+        if (command.constructor === HeadBucketCommand) return {};
+        return {};
+      });
+
+      await expect(
+        service.uploadBuffer('images/movie/a.webp', Buffer.from('x')),
+      ).rejects.toThrow('ECONNREFUSED');
+      // A network error is never mistaken for "bucket missing".
+      expect(sent().some((c) => c.name === 'CreateBucketCommand')).toBe(false);
+
+      storageUp = true;
+      await expect(
+        service.uploadBuffer('images/movie/a.webp', Buffer.from('x')),
+      ).resolves.toBeUndefined();
+      expect(sent().some((c) => c.name === 'PutObjectCommand')).toBe(true);
+    });
+
+    it('creates the bucket only when HeadBucket says it does not exist (404)', async () => {
+      send.mockImplementation(async (command: { constructor: unknown }) => {
+        if (command.constructor === HeadBucketCommand)
+          throw new NotFound({ message: 'no bucket', $metadata: {} });
+        return {};
+      });
+
+      await service.uploadBuffer('images/movie/a.webp', Buffer.from('x'));
+
+      expect(sent().map((c) => c.name)).toEqual([
+        'HeadBucketCommand',
+        'CreateBucketCommand',
+        'PutBucketLifecycleConfigurationCommand',
+        'PutObjectCommand',
+      ]);
+    });
+
+    it('checks the bucket once and shares the result with later calls', async () => {
+      send.mockResolvedValue({});
+
+      await service.uploadBuffer('images/movie/a.webp', Buffer.from('x'));
+      await service.uploadBuffer('images/movie/b.webp', Buffer.from('y'));
+
+      expect(sent().filter((c) => c.name === 'HeadBucketCommand')).toHaveLength(
+        1,
+      );
+    });
+  });
+
   describe('listObjects / listKeys', () => {
     it('walks every page of the listing and keeps each key with its stamp', async () => {
       const stamp = new Date('2026-09-01T00:00:00Z');
@@ -515,14 +617,29 @@ describe('MinioService object helpers', () => {
       const objects = await service.listObjects('videos/m1/');
 
       expect(objects).toEqual([
-        { key: 'videos/m1/a.ts', lastModified: stamp },
-        { key: 'videos/m1/b.ts', lastModified: undefined },
+        { key: 'videos/m1/a.ts', lastModified: stamp, size: undefined },
+        { key: 'videos/m1/b.ts', lastModified: undefined, size: undefined },
       ]);
       expect(sent().map((c) => c.input.ContinuationToken)).toEqual([
         undefined,
         'page-2',
       ]);
       expect(sent().every((c) => c.input.Prefix === 'videos/m1/')).toBe(true);
+    });
+
+    it("carries each object's size from the listing", async () => {
+      send.mockResolvedValueOnce({
+        Contents: [{ Key: 'temp/video-replace/m1/hls/master.m3u8', Size: 321 }],
+        IsTruncated: false,
+      });
+
+      expect(await service.listObjects('temp/video-replace/m1/')).toEqual([
+        {
+          key: 'temp/video-replace/m1/hls/master.m3u8',
+          lastModified: undefined,
+          size: 321,
+        },
+      ]);
     });
 
     it('listKeys is the same walk reduced to keys', async () => {
@@ -600,6 +717,118 @@ describe('MinioService object helpers', () => {
       expect(objectsOf(batches[1].input)).toEqual([
         { Key: 'videos/m1/1000.ts' },
       ]);
+    });
+  });
+
+  describe('presigned PUT / part URLs bind the declared length (M-23)', () => {
+    const signedHeaders = (url: string) =>
+      decodeURIComponent(
+        new URL(url).searchParams.get('X-Amz-SignedHeaders') ?? '',
+      ).split(';');
+
+    it('signs content-length into a presigned PUT when a length is given, so a longer or shorter body is refused by MinIO', async () => {
+      send.mockResolvedValue({}); // HeadBucket in ensureBucket()
+
+      const url = await service.getPresignedPutUrl(
+        'videos/m1/hls/master.m3u8',
+        512,
+      );
+
+      expect(signedHeaders(url)).toContain('content-length');
+      expect(signedHeaders(url)).toContain('host');
+    });
+
+    it('leaves content-length out when no length is given — the old shape, for callers that have none', async () => {
+      send.mockResolvedValue({});
+
+      const url = await service.getPresignedPutUrl('videos/m1/hls/master.m3u8');
+
+      expect(signedHeaders(url)).not.toContain('content-length');
+    });
+
+    it('signs content-length into a presigned UploadPart URL the same way', async () => {
+      const url = await service.getPresignedUploadPartUrl(
+        'videos/m1/original.mp4',
+        'upload-1',
+        3,
+        32 * 1024 * 1024,
+      );
+
+      expect(signedHeaders(url)).toContain('content-length');
+    });
+  });
+
+  describe('objectStat', () => {
+    it('returns size and the unquoted ETag from one HEAD', async () => {
+      send.mockResolvedValue({ ContentLength: 4096, ETag: '"abc123"' });
+
+      await expect(
+        service.objectStat('documents/books/b/e/c/original.pdf'),
+      ).resolves.toEqual({
+        size: 4096,
+        etag: 'abc123',
+      });
+      expect(sent().map((c) => c.name)).toEqual(['HeadObjectCommand']);
+    });
+
+    it('is null for a key that does not exist, and objectSize follows it', async () => {
+      send.mockRejectedValue(new NotFound({ message: 'nope', $metadata: {} }));
+
+      await expect(service.objectStat('missing')).resolves.toBeNull();
+      await expect(service.objectSize('missing')).resolves.toBeNull();
+    });
+
+    it('objectSize stays null (never 0) when the HEAD carries no Content-Length — the shape it always had — while objectStat reports 0 and the object still exists', async () => {
+      send.mockResolvedValue({ ETag: '"abc123"' });
+
+      await expect(service.objectSize('k')).resolves.toBeNull();
+      await expect(service.objectStat('k')).resolves.toEqual({
+        size: 0,
+        etag: 'abc123',
+      });
+      await expect(service.objectExists('k')).resolves.toBe(true);
+    });
+  });
+
+  describe('readText size cap (M-24)', () => {
+    it('refuses an object larger than the cap BEFORE buffering it, and destroys the stream', async () => {
+      const destroy = jest.fn();
+      const transformToString = jest.fn();
+      send.mockResolvedValue({
+        ContentLength: 16 * 1024 * 1024 + 1,
+        Body: { destroy, transformToString },
+      });
+
+      await expect(service.readText('subtitles/m1/huge.srt')).rejects.toThrow(
+        /larger than the .*-byte limit/,
+      );
+      expect(destroy).toHaveBeenCalled();
+      expect(transformToString).not.toHaveBeenCalled();
+    });
+
+    it('reads a normal-sized object exactly as before', async () => {
+      send.mockResolvedValue({
+        ContentLength: 120,
+        Body: {
+          destroy: jest.fn(),
+          transformToString: jest.fn().mockResolvedValue('#EXTM3U\n'),
+        },
+      });
+
+      await expect(service.readText('videos/m1/hls/master.m3u8')).resolves.toBe(
+        '#EXTM3U\n',
+      );
+    });
+
+    it('honours a caller-supplied cap', async () => {
+      send.mockResolvedValue({
+        ContentLength: 2000,
+        Body: { destroy: jest.fn(), transformToString: jest.fn() },
+      });
+
+      await expect(service.readText('k', 1000)).rejects.toThrow(
+        /1000-byte limit/,
+      );
     });
   });
 

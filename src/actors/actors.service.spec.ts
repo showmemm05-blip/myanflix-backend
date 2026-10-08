@@ -5,7 +5,6 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { AuditService } from '../audit/audit.service';
 import { MovieStatus, Role, SeriesStatus } from '../generated/prisma/client';
-import { CATALOG_INCLUDE } from '../movies/movies.service';
 
 const ACTOR_ID = 'actor-1';
 
@@ -399,49 +398,6 @@ describe('ActorsService', () => {
     it('404s an unknown actor instead of silently succeeding', async () => {
       prisma.actor.findUnique.mockResolvedValue(null);
       await expect(service.remove('nope', STAFF)).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
-    });
-  });
-
-  describe('getMovies', () => {
-    it('returns everything the actor appears in to staff, newest first', async () => {
-      prisma.actor.findUnique.mockResolvedValue({ id: ACTOR_ID });
-
-      await service.getMovies(ACTOR_ID, Role.ADMIN);
-
-      expect(prisma.movie.findMany).toHaveBeenCalledWith({
-        where: { actors: { some: { id: ACTOR_ID } } },
-        include: CATALOG_INCLUDE,
-        orderBy: { releaseYear: 'desc' },
-      });
-    });
-
-    /**
-     * H-7: this route is open to every signed-in user, so it must not hand
-     * out the ids of DRAFT, ARCHIVED or READY_TO_PUBLISH titles, nor of
-     * episodes (GET /movies never lists an episode) — the same catalogue
-     * rule the People counts use.
-     */
-    it('narrows a regular viewer to PUBLISHED standalone films', async () => {
-      prisma.actor.findUnique.mockResolvedValue({ id: ACTOR_ID });
-
-      await service.getMovies(ACTOR_ID, Role.USER);
-
-      expect(prisma.movie.findMany).toHaveBeenCalledWith({
-        where: {
-          actors: { some: { id: ACTOR_ID } },
-          seriesId: null,
-          status: MovieStatus.PUBLISHED,
-        },
-        include: CATALOG_INCLUDE,
-        orderBy: { releaseYear: 'desc' },
-      });
-    });
-
-    it('404s an unknown actor', async () => {
-      prisma.actor.findUnique.mockResolvedValue(null);
-      await expect(service.getMovies('nope', Role.USER)).rejects.toBeInstanceOf(
         NotFoundException,
       );
     });

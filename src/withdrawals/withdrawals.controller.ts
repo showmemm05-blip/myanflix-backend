@@ -12,6 +12,7 @@ import {
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { ThrottleAuth } from '../common/throttling/throttling.config';
 import { VerificationReviewDto } from '../deposits/dto/verification-review.dto';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
@@ -32,7 +33,13 @@ import { WithdrawalsService } from './withdrawals.service';
 export class WithdrawalsController {
   constructor(private readonly withdrawalsService: WithdrawalsService) {}
 
+  /**
+   * Requires the account's withdrawal code (`withdrawalCode`), checked by
+   * the server before any money moves — see WithdrawalsService.create.
+   * Throttled like the other "is this code right?" routes, per account.
+   */
   @Post()
+  @ThrottleAuth('credential')
   create(
     @CurrentUser() user: AuthenticatedUser,
     @Body() dto: CreateWithdrawalDto,

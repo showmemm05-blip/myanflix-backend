@@ -7,6 +7,22 @@ import type { UpdateAdditionalPeakDto } from './dto/update-additional-peak.dto';
 
 @Injectable()
 export class PeakUsersService {
+  /**
+   * The stored actualPeak as last read or written by this process. Lets the
+   * socket connect path skip the database entirely for a count that cannot
+   * be a new peak. Re-synced to the database value on every getOrCreate()
+   * read (so a reset row is noticed again), and whenever a conditional write
+   * matches nothing. If it is ever stale-high, the next admin or public read
+   * corrects it; if it is stale-low, the cost is one no-op write.
+   */
+  private knownPeak = 0;
+
+  /**
+   * Id of the singleton row, once read. The conditional write targets this
+   * row only — the same single row the old read-then-write updated.
+   */
+  private rowId: string | null = null;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
@@ -19,9 +35,11 @@ export class PeakUsersService {
    */
   async getOrCreate() {
     const existing = await this.prisma.peakUserStats.findFirst();
-    if (existing) return existing;
-
-    return this.prisma.peakUserStats.create({ data: {} });
+    const row =
+      existing ?? (await this.prisma.peakUserStats.create({ data: {} }));
+    this.rowId = row.id;
+    this.knownPeak = row.actualPeak;
+    return row;
   }
 
   /**
@@ -78,12 +96,28 @@ export class PeakUsersService {
    * rare, so the socket connect path almost never writes.
    */
   async recordConcurrent(count: number): Promise<void> {
-    const current = await this.getOrCreate();
-    if (count <= current.actualPeak) return;
+    if (count <= this.knownPeak) return;
 
-    await this.prisma.peakUserStats.update({
-      where: { id: current.id },
+    // One conditional write instead of read-then-write: it raises the peak
+    // only while the stored one is lower, so two connects racing each other
+    // can never lower it again.
+    if (this.rowId && (await this.raisePeakTo(this.rowId, count))) return;
+
+    // Row not read yet, or nothing matched: either the stored peak already
+    // covers this count (another process raised it) or the row was reset or
+    // replaced. Read the truth (creating the row if missing) and retry once.
+    const current = await this.getOrCreate();
+    if (count > current.actualPeak) await this.raisePeakTo(current.id, count);
+  }
+
+  /** Raises actualPeak to `count` if it is lower; true when it was raised. */
+  private async raisePeakTo(id: string, count: number): Promise<boolean> {
+    const { count: raised } = await this.prisma.peakUserStats.updateMany({
+      where: { id, actualPeak: { lt: count } },
       data: { actualPeak: count, actualPeakAt: new Date() },
     });
+    if (raised === 0) return false;
+    this.knownPeak = Math.max(this.knownPeak, count);
+    return true;
   }
 }

@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
 import { RealtimeModule } from '../realtime/realtime.module';
+import { PaymentAccountsModule } from '../payment-accounts/payment-accounts.module';
 import { BankEventsController } from './bank-events.controller';
 import { BankEventsService } from './bank-events.service';
 import { MachineTokenGuard } from './machine-token.guard';
@@ -16,7 +17,9 @@ import { MachineTokenGuard } from './machine-token.guard';
  * per-module like everywhere else.
  */
 @Module({
-  imports: [RealtimeModule],
+  // PaymentAccountsModule only for PaymentAccountEvents (bam-16): its
+  // imports (roles, realtime) never lead back here, so no cycle.
+  imports: [RealtimeModule, PaymentAccountsModule],
   controllers: [BankEventsController],
   providers: [
     BankEventsService,

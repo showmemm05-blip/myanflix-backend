@@ -71,10 +71,6 @@ export class VideosService {
     });
   }
 
-  findById(id: string): Promise<Video | null> {
-    return this.prisma.video.findUnique({ where: { id } });
-  }
-
   /** Most recently created video for a movie — the one currently being processed or served. */
   findLatestForMovie(movieId: string): Promise<Video | null> {
     return this.prisma.video.findFirst({
@@ -146,18 +142,22 @@ export class VideosService {
     qualities: StreamQualityInfo[];
     subtitles: SubtitleInfo[];
   }> {
+    // Only the fields the two checks below read: the publish rule
+    // (status, seriesId, series.status) and the access rule (accessType,
+    // series.accessType) — not the whole movie and series rows.
     const movie = await this.prisma.movie.findUnique({
       where: { id: movieId },
-      include: { series: true },
+      select: {
+        status: true,
+        accessType: true,
+        seriesId: true,
+        series: { select: { status: true, accessType: true } },
+      },
     });
     if (!movie) throw new NotFoundException('Movie not found');
 
     if (role === Role.USER) {
-      if (
-        movie.status !== MovieStatus.PUBLISHED ||
-        (movie.seriesId !== null &&
-          movie.series?.status !== SeriesStatus.PUBLISHED)
-      ) {
+      if (VideosService.isHiddenFromViewers(movie)) {
         throw new NotFoundException('Movie not found');
       }
 
@@ -182,14 +182,18 @@ export class VideosService {
       }
     }
 
-    const video = await this.findLatestForMovie(movieId);
+    // Loaded only AFTER the checks above passed, so the 404-before-403 order
+    // and the subscription gate are unchanged. The latest video and its
+    // subtitles come back in one query (they used to be two).
+    const video = await this.prisma.video.findFirst({
+      where: { movieId },
+      orderBy: { createdAt: 'desc' },
+      include: { subtitles: true },
+    });
     if (!video || video.status !== VideoStatus.READY || !video.hlsMasterPath) {
       throw new NotFoundException('This movie is not ready for streaming yet');
     }
-
-    const subtitles = await this.prisma.subtitle.findMany({
-      where: { videoId: video.id },
-    });
+    const subtitles = video.subtitles;
 
     return {
       // signedPlaybackUrl: follows the host the client called the API on
@@ -283,18 +287,33 @@ export class VideosService {
    * The seconds credited to that log are derived from the position ALREADY
    * STORED versus the one being written, both server-side facts — the client
    * never gets to say how long it watched. Its own response is unchanged.
+   *
+   * A regular viewer is held to the same publish decision as getStreamInfo
+   * (L-45): a title they could not stream answers the same 404 as a missing
+   * id, so a heartbeat can neither write progress / watch-activity rows for
+   * a draft or archived title nor confirm that its id exists. Staff keep
+   * recording against their draft previews.
    */
   async recordWatchProgress(
     userId: string,
     movieId: string,
     progress: number,
     lastPosition: number,
+    viewerRole: Role,
   ) {
     const movie = await this.prisma.movie.findUnique({
       where: { id: movieId },
-      select: { id: true },
+      select: {
+        id: true,
+        status: true,
+        seriesId: true,
+        series: { select: { status: true } },
+      },
     });
     if (!movie) throw new NotFoundException('Movie not found');
+    if (viewerRole === Role.USER && VideosService.isHiddenFromViewers(movie)) {
+      throw new NotFoundException('Movie not found');
+    }
 
     // Read before the upsert overwrites it — this is the "previous" end of
     // the delta. No row yet means the user is starting from 0.
@@ -326,6 +345,50 @@ export class VideosService {
       );
 
     return updated;
+  }
+
+  /**
+   * The caller's own saved position for one title, or null when they have
+   * none — what a player needs to resume, without paging through the whole
+   * watch history (the mobile app used to read 100 rows to find one, and a
+   * title older than those 100 silently restarted at 0:00).
+   *
+   * Keyed by the caller's id from the access token and the movie id, exactly
+   * like the PATCH that writes it: a user can only ever read their own row.
+   * One indexed lookup on the (userId, movieId) unique key.
+   */
+  async getWatchProgress(
+    userId: string,
+    movieId: string,
+  ): Promise<{ position: number; progress: number; updatedAt: Date } | null> {
+    const row = await this.prisma.watchHistory.findUnique({
+      where: { userId_movieId: { userId, movieId } },
+      select: { lastPosition: true, progress: true, updatedAt: true },
+    });
+    if (!row) return null;
+    return {
+      position: row.lastPosition,
+      progress: row.progress,
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  /**
+   * The one publish rule a regular viewer is held to, shared by streaming and
+   * watch-progress so the two can never disagree: the title must be
+   * PUBLISHED and, for an episode, so must its show — the same rule as
+   * MoviesService.findByIdOrThrow.
+   */
+  private static isHiddenFromViewers(movie: {
+    status: MovieStatus;
+    seriesId: string | null;
+    series: { status: SeriesStatus } | null;
+  }): boolean {
+    return (
+      movie.status !== MovieStatus.PUBLISHED ||
+      (movie.seriesId !== null &&
+        movie.series?.status !== SeriesStatus.PUBLISHED)
+    );
   }
 
   /** Watch history for a user (own profile, or an admin viewing any user). */

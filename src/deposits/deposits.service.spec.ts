@@ -3,6 +3,7 @@ import { Readable } from 'node:stream';
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -145,7 +146,9 @@ describe('DepositsService', () => {
       },
       // create() now checks the declared account is still active; tests
       // about a specific account override this per test.
-      paymentAccount: { findUnique: jest.fn().mockResolvedValue({ isActive: true }) },
+      paymentAccount: {
+        findUnique: jest.fn().mockResolvedValue({ isActive: true }),
+      },
       // The stored phone notifications (bank_transactions): create() looks
       // for a waiting transfer through $queryRaw (Q-BT1, default: none) and
       // links by updateMany; unlink reads the link by findUnique.
@@ -680,7 +683,7 @@ describe('DepositsService', () => {
                 email: true,
               },
             },
-            bankTransaction: { select: { id: true } },
+            bankTransaction: { select: { id: true, counterparty: true } },
           },
         }),
       );
@@ -753,6 +756,168 @@ describe('DepositsService', () => {
 
   describe('approve', () => {
     const admin = { id: 'admin-1', username: 'admin', role: 'ADMIN' } as never;
+
+    /** The approved row + the notification every happy path reads back. */
+    function primeApprove(pending: Record<string, unknown>) {
+      prisma.deposit.findUnique.mockResolvedValue(pending);
+      prisma.deposit.updateMany.mockResolvedValue({ count: 1 });
+      prisma.deposit.findUniqueOrThrow.mockResolvedValue(
+        makeDeposit({
+          ...pending,
+          status: DepositStatus.APPROVED,
+          approvedByUserId: 'admin-1',
+          approvedAt: new Date(),
+        }),
+      );
+      prisma.wallet.findUniqueOrThrow.mockResolvedValue({
+        balance: new Prisma.Decimal(10000),
+      });
+      prisma.notification.create.mockResolvedValue({
+        id: 'notif-1',
+        type: 'DEPOSIT_APPROVED',
+        title: 't',
+        message: 'm',
+        payload: {},
+        isRead: false,
+        createdAt: new Date(),
+      });
+    }
+
+    describe("M-11/M-14: a staff member's own deposit", () => {
+      it('is refused with 403 before the claim, and nothing moves', async () => {
+        prisma.deposit.findUnique.mockResolvedValue(
+          makeDeposit({ userId: 'admin-1' }),
+        );
+
+        await expect(service.approve('deposit-1', admin)).rejects.toThrow(
+          new ForbiddenException(
+            'You cannot approve a deposit into your own account',
+          ),
+        );
+        expect(prisma.deposit.updateMany).not.toHaveBeenCalled();
+        expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
+        expect(audit.record).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('M-15/M-7: the bank saw a different amount than the user typed', () => {
+      const mismatched = () =>
+        makeDeposit({
+          amount: new Prisma.Decimal(9000),
+          receivingAmount: new Prisma.Decimal(1000),
+          bankCheckedAt: new Date(),
+          matchStatus: 'SUSPICIOUS',
+          riskLevel: 'HIGH',
+          riskReasons: ['AMOUNT_MISMATCH'],
+        });
+
+      it('a plain approve is refused (409) before the claim — the row stays PENDING, no money moves', async () => {
+        prisma.deposit.findUnique.mockResolvedValue(mismatched());
+
+        await expect(service.approve('deposit-1', admin, {})).rejects.toThrow(
+          ConflictException,
+        );
+        expect(prisma.deposit.updateMany).not.toHaveBeenCalled();
+        expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
+      });
+
+      it('the flag without a reason is refused (400)', async () => {
+        prisma.deposit.findUnique.mockResolvedValue(mismatched());
+
+        await expect(
+          service.approve('deposit-1', admin, {
+            creditBankAmount: true,
+            overrideReason: '   ',
+          }),
+        ).rejects.toThrow(BadRequestException);
+        expect(prisma.deposit.updateMany).not.toHaveBeenCalled();
+      });
+
+      it('with the flag and a reason: credits the BANK amount, writes it on the row, the ledger row and the notification, and audits the override', async () => {
+        primeApprove(mismatched());
+        walletService.creditWithinTransaction.mockResolvedValue({
+          balance: new Prisma.Decimal(1500),
+        });
+
+        await service.approve('deposit-1', admin, {
+          creditBankAmount: true,
+          overrideReason: 'Receipt shows 1,000',
+        });
+
+        expect(walletService.creditWithinTransaction).toHaveBeenCalledWith(
+          prisma,
+          'user-1',
+          1000,
+        );
+        expect(prisma.deposit.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              status: DepositStatus.APPROVED,
+              amount: new Prisma.Decimal(1000),
+            }),
+          }),
+        );
+        expect(prisma.deposit.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: {
+              walletBalanceBefore: new Prisma.Decimal(500),
+              walletBalanceAfter: new Prisma.Decimal(1500),
+            },
+          }),
+        );
+        expect(prisma.transaction.create).toHaveBeenCalledWith({
+          data: expect.objectContaining({
+            amount: new Prisma.Decimal(1000),
+            type: TransactionType.DEPOSIT,
+          }),
+        });
+        expect(prisma.notification.create).toHaveBeenCalledWith({
+          data: expect.objectContaining({
+            message: expect.stringContaining('1000 Ks'),
+            payload: expect.objectContaining({ amount: 1000 }),
+          }),
+        });
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: 'deposit.approve',
+            metadata: expect.objectContaining({
+              creditedAmount: 1000,
+              amountOverride: true,
+              declaredAmount: 9000,
+              bankAmount: 1000,
+              overrideReason: 'Receipt shows 1,000',
+            }),
+          }),
+        );
+      });
+
+      it('when the amounts agree the flag is not needed and the typed amount is credited, as before', async () => {
+        primeApprove(
+          makeDeposit({
+            receivingAmount: new Prisma.Decimal(5000),
+            bankCheckedAt: new Date(),
+          }),
+        );
+
+        await service.approve('deposit-1', admin);
+
+        expect(walletService.creditWithinTransaction).toHaveBeenCalledWith(
+          prisma,
+          'user-1',
+          5000,
+        );
+        expect(prisma.deposit.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.not.objectContaining({ amount: expect.anything() }),
+          }),
+        );
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({
+            metadata: expect.not.objectContaining({ amountOverride: true }),
+          }),
+        );
+      });
+    });
 
     it('credits the wallet exactly once, creates a Transaction, and creates a Notification', async () => {
       const pending = makeDeposit();
@@ -874,7 +1039,7 @@ describe('DepositsService', () => {
                 email: true,
               },
             },
-            bankTransaction: { select: { id: true } },
+            bankTransaction: { select: { id: true, counterparty: true } },
           },
         }),
       );
@@ -1107,6 +1272,238 @@ describe('DepositsService', () => {
       ).rejects.toThrow(ConflictException);
     });
 
+    it("M-11/M-14: a staff member's own deposit cannot be rejected by them (403), nothing written", async () => {
+      prisma.deposit.findUnique.mockResolvedValue(
+        makeDeposit({ userId: 'admin-1' }),
+      );
+
+      await expect(
+        service.reject('deposit-1', admin, { reason: 'x' }),
+      ).rejects.toThrow(
+        new ForbiddenException(
+          'You cannot reject a deposit into your own account',
+        ),
+      );
+      expect(prisma.deposit.updateMany).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
+    describe('M-17: the bank transfer is given back', () => {
+      const rejectedNotification = {
+        id: 'notif-2',
+        type: 'DEPOSIT_REJECTED',
+        title: 't',
+        message: 'm',
+        payload: {},
+        isRead: false,
+        createdAt: new Date(),
+      };
+
+      it('a bank-checked row: the claim clears every bank column (event key included) and re-scores without the bank reasons; the transaction goes back to UNMATCHED in the same transaction; admins are told after commit', async () => {
+        prisma.deposit.findUnique.mockResolvedValue(
+          makeDeposit({
+            bankCheckedAt: new Date(),
+            receivingAmount: new Prisma.Decimal(1000),
+            receivingTransactionCode: '000123',
+            receivingTransactionAt: new Date(),
+            receivingEventKey: 'k'.repeat(64),
+            receivingScreenshotKey:
+              'documents/bank-screenshots/transactions/tx-1/x.png',
+            matchStatus: 'SUSPICIOUS',
+            riskLevel: 'HIGH',
+            riskReasons: ['AMOUNT_MISMATCH', 'DUPLICATE_REFERENCE'],
+          }),
+        );
+        prisma.deposit.updateMany.mockResolvedValue({ count: 1 });
+        prisma.deposit.findUniqueOrThrow.mockResolvedValue(
+          makeDeposit({ status: DepositStatus.REJECTED }),
+        );
+        prisma.notification.create.mockResolvedValue(rejectedNotification);
+        prisma.bankTransaction.findUnique
+          .mockResolvedValueOnce({ id: 'tx-1', state: 'MATCHED' })
+          .mockResolvedValueOnce({
+            id: 'tx-1',
+            state: 'UNMATCHED',
+            direction: 'RECEIVED',
+            amount: new Prisma.Decimal(1000),
+            occurredAt: new Date(),
+            postedAt: new Date(),
+            createdAt: new Date(),
+            linkedDepositId: null,
+            linkedWithdrawalId: null,
+            matchedAt: null,
+            screenshotKey: null,
+            counterparty: null,
+            txCode: 'X000123',
+            txCodeLast6: '000123',
+            paymentAccountId: 'acct-1',
+            deviceSerial: 'PIXEL10',
+            idempotencyKey: 'k'.repeat(64),
+            currency: 'MMK',
+            detailStatus: null,
+            updatedAt: new Date(),
+          });
+
+        await service.reject('deposit-1', admin, { reason: 'wrong row' });
+
+        expect(prisma.deposit.updateMany).toHaveBeenCalledWith({
+          where: { id: 'deposit-1', status: DepositStatus.PENDING },
+          data: expect.objectContaining({
+            status: DepositStatus.REJECTED,
+            rejectionReason: 'wrong row',
+            receivingAmount: null,
+            receivingTransactionCode: null,
+            receivingTransactionTime: null,
+            receivingTransactionAt: null,
+            receivingEventKey: null,
+            receivingScreenshotKey: null,
+            bankCheckedAt: null,
+            matchStatus: 'PENDING_REVIEW',
+            riskReasons: ['DUPLICATE_REFERENCE'],
+          }),
+        });
+        // Q-BT3, by the unique link column, inside the same transaction.
+        expect(prisma.bankTransaction.update).toHaveBeenCalledWith({
+          where: { id: 'tx-1' },
+          data: { state: 'UNMATCHED', linkedDepositId: null, matchedAt: null },
+        });
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: 'bank_transaction.unlink',
+            actor: admin,
+          }),
+        );
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: 'deposit.reject',
+            metadata: { reason: 'wrong row', unlinkedTransactionId: 'tx-1' },
+          }),
+        );
+        expect(
+          gateway.notifyAdminsDepositVerificationUpdated,
+        ).toHaveBeenCalledTimes(1);
+        expect(gateway.notifyAdminsBankTransactionUpdated).toHaveBeenCalledWith(
+          expect.objectContaining({ id: 'tx-1', state: 'UNMATCHED' }),
+        );
+        // The transaction's own screenshot is evidence — never deleted here.
+        expect(minio.deleteObject).not.toHaveBeenCalled();
+      });
+
+      it("M-16/M-17: rejecting also drops COUNTERPARTY_MISMATCH with the other bank-derived reasons — the sender name belonged to the transfer that is being given back; the submission's own reasons stay", async () => {
+        prisma.deposit.findUnique.mockResolvedValue(
+          makeDeposit({
+            bankCheckedAt: new Date(),
+            receivingAmount: new Prisma.Decimal(1000),
+            receivingTransactionCode: '000123',
+            matchStatus: 'PENDING_REVIEW',
+            riskLevel: 'MEDIUM',
+            riskReasons: ['COUNTERPARTY_MISMATCH', 'VELOCITY'],
+          }),
+        );
+        prisma.deposit.updateMany.mockResolvedValue({ count: 1 });
+        prisma.deposit.findUniqueOrThrow.mockResolvedValue(
+          makeDeposit({ status: DepositStatus.REJECTED }),
+        );
+        prisma.notification.create.mockResolvedValue(rejectedNotification);
+
+        await service.reject('deposit-1', admin, { reason: 'not this one' });
+
+        expect(prisma.deposit.updateMany).toHaveBeenCalledWith({
+          where: { id: 'deposit-1', status: DepositStatus.PENDING },
+          data: expect.objectContaining({
+            status: DepositStatus.REJECTED,
+            receivingAmount: null,
+            bankCheckedAt: null,
+            riskReasons: ['VELOCITY'],
+          }),
+        });
+        const written = prisma.deposit.updateMany.mock.calls[0][0].data;
+        expect(written.riskReasons).not.toContain('COUNTERPARTY_MISMATCH');
+      });
+
+      it('a legacy bank-checked row with no bank_transactions link: the bank columns are still cleared AND admins are still told after commit (no transaction push — there is none to give back)', async () => {
+        prisma.deposit.findUnique.mockResolvedValue(
+          makeDeposit({
+            bankCheckedAt: new Date(),
+            receivingAmount: new Prisma.Decimal(1000),
+            receivingTransactionCode: '000123',
+            receivingEventKey: 'k'.repeat(64),
+            matchStatus: 'SUSPICIOUS',
+            riskLevel: 'HIGH',
+            riskReasons: ['AMOUNT_MISMATCH'],
+          }),
+        );
+        prisma.deposit.updateMany.mockResolvedValue({ count: 1 });
+        prisma.deposit.findUniqueOrThrow.mockResolvedValue(
+          makeDeposit({ status: DepositStatus.REJECTED }),
+        );
+        prisma.notification.create.mockResolvedValue(rejectedNotification);
+        // Pre-table data: nothing in bank_transactions points at this row.
+        prisma.bankTransaction.findUnique.mockResolvedValue(null);
+
+        await service.reject('deposit-1', admin, { reason: 'legacy' });
+
+        expect(prisma.deposit.updateMany).toHaveBeenCalledWith({
+          where: { id: 'deposit-1', status: DepositStatus.PENDING },
+          data: expect.objectContaining({
+            status: DepositStatus.REJECTED,
+            receivingAmount: null,
+            receivingEventKey: null,
+            bankCheckedAt: null,
+            riskReasons: [],
+          }),
+        });
+        expect(prisma.bankTransaction.update).not.toHaveBeenCalled();
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: 'deposit.reject',
+            metadata: { reason: 'legacy', unlinkedTransactionId: null },
+          }),
+        );
+        expect(
+          gateway.notifyAdminsDepositVerificationUpdated,
+        ).toHaveBeenCalledTimes(1);
+        expect(
+          gateway.notifyAdminsDepositVerificationUpdated,
+        ).toHaveBeenCalledWith(expect.objectContaining({ id: 'deposit-1' }));
+        expect(
+          gateway.notifyAdminsBankTransactionUpdated,
+        ).not.toHaveBeenCalled();
+      });
+
+      it('a row the bank never checked: rejected exactly as before — no bank columns touched, no unlink, no admin push', async () => {
+        prisma.deposit.findUnique.mockResolvedValue(makeDeposit());
+        prisma.deposit.updateMany.mockResolvedValue({ count: 1 });
+        prisma.deposit.findUniqueOrThrow.mockResolvedValue(
+          makeDeposit({ status: DepositStatus.REJECTED }),
+        );
+        prisma.notification.create.mockResolvedValue(rejectedNotification);
+
+        await service.reject('deposit-1', admin, { reason: 'x' });
+
+        expect(prisma.deposit.updateMany).toHaveBeenCalledWith({
+          where: { id: 'deposit-1', status: DepositStatus.PENDING },
+          data: {
+            status: DepositStatus.REJECTED,
+            rejectionReason: 'x',
+            approvedByUserId: 'admin-1',
+            approvedAt: expect.any(Date),
+          },
+        });
+        expect(prisma.bankTransaction.findUnique).not.toHaveBeenCalled();
+        expect(prisma.bankTransaction.update).not.toHaveBeenCalled();
+        expect(
+          gateway.notifyAdminsDepositVerificationUpdated,
+        ).not.toHaveBeenCalled();
+        expect(audit.record).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: 'deposit.reject',
+            metadata: { reason: 'x' },
+          }),
+        );
+      });
+    });
+
     it('includes the depositing user on the response, so the admin table never shows "Unknown user" right after rejecting', async () => {
       prisma.deposit.findUnique.mockResolvedValue(makeDeposit());
       prisma.deposit.updateMany.mockResolvedValue({ count: 1 });
@@ -1140,7 +1537,7 @@ describe('DepositsService', () => {
                 email: true,
               },
             },
-            bankTransaction: { select: { id: true } },
+            bankTransaction: { select: { id: true, counterparty: true } },
           },
         }),
       );
@@ -1245,7 +1642,7 @@ describe('DepositsService', () => {
               email: true,
             },
           },
-          bankTransaction: { select: { id: true } },
+          bankTransaction: { select: { id: true, counterparty: true } },
         },
       });
       expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
@@ -1456,10 +1853,45 @@ describe('DepositsService', () => {
       prisma.paymentAccount.findUnique.mockResolvedValue({ id: 'acct-dest' });
     });
 
+    describe('M-11/M-14: whose account a manual deposit may go into', () => {
+      it("the recording admin's own account: 403 before anything is read or locked", async () => {
+        await expect(
+          service.createManual({ ...dto, userId: 'admin-1' }, admin),
+        ).rejects.toThrow(
+          new ForbiddenException(
+            'You cannot record a deposit into your own account',
+          ),
+        );
+        expect(lockAccountStatusMock).not.toHaveBeenCalled();
+        expect(prisma.deposit.create).not.toHaveBeenCalled();
+        expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
+      });
+
+      it('a staff account (any non-USER role): 403, nothing written', async () => {
+        prisma.user.findUnique.mockResolvedValue({
+          id: 'user-1',
+          role: 'ADMIN',
+        });
+
+        await expect(service.createManual(dto, admin)).rejects.toThrow(
+          new ForbiddenException(
+            'Manual deposits can only be recorded for customer accounts',
+          ),
+        );
+        expect(prisma.user.findUnique).toHaveBeenCalledWith({
+          where: { id: 'user-1' },
+          select: { role: true },
+        });
+        expect(prisma.deposit.create).not.toHaveBeenCalled();
+        expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
+        expect(audit.record).not.toHaveBeenCalled();
+      });
+    });
+
     it('rejects a reference the same user already has on a PENDING or APPROVED deposit, writing nothing', async () => {
       // The exact double-credit scenario: the user already submitted this
       // transfer through the app, and an admin records it manually too.
-      prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
+      prisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'USER' });
       prisma.deposit.findFirst.mockResolvedValue(
         makeDeposit({ status: DepositStatus.PENDING }),
       );
@@ -1484,7 +1916,7 @@ describe('DepositsService', () => {
     });
 
     it('rejects an unknown destination account with NotFound, writing nothing', async () => {
-      prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
+      prisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'USER' });
       prisma.paymentAccount.findUnique.mockResolvedValue(null);
 
       await expect(service.createManual(dto, admin)).rejects.toThrow(
@@ -1500,7 +1932,7 @@ describe('DepositsService', () => {
       // the pre-check ran), then the partial unique index rejects the
       // insert. The transaction is rolled back before the ledger credit,
       // wallet credit, Transaction row, notification and audit row.
-      prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
+      prisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'USER' });
       prisma.deposit.create.mockRejectedValue(makeP2002());
 
       await expect(service.createManual(dto, admin)).rejects.toThrow(
@@ -1523,7 +1955,7 @@ describe('DepositsService', () => {
     });
 
     it('rethrows a non-P2002 transaction failure untouched', async () => {
-      prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
+      prisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'USER' });
       prisma.deposit.create.mockRejectedValue(new Error('db down'));
 
       const attempt = service.createManual(dto, admin);
@@ -1534,7 +1966,7 @@ describe('DepositsService', () => {
     });
 
     it('creates the deposit directly APPROVED, credits the destination ledger and wallet, and records Transaction + Notification', async () => {
-      prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
+      prisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'USER' });
       const created = makeDeposit({
         status: DepositStatus.APPROVED,
         approvedByUserId: 'admin-1',
@@ -1630,7 +2062,7 @@ describe('DepositsService', () => {
     });
 
     it('persists wallet balance snapshots on the created deposit row, derived from the post-credit wallet (before = after - amount)', async () => {
-      prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
+      prisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'USER' });
       const created = makeDeposit({
         status: DepositStatus.APPROVED,
         approvedByUserId: 'admin-1',
@@ -1670,7 +2102,7 @@ describe('DepositsService', () => {
     });
 
     it('emits the same post-commit realtime events approve() does, including the destination-account update', async () => {
-      prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
+      prisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'USER' });
       const approvedAt = new Date();
       const created = makeDeposit({
         status: DepositStatus.APPROVED,
@@ -1729,7 +2161,7 @@ describe('DepositsService', () => {
     });
 
     it('falls back to the reference as the ledger reference when no transaction code was given, and stores null optionals', async () => {
-      prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
+      prisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'USER' });
       const created = makeDeposit({
         status: DepositStatus.APPROVED,
         approvedByUserId: 'admin-1',
@@ -1774,6 +2206,7 @@ describe('DepositsService', () => {
 
     it('share-locks the customer row before anything is written', async () => {
       // Stop right at the insert: only the order up to it matters here.
+      prisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'USER' });
       prisma.deposit.create.mockRejectedValue(new Error('stop here'));
 
       await expect(service.createManual(dto, admin)).rejects.toThrow(
@@ -1819,7 +2252,7 @@ describe('DepositsService', () => {
     });
 
     it('propagates a ledger NotFound (bogus destination account) before any wallet credit, and emits nothing', async () => {
-      prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
+      prisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'USER' });
       prisma.deposit.create.mockResolvedValue(
         makeDeposit({
           status: DepositStatus.APPROVED,
@@ -1915,7 +2348,9 @@ describe('DepositsService — bank verification', () => {
       },
       // create() now checks the declared account is still active; tests
       // about a specific account override this per test.
-      paymentAccount: { findUnique: jest.fn().mockResolvedValue({ isActive: true }) },
+      paymentAccount: {
+        findUnique: jest.fn().mockResolvedValue({ isActive: true }),
+      },
       // The stored phone notifications (bank_transactions): create() looks
       // for a waiting transfer through $queryRaw (Q-BT1, default: none) and
       // links by updateMany; unlink reads the link by findUnique.
@@ -2514,6 +2949,7 @@ describe('DepositsService — bank verification', () => {
             matchStatus: 'SUSPICIOUS',
             riskLevel: 'HIGH',
             riskReasons: ['AMOUNT_MISMATCH'],
+            creditedAmount: 5000,
           },
         }),
       );
@@ -2719,6 +3155,36 @@ describe('DepositsService — bank verification', () => {
           state: 'UNMATCHED',
           view: 'WAITING',
           hasScreenshot: true,
+        }),
+      );
+    });
+
+    it("M-16/M-17: unlink also drops COUNTERPARTY_MISMATCH — it came from the released transfer's sender name, so the row goes back to UNVERIFIED instead of a stale 'Needs review'", async () => {
+      prisma.deposit.findUnique.mockResolvedValue(
+        makeDeposit({
+          bankCheckedAt: new Date(),
+          receivingAmount: new Prisma.Decimal(1000),
+          receivingTransactionCode: '000123',
+          matchStatus: 'PENDING_REVIEW',
+          riskLevel: 'LOW',
+          riskReasons: ['COUNTERPARTY_MISMATCH'],
+        }),
+      );
+      prisma.deposit.update.mockResolvedValue(withUser(makeDeposit()));
+
+      await service.reviewVerification(
+        'deposit-1',
+        { action: 'unlink' },
+        admin,
+      );
+
+      expect(prisma.deposit.update.mock.calls[0][0].data).toEqual(
+        expect.objectContaining({
+          receivingAmount: null,
+          bankCheckedAt: null,
+          matchStatus: 'UNVERIFIED',
+          riskLevel: null,
+          riskReasons: [],
         }),
       );
     });

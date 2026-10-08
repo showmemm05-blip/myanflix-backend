@@ -42,6 +42,7 @@ describe('FeedbackService', () => {
       findMany: jest.Mock;
     };
     $transaction: jest.Mock;
+    $executeRaw: jest.Mock;
   };
 
   beforeEach(async () => {
@@ -53,13 +54,21 @@ describe('FeedbackService', () => {
         count: jest.fn().mockResolvedValue(0),
         findMany: jest.fn().mockResolvedValue([]),
       },
-      $transaction: jest.fn((operations: Promise<unknown>[]) =>
-        Promise.all(operations),
+      // Interactive transactions get the same mock back as `tx`, so every
+      // query the callback makes is visible on `prisma.feedback.*`.
+      $transaction: jest.fn((arg: unknown) =>
+        typeof arg === 'function'
+          ? (arg as (tx: unknown) => Promise<unknown>)(prisma)
+          : Promise.all(arg as Promise<unknown>[]),
       ),
+      $executeRaw: jest.fn().mockResolvedValue(1),
     };
 
     const module: TestingModule = await Test.createTestingModule({
-      providers: [FeedbackService, { provide: PrismaService, useValue: prisma }],
+      providers: [
+        FeedbackService,
+        { provide: PrismaService, useValue: prisma },
+      ],
     }).compile();
 
     service = module.get(FeedbackService);
@@ -122,10 +131,64 @@ describe('FeedbackService', () => {
       );
     });
 
+    it('takes a per-user advisory lock before counting, inside one transaction', async () => {
+      const order: string[] = [];
+      prisma.$executeRaw.mockImplementation(() => {
+        order.push('lock');
+        return Promise.resolve(1);
+      });
+      prisma.feedback.count.mockImplementation(() => {
+        order.push('count');
+        return Promise.resolve(0);
+      });
+      prisma.feedback.create.mockImplementation(() => {
+        order.push('create');
+        return Promise.resolve(createdRow());
+      });
+
+      await service.create('user-1', {
+        category: FeedbackCategory.BUG,
+        message: 'Still broken',
+      });
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(typeof prisma.$transaction.mock.calls[0][0]).toBe('function');
+      expect(order).toEqual(['lock', 'count', 'create']);
+
+      // Tagged template: strings in [0], the interpolated user id after.
+      const [strings, ...values] = prisma.$executeRaw.mock.calls[0];
+      expect(strings.join('?')).toContain(
+        "pg_advisory_xact_lock(hashtext('feedback.create'), hashtext(?))",
+      );
+      expect(values).toEqual(['user-1']);
+    });
+
+    it('throws the 429 inside the transaction so it rolls back', async () => {
+      prisma.feedback.count.mockResolvedValue(FEEDBACK_MAX_PER_HOUR);
+
+      await expect(
+        service.create('user-1', {
+          category: FeedbackCategory.BUG,
+          message: 'Still broken',
+        }),
+      ).rejects.toMatchObject({ status: HttpStatus.TOO_MANY_REQUESTS });
+
+      // The transaction callback itself rejected (nothing committed).
+      await expect(
+        prisma.$transaction.mock.results[0].value,
+      ).rejects.toMatchObject({
+        status: HttpStatus.TOO_MANY_REQUESTS,
+      });
+      expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+      expect(prisma.feedback.create).not.toHaveBeenCalled();
+    });
+
     it('limits per account, so one spammer cannot block everyone behind their IP', async () => {
       prisma.feedback.count.mockImplementation(
         ({ where }: { where: { userId: string } }) =>
-          Promise.resolve(where.userId === 'user-1' ? FEEDBACK_MAX_PER_HOUR : 0),
+          Promise.resolve(
+            where.userId === 'user-1' ? FEEDBACK_MAX_PER_HOUR : 0,
+          ),
       );
 
       await expect(
@@ -181,6 +244,7 @@ describe('FeedbackService', () => {
         }),
       ).rejects.toThrow(BadRequestException);
       expect(prisma.feedback.count).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
     });
   });
 
@@ -235,5 +299,4 @@ describe('FeedbackService', () => {
       expect(result).not.toHaveProperty('adminNote');
     });
   });
-
 });

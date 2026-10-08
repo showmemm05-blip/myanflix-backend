@@ -67,6 +67,11 @@ import {
   type NumberedChapter,
   type NumberedSection,
 } from './book-numbering';
+import {
+  describeBytes,
+  maxDocumentUploadBytes,
+} from '../uploads/upload-limits';
+import { MAX_SECTIONS_PER_CHAPTER } from './dto/document-limits';
 
 /**
  * What a reader is allowed to see. Staff browse every edition; a regular
@@ -83,35 +88,53 @@ const CATALOG_INCLUDE = {
   categories: true,
   editions: {
     orderBy: editionOrder,
-    include: {
-      _count: { select: { chapters: true } },
-      // How many chapters a reader could actually open. That — not the
-      // chapter count — is what "can this language be published?" means now,
-      // so the admin must not be left to guess it. Selected as ids rather
-      // than a filtered _count because Prisma cannot alias two counts of the
-      // same relation.
-      chapters: {
-        where: { status: ChapterStatus.READY },
-        select: { id: true },
-      },
-    },
+    // The READY count rides beside this one but is NOT included here: it is
+    // filled in afterwards by one grouped count (see readyChapterCounts),
+    // because a nested include would load the id of every ready chapter of
+    // every edition on the page just to take its length.
+    include: { _count: { select: { chapters: true } } },
   },
 } satisfies Prisma.BookInclude;
 
-type EditionWithCounts = BookEdition & {
-  _count: { chapters: number };
-  /** Only the READY ones — see CATALOG_INCLUDE. */
-  chapters: { id: string }[];
+/** An edition as the catalog include loads it — total chapter count only. */
+type EditionRow = BookEdition & { _count: { chapters: number } };
+
+type EditionWithCounts = EditionRow & {
+  /**
+   * How many chapters a reader could actually open. That — not the chapter
+   * count — is what "can this language be published?" means now, so the
+   * admin must not be left to guess it. See readyChapterCounts.
+   */
+  readyChapterCount: number;
 };
 
-export type BookWithRelations = Book & {
+/** A book as CATALOG_INCLUDE loads it, before the READY counts are added. */
+type BookRow = Book & {
   authorRef: { id: string; name: string; imageUrl: string | null } | null;
   categories: BookCategory[];
+  editions: EditionRow[];
+};
+
+export type BookWithRelations = Omit<BookRow, 'editions'> & {
   editions: EditionWithCounts[];
 };
 
 /** A chapter row decorated by book-numbering: `number` and numbered `sections`. */
 export type ChapterWithHierarchy = NumberedChapter<BookChapter, BookSection>;
+
+/**
+ * List/contents rows: every column except the document. The chapter list and
+ * the table of contents only ever return titles and numbers, so reading each
+ * chapter's and section's TipTap JSON there was megabytes of wasted I/O on a
+ * long written book. `omit` (not a hand-written select) so a new column is
+ * never silently dropped.
+ */
+type ChapterSummaryRow = Omit<BookChapter, 'content'>;
+type SectionSummaryRow = Omit<BookSection, 'content'>;
+export type ChapterSummaryWithHierarchy = NumberedChapter<
+  ChapterSummaryRow,
+  SectionSummaryRow
+>;
 export type SectionWithNumber = NumberedSection<BookSection>;
 export type PartWithCounts = BookPart & {
   number: number;
@@ -221,7 +244,7 @@ export class BooksService {
       this.prisma.book.count({ where }),
     ]);
 
-    return { items, total, page, limit };
+    return { items: await this.withReadyCounts(items), total, page, limit };
   }
 
   /**
@@ -240,6 +263,51 @@ export class BooksService {
     } satisfies Prisma.BookInclude;
   }
 
+  /**
+   * How many READY chapters each of these editions has, in ONE grouped
+   * count (served by the editionId index) — the same condition the old
+   * nested `chapters: { where: { status: READY } }` include used, so the
+   * number is identical. An edition with none is simply absent: 0.
+   */
+  private async readyChapterCounts(
+    editionIds: string[],
+  ): Promise<Map<string, number>> {
+    if (editionIds.length === 0) return new Map();
+    const groups = await this.prisma.bookChapter.groupBy({
+      by: ['editionId'],
+      where: { editionId: { in: editionIds }, status: ChapterStatus.READY },
+      _count: { _all: true },
+    });
+    return new Map(groups.map((g) => [g.editionId, g._count._all]));
+  }
+
+  /**
+   * Every path that hands a book to BookResponseDto goes through here, so
+   * readyChapterCount is the same number on the list, the detail and the
+   * create/update responses.
+   */
+  private async withReadyCounts(
+    books: BookRow[],
+  ): Promise<BookWithRelations[]> {
+    const counts = await this.readyChapterCounts(
+      books.flatMap((b) => b.editions.map((e) => e.id)),
+    );
+    return books.map((book) => ({
+      ...book,
+      editions: book.editions.map((e) => ({
+        ...e,
+        readyChapterCount: counts.get(e.id) ?? 0,
+      })),
+    }));
+  }
+
+  private async withReadyCount(
+    edition: EditionRow,
+  ): Promise<EditionWithCounts> {
+    const counts = await this.readyChapterCounts([edition.id]);
+    return { ...edition, readyChapterCount: counts.get(edition.id) ?? 0 };
+  }
+
   async findByIdOrThrow(
     id: string,
     viewerRole: Role,
@@ -254,7 +322,7 @@ export class BooksService {
     if (!book || (publishedOnly(viewerRole) && book.editions.length === 0)) {
       throw new NotFoundException('Book not found');
     }
-    return book;
+    return (await this.withReadyCounts([book]))[0];
   }
 
   /**
@@ -328,7 +396,7 @@ export class BooksService {
       after: bookSnapshot(book),
       metadata: { language },
     });
-    return book;
+    return (await this.withReadyCounts([book]))[0];
   }
 
   async update(
@@ -387,7 +455,7 @@ export class BooksService {
     ) {
       await this.deleteCoverObject(before.coverUrl, id, 'replaced');
     }
-    return after;
+    return (await this.withReadyCounts([after]))[0];
   }
 
   /**
@@ -528,18 +596,9 @@ export class BooksService {
 
     const created = await this.prisma.bookEdition.create({
       data: { bookId, ...this.newEditionData(book.type, dto.language) },
-      include: {
-        _count: { select: { chapters: true } },
-        // How many chapters a reader could actually open. That — not the
-        // chapter count — is what "can this language be published?" means now,
-        // so the admin must not be left to guess it. Selected as ids rather
-        // than a filtered _count because Prisma cannot alias two counts of the
-        // same relation.
-        chapters: {
-          where: { status: ChapterStatus.READY },
-          select: { id: true },
-        },
-      },
+      // readyChapterCount is added below by the same grouped count the
+      // catalog uses (see readyChapterCounts).
+      include: { _count: { select: { chapters: true } } },
     });
 
     await this.audit.record({
@@ -553,7 +612,7 @@ export class BooksService {
       after: bookEditionSnapshot(created),
       metadata: { bookId },
     });
-    return created;
+    return this.withReadyCount(created);
   }
 
   async updateEdition(
@@ -595,18 +654,9 @@ export class BooksService {
           ? { publishedAt: new Date() }
           : {}),
       },
-      include: {
-        _count: { select: { chapters: true } },
-        // How many chapters a reader could actually open. That — not the
-        // chapter count — is what "can this language be published?" means now,
-        // so the admin must not be left to guess it. Selected as ids rather
-        // than a filtered _count because Prisma cannot alias two counts of the
-        // same relation.
-        chapters: {
-          where: { status: ChapterStatus.READY },
-          select: { id: true },
-        },
-      },
+      // readyChapterCount is added below by the same grouped count the
+      // catalog uses (see readyChapterCounts).
+      include: { _count: { select: { chapters: true } } },
     });
 
     // One row per PUT: the status line it crosses picks the action, and the
@@ -624,7 +674,7 @@ export class BooksService {
       after: bookEditionSnapshot(updated),
       metadata: { bookId },
     });
-    return updated;
+    return this.withReadyCount(updated);
   }
 
   /**
@@ -947,15 +997,21 @@ export class BooksService {
     bookId: string,
     editionId: string,
     viewerRole: Role,
-  ): Promise<ChapterWithHierarchy[]> {
+  ): Promise<ChapterSummaryWithHierarchy[]> {
     await this.assertEditionVisible(bookId, editionId, viewerRole);
     const rows = await this.prisma.bookChapter.findMany({
       where: { editionId },
       orderBy: { order: 'asc' },
+      omit: { content: true },
     });
     // Canonical reading order — for an edition with no parts, exactly the
-    // orderBy above.
-    return this.decorateChapters(editionId, rows, { complete: true });
+    // orderBy above. `complete` means `flat` is exactly these rows, decorated
+    // — what decorateChapters would return — without any section documents.
+    const tree = await this.loadContentsTree(editionId, rows, {
+      complete: true,
+      sectionContent: false,
+    });
+    return tree.flat as ChapterSummaryWithHierarchy[];
   }
 
   async getChapterOrThrow(
@@ -1003,22 +1059,46 @@ export class BooksService {
     >[];
   }
 
-  private async loadContentsTree<T extends BookChapter>(
+  /**
+   * `sectionContent: false` leaves each section's document out of the read —
+   * only the summary routes (getChapters, getContents) ask for that. Every
+   * other caller feeds toChapterDetail, which returns the sections WITH
+   * their documents, so the default stays "read them".
+   */
+  private loadContentsTree(
     editionId: string,
-    rows: T[],
-    options: { complete?: boolean } = {},
+    rows: ChapterSummaryRow[],
+    options: { complete?: boolean; sectionContent: false },
   ): Promise<
-    ContentsTree<ChapterRowLike & { pageCount: number }, BookSection>
+    ContentsTree<ChapterRowLike & { pageCount: number }, SectionSummaryRow>
+  >;
+  private loadContentsTree(
+    editionId: string,
+    rows: ChapterSummaryRow[],
+    options?: { complete?: boolean; sectionContent?: true },
+  ): Promise<ContentsTree<ChapterRowLike & { pageCount: number }, BookSection>>;
+  private async loadContentsTree(
+    editionId: string,
+    rows: ChapterSummaryRow[],
+    options: { complete?: boolean; sectionContent?: boolean } = {},
+  ): Promise<
+    ContentsTree<ChapterRowLike & { pageCount: number }, SectionSummaryRow>
   > {
+    const sectionQuery = {
+      where: { chapterId: { in: rows.map((r) => r.id) } },
+      orderBy: positionOrder(),
+    };
     const [parts, sections, others] = await Promise.all([
       this.prisma.bookPart.findMany({
         where: { editionId },
         orderBy: positionOrder(),
       }),
-      this.prisma.bookSection.findMany({
-        where: { chapterId: { in: rows.map((r) => r.id) } },
-        orderBy: positionOrder(),
-      }),
+      options.sectionContent === false
+        ? this.prisma.bookSection.findMany({
+            ...sectionQuery,
+            omit: { content: true },
+          })
+        : this.prisma.bookSection.findMany(sectionQuery),
       options.complete
         ? Promise.resolve([] as (ChapterRowLike & { pageCount: number })[])
         : this.prisma.bookChapter.findMany({
@@ -1042,7 +1122,7 @@ export class BooksService {
       ...rows.filter((r) => !others.some((o) => o.id === r.id)),
     ];
 
-    const sectionsByChapter = new Map<string, BookSection[]>();
+    const sectionsByChapter = new Map<string, SectionSummaryRow[]>();
     for (const section of sections) {
       sectionsByChapter.set(section.chapterId, [
         ...(sectionsByChapter.get(section.chapterId) ?? []),
@@ -1161,10 +1241,35 @@ export class BooksService {
       const pdfKey =
         chapter.pdfKey ??
         this.storageService.bookPdfKey(bookId, editionId, chapterId);
-      const size = await this.minioService.objectSize(pdfKey);
-      if (size === null) {
+      const stat = await this.minioService.objectStat(pdfKey);
+      if (stat === null) {
         throw new BadRequestException(
           'No uploaded PDF found for this chapter — upload the file first',
+        );
+      }
+      const size = stat.size;
+      // The document budget, checked from the HEAD alone (M-24): a PDF over
+      // it is refused at the press, before the pipeline would download it.
+      const maxBytes = maxDocumentUploadBytes();
+      if (size > maxBytes) {
+        throw new BadRequestException(
+          `The uploaded PDF is ${size} bytes — a chapter PDF may be at most ${describeBytes(maxBytes)}`,
+        );
+      }
+      // A READY chapter whose pages were converted from THIS exact file has
+      // nothing to do: pressing Convert again used to re-download the whole
+      // PDF and re-run pdfinfo for zero new pages (M-9). Only a new file at
+      // the key (a different ETag) — or a chapter from before the ETag was
+      // tracked — may convert again. FAILED / DRAFT / orphaned PROCESSING
+      // rows are the retry path and are untouched by this.
+      if (
+        chapter.status === ChapterStatus.READY &&
+        chapter.pagesSourceEtag !== null &&
+        stat.etag !== null &&
+        stat.etag === chapter.pagesSourceEtag
+      ) {
+        throw new ConflictException(
+          'This chapter is already converted from this exact PDF — upload a new file to convert it again',
         );
       }
       await this.prisma.bookChapter.update({
@@ -1612,6 +1717,17 @@ export class BooksService {
     );
     await this.assertSectionShape(type, chapter, dto, true);
 
+    // A chapter's detail response carries every section's document (M-8),
+    // so the count is bounded along with each document's size.
+    const sectionCount = await this.prisma.bookSection.count({
+      where: { chapterId },
+    });
+    if (sectionCount >= MAX_SECTIONS_PER_CHAPTER) {
+      throw new BadRequestException(
+        `A chapter may have at most ${MAX_SECTIONS_PER_CHAPTER} sections`,
+      );
+    }
+
     const last = await this.prisma.bookSection.findFirst({
       where: { chapterId },
       orderBy: { order: 'desc' },
@@ -1780,20 +1896,24 @@ export class BooksService {
     viewerRole: Role,
   ): Promise<{
     bookType: BookType;
-    tree: ContentsTree<BookChapter, BookSection>;
+    tree: ContentsTree<ChapterSummaryRow, SectionSummaryRow>;
   }> {
     const edition = await this.assertEditionVisible(
       bookId,
       editionId,
       viewerRole,
     );
+    // Titles and numbers only — no chapter or section documents (see
+    // ChapterSummaryRow).
     const rows = await this.prisma.bookChapter.findMany({
       where: { editionId },
       orderBy: { order: 'asc' },
+      omit: { content: true },
     });
     const tree = (await this.loadContentsTree(editionId, rows, {
       complete: true,
-    })) as ContentsTree<BookChapter, BookSection>;
+      sectionContent: false,
+    })) as ContentsTree<ChapterSummaryRow, SectionSummaryRow>;
     return { bookType: edition.book.type, tree };
   }
 
@@ -1817,8 +1937,7 @@ export class BooksService {
     if (!edition || edition.bookId !== bookId) {
       throw new NotFoundException('Book edition not found');
     }
-    return edition as BookEdition &
-      Prisma.BookEditionGetPayload<{ include: T }>;
+    return edition;
   }
 
   /** The edition, if this viewer may read it — USERs only see PUBLISHED. */

@@ -6,7 +6,9 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-myanflix}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      # No fallback on purpose: a stack that boots with a password everyone
+      # knows is worse than one that refuses to start (M-33).
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in backend/.env}
       POSTGRES_DB: ${POSTGRES_DB:-myanflix}
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -22,11 +24,13 @@ services:
       # postgres:5432 is this compose network's internal address for the
       # service above — always correct here regardless of what host/port the
       # outside world reaches it on.
-      DATABASE_URL: postgresql://${POSTGRES_USER:-myanflix}:${POSTGRES_PASSWORD:-change-me-locally}@postgres:5432/${POSTGRES_DB:-myanflix}?schema=public
+      DATABASE_URL: postgresql://${POSTGRES_USER:-myanflix}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in backend/.env}@postgres:5432/${POSTGRES_DB:-myanflix}?schema=public
       NODE_ENV: production
       PORT: 3001
-      JWT_SECRET: ${JWT_SECRET}
-      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      # Both required, 32+ random characters each, never a placeholder, never
+      # equal (the backend checks all three at boot; M-33).
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in backend/.env (openssl rand -hex 32)}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET must be set in backend/.env (openssl rand -hex 32)}
       JWT_ACCESS_EXPIRES_IN: ${JWT_ACCESS_EXPIRES_IN:-15m}
       JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-7d}
       # Scratch only, on the backend-storage volume below. Every transient
@@ -43,8 +47,8 @@ services:
       # URLs, never for the backend's own server-side MinIO calls above.
       # Points at storage-server/upload-proxy, not MinIO's own port.
       MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:8443}
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set in backend/.env}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set in backend/.env}
       MINIO_BUCKET: ${MINIO_BUCKET:-movies}
       # Local: ../cacheserver. Real deployment: the cache server VPS's public
       # domain — end users' browsers fetch video bytes from here, not from
@@ -68,9 +72,10 @@ services:
       # Signs the path token on every playback link; must equal the cache
       # server's STREAM_SIGNING_SECRET. Deliberately no default — a missing
       # secret refuses to boot rather than minting links nobody can play.
-      STREAM_SIGNING_SECRET: ${STREAM_SIGNING_SECRET}
-      # Lifetime of a signed playback link in seconds (default 12 h).
-      STREAM_URL_TTL_SECONDS: ${STREAM_URL_TTL_SECONDS:-43200}
+      STREAM_SIGNING_SECRET: ${STREAM_SIGNING_SECRET:?STREAM_SIGNING_SECRET must be set in backend/.env (same value as cacheserver/.env)}
+      # Lifetime of a signed playback link in seconds (default 4 h — a link is
+      # a bearer URL anyone holding it can play, so keep it short; M-21).
+      STREAM_URL_TTL_SECONDS: ${STREAM_URL_TTL_SECONDS:-14400}
       # "Continue with Google" on the website: the OAuth Web client ID the
       # backend verifies every Google ID token's audience against. Must equal
       # the website's NEXT_PUBLIC_GOOGLE_CLIENT_ID. Empty = feature disabled
@@ -83,13 +88,51 @@ services:
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       # API rate limiting kill switch — "true" disables it. Never in prod.
       THROTTLE_DISABLED: ${THROTTLE_DISABLED:-false}
-      # Only these peers may set X-Forwarded-For for rate limiting (empty = API reached directly).
+      # Only a connection FROM these IPs may set X-Forwarded-For — for rate
+      # limiting, tracking rows and the socket gateway alike. Empty = the API
+      # is reached directly. REQUIRED once nginx/HTTPS sits in front (see
+      # DOCKER.md), or every visitor shares one rate-limit bucket.
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      # Browser origins allowed to call the API (comma-separated, e.g.
+      # https://admin.example.com,https://www.example.com). Empty = any
+      # origin, as before. The apps and curl send no Origin and are never
+      # affected. See DOCKER.md, "Browser origins (CORS)".
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
       # Bearer token the phone-monitor desktop app presents on
       # POST /bank-events/* and its socket handshake. Same value as the
       # phone-monitor's config.json (myanflix.token). Empty = bank-event
       # ingestion disabled (those routes answer 503). Never a user login.
       BANK_EVENTS_TOKEN: ${BANK_EVENTS_TOKEN:-}
+      # Server secret mixed into every 6-digit withdrawal code before it is
+      # hashed, so a leaked database alone gives no code away. 32+ chars
+      # (`openssl rand -hex 32`); set it ONCE and never change or remove it —
+      # codes saved under it could no longer be checked. Empty = codes are
+      # bcrypt-only (a warning is logged); a public production deployment
+      # refuses to boot without it.
+      WITHDRAWAL_CODE_PEPPER: ${WITHDRAWAL_CODE_PEPPER:-}
+      # Server secret that keys the HMAC every SMS one-time code is stored
+      # under (32+ chars). Empty = a key derived from JWT_SECRET (a warning is
+      # logged in production). Safe to change: only codes still in flight
+      # (5 minutes) stop working. Missing from this list until 2026-10-08, so
+      # a value in .env never reached the container before then.
+      OTP_CODE_PEPPER: ${OTP_CODE_PEPPER:-}
+      # LOCAL DEVELOPMENT ONLY: a fixed 6-digit code every OTP becomes, with
+      # no SMS sent. Empty = off (real codes). The backend refuses to start
+      # with it set on anything that looks like a real server (public cache,
+      # upload or CORS address, IS_PUBLIC=true, TRUSTED_PROXIES set). See
+      # .env.example and DOCKER.md, "Fixed dev OTP code".
+      OTP_DEV_CODE: ${OTP_DEV_CODE:-}
+      # How OTP codes are sent: "log" (default — nothing is sent, dev only)
+      # or "phone-gateway" (the company Android phone sends them from its
+      # own SIM). See .env.example for all five SMS_* settings.
+      SMS_PROVIDER: ${SMS_PROVIDER:-log}
+      # Bearer token the gateway phone presents on /api/sms-gateway/device/*.
+      # Required (32+ chars) when SMS_PROVIDER=phone-gateway. Empty = every
+      # device route answers 401.
+      SMS_GATEWAY_TOKEN: ${SMS_GATEWAY_TOKEN:-}
+      SMS_DAILY_CAP: ${SMS_DAILY_CAP:-1000}
+      SMS_DAILY_CAP_PER_PHONE: ${SMS_DAILY_CAP_PER_PHONE:-10}
+      SMS_GATEWAY_OFFLINE_AFTER_SECONDS: ${SMS_GATEWAY_OFFLINE_AFTER_SECONDS:-90}
     extra_hosts:
       # host.docker.internal is automatic on Docker Desktop (macOS/Windows);
       # this makes it also resolve on Linux Docker engines.

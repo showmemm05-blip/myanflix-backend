@@ -28,6 +28,7 @@ import type { PaymentAccountTransactionQueryDto } from './dto/payment-account-tr
 import type { AllPaymentAccountTransactionsQueryDto } from './dto/all-payment-account-transactions-query.dto';
 import type { CreateManualPaymentAccountTransactionDto } from './dto/create-manual-payment-account-transaction.dto';
 import { PaymentAccountLedgerService } from './payment-account-ledger.service';
+import { PaymentAccountEvents } from './payment-account-events';
 
 const ADMIN_INCLUDE = {
   createdBy: { select: { id: true, username: true, displayName: true } },
@@ -131,6 +132,7 @@ export class PaymentAccountsService {
     private readonly minioService: MinioService,
     private readonly permissionResolver: PermissionResolverService,
     private readonly audit: AuditService,
+    private readonly accountEvents: PaymentAccountEvents,
   ) {}
 
   /**
@@ -355,6 +357,7 @@ export class PaymentAccountsService {
       },
       include: ADMIN_INCLUDE,
     });
+    this.accountEvents.emitChanged();
     await this.audit.record({
       action: 'payment_account.create',
       actor,
@@ -386,6 +389,9 @@ export class PaymentAccountsService {
       data: { ...dto, updatedByUserId: actor.id },
       include: ADMIN_INCLUDE,
     });
+    // Saved: bank-event ingestion forgets its cached active flag now, so a
+    // deactivation applies to the very next bank event (bam-16).
+    this.accountEvents.emitChanged();
     await this.audit.record({
       action: 'payment_account.update',
       actor,
@@ -409,10 +415,13 @@ export class PaymentAccountsService {
     });
     if (!before) throw new NotFoundException('Payment account not found');
 
-    const inUse = await this.prisma.paymentAccountTransaction.count({
+    // An existence check: stops at the first ledger row instead of counting
+    // the account's whole history (db-12).
+    const inUse = await this.prisma.paymentAccountTransaction.findFirst({
       where: { paymentAccountId: id },
+      select: { id: true },
     });
-    if (inUse > 0) {
+    if (inUse) {
       throw new ConflictException(
         'This account has transaction history and cannot be deleted. Deactivate it instead.',
       );
@@ -435,6 +444,7 @@ export class PaymentAccountsService {
       );
     }
     await this.prisma.paymentAccount.delete({ where: { id } });
+    this.accountEvents.emitChanged();
     await this.audit.record({
       action: 'payment_account.delete',
       actor,

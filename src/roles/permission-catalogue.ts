@@ -116,6 +116,16 @@ export const PERMISSION_CATALOGUE = [
   },
   { key: 'SETTINGS', label: 'Settings', actions: ['VIEW', 'MANAGE'] },
   {
+    // The "Home promos" admin page (2026-10-08): hero slides, the spotlight,
+    // coming-soon cards and the home settings (web address, store links,
+    // games teaser). VIEW reads them, MANAGE creates/edits/reorders/deletes.
+    // The public GET /home/showcase needs neither. Seeded to ADMIN by the
+    // home_promos migration; SUPER_ADMIN holds both implicitly.
+    key: 'HOME',
+    label: 'Home promos',
+    actions: ['VIEW', 'MANAGE'],
+  },
+  {
     // VIEW is the only action: the log is append-only and read through
     // GET /audit alone. It exposes staff IPs and user agents un-masked, so
     // no seeded role besides the protected SUPER_ADMIN (which holds the

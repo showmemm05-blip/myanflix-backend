@@ -14,6 +14,8 @@ import {
   WITHDRAWAL_PAYOUT_WINDOW_MS,
   amountsEqual,
   codesEqual,
+  counterpartyMatches,
+  counterpartyReasons,
   depositTimingReasons,
   isNoBankTransaction,
   isPlainCode,
@@ -243,6 +245,36 @@ describe('individual rules', () => {
       expect(
         referenceTwinReasons(me, [{ userId: 'u2', amount: D(5001) }]),
       ).toEqual(['DUPLICATE_REFERENCE']);
+    });
+  });
+
+  describe('counterpartyMatches / counterpartyReasons (M-16)', () => {
+    it('ignores case, spaces, punctuation and honorifics — either side containing the other is a match', () => {
+      expect(counterpartyMatches('U KO KO AUNG', 'Ko Ko Aung')).toBe(true);
+      expect(counterpartyMatches('ko-ko aung.', 'KO KO AUNG')).toBe(true);
+      expect(counterpartyMatches('Ko Ko', 'Ko Ko Aung')).toBe(true);
+      expect(counterpartyMatches('MAUNG MAUNG', 'Ko Ko Aung')).toBe(false);
+    });
+
+    it('a missing or empty side is never a mismatch', () => {
+      expect(counterpartyMatches(null, 'Ko Ko')).toBe(true);
+      expect(counterpartyMatches('Ko Ko', null)).toBe(true);
+      expect(counterpartyMatches('Ko Ko', undefined)).toBe(true);
+      expect(counterpartyMatches('...', 'Ko Ko')).toBe(true);
+      expect(counterpartyMatches('', '')).toBe(true);
+    });
+
+    it('is a SOFT reason: alone it scores PENDING_REVIEW / LOW, never SUSPICIOUS', () => {
+      expect(counterpartyReasons('MAUNG MAUNG', 'Ko Ko')).toEqual([
+        'COUNTERPARTY_MISMATCH',
+      ]);
+      expect(counterpartyReasons('U KO KO', 'Ko Ko')).toEqual([]);
+      expect(HARD_REASONS.has('COUNTERPARTY_MISMATCH')).toBe(false);
+      expect(scoreVerification(['COUNTERPARTY_MISMATCH'], true)).toEqual({
+        matchStatus: BankMatchStatus.PENDING_REVIEW,
+        riskLevel: BankRiskLevel.LOW,
+        riskReasons: ['COUNTERPARTY_MISMATCH'],
+      });
     });
   });
 

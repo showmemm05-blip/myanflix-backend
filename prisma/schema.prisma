@@ -31,12 +31,38 @@ enum UserStatus {
   CLOSED
 }
 
-/// What an OTP code was requested for (POST /auth/otp/request `purpose`).
-/// Every verify path accepts only its own: LOGIN for POST /auth/otp/verify,
-/// PASSWORD_RESET for POST /auth/password/reset.
+/// What an OTP code was requested for. Every verify path accepts only its
+/// own: LOGIN for POST /auth/otp/verify, PASSWORD_RESET for POST
+/// /auth/password/reset (both requested through POST /auth/otp/request
+/// `purpose`), and WITHDRAWAL_CODE_RESET for the signed-in "forgot
+/// withdrawal code" flow (requested and verified only through
+/// /users/me/withdrawal-code/reset/*, never through /auth/otp/request).
 enum OtpPurpose {
   LOGIN
   PASSWORD_RESET
+  WITHDRAWAL_CODE_RESET
+}
+
+/// Where one outgoing SMS is in the phone-gateway pipeline (SmsMessage).
+/// QUEUED -> LEASED (the gateway phone took it) -> SENT (the SIM accepted
+/// it) -> DELIVERED / DELIVERY_FAILED (the carrier's delivery report), or
+/// LEASED -> FAILED (the phone could not send it). The sweeper moves a
+/// QUEUED row past its expiry to EXPIRED and a LEASED row whose lease ran
+/// out with no result to UNKNOWN (the phone may or may not have sent it —
+/// nothing is ever re-queued, so a code is sent at most once). A QUEUED row
+/// becomes CANCELLED when a newer code for the same phone and purpose
+/// replaces the one it carries, or when that phone's account is closed:
+/// the phone never gets it.
+enum SmsMessageStatus {
+  QUEUED
+  LEASED
+  SENT
+  DELIVERED
+  FAILED
+  DELIVERY_FAILED
+  EXPIRED
+  UNKNOWN
+  CANCELLED
 }
 
 enum MovieStatus {
@@ -345,6 +371,23 @@ model User {
   /// the 15-minute access token expires. NULL = never revoked.
   sessionsRevokedAt DateTime?
 
+  /// The 6-digit withdrawal code every POST /withdrawals must carry, as a
+  /// bcrypt hash (same cost as passwords) — never the code itself, and never
+  /// returned by any route or written to any log. NULL = the account has no
+  /// code yet: its next withdrawal first creates one (WithdrawalCodeService).
+  withdrawalCodeHash        String?
+  /// When the current code was created, changed or reset. Also the version a
+  /// "forgot code" reset step token is bound to, so one SMS check sets at
+  /// most one new code.
+  withdrawalCodeSetAt       DateTime?
+  /// Wrong codes in a row since the last right one (or since the last lock
+  /// ran out). The 5th locks the code for 15 minutes; a right code resets it.
+  withdrawalCodeFailedCount Int       @default(0)
+  /// Set by the 5th wrong code in a row: until then every code — even the
+  /// right one — is refused. A lock in the past means "lock over, counter
+  /// starts again from 0". The SMS reset clears it.
+  withdrawalCodeLockedUntil DateTime?
+
   wallet                              Wallet?
   purchases                           Purchase[]
   seriesPurchases                     SeriesPurchase[]
@@ -366,6 +409,7 @@ model User {
   walletAdjustmentsPerformed          WalletAdjustment[]          @relation("WalletAdjustmentPerformedBy")
   appRole                             AppRole?                    @relation("UserAppRole", fields: [appRoleId], references: [id], onDelete: SetNull)
   comments                            Comment[]
+  commentPostEvents                   CommentPostEvent[]
   feedbacks                           Feedback[]                  @relation("FeedbackAuthor")
   handledFeedbacks                    Feedback[]                  @relation("FeedbackHandledBy")
   searchQueries                       SearchQuery[]
@@ -373,8 +417,14 @@ model User {
   sessions                            UserSession[]
   bookReadingProgress                 BookReadingProgress[]
   auditLogs                           AuditLog[]
+  homePromosCreated                   HomePromo[]                 @relation("HomePromoCreatedBy")
+  homeSettingsUpdates                 HomeSettings[]              @relation("HomeSettingsUpdatedBy")
 
   @@index([appRoleId])
+  /// Sign-up range counts on the analytics dashboard.
+  @@index([createdAt])
+  /// Admin subscribers list: role = USER, newest first.
+  @@index([role, createdAt(sort: Desc)])
   @@map("users")
 }
 
@@ -420,7 +470,6 @@ model AppRolePermission {
   role AppRole @relation(fields: [roleId], references: [id], onDelete: Cascade)
 
   @@unique([roleId, permission])
-  @@index([roleId])
   @@map("app_role_permissions")
 }
 
@@ -437,6 +486,7 @@ model RefreshToken {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+  @@index([expiresAt])
   @@map("refresh_tokens")
 }
 
@@ -444,26 +494,141 @@ model RefreshToken {
 /// phone number itself is the identity, since verifying it is what creates
 /// or authenticates the account.
 ///
-/// `code` is stored in plaintext (unlike RefreshToken's hashed tokens) as a
-/// deliberate, temporary testing-stage choice: no SMS provider is wired in
-/// yet (see SmsService), so this is how the code is actually retrieved
-/// during development. Once a real provider sends the code over SMS, this
-/// should switch to a hash, matching RefreshToken's pattern.
+/// `codeHash` (M-1) is an HMAC-SHA256 of the 6 digits under a server secret
+/// (OTP_CODE_PEPPER, or a key derived from JWT_SECRET) — see
+/// src/otp/otp-code.hasher.ts. The plain code is never written here, so a
+/// database read alone cannot reset a password or sign in. With
+/// SMS_PROVIDER=log (the development default, see SmsService) the code is
+/// read from the backend log; with phone-gateway the company phone sends
+/// it (SmsMessage.body carries the text until it is sent).
 ///
 /// `purpose` binds the code to the flow it was requested for: a sign-in code
 /// never resets a password, and a reset code never signs anyone in.
+///
+/// Rows older than a day are swept by OtpService every night (a code lives
+/// 5 minutes; the hourly request cap only looks back one hour).
 model OtpCode {
   id           String     @id @default(uuid())
   phone        String
-  code         String
+  codeHash     String
   purpose      OtpPurpose @default(LOGIN)
   expiresAt    DateTime
   consumedAt   DateTime?
   attemptCount Int        @default(0)
   createdAt    DateTime   @default(now())
 
+  /// The SMS that carries this code, when SMS_PROVIDER=phone-gateway.
+  smsMessage SmsMessage?
+
   @@index([phone])
   @@map("otp_codes")
+}
+
+/// One outgoing SMS for the company gateway phone (SMS_PROVIDER=
+/// phone-gateway). SmsService queues it; the phone long-polls
+/// GET /sms-gateway/device/jobs, which leases the oldest QUEUED row
+/// atomically (FOR UPDATE SKIP LOCKED), sends it from its own SIM and
+/// reports back through POST /sms-gateway/device/jobs/:id/result.
+///
+/// `otpCodeId` is UNIQUE so one code can never be queued twice. `body`
+/// holds the code — never log it. `expiresAt` is the code's own expiry: a
+/// row still QUEUED after it is swept to EXPIRED instead of being sent late.
+/// The sweeper replaces `body` with "[redacted]" once the row is final and
+/// an hour old; closing the account redacts `phone` and `body` at once.
+model SmsMessage {
+  id             String           @id @default(uuid()) @db.Uuid
+  otpCodeId      String?          @unique
+  otpCode        OtpCode?         @relation(fields: [otpCodeId], references: [id], onDelete: SetNull)
+  phone          String
+  body           String
+  status         SmsMessageStatus @default(QUEUED)
+  /// The gateway device that leased it (sms_gateway_devices.id, not a FK).
+  deviceId       String?
+  leasedAt       DateTime?
+  /// min(leasedAt + 60 s, expiresAt); past it with no result -> UNKNOWN.
+  leaseExpiresAt DateTime?
+  sentAt         DateTime?
+  deliveredAt    DateTime?
+  /// When FAILED or DELIVERY_FAILED was reported.
+  failedAt       DateTime?
+  errorCode      String?
+  errorMessage   String?
+  expiresAt      DateTime
+  /// When `body` (and, on account close, `phone`) was replaced with
+  /// "[redacted]"; null while the row still holds them.
+  redactedAt     DateTime?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  @@index([status, createdAt])
+  @@index([expiresAt])
+  /// The daily-cap count and the staff status card read "rows created
+  /// since UTC midnight".
+  @@index([createdAt])
+  /// The per-phone daily cap, the resend cancel and the account-close
+  /// redaction all look rows up by phone.
+  @@index([phone, createdAt])
+  /// The sweeper's redaction pass: only rows still holding their body.
+  @@index([createdAt], map: "sms_messages_unredacted_createdAt_idx", where: raw("\"redactedAt\" IS NULL"))
+  @@map("sms_messages")
+}
+
+/// The company phone(s) running the SMS gateway app, keyed by the stable
+/// uuid the app generates once (X-Device-Id). One row per device, upserted
+/// by every heartbeat; a job poll refreshes lastSeenAt too. The gateway is
+/// "online" while some device was seen within
+/// SMS_GATEWAY_OFFLINE_AFTER_SECONDS.
+model SmsGatewayDevice {
+  id             String   @id
+  lastSeenAt     DateTime
+  appVersion     String
+  /// Battery percentage, 0-100.
+  battery        Int
+  charging       Boolean
+  /// Android's 0-4 signal bars; null when unknown.
+  signalLevel    Int?
+  networkType    String?
+  simOperator    String?
+  /// Results the phone has stored but not yet uploaded.
+  pendingResults Int      @default(0)
+  lastError      String?
+  /// The phone's own verdict in its last heartbeat: false while it cannot
+  /// send (no permission, no SIM, no service, ...). A device that says so
+  /// counts as offline — codes are refused with the 503 and it is leased
+  /// nothing. True when the app does not report it.
+  canSend        Boolean  @default(true)
+  /// Why canSend is false, in the app's own short words (<= 64 chars).
+  notReadyReason String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@map("sms_gateway_devices")
+}
+
+/// The ONE phone the shared SMS_GATEWAY_TOKEN is bound to (H-5 / H-7,
+/// 2026-10-06). A single row (id 1). The first device uuid that presents
+/// the right token is pinned here; every other uuid is refused with 401
+/// and recorded as a rejection so the admin card can warn. A super admin
+/// clears the pin (DELETE /sms-gateway/binding) after a phone reinstall;
+/// the next device to present the token is then pinned.
+model SmsGatewayBinding {
+  id                   Int       @id @default(1)
+  /// The pinned device uuid; null while nothing is pinned (fresh install,
+  /// or right after a staff reset).
+  deviceId             String?
+  pinnedAt             DateTime?
+  /// The last device that presented the right token under another uuid.
+  lastRejectedDeviceId String?
+  lastRejectedAt       DateTime?
+  /// Refusals since the pin was set (cleared by a reset).
+  rejectedCount        Int       @default(0)
+  /// The last staff reset: when and by which user id.
+  resetAt              DateTime?
+  resetById            String?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@map("sms_gateway_binding")
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +683,14 @@ model Movie {
 
   @@index([status])
   @@index([seriesId, seasonNumber, episodeNumber])
+  /// The public catalogue page: standalone movies (seriesId IS NULL) of one
+  /// status, newest first, tie-broken by id — exactly the default
+  /// RECENTLY_ADDED order. status is a key column rather than part of the
+  /// WHERE so the index still matches when Prisma sends the status as a
+  /// bound parameter; the predicate is a literal IS NULL, which Prisma
+  /// renders as-is. Reads `limit` entries and stops instead of sorting the
+  /// whole catalogue (and its episodes) on every page.
+  @@index([status, createdAt(sort: Desc), id(sort: Desc)], map: "movies_standalone_recent_idx", where: raw("\"seriesId\" IS NULL"))
   @@map("movies")
 }
 
@@ -556,7 +729,8 @@ model Series {
   purchases  SeriesPurchase[]
   comments   Comment[]
 
-  @@index([status])
+  // Ends in id to match every series list order ([createdAt desc, id desc]).
+  @@index([status, createdAt(sort: Desc), id(sort: Desc)])
   @@map("series")
 }
 
@@ -889,6 +1063,8 @@ model BookReadingProgress {
 
   @@unique([userId, editionId])
   @@index([editionId])
+  @@index([chapterId])
+  @@index([sectionId])
   @@map("book_reading_progress")
 }
 
@@ -978,6 +1154,8 @@ model UploadSession {
   movie Movie @relation(fields: [movieId], references: [id], onDelete: Cascade)
 
   @@index([movieId])
+  /// Daily cleanup sweeps filter on status + updatedAt age.
+  @@index([status, updatedAt])
   @@map("upload_sessions")
 }
 
@@ -1015,6 +1193,10 @@ model MultipartUploadSession {
   updatedAt     DateTime     @updatedAt
 
   @@index([resourceType, resourceId])
+  /// Daily cleanup sweeps filter on status + updatedAt age, and match MinIO
+  /// uploads back to rows by minioUploadId.
+  @@index([status, updatedAt])
+  @@index([minioUploadId])
   @@map("multipart_upload_sessions")
 }
 
@@ -1063,7 +1245,7 @@ model Transaction {
   /// Back-relation only: the withdrawal whose held money this row records (C-4).
   heldWithdrawal   Withdrawal?       @relation("WithdrawalHold")
 
-  @@index([userId])
+  @@index([userId, createdAt(sort: Desc)])
   @@index([createdAt])
   @@map("transactions")
 }
@@ -1091,7 +1273,8 @@ model WalletAdjustment {
   performedBy User?        @relation("WalletAdjustmentPerformedBy", fields: [performedByUserId], references: [id], onDelete: SetNull)
   transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
 
-  @@index([userId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([performedByUserId])
   @@index([createdAt])
   @@map("wallet_adjustments")
 }
@@ -1218,12 +1401,13 @@ model Deposit {
   /// `userId_reference` in DepositWhereUniqueInput — never findUnique/upsert
   /// by it, it is only unique among PENDING/APPROVED rows.
   @@unique([userId, reference], where: raw("status = ANY (ARRAY['PENDING'::\"DepositStatus\", 'APPROVED'::\"DepositStatus\"])"), map: "deposits_user_reference_active_key")
-  @@index([userId])
   @@index([status])
   @@index([reference])
   @@index([createdAt])
   @@index([declaredPaymentAccountId])
   @@index([receivingPaymentAccountId])
+  /// Staff-account deletion SETs NULL here; without an index that is a scan.
+  @@index([approvedByUserId])
   /// The OPEN SET — deposits still waiting for their bank notification. A
   /// row enters it at create and leaves it for good the moment it is
   /// matched, approved or rejected, so these three partial indexes hold
@@ -1238,8 +1422,10 @@ model Deposit {
   @@index([declaredPaymentAccountId, reference], map: "deposits_open_match_idx", where: raw("status = 'PENDING'::\"DepositStatus\" AND \"bankCheckedAt\" IS NULL"))
   @@index([createdAt], map: "deposits_open_createdAt_idx", where: raw("status = 'PENDING'::\"DepositStatus\" AND \"bankCheckedAt\" IS NULL"))
   /// VELOCITY = "rows by this user inside the last few minutes" — reads
-  /// only the rows inside the window, where deposits_userId_idx would read
-  /// a heavy user's whole history and filter createdAt per row.
+  /// only the rows inside the window, where a userId-only index would read
+  /// a heavy user's whole history and filter createdAt per row. Also serves
+  /// every userId-only lookup and the user FK (it replaced the separate
+  /// deposits_userId_idx on 2026-10-07).
   @@index([userId, createdAt])
   /// The "verified" / "needs review" admin filters ordered by createdAt
   /// DESC — a paginated scan reads `limit` entries and stops. Not partial:
@@ -1345,10 +1531,15 @@ model Withdrawal {
   /// Back-relation only — see Deposit.bankTransaction.
   bankTransaction        BankTransaction?            @relation("BankTransactionWithdrawal")
 
-  @@index([userId])
-  @@index([status])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status, createdAt(sort: Desc)])
   @@index([createdAt])
   @@index([transferPaymentAccountId])
+  /// The user-relationships search looks withdrawals up by payout account
+  /// number (accountNumber IN (...)) on every wave.
+  @@index([accountNumber])
+  /// Staff-account deletion SETs NULL here; without an index that is a scan.
+  @@index([approvedByUserId])
   /// DUPLICATE_PAYOUT_CODE = "this payout code already sits on another
   /// withdrawal". Without an index that check is a sequential scan. Plain,
   /// not unique: the decision is flag-not-block.
@@ -1580,11 +1771,12 @@ model PaymentAccountTransaction {
   relatedWithdrawal Withdrawal?    @relation("WithdrawalLedgerEntries", fields: [relatedWithdrawalId], references: [id], onDelete: SetNull)
   performedBy       User?          @relation("PaymentAccountTransactionPerformedBy", fields: [performedByUserId], references: [id], onDelete: SetNull)
 
-  @@index([paymentAccountId])
+  @@index([paymentAccountId, createdAt(sort: Desc)])
   @@index([type])
   @@index([createdAt])
   @@index([relatedDepositId])
   @@index([relatedWithdrawalId])
+  @@index([performedByUserId])
   @@map("payment_account_transactions")
 }
 
@@ -1664,6 +1856,8 @@ model WatchHistory {
 
   @@unique([userId, movieId])
   @@index([movieId])
+  /// Continue-watching list: one user, most recently watched first.
+  @@index([userId, updatedAt(sort: Desc)])
   @@map("watch_history")
 }
 
@@ -1683,7 +1877,7 @@ model Notification {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId])
+  @@index([userId, createdAt(sort: Desc)])
   @@index([userId, isRead])
   @@map("notifications")
 }
@@ -1737,13 +1931,31 @@ model Comment {
   parent  Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
   replies Comment[] @relation("CommentReplies")
 
-  @@index([movieId])
-  @@index([seriesId])
-  @@index([bookId])
+  /// The public thread: one target's visible top-level comments, newest
+  /// first. Each also serves its target's plain lookups and FK cascade.
+  @@index([movieId, parentId, status, createdAt])
+  @@index([seriesId, parentId, status, createdAt])
+  @@index([bookId, parentId, status, createdAt])
   @@index([userId])
   @@index([parentId])
   @@index([createdAt])
   @@map("comments")
+}
+
+/// One row per comment an account posted, kept when the comment itself is
+/// deleted. CommentsService counts these for its per-account posting limit,
+/// so deleting your own comments cannot hand the allowance back (security
+/// audit 2026-10-06, M-6). Rows older than the day window are pruned on the
+/// account's next post, so the table never holds more than a day per user.
+model CommentPostEvent {
+  id        String   @id @default(uuid())
+  userId    String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("comment_post_events")
 }
 
 /// Free-text feedback submitted from the website or the app. Kept forever
@@ -1873,7 +2085,7 @@ model UserSession {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId])
+  @@index([userId, lastSeenAt(sort: Desc)])
   @@index([lastSeenAt])
   @@index([ipAddress])
   @@map("user_sessions")
@@ -1960,4 +2172,104 @@ model AuditLog {
   @@index([action, createdAt])
   @@index([category, createdAt])
   @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Home showcase (the "Home promos" admin page, 2026-10-08)
+// ---------------------------------------------------------------------------
+
+/// Where a home promo appears. HERO = a slide interleaved with the featured
+/// titles in the home carousel; SPOTLIGHT = the "New this week" banner (the
+/// first live one wins); COMING_SOON = a card in the "Coming soon" strip.
+enum HomePromoKind {
+  HERO
+  SPOTLIGHT
+  COMING_SOON
+}
+
+/// What a promo's button does. MOVIE / SERIES / BOOK open that title
+/// (HomePromo.targetId); URL opens HomePromo.url; NONE shows no button.
+enum HomePromoCtaTarget {
+  SUBSCRIBE
+  ADD_MONEY
+  MOVIE
+  SERIES
+  BOOK
+  URL
+  NONE
+}
+
+/// The drawn artwork a promo uses when it has no uploaded image — each app
+/// draws these scenes itself (the showcase design boards' SVG scenes).
+enum HomePromoArtPreset {
+  PREMIUM
+  PAYMENT
+  GAMES
+  GENERIC
+}
+
+/// One staff-managed home promo. Every user-facing text comes as an
+/// English + Burmese pair. `targetId` is polymorphic (a movie, series or
+/// book id, by ctaTarget), so it has no foreign key: a promo whose title was
+/// deleted or unpublished is simply skipped (or, for COMING_SOON, shown
+/// without its link) by GET /home/showcase. Live = isActive and now inside
+/// [startsAt, endsAt) — either bound may be open.
+model HomePromo {
+  id          String             @id @default(uuid())
+  kind        HomePromoKind
+  titleEn     String
+  titleMm     String
+  kickerEn    String?
+  kickerMm    String?
+  bodyEn      String?
+  bodyMm      String?
+  ctaLabelEn  String?
+  ctaLabelMm  String?
+  ctaTarget   HomePromoCtaTarget @default(NONE)
+  targetId    String?
+  /// http(s) link, set only when ctaTarget = URL.
+  url         String?
+  artPreset   HomePromoArtPreset @default(GENERIC)
+  /// Absolute URL of one of our own uploads (images/<purpose>/...), stored
+  /// canonical and re-hosted per request like every other image URL.
+  imageUrl    String?
+  /// Short free text for a coming-soon card ("December", "2027"); never a
+  /// computed date.
+  dateText    String?
+  startsAt    DateTime?
+  endsAt      DateTime?
+  isActive    Boolean            @default(true)
+  /// Position within its kind, 0 first.
+  sortOrder   Int                @default(0)
+  createdById String?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  createdBy User? @relation("HomePromoCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  /// GET /home/showcase reads the active promos of every kind in order.
+  @@index([kind, isActive, sortOrder])
+  @@index([createdById])
+  @@map("home_promos")
+}
+
+/// Single global row for the home page's settings, created on the first
+/// PUT /home/settings (reads fall back to the defaults below until then).
+/// A NULL link means "not set": the card or badge that needs it does not
+/// render.
+model HomeSettings {
+  id                  String   @id @default(uuid())
+  webUrl              String?
+  appStoreUrl         String?
+  playStoreUrl        String?
+  gamesTeaserEnabled  Boolean  @default(true)
+  gamesTeaserDateText String?
+  updatedByUserId     String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  updatedBy User? @relation("HomeSettingsUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([updatedByUserId])
+  @@map("home_settings")
 }

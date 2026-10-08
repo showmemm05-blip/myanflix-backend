@@ -2,13 +2,61 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { decimalToNumber } from '../common/utils/decimal.util';
-import { TransactionType, type Prisma } from '../generated/prisma/client';
+import { Prisma, TransactionType } from '../generated/prisma/client';
 
 /** Revenue-bearing transaction types — everything that ever put money in, purchases (historical) and subscriptions (current). */
 const REVENUE_TRANSACTION_TYPES = [
   TransactionType.PURCHASE,
   TransactionType.SUBSCRIPTION,
 ];
+
+/** `"type" IN (...)` for the revenue types, as bound, enum-cast parameters. */
+const REVENUE_TYPES_SQL = Prisma.join(
+  REVENUE_TRANSACTION_TYPES.map(
+    (type) => Prisma.sql`${type}::"TransactionType"`,
+  ),
+);
+
+/**
+ * The IANA timezone this process's local-time getters use (`TZ`; UTC in the
+ * backend container). The weekly and monthly chart buckets are keyed in it.
+ */
+export function processTimeZone(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+}
+
+/**
+ * How finely getRevenueTrend's SQL groups transactions so every chart key
+ * stays exact. 'day' when this process's UTC offset is the same all year
+ * (UTC — the backend container — or a zone without daylight saving, such as
+ * Asia/Yangon). Under daylight saving, weekNumber() counts milliseconds
+ * since local 1 January, so its day boundary can fall away from local
+ * midnight: grouping by the hour keeps it exact when every offset is a whole
+ * number of hours, and by the minute when one is not (e.g. Australia/
+ * Adelaide at +9:30/+10:30, or Lord_Howe at +10:30/+11).
+ */
+export function revenueGroupUnit(now = new Date()): 'day' | 'hour' | 'minute' {
+  const year = now.getFullYear();
+  return groupUnitForOffsets(
+    [year - 1, year].flatMap((y) =>
+      [0, 6].map((month) => new Date(y, month, 1).getTimezoneOffset()),
+    ),
+  );
+}
+
+/** revenueGroupUnit's rule, given the zone's UTC offsets in minutes. */
+export function groupUnitForOffsets(
+  offsets: number[],
+): 'day' | 'hour' | 'minute' {
+  if (new Set(offsets).size === 1) return 'day';
+  return offsets.every((offset) => offset % 60 === 0) ? 'hour' : 'minute';
+}
+
+/** One SQL row of getRevenueTrend: a group's revenue and one of its timestamps. */
+export interface RevenueDayRow {
+  amount: Prisma.Decimal;
+  createdAt: Date;
+}
 
 const TOP_N = 5;
 const MONTH_LABELS = [
@@ -87,42 +135,42 @@ export class FinanceService {
   ) {}
 
   async getDashboard() {
-    const [
-      totalRevenueAgg,
-      monthlyRevenueAgg,
-      dailyRevenueAgg,
-      topMovies,
-      topUsers,
-    ] = await Promise.all([
-      this.prisma.transaction.aggregate({
-        _sum: { amount: true },
-        where: { type: { in: REVENUE_TRANSACTION_TYPES } },
-      }),
-      this.prisma.transaction.aggregate({
-        _sum: { amount: true },
-        where: {
-          type: { in: REVENUE_TRANSACTION_TYPES },
-          createdAt: { gte: startOfMonth() },
-        },
-      }),
-      this.prisma.transaction.aggregate({
-        _sum: { amount: true },
-        where: {
-          type: { in: REVENUE_TRANSACTION_TYPES },
-          createdAt: { gte: startOfToday() },
-        },
-      }),
+    const [totals, topMovies, topUsers] = await Promise.all([
+      this.getRevenueTotals(),
       this.getTopMovies(),
       this.getTopUsers(),
     ]);
 
     return {
-      totalRevenue: decimalToNumber(totalRevenueAgg._sum.amount),
-      monthlyRevenue: decimalToNumber(monthlyRevenueAgg._sum.amount),
-      dailyRevenue: decimalToNumber(dailyRevenueAgg._sum.amount),
+      totalRevenue: decimalToNumber(totals?.total),
+      monthlyRevenue: decimalToNumber(totals?.month),
+      dailyRevenue: decimalToNumber(totals?.today),
       topMovies,
       topUsers,
     };
+  }
+
+  /**
+   * All-time, this-month and today revenue in ONE pass over the revenue
+   * rows (bam-02) — it used to be three separate SUMs, the all-time one a
+   * full table scan of its own. Same rows, same exact numeric sums: each
+   * total is NULL (shown as 0) when no row matches, exactly as before.
+   */
+  private async getRevenueTotals() {
+    const rows = await this.prisma.$queryRaw<
+      {
+        total: Prisma.Decimal | null;
+        month: Prisma.Decimal | null;
+        today: Prisma.Decimal | null;
+      }[]
+    >`
+      SELECT
+        sum("amount") AS "total",
+        sum("amount") FILTER (WHERE "createdAt" >= ${startOfMonth()}) AS "month",
+        sum("amount") FILTER (WHERE "createdAt" >= ${startOfToday()}) AS "today"
+      FROM "transactions"
+      WHERE "type" IN (${REVENUE_TYPES_SQL})`;
+    return rows[0];
   }
 
   /** Daily/weekly/monthly revenue series for the admin dashboard's trend chart. */
@@ -130,13 +178,22 @@ export class FinanceService {
     const oneYearAgo = new Date();
     oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
 
-    const transactions = await this.prisma.transaction.findMany({
-      where: {
-        type: { in: REVENUE_TRANSACTION_TYPES },
-        createdAt: { gte: oneYearAgo },
-      },
-      select: { amount: true, createdAt: true },
-    });
+    // bam-01: Postgres sums the year into day rows (about 366; hour or
+    // minute rows only under daylight saving, see revenueGroupUnit) instead of sending
+    // every revenue transaction here. Each row groups the transactions that
+    // share BOTH their UTC day (the DAILY key) and their date in this
+    // process's timezone (the WEEKLY/MONTHLY keys), and carries the earliest
+    // real createdAt of the group, so every bucket key below comes out
+    // exactly as it did for each single transaction. In the container
+    // (TZ=UTC) the two dates are the same day.
+    const transactions = await this.prisma.$queryRaw<RevenueDayRow[]>`
+      SELECT sum("amount")::numeric AS "amount", min("createdAt") AS "createdAt"
+      FROM "transactions"
+      WHERE "type" IN (${REVENUE_TYPES_SQL})
+        AND "createdAt" >= ${oneYearAgo}
+      GROUP BY
+        date_trunc(${revenueGroupUnit()}, "createdAt"),
+        date_trunc('day', ("createdAt" AT TIME ZONE 'UTC') AT TIME ZONE ${processTimeZone()})`;
 
     return {
       daily: this.bucketRevenue(transactions, 14, DAILY_GRANULARITY),

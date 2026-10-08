@@ -8,6 +8,7 @@ import { UpdateBookPartDto } from '../../books/dto/part.dto';
 import { UpdateBookSectionDto } from '../../books/dto/section.dto';
 import { UpdateBookDto } from '../../books/dto/update-book.dto';
 import { UpdateCategoryDto } from '../../categories/dto/update-category.dto';
+import { UpdateHomePromoDto } from '../../home/dto/home-promo.dto';
 import { UpdateLevelDto } from '../../levels/dto/level.dto';
 import { UpdateMovieDto } from '../../movies/dto/update-movie.dto';
 import { UpdatePaymentAccountDto } from '../../payment-accounts/dto/update-payment-account.dto';
@@ -41,6 +42,7 @@ describe('update DTOs carry no class-property initializers', () => {
     ['UpdateBookSectionDto', UpdateBookSectionDto],
     ['UpdateBookDto', UpdateBookDto],
     ['UpdateCategoryDto', UpdateCategoryDto],
+    ['UpdateHomePromoDto', UpdateHomePromoDto],
     ['UpdateLevelDto', UpdateLevelDto],
     ['UpdateMovieDto', UpdateMovieDto],
     ['UpdatePaymentAccountDto', UpdatePaymentAccountDto],

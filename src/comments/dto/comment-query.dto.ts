@@ -1,15 +1,31 @@
-import { IsOptional, IsUUID } from 'class-validator';
+import { Type } from 'class-transformer';
+import { IsInt, IsOptional, IsUUID, Max, Min } from 'class-validator';
+import { PUBLIC_COMMENT_LIMIT } from '../comments.service';
 
 /**
  * Which title's comments to list. Exactly one of the three is required —
  * enforced in the service, same either/or rule as CreateCommentDto.
  *
- * Deliberately not paginated: a title's comment thread is read whole by both
- * clients (the section renders every top-level comment with its replies
- * nested underneath), and PUBLIC_LIMIT in the service caps how much a single
- * request can pull.
+ * `page`/`limit` page the top-level comments. Both are optional and default
+ * to the first page of PUBLIC_COMMENT_LIMIT, which is exactly what the
+ * clients read today — they render a whole thread and send neither.
+ * Replies ride along capped at REPLY_PREVIEW_LIMIT per comment; the rest
+ * come from `GET /comments/:id/replies`.
  */
 export class CommentQueryDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(PUBLIC_COMMENT_LIMIT)
+  limit?: number;
+
   @IsOptional()
   @IsUUID('4')
   movieId?: string;

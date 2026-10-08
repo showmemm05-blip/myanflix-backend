@@ -166,6 +166,7 @@ describe('LevelsService', () => {
     transaction: { aggregate: jest.Mock; groupBy: jest.Mock };
     $transaction: jest.Mock;
   };
+  let audit: { record: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
@@ -179,17 +180,19 @@ describe('LevelsService', () => {
         aggregate: jest.fn(),
       },
       transaction: { aggregate: jest.fn(), groupBy: jest.fn() },
-      $transaction: jest.fn(),
+      // Every write runs in an interactive transaction (L-38); the same mock
+      // is handed back as `tx`, so assertions see the writes either way.
+      $transaction: jest.fn(async (fn: (tx: unknown) => Promise<unknown>) =>
+        fn(prisma),
+      ),
     };
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         LevelsService,
         { provide: PrismaService, useValue: prisma },
-        {
-          provide: AuditService,
-          useValue: { record: jest.fn().mockResolvedValue(undefined) },
-        },
+        { provide: AuditService, useValue: audit },
       ],
     }).compile();
 
@@ -393,6 +396,51 @@ describe('LevelsService', () => {
       });
       expect(created.threshold).toBe(20000); // plain number, not Decimal
     });
+
+    // L-38: the level and its audit row commit together or not at all.
+    it('creates the level and writes its audit row inside one transaction (audit gets the tx)', async () => {
+      prisma.userLevel.findFirst.mockResolvedValue(null);
+      prisma.userLevel.aggregate.mockResolvedValue({ _max: { order: 6 } });
+      prisma.userLevel.create.mockResolvedValue(
+        makeRow({ id: 'level-7', name: 'Ruby', order: 7 }),
+      );
+
+      await service.create(
+        { name: 'Ruby', threshold: 20000, icon: 'shield', color: '#FF0000' },
+        actor,
+      );
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'level.create',
+          actor,
+          target: { type: 'level', id: 'level-7', label: 'Ruby' },
+          tx: prisma,
+        }),
+      );
+      const txStarted = prisma.$transaction.mock.invocationCallOrder[0];
+      expect(
+        prisma.userLevel.create.mock.invocationCallOrder[0],
+      ).toBeGreaterThan(txStarted);
+      expect(audit.record.mock.invocationCallOrder[0]).toBeGreaterThan(
+        prisma.userLevel.create.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('fails the create when the audit write fails, so the transaction rolls the level back', async () => {
+      prisma.userLevel.findFirst.mockResolvedValue(null);
+      prisma.userLevel.aggregate.mockResolvedValue({ _max: { order: 6 } });
+      prisma.userLevel.create.mockResolvedValue(makeRow());
+      audit.record.mockRejectedValueOnce(new Error('audit table unavailable'));
+
+      await expect(
+        service.create(
+          { name: 'Ruby', threshold: 20000, icon: 'shield', color: '#FF0000' },
+          actor,
+        ),
+      ).rejects.toThrow('audit table unavailable');
+    });
   });
 
   describe('update', () => {
@@ -412,18 +460,108 @@ describe('LevelsService', () => {
         service.update('level-1', { threshold: 0 }, actor),
       ).resolves.toBeDefined();
     });
+
+    // L-38: a threshold change and its audit row commit together or not at all.
+    it('updates the level and writes its audit row inside one transaction (audit gets the tx)', async () => {
+      const before = makeRow({ threshold: new Prisma.Decimal(0) });
+      prisma.userLevel.findUnique.mockResolvedValue(before);
+      prisma.userLevel.findFirst.mockResolvedValue(null);
+      prisma.userLevel.update.mockResolvedValue(
+        makeRow({ threshold: new Prisma.Decimal(50) }),
+      );
+
+      const result = await service.update('level-1', { threshold: 50 }, actor);
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'level.update',
+          actor,
+          target: { type: 'level', id: 'level-1', label: 'Starter' },
+          tx: prisma,
+        }),
+      );
+      const txStarted = prisma.$transaction.mock.invocationCallOrder[0];
+      expect(
+        prisma.userLevel.update.mock.invocationCallOrder[0],
+      ).toBeGreaterThan(txStarted);
+      expect(audit.record.mock.invocationCallOrder[0]).toBeGreaterThan(
+        prisma.userLevel.update.mock.invocationCallOrder[0],
+      );
+      expect(result.threshold).toBe(50);
+    });
+
+    it('fails the update when the audit write fails, so the transaction rolls the change back', async () => {
+      prisma.userLevel.findUnique.mockResolvedValue(makeRow());
+      prisma.userLevel.findFirst.mockResolvedValue(null);
+      prisma.userLevel.update.mockResolvedValue(makeRow());
+      audit.record.mockRejectedValueOnce(new Error('audit table unavailable'));
+
+      await expect(
+        service.update('level-1', { threshold: 50 }, actor),
+      ).rejects.toThrow('audit table unavailable');
+    });
+  });
+
+  describe('remove', () => {
+    it('404s on an unknown id without deleting anything', async () => {
+      prisma.userLevel.findUnique.mockResolvedValue(null);
+
+      await expect(service.remove('missing', actor)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      expect(prisma.userLevel.delete).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    // L-38: the delete and its audit row commit together or not at all.
+    it('deletes the level and writes its audit row inside one transaction (audit gets the tx)', async () => {
+      prisma.userLevel.findUnique.mockResolvedValue(makeRow({ name: 'Gold' }));
+      prisma.userLevel.delete.mockResolvedValue(undefined);
+
+      await service.remove('level-1', actor);
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.userLevel.delete).toHaveBeenCalledWith({
+        where: { id: 'level-1' },
+      });
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'level.delete',
+          actor,
+          target: { type: 'level', id: 'level-1', label: 'Gold' },
+          tx: prisma,
+        }),
+      );
+      const txStarted = prisma.$transaction.mock.invocationCallOrder[0];
+      expect(
+        prisma.userLevel.delete.mock.invocationCallOrder[0],
+      ).toBeGreaterThan(txStarted);
+      expect(audit.record.mock.invocationCallOrder[0]).toBeGreaterThan(
+        prisma.userLevel.delete.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('fails the delete when the audit write fails, so the transaction restores the level', async () => {
+      prisma.userLevel.findUnique.mockResolvedValue(makeRow());
+      prisma.userLevel.delete.mockResolvedValue(undefined);
+      audit.record.mockRejectedValueOnce(new Error('audit table unavailable'));
+
+      await expect(service.remove('level-1', actor)).rejects.toThrow(
+        'audit table unavailable',
+      );
+    });
   });
 
   describe('reorder', () => {
-    it('applies every update inside one transaction', async () => {
+    it('applies every update and the one audit row inside one transaction', async () => {
       prisma.userLevel.findMany
         .mockResolvedValueOnce([{ id: 'l1' }, { id: 'l2' }]) // existence check
         .mockResolvedValueOnce([
           makeRow({ id: 'l2', name: 'Bronze', order: 1 }),
           makeRow({ id: 'l1', name: 'Starter', order: 2 }),
         ]); // findAll after
-      prisma.$transaction.mockResolvedValue([]);
-      prisma.userLevel.update.mockImplementation((args: unknown) => args);
+      prisma.userLevel.update.mockResolvedValue(undefined);
 
       const result = await service.reorder(
         {
@@ -436,10 +574,57 @@ describe('LevelsService', () => {
       );
 
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-      expect((prisma.$transaction.mock.calls[0][0] as unknown[]).length).toBe(
-        2,
+      expect(prisma.userLevel.update).toHaveBeenCalledTimes(2);
+      expect(prisma.userLevel.update).toHaveBeenNthCalledWith(1, {
+        where: { id: 'l2' },
+        data: { order: 1 },
+      });
+      expect(prisma.userLevel.update).toHaveBeenNthCalledWith(2, {
+        where: { id: 'l1' },
+        data: { order: 2 },
+      });
+      const txStarted = prisma.$transaction.mock.invocationCallOrder[0];
+      for (const call of prisma.userLevel.update.mock.invocationCallOrder) {
+        expect(call).toBeGreaterThan(txStarted);
+      }
+      // L-38: the audit row is the last write of the same transaction.
+      expect(audit.record).toHaveBeenCalledTimes(1);
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'level.reorder',
+          actor,
+          target: { type: 'level', id: null, label: '2 levels' },
+          metadata: { before: ['l1', 'l2'], after: ['l2', 'l1'] },
+          tx: prisma,
+        }),
+      );
+      expect(audit.record.mock.invocationCallOrder[0]).toBeGreaterThan(
+        prisma.userLevel.update.mock.invocationCallOrder[1],
       );
       expect(result.map((l) => l.id)).toEqual(['l2', 'l1']);
+    });
+
+    it('fails the reorder when the audit write fails, so the transaction restores the old order', async () => {
+      prisma.userLevel.findMany.mockResolvedValueOnce([
+        { id: 'l1' },
+        { id: 'l2' },
+      ]);
+      prisma.userLevel.update.mockResolvedValue(undefined);
+      audit.record.mockRejectedValueOnce(new Error('audit table unavailable'));
+
+      await expect(
+        service.reorder(
+          {
+            items: [
+              { id: 'l2', order: 1 },
+              { id: 'l1', order: 2 },
+            ],
+          },
+          actor,
+        ),
+      ).rejects.toThrow('audit table unavailable');
+      // findAll (the second findMany) never ran: the error left the transaction.
+      expect(prisma.userLevel.findMany).toHaveBeenCalledTimes(1);
     });
 
     it('404s when any id is unknown and writes nothing', async () => {

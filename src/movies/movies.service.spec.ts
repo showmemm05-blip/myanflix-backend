@@ -608,6 +608,27 @@ describe('buildMovieWhere', () => {
     expect(where.OR).toBeUndefined();
     expect(where.title).toBeUndefined();
   });
+
+  /**
+   * ids only narrows: a USER/guest asking for an unpublished movie or an
+   * episode by id still gets nothing back, because PUBLISHED and
+   * seriesId = null stay in the same where.
+   */
+  it('ids narrows to those titles and keeps PUBLISHED standalone-only for a USER', () => {
+    const where = buildMovieWhere(
+      { ids: ['m1', 'm2'], status: MovieStatus.DRAFT },
+      Role.USER,
+    );
+    expect(where).toEqual({
+      id: { in: ['m1', 'm2'] },
+      status: MovieStatus.PUBLISHED,
+      seriesId: null,
+    });
+  });
+
+  it('an empty ids list adds nothing', () => {
+    expect(buildMovieWhere({ ids: [] }, Role.USER).id).toBeUndefined();
+  });
 });
 
 describe('movieOrderBy — the sort mapping table', () => {
@@ -929,6 +950,148 @@ describe('MoviesService — catalog sort paths, facets, and metadata normalizati
       });
       expect(prisma.watchHistory.groupBy).not.toHaveBeenCalled();
       expect(result.items.map((m) => m.id)).toEqual(['m-1', 'm-2']);
+    });
+  });
+
+  /**
+   * The per-movie counts are a whole-table aggregate, so they are reused for
+   * 60s. The visibility `where` must still be applied on EVERY request —
+   * the cache may make the ranking a minute old, never widen what a viewer
+   * can see.
+   */
+  describe('popularity counts cache (60s)', () => {
+    afterEach(() => jest.restoreAllMocks());
+
+    it('runs the watch-history groupBy once for back-to-back pages, but scans with the where every time', async () => {
+      prisma.movie.findMany.mockResolvedValue([]);
+
+      await service.findAll({ sort: MovieSort.MOST_VIEWED }, Role.USER);
+      await service.findAll(
+        { sort: MovieSort.MOST_VIEWED, page: 2, genres: ['Action'] },
+        Role.USER,
+      );
+
+      expect(prisma.watchHistory.groupBy).toHaveBeenCalledTimes(1);
+      expect(prisma.movie.findMany).toHaveBeenCalledTimes(2);
+      for (const [args] of prisma.movie.findMany.mock.calls) {
+        expect(args.where).toMatchObject({
+          status: MovieStatus.PUBLISHED,
+          seriesId: null,
+        });
+      }
+      expect(prisma.movie.findMany.mock.calls[1][0].where.genre).toEqual({
+        equals: 'Action',
+        mode: 'insensitive',
+      });
+    });
+
+    it('requests that arrive together share one groupBy', async () => {
+      prisma.movie.findMany.mockResolvedValue([]);
+
+      await Promise.all([
+        service.findAll({ sort: MovieSort.MOST_VIEWED }, Role.USER),
+        service.findAll({ sort: MovieSort.MOST_VIEWED }, Role.USER),
+        service.findAll({ sort: MovieSort.MOST_VIEWED }, Role.ADMIN),
+      ]);
+
+      expect(prisma.watchHistory.groupBy).toHaveBeenCalledTimes(1);
+    });
+
+    it('is keyed by sort — mostPurchased has its own entry', async () => {
+      prisma.movie.findMany.mockResolvedValue([]);
+
+      await service.findAll({ sort: MovieSort.MOST_VIEWED }, Role.USER);
+      await service.findAll({ sort: MovieSort.MOST_PURCHASED }, Role.USER);
+      await service.findAll({ sort: MovieSort.MOST_PURCHASED }, Role.USER);
+
+      expect(prisma.watchHistory.groupBy).toHaveBeenCalledTimes(1);
+      expect(prisma.purchase.groupBy).toHaveBeenCalledTimes(1);
+    });
+
+    it('recounts after 60 seconds', async () => {
+      prisma.movie.findMany.mockResolvedValue([]);
+      const now = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+
+      await service.findAll({ sort: MovieSort.MOST_VIEWED }, Role.USER);
+      now.mockReturnValue(1_000_000 + 59_999);
+      await service.findAll({ sort: MovieSort.MOST_VIEWED }, Role.USER);
+      expect(prisma.watchHistory.groupBy).toHaveBeenCalledTimes(1);
+
+      now.mockReturnValue(1_000_000 + 60_001);
+      await service.findAll({ sort: MovieSort.MOST_VIEWED }, Role.USER);
+      expect(prisma.watchHistory.groupBy).toHaveBeenCalledTimes(2);
+    });
+
+    it('a failed count is not cached — the next request retries', async () => {
+      prisma.movie.findMany.mockResolvedValue([]);
+      prisma.watchHistory.groupBy.mockRejectedValueOnce(new Error('db down'));
+
+      await expect(
+        service.findAll({ sort: MovieSort.MOST_VIEWED }, Role.USER),
+      ).rejects.toThrow('db down');
+      await service.findAll({ sort: MovieSort.MOST_VIEWED }, Role.USER);
+
+      expect(prisma.watchHistory.groupBy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('getMostPurchased — 60s cache', () => {
+    afterEach(() => jest.restoreAllMocks());
+
+    it('caches the ranking for 60 seconds but reads the PUBLISHED rows fresh every time', async () => {
+      const now = jest.spyOn(Date, 'now').mockReturnValue(5_000_000);
+      prisma.purchase.groupBy.mockResolvedValue([
+        { movieId: 'm-2', _count: { movieId: 5 } },
+        { movieId: 'm-1', _count: { movieId: 2 } },
+      ]);
+      prisma.movie.findMany.mockResolvedValue([{ id: 'm-1' }, { id: 'm-2' }]);
+
+      const first = await service.getMostPurchased();
+      const second = await service.getMostPurchased();
+
+      expect(first.map((m) => m.id)).toEqual(['m-2', 'm-1']);
+      expect(second.map((m) => m.id)).toEqual(['m-2', 'm-1']);
+      expect(prisma.purchase.groupBy).toHaveBeenCalledTimes(1);
+      // The visibility read is never cached.
+      expect(prisma.movie.findMany).toHaveBeenCalledTimes(2);
+      for (const call of prisma.movie.findMany.mock.calls) {
+        expect(call[0].where).toEqual({
+          id: { in: ['m-2', 'm-1'] },
+          status: MovieStatus.PUBLISHED,
+        });
+      }
+
+      now.mockReturnValue(5_000_000 + 60_001);
+      await service.getMostPurchased();
+      expect(prisma.purchase.groupBy).toHaveBeenCalledTimes(2);
+    });
+
+    it('a title unpublished inside the 60 seconds leaves the row at once', async () => {
+      jest.spyOn(Date, 'now').mockReturnValue(7_000_000);
+      prisma.purchase.groupBy.mockResolvedValue([
+        { movieId: 'm-2', _count: { movieId: 5 } },
+        { movieId: 'm-1', _count: { movieId: 2 } },
+      ]);
+      prisma.movie.findMany
+        .mockResolvedValueOnce([{ id: 'm-1' }, { id: 'm-2' }])
+        // Staff unpublished m-2: the PUBLISHED-filtered read no longer finds it.
+        .mockResolvedValueOnce([{ id: 'm-1' }]);
+
+      await service.getMostPurchased();
+      const after = await service.getMostPurchased();
+
+      expect(after.map((m) => m.id)).toEqual(['m-1']);
+      expect(prisma.purchase.groupBy).toHaveBeenCalledTimes(1);
+    });
+
+    it('a failure is not cached', async () => {
+      prisma.purchase.groupBy
+        .mockRejectedValueOnce(new Error('db down'))
+        .mockResolvedValueOnce([]);
+
+      await expect(service.getMostPurchased()).rejects.toThrow('db down');
+      await expect(service.getMostPurchased()).resolves.toEqual([]);
+      expect(prisma.purchase.groupBy).toHaveBeenCalledTimes(2);
     });
   });
 

@@ -366,12 +366,42 @@ export class RolesService {
     return explicit + fallback;
   }
 
+  /**
+   * countUsers for a whole list in two grouped queries (bam-11) instead of
+   * up to two counts per role one after another: the explicit assignments
+   * grouped by appRoleId, and the NULL-fallback accounts grouped by their
+   * `role` enum. Same meaning as countUsers, role for role.
+   */
   private async countUsersByRole(
     roles: { id: string; key: string; isSystem: boolean }[],
   ): Promise<Map<string, number>> {
+    if (roles.length === 0) return new Map();
+    const [explicit, fallback] = await Promise.all([
+      this.prisma.user.groupBy({
+        by: ['appRoleId'],
+        where: { appRoleId: { in: roles.map((role) => role.id) } },
+        _count: { _all: true },
+      }),
+      this.prisma.user.groupBy({
+        by: ['role'],
+        where: { appRoleId: null },
+        _count: { _all: true },
+      }),
+    ]);
+    const explicitByRoleId = new Map(
+      explicit.map((row) => [row.appRoleId, row._count._all]),
+    );
+    const fallbackByKey = new Map<string, number>(
+      fallback.map((row) => [row.role, row._count._all]),
+    );
+
     const counts = new Map<string, number>();
     for (const role of roles) {
-      counts.set(role.id, await this.countUsers(role));
+      let count = explicitByRoleId.get(role.id) ?? 0;
+      if (role.isSystem && isSystemRoleKey(role.key)) {
+        count += fallbackByKey.get(role.key) ?? 0;
+      }
+      counts.set(role.id, count);
     }
     return counts;
   }

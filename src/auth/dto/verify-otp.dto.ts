@@ -17,6 +17,10 @@ export class VerifyOtpDto {
   @Matches(/^\+95\d{7,10}$/, { message: 'Enter a valid Myanmar phone number' })
   phone!: string;
 
+  /** The SMS shows the code as "482 913"; a pasted copy keeps the space. */
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.replace(/\s+/g, '') : value,
+  )
   @IsString()
   @Length(6, 6)
   code!: string;

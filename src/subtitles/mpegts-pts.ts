@@ -53,9 +53,7 @@ const LAST_ELEMENTARY_STREAM_ID = 0xef;
  * too, and their timeline genuinely starts at 0, which is what the caller
  * falls back to.
  */
-export function initialPtsFromTransportStream(
-  data: Uint8Array,
-): number | null {
+export function initialPtsFromTransportStream(data: Uint8Array): number | null {
   const start = findSyncOffset(data);
   if (start === null) return null;
 

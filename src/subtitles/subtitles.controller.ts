@@ -86,16 +86,22 @@ export class SubtitlesController {
   @Post(':id/publish')
   @RequirePermissions('MEDIA.UPLOAD')
   @HttpCode(HttpStatus.OK)
-  publish(@Param('id', ParseUUIDPipe) id: string) {
-    return this.subtitlesService.republish(id);
+  publish(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.subtitlesService.republish(id, user);
   }
 
   /** The same backfill addressed by movie, for when no subtitle id is at hand. */
   @Post('publish')
   @RequirePermissions('MEDIA.UPLOAD')
   @HttpCode(HttpStatus.OK)
-  publishForMovie(@Query('movieId', ParseUUIDPipe) movieId: string) {
-    return this.subtitlesService.republishForMovie(movieId);
+  publishForMovie(
+    @Query('movieId', ParseUUIDPipe) movieId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.subtitlesService.republishForMovie(movieId, user);
   }
 
   @Patch(':id/set-default')

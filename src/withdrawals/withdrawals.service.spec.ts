@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Logger,
   NotFoundException,
   UnauthorizedException,
@@ -18,7 +19,17 @@ import { AuditService } from '../audit/audit.service';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
 import { CLOCK_SKEW_MS } from '../bank-events/risk-rules';
+import { WithdrawalCodeService } from '../withdrawal-code/withdrawal-code.service';
+import {
+  withdrawalCodeLocked,
+  withdrawalCodeNotSet,
+  withdrawalCodeRequired,
+  withdrawalCodeWrong,
+} from '../withdrawal-code/withdrawal-code.errors';
 import { WithdrawalsService } from './withdrawals.service';
+
+/** The account's withdrawal code every create() now carries (2026-10-05). */
+const WITHDRAWAL_CODE = '582904';
 
 // The account-row lock answers ACTIVE unless a test says otherwise — see
 // deposits.service.spec.ts (its SQL is account-status-lock.spec.ts's).
@@ -110,6 +121,7 @@ describe('WithdrawalsService', () => {
   let financeSettingsService: { getLimits: jest.Mock };
   let paymentAccountLedgerService: { syncWithdrawalLink: jest.Mock };
   let audit: { record: jest.Mock };
+  let withdrawalCode: { assertValidForWithdrawal: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
@@ -194,6 +206,11 @@ describe('WithdrawalsService', () => {
       syncWithdrawalLink: jest.fn().mockResolvedValue(undefined),
     };
     audit = { record: jest.fn().mockResolvedValue(undefined) };
+    // The code is right unless a test says otherwise — the code's own rules
+    // (lock, tries, too easy) are withdrawal-code.service.spec.ts's.
+    withdrawalCode = {
+      assertValidForWithdrawal: jest.fn().mockResolvedValue(undefined),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -209,6 +226,7 @@ describe('WithdrawalsService', () => {
         { provide: AuditService, useValue: audit },
         { provide: MinioService, useValue: minio },
         { provide: StorageService, useValue: storageStub },
+        { provide: WithdrawalCodeService, useValue: withdrawalCode },
       ],
     }).compile();
 
@@ -229,6 +247,7 @@ describe('WithdrawalsService', () => {
         accountType: 'KBZPay',
         accountName: 'Ko Ko',
         accountNumber: '09123456789',
+        withdrawalCode: WITHDRAWAL_CODE,
       });
 
       expect(result.status).toBe(WithdrawalStatus.PENDING);
@@ -278,6 +297,7 @@ describe('WithdrawalsService', () => {
         accountType: 'KBZPay',
         accountName: 'Ko Ko',
         accountNumber: '09123456789',
+        withdrawalCode: WITHDRAWAL_CODE,
       };
 
       it('share-locks the account row inside the hold transaction, before any money moves', async () => {
@@ -335,6 +355,7 @@ describe('WithdrawalsService', () => {
           accountType: 'KBZPay',
           accountName: 'Ko Ko',
           accountNumber: '09123456789',
+          withdrawalCode: WITHDRAWAL_CODE,
         }),
       ).rejects.toThrow(BadRequestException);
       expect(prisma.transaction.create).not.toHaveBeenCalled();
@@ -355,6 +376,7 @@ describe('WithdrawalsService', () => {
         accountType: 'Bank Account',
         accountName: 'Daw Mya',
         accountNumber: '09999999999',
+        withdrawalCode: WITHDRAWAL_CODE,
         bankName: 'AYA Bank',
       });
 
@@ -396,6 +418,7 @@ describe('WithdrawalsService', () => {
         accountType: 'KBZPay',
         accountName: 'Ko Ko',
         accountNumber: '09123456789',
+        withdrawalCode: WITHDRAWAL_CODE,
       });
 
       // The raw username is the login identity and must survive alongside the
@@ -423,6 +446,7 @@ describe('WithdrawalsService', () => {
         accountType: 'KBZPay',
         accountName: 'Ko Ko',
         accountNumber: '09123456789',
+        withdrawalCode: WITHDRAWAL_CODE,
       });
 
       expect(gateway.notifyAdminsWithdrawalCreated).toHaveBeenCalledWith(
@@ -441,6 +465,7 @@ describe('WithdrawalsService', () => {
           accountType: 'KBZPay',
           accountName: 'Ko Ko',
           accountNumber: '09123456789',
+          withdrawalCode: WITHDRAWAL_CODE,
         }),
       ).rejects.toThrow(BadRequestException);
       expect(prisma.withdrawal.create).not.toHaveBeenCalled();
@@ -461,6 +486,7 @@ describe('WithdrawalsService', () => {
           accountType: 'KBZPay',
           accountName: 'Ko Ko',
           accountNumber: '09123456789',
+          withdrawalCode: WITHDRAWAL_CODE,
         }),
       ).rejects.toThrow(BadRequestException);
       expect(walletService.getByUserId).not.toHaveBeenCalled();
@@ -481,6 +507,7 @@ describe('WithdrawalsService', () => {
           accountType: 'KBZPay',
           accountName: 'Ko Ko',
           accountNumber: '09123456789',
+          withdrawalCode: WITHDRAWAL_CODE,
         }),
       ).rejects.toThrow(BadRequestException);
       expect(prisma.withdrawal.create).not.toHaveBeenCalled();
@@ -505,9 +532,119 @@ describe('WithdrawalsService', () => {
           accountType: 'KBZPay',
           accountName: 'Ko Ko',
           accountNumber: '09123456789',
+          withdrawalCode: WITHDRAWAL_CODE,
         }),
       ).resolves.toBeDefined();
       expect(prisma.withdrawal.create).toHaveBeenCalled();
+    });
+
+    describe('withdrawal code (2026-10-05)', () => {
+      const request = {
+        amount: 5000,
+        accountType: 'KBZPay',
+        accountName: 'Ko Ko',
+        accountNumber: '09123456789',
+        withdrawalCode: WITHDRAWAL_CODE,
+      };
+
+      beforeEach(() => {
+        walletService.getByUserId.mockResolvedValue({
+          balance: new Prisma.Decimal(10000),
+        });
+        prisma.withdrawal.create.mockResolvedValue(makeWithdrawal());
+        prisma.user.findUniqueOrThrow.mockResolvedValue({ username: 'john' });
+      });
+
+      /** Nothing held, written or announced. */
+      function expectNoMoneySideEffects() {
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+        expect(lockAccountStatusMock).not.toHaveBeenCalled();
+        expect(walletService.debitWithinTransaction).not.toHaveBeenCalled();
+        expect(prisma.transaction.create).not.toHaveBeenCalled();
+        expect(prisma.withdrawal.create).not.toHaveBeenCalled();
+        expect(gateway.notifyAdminsWithdrawalCreated).not.toHaveBeenCalled();
+        expect(gateway.notifyUserBalanceUpdated).not.toHaveBeenCalled();
+      }
+
+      it('checks the code with the server-side service BEFORE the hold transaction, and proceeds exactly as before when it is right', async () => {
+        const result = await service.create('user-1', request);
+
+        expect(withdrawalCode.assertValidForWithdrawal).toHaveBeenCalledWith(
+          'user-1',
+          WITHDRAWAL_CODE,
+        );
+        expect(
+          withdrawalCode.assertValidForWithdrawal.mock.invocationCallOrder[0],
+        ).toBeLessThan(prisma.$transaction.mock.invocationCallOrder[0]);
+        expect(walletService.debitWithinTransaction).toHaveBeenCalledWith(
+          prisma,
+          'user-1',
+          5000,
+        );
+        expect(gateway.notifyAdminsWithdrawalCreated).toHaveBeenCalled();
+        expect(result.status).toBe(WithdrawalStatus.PENDING);
+      });
+
+      it('never stores the code on the withdrawal row nor sends it to admins', async () => {
+        await service.create('user-1', request);
+
+        const [{ data }] = prisma.withdrawal.create.mock.calls[0] as [
+          { data: Record<string, unknown> },
+        ];
+        expect(data).not.toHaveProperty('withdrawalCode');
+        expect(JSON.stringify(data)).not.toContain(WITHDRAWAL_CODE);
+        expect(
+          JSON.stringify(gateway.notifyAdminsWithdrawalCreated.mock.calls),
+        ).not.toContain(WITHDRAWAL_CODE);
+      });
+
+      it.each([
+        ['no code yet (409 NOT_SET)', withdrawalCodeNotSet()],
+        ['no code sent (400 REQUIRED)', withdrawalCodeRequired()],
+        ['a wrong code (400 WRONG)', withdrawalCodeWrong(3)],
+        [
+          'a locked code (423 LOCKED)',
+          withdrawalCodeLocked(new Date(Date.now() + 15 * 60 * 1000)),
+        ],
+      ])(
+        '%s: refused with the coded error and no money moves',
+        async (_label, error) => {
+          withdrawalCode.assertValidForWithdrawal.mockRejectedValue(error);
+
+          await expect(service.create('user-1', request)).rejects.toBe(error);
+          expectNoMoneySideEffects();
+        },
+      );
+
+      it('passes a missing code through to the service (which answers NOT_SET or REQUIRED)', async () => {
+        const { withdrawalCode: _omitted, ...withoutCode } = request;
+        const notSet = withdrawalCodeNotSet();
+        withdrawalCode.assertValidForWithdrawal.mockRejectedValue(notSet);
+
+        await expect(
+          service.create('user-1', withoutCode),
+        ).rejects.toMatchObject({ code: 'WITHDRAWAL_CODE_NOT_SET' });
+        expect(notSet.getStatus()).toBe(409);
+        expect(withdrawalCode.assertValidForWithdrawal).toHaveBeenCalledWith(
+          'user-1',
+          undefined,
+        );
+        expectNoMoneySideEffects();
+      });
+
+      it('a bad amount is refused before the code is checked, so it never uses up a try', async () => {
+        walletService.getByUserId.mockResolvedValue({
+          balance: new Prisma.Decimal(1000),
+        });
+
+        await expect(service.create('user-1', request)).rejects.toThrow(
+          new BadRequestException(
+            'Withdrawal amount exceeds your available wallet balance',
+          ),
+        );
+        expect(withdrawalCode.assertValidForWithdrawal).not.toHaveBeenCalled();
+        expectNoMoneySideEffects();
+      });
     });
   });
 
@@ -566,7 +703,7 @@ describe('WithdrawalsService', () => {
                 email: true,
               },
             },
-            bankTransaction: { select: { id: true } },
+            bankTransaction: { select: { id: true, counterparty: true } },
           },
         }),
       );
@@ -655,6 +792,24 @@ describe('WithdrawalsService', () => {
         service.approve('nope', { id: 'admin-1' } as never),
       ).rejects.toThrow(NotFoundException);
       expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("M-11/M-14: a staff member's own withdrawal cannot be approved by them (403), nothing written or settled", async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue(
+        makeWithdrawal({ userId: 'admin-1', holdTransactionId: 'txn-hold-1' }),
+      );
+
+      await expect(
+        service.approve('withdrawal-1', { id: 'admin-1' } as never),
+      ).rejects.toThrow(
+        new ForbiddenException(
+          'You cannot approve a withdrawal from your own account',
+        ),
+      );
+      expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
+      expect(prisma.transaction.update).not.toHaveBeenCalled();
+      expect(walletService.debitWithinTransaction).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
     });
 
     it('throws ConflictException when the withdrawal is no longer PENDING (double-processing guard)', async () => {
@@ -805,6 +960,25 @@ describe('WithdrawalsService', () => {
         service.reject('nope', { id: 'admin-1' } as never, { reason: 'bad' }),
       ).rejects.toThrow(NotFoundException);
       expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("M-11/M-14: a staff member's own withdrawal cannot be rejected by them (403), no refund, nothing written", async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue(
+        makeWithdrawal({ userId: 'admin-1', holdTransactionId: 'txn-hold-1' }),
+      );
+
+      await expect(
+        service.reject('withdrawal-1', { id: 'admin-1' } as never, {
+          reason: 'bad',
+        }),
+      ).rejects.toThrow(
+        new ForbiddenException(
+          'You cannot reject a withdrawal from your own account',
+        ),
+      );
+      expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
+      expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
     });
 
     it('throws ConflictException when the withdrawal is no longer PENDING', async () => {
@@ -1037,7 +1211,7 @@ describe('WithdrawalsService', () => {
               email: true,
             },
           },
-          bankTransaction: { select: { id: true } },
+          bankTransaction: { select: { id: true, counterparty: true } },
         },
       });
       expect(walletService.debitWithinTransaction).not.toHaveBeenCalled();
@@ -1213,6 +1387,11 @@ describe('WithdrawalsService — bank verification', () => {
         { provide: AuditService, useValue: audit },
         { provide: MinioService, useValue: minio },
         { provide: StorageService, useValue: storageStub },
+        // Not reached: these suites never create a withdrawal.
+        {
+          provide: WithdrawalCodeService,
+          useValue: { assertValidForWithdrawal: jest.fn() },
+        },
       ],
     }).compile();
     service = module.get(WithdrawalsService);
@@ -1902,6 +2081,11 @@ describe('WithdrawalsService — order-independent bank matching', () => {
           useValue: { deleteObject: jest.fn(), getObjectStream: jest.fn() },
         },
         { provide: StorageService, useValue: storageStub },
+        // Not reached: these suites never create a withdrawal.
+        {
+          provide: WithdrawalCodeService,
+          useValue: { assertValidForWithdrawal: jest.fn() },
+        },
       ],
     }).compile();
     service = module.get(WithdrawalsService);
