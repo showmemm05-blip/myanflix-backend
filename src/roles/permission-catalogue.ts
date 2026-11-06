@@ -126,6 +126,44 @@ export const PERMISSION_CATALOGUE = [
     actions: ['VIEW', 'MANAGE'],
   },
   {
+    // The admin "Advertisements" page (pre-roll video ads, 2026-11-04).
+    // VIEW reads the list and the analytics; MANAGE creates, edits, uploads
+    // and attaches the video, switches on/off and deletes. The viewer
+    // routes (POST /ads/preroll, the playback events) need neither. Seeded
+    // to ADMIN by the advertisements migration; SUPER_ADMIN holds both.
+    key: 'ADS',
+    label: 'Advertisements',
+    actions: ['VIEW', 'MANAGE'],
+  },
+  {
+    // The Lottery admin pages (2026-10-19). VIEW reads everything (the
+    // dream books, the draws and their tickets, the settings);
+    // DREAMS_MANAGE edits a dream / imports a spreadsheet; DRAWS_MANAGE
+    // makes, edits, opens, pauses and closes a draw and takes numbers off
+    // sale; SETTINGS_MANAGE changes the ticket price, per-number limit,
+    // exchange rate, sales-close gap and the results source;
+    // RESULTS_PUBLISH fetches or enters a draw's winning numbers, tests the
+    // results source, and publishes a draw (marks the tickets and awards
+    // every prize — since 2026-10-24 nobody is paid at publish);
+    // CLAIMS_CONFIRM confirms or rejects a customer's prize claim on the
+    // "Prize claims" page (the confirm credits the wallet) — separately
+    // grantable because it moves money. The public /lottery/dreams*,
+    // /lottery/draws* and /lottery/results* reads need none of them, nor
+    // do the customer's own /lottery/claims routes. Seeded to ADMIN by the
+    // lottery_dreams, lottery_draws, lottery_results and lottery_claims
+    // migrations; SUPER_ADMIN holds all six implicitly.
+    key: 'LOTTERY',
+    label: 'Lottery',
+    actions: [
+      'VIEW',
+      'DREAMS_MANAGE',
+      'DRAWS_MANAGE',
+      'SETTINGS_MANAGE',
+      'RESULTS_PUBLISH',
+      'CLAIMS_CONFIRM',
+    ],
+  },
+  {
     // VIEW is the only action: the log is append-only and read through
     // GET /audit alone. It exposes staff IPs and user agents un-masked, so
     // no seeded role besides the protected SUPER_ADMIN (which holds the

@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
@@ -21,6 +22,8 @@ import { trustedClientIp, trustedProxyList } from './config/trusted-proxies';
 // longer than that on a slow/mobile connection — this only bounds how long
 // the server waits on one request, not how much data it accepts.
 const REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
+
+const logger = new Logger('Bootstrap');
 
 /**
  * The socket.io server with the same browser-origin allowlist as the HTTP
@@ -59,6 +62,11 @@ class CorsAwareIoAdapter extends IoAdapter {
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
+  // Express adds `X-Powered-By: Express` to every response by default — a
+  // free fingerprint of the stack for anyone probing the API (SEC-017; the
+  // two Next apps already drop theirs). Nest's typed wrapper around
+  // express's own `app.disable()`.
+  app.disable('x-powered-by');
   const configService = app.get(ConfigService);
   const corsOrigins = configService.get<string>('CORS_ORIGINS');
 
@@ -136,6 +144,19 @@ async function bootstrap() {
 
   const port = configService.get<number>('PORT') ?? 3001;
   await app.listen(port);
+
+  // Last line of defence (STR-009): Node turns a promise rejection nobody
+  // caught into a process exit, which takes every in-flight upload and
+  // transcode down with it. The real fixes catch at the source (the
+  // fire-and-forget `processVideo` calls); this only makes sure a rejection
+  // that still slips through is LOGGED instead of fatal. Registered once the
+  // server is listening, on purpose: a failure during boot still exits like
+  // before, which is what the container's restart policy relies on. Never
+  // exits.
+  process.on('unhandledRejection', (reason) => {
+    const error = reason instanceof Error ? reason : new Error(String(reason));
+    logger.error(`Unhandled promise rejection: ${error.message}`, error.stack);
+  });
 
   console.log(`MyanFlix API listening on http://localhost:${port}/api`);
 }

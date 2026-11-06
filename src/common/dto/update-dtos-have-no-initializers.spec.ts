@@ -9,7 +9,11 @@ import { UpdateBookSectionDto } from '../../books/dto/section.dto';
 import { UpdateBookDto } from '../../books/dto/update-book.dto';
 import { UpdateCategoryDto } from '../../categories/dto/update-category.dto';
 import { UpdateHomePromoDto } from '../../home/dto/home-promo.dto';
+import { UpdateAdvertisementDto } from '../../ads/dto/advertisement.dto';
 import { UpdateLevelDto } from '../../levels/dto/level.dto';
+import { UpdateLotteryDrawDto } from '../../lottery/dto/lottery-draw.dto';
+import { UpdateLotteryDreamDto } from '../../lottery/dto/lottery-dream.dto';
+import { UpdateLotterySettingsDto } from '../../lottery/dto/lottery-settings.dto';
 import { UpdateMovieDto } from '../../movies/dto/update-movie.dto';
 import { UpdatePaymentAccountDto } from '../../payment-accounts/dto/update-payment-account.dto';
 import { UpdatePaymentMethodTypeDto } from '../../payment-accounts/dto/update-payment-method-type.dto';
@@ -43,7 +47,11 @@ describe('update DTOs carry no class-property initializers', () => {
     ['UpdateBookDto', UpdateBookDto],
     ['UpdateCategoryDto', UpdateCategoryDto],
     ['UpdateHomePromoDto', UpdateHomePromoDto],
+    ['UpdateAdvertisementDto', UpdateAdvertisementDto],
     ['UpdateLevelDto', UpdateLevelDto],
+    ['UpdateLotteryDrawDto', UpdateLotteryDrawDto],
+    ['UpdateLotteryDreamDto', UpdateLotteryDreamDto],
+    ['UpdateLotterySettingsDto', UpdateLotterySettingsDto],
     ['UpdateMovieDto', UpdateMovieDto],
     ['UpdatePaymentAccountDto', UpdatePaymentAccountDto],
     ['UpdatePaymentMethodTypeDto', UpdatePaymentMethodTypeDto],

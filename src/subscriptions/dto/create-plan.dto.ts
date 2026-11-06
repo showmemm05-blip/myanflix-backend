@@ -1,6 +1,7 @@
 import {
   IsBoolean,
   IsInt,
+  IsNumber,
   IsString,
   Max,
   Min,
@@ -25,8 +26,16 @@ export class CreatePlanDto {
   @MinLength(1)
   name!: string;
 
+  /**
+   * A real number with at most two decimals, like every other money field
+   * (DB-007): without @IsNumber a "1e400" coerced to Infinity passed @Min(0)
+   * and failed only at the database. 0 stays allowed (a free plan); @Max is
+   * the Decimal(12,2) column ceiling.
+   */
   @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)
+  @Max(9_999_999_999.99)
   price!: number;
 
   /**

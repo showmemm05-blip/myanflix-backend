@@ -31,6 +31,7 @@ import {
   reasonsEqual,
   referenceTwinReasons,
   scoreVerification,
+  screenshotReasons,
   velocityReasons,
   yangonTimeOfDay,
 } from './risk-rules';
@@ -147,17 +148,23 @@ export async function findOpenDepositByReference(
  * says the money came from someone else. Nothing on the deposit itself
  * names the sender (Deposit.accountName is OUR account the user picked),
  * so the user's own profile name is the name compared.
+ *
+ * SEC-004: a transaction with no screenshot behind it adds NO_SCREENSHOT
+ * (soft) — the green badge waits for the picture, which the upload path
+ * clears (clearDepositScreenshotReason).
  */
 async function evaluateCandidate(
   tx: Prisma.TransactionClient,
   row: OpenDepositRow,
   event: NormalizedBankEvent,
   counterparty: string | null,
+  screenshotKey: string | null,
   extra: readonly RiskReason[],
 ) {
   const reasons: RiskReason[] = [...extra];
   if (!amountsEqual(event.amount, row.amount)) reasons.push('AMOUNT_MISMATCH');
   reasons.push(...depositTimingReasons(row, event.occurredAt));
+  reasons.push(...screenshotReasons(screenshotKey));
   const twins = await findDepositTwins(tx, row.reference, row.id);
   reasons.push(...referenceTwinReasons(row, twins));
   const recent = await countRecentDepositsByUser(tx, row.userId, row.createdAt);
@@ -214,6 +221,7 @@ export async function claimDepositWithTransaction(
     row,
     event,
     transaction.counterparty ?? null,
+    transaction.screenshotKey,
     extra,
   );
   const before = await tx.deposit.findUniqueOrThrow({ where: { id: row.id } });

@@ -6,14 +6,32 @@ import {
 } from './permission-catalogue';
 
 describe('permission catalogue', () => {
-  it('declares 22 modules and 82 MODULE.ACTION permissions', () => {
+  it('declares 24 modules and 90 MODULE.ACTION permissions', () => {
     // 76 + DEPOSITS.BANK_EVIDENCE + WITHDRAWALS.BANK_EVIDENCE (bank
     // verification: the balance-revealing screenshot streams) + the
     // BANK_TRANSACTIONS module (VIEW, BANK_EVIDENCE) for the phone-monitor's
     // stored notifications + the HOME module (VIEW, MANAGE) for the
-    // "Home promos" admin page.
-    expect(PERMISSION_CATALOGUE).toHaveLength(22);
-    expect(ALL_PERMISSIONS).toHaveLength(82);
+    // "Home promos" admin page + the LOTTERY module (VIEW, DREAMS_MANAGE
+    // for the dream books; DRAWS_MANAGE, SETTINGS_MANAGE for the draws;
+    // RESULTS_PUBLISH for the results and the awarded prizes;
+    // CLAIMS_CONFIRM for paying or rejecting a prize claim).
+    expect(PERMISSION_CATALOGUE).toHaveLength(24);
+    expect(ALL_PERMISSIONS).toHaveLength(90);
+  });
+
+  it('declares the LOTTERY module with exactly VIEW, DREAMS_MANAGE, DRAWS_MANAGE, SETTINGS_MANAGE, RESULTS_PUBLISH and CLAIMS_CONFIRM', () => {
+    const lottery = getPermissionCatalogue().find(
+      (module) => module.key === 'LOTTERY',
+    );
+    expect(lottery?.label).toBe('Lottery');
+    expect(lottery?.actions.map((action) => action.permission)).toEqual([
+      'LOTTERY.VIEW',
+      'LOTTERY.DREAMS_MANAGE',
+      'LOTTERY.DRAWS_MANAGE',
+      'LOTTERY.SETTINGS_MANAGE',
+      'LOTTERY.RESULTS_PUBLISH',
+      'LOTTERY.CLAIMS_CONFIRM',
+    ]);
   });
 
   it('declares the HOME module with exactly VIEW and MANAGE', () => {

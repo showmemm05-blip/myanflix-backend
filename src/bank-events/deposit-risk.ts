@@ -9,6 +9,7 @@ import type { DepositVerificationPayload } from '../realtime/realtime.gateway';
 import { decimalToNumber } from '../common/utils/decimal.util';
 import {
   REFERENCE_TWIN_REASONS,
+  SCREENSHOT_REASONS,
   TWIN_PROBE_LIMIT,
   VELOCITY_PROBE_LIMIT,
   VELOCITY_WINDOW_MS,
@@ -201,6 +202,47 @@ export async function recomputeDepositTwins(
 }
 
 /**
+ * SEC-004: the screenshot for the bank event that claimed `depositId` has
+ * just landed, so the NO_SCREENSHOT class is swapped out (every other
+ * stored reason is kept) and status/level re-derived — the row that was
+ * waiting in PENDING_REVIEW on the phone's text alone becomes MATCHED / LOW
+ * when nothing else was wrong. Runs inside the upload's transaction, by
+ * primary key; a no-op (no write, no audit row) when the reason is not
+ * there. Returns whether the row changed.
+ */
+export async function clearDepositScreenshotReason(
+  tx: Prisma.TransactionClient,
+  audit: AuditService,
+  depositId: string,
+  metadata: Record<string, unknown>,
+): Promise<boolean> {
+  const row = await tx.deposit.findUnique({
+    where: { id: depositId },
+    select: {
+      id: true,
+      userId: true,
+      amount: true,
+      reference: true,
+      status: true,
+      bankCheckedAt: true,
+      matchStatus: true,
+      riskLevel: true,
+      riskReasons: true,
+    },
+  });
+  if (!row) return false;
+  const riskReasons = replaceReasonClass(
+    row.riskReasons,
+    SCREENSHOT_REASONS,
+    [],
+  );
+  if (reasonsEqual(riskReasons, row.riskReasons)) return false;
+  const next = scoreVerification(riskReasons, row.bankCheckedAt !== null);
+  await updateDepositRisk(tx, audit, row, next, metadata);
+  return true;
+}
+
+/**
  * Admins-room realtime payload for one deposit, with the read-time
  * NO_BANK_TRANSACTION derivation applied exactly as the list response
  * applies it — the socket row and the fetched row must never disagree.
@@ -219,7 +261,13 @@ export function depositVerificationPayload(
     | 'receivingTransactionCode'
     | 'receivingTransactionAt'
     | 'receivingScreenshotKey'
-  > & { bankTransaction?: { id: string; counterparty?: string | null } | null },
+  > & {
+    bankTransaction?: {
+      id: string;
+      counterparty?: string | null;
+      deviceSerial?: string | null;
+    } | null;
+  },
   now: Date = new Date(),
 ): DepositVerificationPayload {
   const view = verificationView(row, now);
@@ -236,15 +284,19 @@ export function depositVerificationPayload(
     hasBankScreenshot: row.receivingScreenshotKey !== null,
     bankTransactionId: row.bankTransaction?.id ?? null,
     bankCounterparty: row.bankTransaction?.counterparty ?? null,
+    bankDeviceSerial: row.bankTransaction?.deviceSerial ?? null,
   };
 }
 
 /**
  * The include every admin deposit/withdrawal read adds — a probe of the
  * unique link index per row. `counterparty` rides along for the deposit
- * verification dialog's "sender name" (M-16); it is one column of the
- * same row, never a second query.
+ * verification dialog's "sender name" (M-16) and `deviceSerial` for its
+ * "posted by phone" line (SEC-004); both are columns of the same row,
+ * never a second query.
  */
 export const BANK_TRANSACTION_LINK_INCLUDE = {
-  bankTransaction: { select: { id: true, counterparty: true } },
+  bankTransaction: {
+    select: { id: true, counterparty: true, deviceSerial: true },
+  },
 } as const;

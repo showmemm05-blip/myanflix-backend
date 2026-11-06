@@ -17,6 +17,10 @@ import { StorageService } from '../common/storage/storage.service';
 import { AuthorityService } from '../roles/authority.service';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { decimalToNumber } from '../common/utils/decimal.util';
+import {
+  IMAGE_MIME_TO_EXTENSION,
+  matchesMagicBytes,
+} from '../common/utils/image-magic-bytes';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import {
   DepositStatus,
@@ -46,48 +50,18 @@ export interface CreateUserInput {
 }
 
 /**
- * File extension is derived from the VALIDATED MIME type — never from the
- * client-supplied filename, which is attacker-controlled. The leading dot is
- * part of the value because that is the form every StorageService key
- * builder takes (extname()'s form), so nothing has to re-add it.
+ * The profile-picture subset of the image types the server stores: JPEG,
+ * PNG and WebP — no GIF, an avatar is a still. The extension is derived
+ * from the VALIDATED MIME type — never from the client-supplied filename,
+ * which is attacker-controlled (the map and the byte check that backs it
+ * live in common/utils/image-magic-bytes.ts, shared with the staff image
+ * route).
  */
 const AVATAR_MIME_TO_EXTENSION: Record<string, string> = {
-  'image/jpeg': '.jpg',
-  'image/png': '.png',
-  'image/webp': '.webp',
+  'image/jpeg': IMAGE_MIME_TO_EXTENSION['image/jpeg'],
+  'image/png': IMAGE_MIME_TO_EXTENSION['image/png'],
+  'image/webp': IMAGE_MIME_TO_EXTENSION['image/webp'],
 };
-
-/**
- * The multipart Content-Type header is attacker-controlled, so the declared
- * MIME must also match the file's magic bytes before the bytes land on the
- * publicly served cache path.
- */
-function matchesMagicBytes(mimetype: string, buffer: Buffer): boolean {
-  switch (mimetype) {
-    case 'image/jpeg':
-      return (
-        buffer.length >= 3 &&
-        buffer[0] === 0xff &&
-        buffer[1] === 0xd8 &&
-        buffer[2] === 0xff
-      );
-    case 'image/png':
-      return (
-        buffer.length >= 8 &&
-        buffer
-          .subarray(0, 8)
-          .equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
-      );
-    case 'image/webp':
-      return (
-        buffer.length >= 12 &&
-        buffer.subarray(0, 4).toString('latin1') === 'RIFF' &&
-        buffer.subarray(8, 12).toString('latin1') === 'WEBP'
-      );
-    default:
-      return false;
-  }
-}
 
 /** H-16 refusals, in the order they are checked. */
 export const ACCOUNT_DELETE_BALANCE_MESSAGE =

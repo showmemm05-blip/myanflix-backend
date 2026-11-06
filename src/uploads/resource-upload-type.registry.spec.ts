@@ -13,6 +13,7 @@ import {
   ResourceUploadTypeRegistry,
 } from './resource-upload-type.registry';
 import {
+  DEFAULT_MAX_AD_VIDEO_UPLOAD_BYTES,
   DEFAULT_MAX_DOCUMENT_UPLOAD_BYTES,
   DEFAULT_MAX_VIDEO_UPLOAD_BYTES,
 } from './upload-limits';
@@ -31,6 +32,7 @@ describe('ResourceUploadTypeRegistry', () => {
   let prisma: {
     movie: { findUnique: jest.Mock };
     book: { findUnique: jest.Mock };
+    advertisement: { findUnique: jest.Mock };
   };
   let permissionResolver: { can: jest.Mock };
 
@@ -42,6 +44,9 @@ describe('ResourceUploadTypeRegistry', () => {
     prisma = {
       movie: { findUnique: jest.fn().mockResolvedValue({ id: 'movie-1' }) },
       book: { findUnique: jest.fn().mockResolvedValue({ id: 'book-1' }) },
+      advertisement: {
+        findUnique: jest.fn().mockResolvedValue({ id: 'ad-1' }),
+      },
     };
     permissionResolver = { can: jest.fn().mockResolvedValue(true) };
 
@@ -200,6 +205,18 @@ describe('ResourceUploadTypeRegistry', () => {
       ).toThrow(/the limit for a book upload is 500 MB/);
     });
 
+    it('caps a pre-roll ad MP4 at 200 MB', () => {
+      expect(() =>
+        registry.assertFileSizeAllowed('ad', DEFAULT_MAX_AD_VIDEO_UPLOAD_BYTES),
+      ).not.toThrow();
+      expect(() =>
+        registry.assertFileSizeAllowed(
+          'ad',
+          DEFAULT_MAX_AD_VIDEO_UPLOAD_BYTES + 1,
+        ),
+      ).toThrow(/the limit for a ad upload is 200 MB/);
+    });
+
     it('can be raised or lowered through the environment without a code change', () => {
       process.env.UPLOAD_MAX_DOCUMENT_BYTES = '1000';
       expect(() => registry.assertFileSizeAllowed('book', 1001)).toThrow(
@@ -304,6 +321,35 @@ describe('ResourceUploadTypeRegistry', () => {
           .resolve('book')
           .buildKey('book-1', 'edition-1/chapter-1/original.pdf'),
       ).toBe('documents/books/book-1/edition-1/chapter-1/original.pdf');
+    });
+  });
+
+  describe('buildKey — ad', () => {
+    it('stages the one allowed file under temp/ads/<adId>/, never on a served key', () => {
+      expect(registry.resolve('ad').buildKey('ad-1', 'video.mp4')).toBe(
+        'temp/ads/ad-1/video.mp4',
+      );
+    });
+
+    it('refuses any other filename or a nested path', () => {
+      expect(() => registry.resolve('ad').buildKey('ad-1', 'clip.mp4')).toThrow(
+        BadRequestException,
+      );
+      expect(() =>
+        registry.resolve('ad').buildKey('ad-1', 'hls/video.mp4'),
+      ).toThrow(BadRequestException);
+    });
+
+    it('needs the ad row and ADS.MANAGE', async () => {
+      prisma.advertisement.findUnique.mockResolvedValue(null);
+      await expect(registry.resolve('ad').assertExists('ad-1')).rejects.toThrow(
+        NotFoundException,
+      );
+      permissionResolver.can.mockResolvedValue(false);
+      await expect(registry.assertPermission('ad', user)).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(permissionResolver.can).toHaveBeenCalledWith(user, 'ADS.MANAGE');
     });
   });
 

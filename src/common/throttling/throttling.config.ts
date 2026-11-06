@@ -27,6 +27,10 @@ import { normalizePhone } from '../utils/phone.util';
  *    per-credential bucket (phone or username from the body, IP when absent)
  *    so one attacker cannot spray one account from many addresses, nor many
  *    accounts from one address.
+ *  - a signed-in route may instead re-key its `default` bucket per account
+ *    with `@Throttle({ default: { getTracker: accountTracker } })` — the
+ *    stream lookup (videos.controller.ts) does, so carrier-NAT neighbours
+ *    never share its bucket and one account cannot escape it.
  *
  * Every ttl is in milliseconds (the v5+ convention). A bucket that overflows
  * blocks for its own ttl (blockDuration defaults to ttl).
@@ -121,6 +125,24 @@ function credentialText(value: unknown): string | null {
   const text = String(value).trim();
   return text || null;
 }
+
+/**
+ * The signed-in account alone (`account:<id>`), else the client IP — and
+ * never anything from the body. On a signed-in route whose bucket must bind
+ * the caller (the per-account stream lookup), credentialTargetTracker is the
+ * wrong key: express.json()/urlencoded() parse a body on ANY method, so a
+ * client could open a fresh bucket per request just by adding a made-up
+ * `username` or `phone` to its GET. `req.user` is there for the same reason
+ * as above (JwtAuthGuard has already run); a @Public route has none and
+ * falls back to the IP, which is what the site-wide bucket keys on anyway.
+ */
+export const accountTracker: ThrottlerGetTrackerFunction = (req) => {
+  const account = req.user as { id?: unknown } | undefined;
+  if (account && typeof account.id === 'string' && account.id) {
+    return `account:${account.id}`;
+  }
+  return `ip:${clientIpOf(req)}`;
+};
 
 /** True when the route did NOT opt into the named throttler. */
 function notOptedIn(name: string) {

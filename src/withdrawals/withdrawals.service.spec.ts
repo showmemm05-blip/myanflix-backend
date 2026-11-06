@@ -703,7 +703,9 @@ describe('WithdrawalsService', () => {
                 email: true,
               },
             },
-            bankTransaction: { select: { id: true, counterparty: true } },
+            bankTransaction: {
+              select: { id: true, counterparty: true, deviceSerial: true },
+            },
           },
         }),
       );
@@ -1211,7 +1213,9 @@ describe('WithdrawalsService', () => {
               email: true,
             },
           },
-          bankTransaction: { select: { id: true, counterparty: true } },
+          bankTransaction: {
+            select: { id: true, counterparty: true, deviceSerial: true },
+          },
         },
       });
       expect(walletService.debitWithinTransaction).not.toHaveBeenCalled();

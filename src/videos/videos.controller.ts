@@ -10,15 +10,27 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
-import { SkipThrottle } from '@nestjs/throttler';
+import { SkipThrottle, Throttle } from '@nestjs/throttler';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
+import {
+  THROTTLER_DEFAULT,
+  accountTracker,
+} from '../common/throttling/throttling.config';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { RequirePermissions } from '../roles/decorators/permissions.decorator';
 import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { UpdateWatchProgressDto } from './dto/update-watch-progress.dto';
 import { VideoDiagnosisService } from './video-diagnosis.service';
 import { VideosService } from './videos.service';
+
+/**
+ * Stream lookups per minute per ACCOUNT on GET :movieId/stream. A player
+ * fetches it once per play and again after a 410 from the cache (hour-
+ * quantised links, so at most once an hour per title); 60 is far above any
+ * honest client and well below what a runaway loop needs to be a problem.
+ */
+export const STREAM_THROTTLE_PER_MINUTE = 60;
 
 @Controller('videos')
 export class VideosController {
@@ -62,8 +74,24 @@ export class VideosController {
     return this.videoDiagnosisService.diagnose(movieId);
   }
 
-  /** Playback bootstrap — never rate limited. */
-  @SkipThrottle()
+  /**
+   * Playback bootstrap. Was @SkipThrottle (SEC-022): many viewers share one
+   * carrier-NAT address, so the site-wide per-IP bucket would let one
+   * household's play lock out the next. Still never keyed by IP — instead
+   * the `default` bucket is re-keyed per account on this route alone
+   * (accountTracker: `account:<id>` from the req.user JwtAuthGuard has
+   * already set, and nothing from the body — express parses a body on a
+   * GET too, so a tracker that read `username`/`phone` first would hand a
+   * hammering client a fresh bucket per made-up value), which is what stops
+   * one client from hammering the subscription check.
+   */
+  @Throttle({
+    [THROTTLER_DEFAULT]: {
+      limit: STREAM_THROTTLE_PER_MINUTE,
+      ttl: 60_000,
+      getTracker: accountTracker,
+    },
+  })
   @Get(':movieId/stream')
   async getStream(
     @Param('movieId', ParseUUIDPipe) movieId: string,

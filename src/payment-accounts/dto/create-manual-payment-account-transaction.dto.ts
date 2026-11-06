@@ -1,4 +1,12 @@
-import { IsIn, IsNumber, IsOptional, IsPositive, IsString, MaxLength } from 'class-validator';
+import {
+  IsIn,
+  IsNumber,
+  IsOptional,
+  IsPositive,
+  IsString,
+  Max,
+  MaxLength,
+} from 'class-validator';
 import { PaymentAccountTransactionType } from '../../generated/prisma/client';
 
 /**
@@ -18,8 +26,10 @@ export class CreateManualPaymentAccountTransactionDto {
   @IsIn(MANUAL_TYPES)
   type!: (typeof MANUAL_TYPES)[number];
 
+  /** @Max is the Decimal(12,2) column ceiling — past it Postgres overflows (DB-007). */
   @IsNumber({ maxDecimalPlaces: 2 })
   @IsPositive()
+  @Max(9_999_999_999.99)
   amount!: number;
 
   @IsOptional()

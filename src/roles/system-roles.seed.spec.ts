@@ -756,6 +756,231 @@ const POST_RBAC_GUARDED_ROUTES: PostRbacRoute[] = [
     granular: ['HOME.MANAGE'],
     allowed: STAFF_ONLY,
   },
+  // lottery dreams (lottery_dreams). ADMIN is granted both actions by the
+  // migration; CONTENT_UPLOADER neither. The two public reads
+  // (GET /lottery/dreams, GET /lottery/dreams/:book/:number) are NOT here:
+  // the dream books are open to guests (@OptionalAuth).
+  {
+    route: 'GET /lottery/admin/dreams',
+    granular: ['LOTTERY.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /lottery/admin/dreams/export',
+    granular: ['LOTTERY.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'PATCH /lottery/admin/dreams/:id',
+    granular: ['LOTTERY.DREAMS_MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /lottery/admin/dreams/import',
+    granular: ['LOTTERY.DREAMS_MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  // lottery draws + settings (lottery_draws). ADMIN is granted both new
+  // actions by the migration; CONTENT_UPLOADER neither. The four public
+  // draw reads (GET /lottery/draws/current, GET /lottery/draws,
+  // GET /lottery/draws/:drawNo, POST /lottery/draws/:drawNo/availability)
+  // are NOT here: they are open to guests (@OptionalAuth). Nor are the
+  // five customer routes (POST/GET /lottery/purchases, GET
+  // /lottery/purchases/:ref, GET /lottery/tickets, GET
+  // /lottery/tickets/:ticketNo): signed-in only, scoped by @CurrentUser(),
+  // no permission — like /subscriptions.
+  {
+    route: 'GET /lottery/admin/settings',
+    granular: ['LOTTERY.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'PATCH /lottery/admin/settings',
+    granular: ['LOTTERY.SETTINGS_MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /lottery/admin/draws',
+    granular: ['LOTTERY.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /lottery/admin/draws',
+    granular: ['LOTTERY.DRAWS_MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /lottery/admin/draws/:id',
+    granular: ['LOTTERY.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'PATCH /lottery/admin/draws/:id',
+    granular: ['LOTTERY.DRAWS_MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /lottery/admin/draws/:id/open',
+    granular: ['LOTTERY.DRAWS_MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /lottery/admin/draws/:id/pause',
+    granular: ['LOTTERY.DRAWS_MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /lottery/admin/draws/:id/close',
+    granular: ['LOTTERY.DRAWS_MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'PUT /lottery/admin/draws/:id/off-sale',
+    granular: ['LOTTERY.DRAWS_MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /lottery/admin/draws/:id/tickets',
+    granular: ['LOTTERY.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  // lottery results (lottery_results). ADMIN is granted RESULTS_PUBLISH by
+  // the migration; CONTENT_UPLOADER not. The public results reads (GET
+  // /lottery/results, GET /lottery/draws/:drawNo/results, GET
+  // /lottery/draws/:drawNo/winners) are guest-open (@OptionalAuth) and
+  // not listed.
+  {
+    route: 'GET /lottery/admin/draws/:id/results',
+    granular: ['LOTTERY.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'PUT /lottery/admin/draws/:id/results',
+    granular: ['LOTTERY.RESULTS_PUBLISH'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /lottery/admin/draws/:id/results/fetch',
+    granular: ['LOTTERY.RESULTS_PUBLISH'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /lottery/admin/settings/results-test',
+    granular: ['LOTTERY.RESULTS_PUBLISH'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /lottery/admin/draws/:id/publish-preview',
+    granular: ['LOTTERY.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /lottery/admin/draws/:id/publish',
+    granular: ['LOTTERY.RESULTS_PUBLISH'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /lottery/admin/draws/:id/winners',
+    granular: ['LOTTERY.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  // lottery prize claims (lottery_claims, 2026-10-24). ADMIN is granted
+  // CLAIMS_CONFIRM by the migration; CONTENT_UPLOADER not. The customer's
+  // own /lottery/claims routes are signed-in only (no permission) and not
+  // listed.
+  {
+    route: 'GET /lottery/admin/claims',
+    granular: ['LOTTERY.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /lottery/admin/claims/summary',
+    granular: ['LOTTERY.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /lottery/admin/claims/:id',
+    granular: ['LOTTERY.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /lottery/admin/claims/:id/confirm',
+    granular: ['LOTTERY.CLAIMS_CONFIRM'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /lottery/admin/claims/:id/reject',
+    granular: ['LOTTERY.CLAIMS_CONFIRM'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /lottery/admin/claims/:id/reopen',
+    granular: ['LOTTERY.CLAIMS_CONFIRM'],
+    allowed: STAFF_ONLY,
+  },
+  // advertisements (2026-11-04). ADMIN is granted both actions by the
+  // migration; CONTENT_UPLOADER neither. POST /ads/preroll and the playback
+  // events are NOT here: any signed-in viewer, no permission.
+  {
+    route: 'GET /ads/admin/analytics/overview',
+    granular: ['ADS.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /ads/admin/analytics/ads',
+    granular: ['ADS.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /ads/admin/analytics/by-date',
+    granular: ['ADS.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /ads/admin',
+    granular: ['ADS.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /ads/admin',
+    granular: ['ADS.MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /ads/admin/:id',
+    granular: ['ADS.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'PATCH /ads/admin/:id',
+    granular: ['ADS.MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /ads/admin/:id/video/attach',
+    granular: ['ADS.MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'POST /ads/admin/:id/image',
+    granular: ['ADS.MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'DELETE /ads/admin/:id',
+    granular: ['ADS.MANAGE'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'GET /ads/admin/settings',
+    granular: ['ADS.VIEW'],
+    allowed: STAFF_ONLY,
+  },
+  {
+    route: 'PUT /ads/admin/settings',
+    granular: ['ADS.MANAGE'],
+    allowed: STAFF_ONLY,
+  },
 ];
 
 const seedFor = (role: Role) => {
@@ -822,17 +1047,26 @@ describe('System role seeds', () => {
    * added BANK_TRANSACTIONS.VIEW and .BANK_EVIDENCE (78 -> 80), once more
    * to no seeded role. HOME (home_promos) added HOME.VIEW and HOME.MANAGE
    * (80 -> 82), INSERTed for ADMIN only (46 -> 48): the home page's promos
-   * are operations, not content ingestion.
+   * are operations, not content ingestion. LOTTERY (lottery_dreams) added
+   * LOTTERY.VIEW and LOTTERY.DREAMS_MANAGE (82 -> 84), again INSERTed for
+   * ADMIN only (48 -> 50); lottery_draws then added LOTTERY.DRAWS_MANAGE
+   * and LOTTERY.SETTINGS_MANAGE (84 -> 86), INSERTed for ADMIN only
+   * (50 -> 52); lottery_results then added LOTTERY.RESULTS_PUBLISH
+   * (86 -> 87), INSERTed for ADMIN only (52 -> 53); lottery_claims then
+   * added LOTTERY.CLAIMS_CONFIRM (87 -> 88), INSERTed for ADMIN only
+   * (53 -> 54). ADS (advertisements, 2026-11-04) added ADS.VIEW and
+   * ADS.MANAGE (88 -> 90), INSERTed for ADMIN only (54 -> 56): pre-roll
+   * ads are marketing, not content ingestion.
    */
-  it('has the expected seed sizes (82 / 48 / 24 / 0, matching the migrations)', () => {
+  it('has the expected seed sizes (90 / 56 / 24 / 0, matching the migrations)', () => {
     expect({
       SUPER_ADMIN: seedFor(Role.SUPER_ADMIN).permissions.length,
       ADMIN: seedFor(Role.ADMIN).permissions.length,
       CONTENT_UPLOADER: seedFor(Role.CONTENT_UPLOADER).permissions.length,
       USER: seedFor(Role.USER).permissions.length,
     }).toEqual({
-      SUPER_ADMIN: 82,
-      ADMIN: 48,
+      SUPER_ADMIN: 90,
+      ADMIN: 56,
       CONTENT_UPLOADER: 24,
       USER: 0,
     });
@@ -935,19 +1169,47 @@ describe('System role seeds — routes added after the RBAC migration', () => {
    * +  2 Queue totals — GET /deposits/stats and /withdrawals/stats (H-24).
    * +  8 Home promos — list, one, create, reorder, edit, delete (promos) and
    *   read/replace (settings). The public GET /home/showcase is ungated.
+   * +  4 Lottery dreams — the admin list and export (VIEW), edit and import
+   *   (DREAMS_MANAGE). The two public dream reads are ungated.
+   * + 11 Lottery draws + settings — settings read (VIEW) and change
+   *   (SETTINGS_MANAGE); the draw list, one draw and its tickets (VIEW);
+   *   create, edit, open, pause, close and the off-sale list
+   *   (DRAWS_MANAGE). The four public draw reads are ungated.
+   * +  4 Lottery results — a draw's sheet (VIEW); enter it by hand, fetch
+   *   it now, and test the results source (RESULTS_PUBLISH).
+   * +  3 Lottery publish — the publish preview and the winners table
+   *   (VIEW); publish the results (RESULTS_PUBLISH). The three public
+   *   results reads are ungated.
+   * +  6 Lottery prize claims — the list, the summary tiles and one claim
+   *   (VIEW); confirm (the wallet credit), reject and reopen
+   *   (CLAIMS_CONFIRM). The customer's own /lottery/claims routes are
+   *   signed-in only, like /lottery/tickets.
+   * + 12 Advertisements — the list, one ad, the three analytics reads and
+   *   the playback rules (VIEW); create, edit, attach the video, attach the
+   *   corner picture, delete and save the rules (MANAGE). The viewer's POST
+   *   /ads/session, /ads/midroll, /ads/preroll and playback events are
+   *   signed-in only.
    */
   it('covers every post-migration permission-gated route', () => {
-    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(50);
+    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(90);
     expect(
       POST_RBAC_GUARDED_ROUTES.filter((r) => r.granular.length > 1),
     ).toHaveLength(2);
   });
 
   // 117 / 114 since the two unused /uploads routes were removed (perf audit
-  // 2026-10-07); 125 / 122 with the eight home-promos routes (2026-10-08).
-  it('leaves the backend with 125 routes in the two tables, 122 permission-gated', () => {
+  // 2026-10-07); 125 / 122 with the eight home-promos routes (2026-10-08);
+  // 129 / 126 with the four lottery-dreams admin routes (2026-10-19);
+  // 140 / 137 with the eleven lottery draws + settings admin routes
+  // (2026-10-19, phase 2); 144 / 141 with the four lottery results admin
+  // routes (2026-10-19, phase 3); 147 / 144 with the three lottery publish
+  // routes (2026-10-20, phase 3 B); 153 / 150 with the six lottery prize
+  // claims admin routes (2026-10-24); 162 / 159 with the nine advertisement
+  // admin routes (2026-11-04); 164 / 161 with the two playback-rules routes
+  // (2026-11-04); 165 / 162 with the corner-picture route (2026-11-04).
+  it('leaves the backend with 165 routes in the two tables, 162 permission-gated', () => {
     const gatedLegacy = GUARDED_ROUTES.filter((r) => r.granular !== null);
-    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(122);
-    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(125);
+    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(162);
+    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(165);
   });
 });

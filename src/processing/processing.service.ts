@@ -14,7 +14,8 @@ import {
   videoTranscodeConcurrency,
 } from '../common/concurrency/slots';
 import { probeVideo, transcodeToHls } from './ffmpeg.util';
-import { approximateWidth, pickRenditions } from './rendition-tiers';
+import { buildMasterPlaylist, type MasterVariant } from './master-playlist';
+import { fitInsideBox, pickRenditions } from './rendition-tiers';
 
 @Injectable()
 export class ProcessingService {
@@ -100,12 +101,17 @@ export class ProcessingService {
     movieId: string,
     inputPath: string,
   ): Promise<void> {
-    await this.videosService.markProcessing(videoId);
-
     // Set once the slot is held, so the finally never releases a slot this
-    // run did not take (e.g. markProcessing above threw first).
+    // run did not take (e.g. markProcessing below threw first).
     let taken = false;
     try {
+      // The run's first write sits INSIDE the handler on purpose: both
+      // callers fire processVideo() and forget it, so a rejection escaping
+      // here — one pool timeout under load is enough — was an unhandled
+      // rejection, fatal for the whole API process (STR-009). Failing here
+      // is now recorded like a failure at any later step.
+      await this.videosService.markProcessing(videoId);
+
       // Wait for a process-wide transcode slot. The video already reads
       // PROCESSING, so the admin sees it queued rather than idle. The
       // per-tier ffmpeg timeout starts inside transcodeToHls, so time spent
@@ -137,16 +143,11 @@ export class ProcessingService {
       }
       await this.videosService.updateOriginalPath(videoId, originalKey);
 
-      const renditions = pickRenditions(probe.height);
+      const renditions = pickRenditions(probe.width, probe.height);
       const hlsDir = this.storageService.hlsDir(movieId);
       await this.storageService.ensureDir(hlsDir);
 
-      const variantEntries: {
-        name: string;
-        bandwidth: number;
-        width: number;
-        height: number;
-      }[] = [];
+      const variantEntries: MasterVariant[] = [];
 
       for (const tier of renditions) {
         const renditionKeyPrefix = this.storageService.hlsRenditionKeyPrefix(
@@ -174,6 +175,7 @@ export class ProcessingService {
             outputDir,
             segmentPattern: join(outputDir, 'segment_%03d.ts'),
             playlistPath: join(outputDir, 'index.m3u8'),
+            targetWidth: tier.width,
             targetHeight: tier.height,
             videoBitrate: tier.videoBitrate,
           });
@@ -194,9 +196,11 @@ export class ProcessingService {
 
         variantEntries.push({
           name: tier.name,
+          tierHeight: tier.height,
           bandwidth: tier.bandwidth,
-          width: approximateWidth(probe.width, probe.height, tier.height),
-          height: tier.height,
+          // The REAL output size, by the same fit-inside maths as the scale
+          // filter: a 1920x800 film's 720p rung is 1280x534, not 1280x720.
+          ...fitInsideBox(tier, probe.width, probe.height),
         });
       }
 
@@ -222,7 +226,8 @@ export class ProcessingService {
         })),
       });
 
-      // buildMasterPlaylist() above wrote a master from scratch, so any
+      // buildMasterPlaylist() above wrote a master from scratch (480p rung
+      // first, then highest to lowest — see master-playlist.ts), so any
       // subtitle group a previous publish had put there is gone. Re-derive
       // it from the rows that still exist. Never allowed to fail the
       // pipeline: the transcode itself succeeded, and the catch below would
@@ -303,7 +308,18 @@ export class ProcessingService {
       // Note this deletes local copies of tiers that already finished too —
       // harmless, since they're already durably in MinIO and the resume
       // check above works off MinIO, not local disk.
-      await this.cleanupScratch(movieId, inputPath);
+      //
+      // The local original is the exception while it is the ONLY copy: a
+      // failure before or during the archive step (the probe, the multi-GB
+      // upload to MinIO) used to delete it too, so Reprocess had nothing to
+      // read and the admin was forced into a re-upload (STR-004). Once the
+      // row points at a MinIO key the local file is just a copy and goes;
+      // a kept original is removed by the 04:00 scratch sweep after 24 h.
+      await this.cleanupScratch(
+        movieId,
+        inputPath,
+        await this.localOriginalStillNeeded(videoId, inputPath),
+      );
     } finally {
       if (taken) this.slots.release();
     }
@@ -318,20 +334,51 @@ export class ProcessingService {
   }
 
   /**
+   * True while the Video row still names the local scratch file this run
+   * was fed as its original — archiving never reached updateOriginalPath,
+   * so that file is the only copy and Reprocess will read it from there
+   * (UploadsService.resolveOriginalForReprocessing). False once the row
+   * holds a MinIO key, and for a row that is gone (the movie was deleted
+   * mid-run: nothing is left to reprocess). A lookup that fails keeps the
+   * file — the safe side; the scratch sweep removes it after 24 h.
+   */
+  private async localOriginalStillNeeded(
+    videoId: string,
+    inputPath: string,
+  ): Promise<boolean> {
+    try {
+      const row = await this.prisma.video.findUnique({
+        where: { id: videoId },
+        select: { originalPath: true },
+      });
+      return row?.originalPath === inputPath;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'unknown error';
+      this.logger.warn(
+        `Could not tell whether video ${videoId}'s original is archived — keeping the local file: ${reason}`,
+      );
+      return true;
+    }
+  }
+
+  /**
    * Removes this movie's local scratch files. Best-effort by design: it runs
    * on both the success and failure paths, and a cleanup problem must never
    * turn into the error the caller sees (or, worse, an unhandled rejection).
+   * `keepOriginal` leaves the input file in place (see
+   * localOriginalStillNeeded); the HLS scratch folder always goes.
    */
   private async cleanupScratch(
     movieId: string,
     inputPath: string,
+    keepOriginal = false,
   ): Promise<void> {
     try {
       await rm(this.storageService.hlsDir(movieId), {
         recursive: true,
         force: true,
       });
-      await rm(inputPath, { force: true });
+      if (!keepOriginal) await rm(inputPath, { force: true });
     } catch (error) {
       const reason = error instanceof Error ? error.message : 'unknown error';
       this.logger.warn(
@@ -339,24 +386,4 @@ export class ProcessingService {
       );
     }
   }
-}
-
-function buildMasterPlaylist(
-  variants: {
-    name: string;
-    bandwidth: number;
-    width: number;
-    height: number;
-  }[],
-): string {
-  const lines = ['#EXTM3U', '#EXT-X-VERSION:3'];
-
-  for (const variant of variants) {
-    lines.push(
-      `#EXT-X-STREAM-INF:BANDWIDTH=${variant.bandwidth},RESOLUTION=${variant.width}x${variant.height}`,
-      `${variant.name}/index.m3u8`,
-    );
-  }
-
-  return lines.join('\n') + '\n';
 }

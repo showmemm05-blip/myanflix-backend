@@ -16,9 +16,11 @@ import {
 } from '../roles/permission-resolver.service';
 import {
   describeBytes,
+  maxAdVideoUploadBytes,
   maxDocumentUploadBytes,
   maxVideoUploadBytes,
 } from './upload-limits';
+import { AD_VIDEO_FILENAME } from '../common/storage/storage.service';
 
 /**
  * The relativePath prefix that marks a bundle file as a subtitle SOURCE
@@ -34,6 +36,14 @@ export const SUBTITLE_RELATIVE_PREFIX = 'subtitles/';
  * under temp/video-replace/<movieId>/ instead of landing on the live keys.
  */
 export const MOVIE_REPLACE_RESOURCE_TYPE = 'movie-replace';
+
+/**
+ * The resourceType a pre-roll ad's MP4 is uploaded under (2026-11-04). One
+ * file only, always named video.mp4, staged under temp/ads/<adId>/ until
+ * POST /ads/admin/:id/video/attach checks it and moves it to its served
+ * key — the "ad" row must already exist (the admin creates it first).
+ */
+export const AD_RESOURCE_TYPE = 'ad';
 
 /**
  * The only movie states whose video may be REPLACED (the owner's decision):
@@ -199,6 +209,35 @@ export class ResourceUploadTypeRegistry {
         },
         buildKey: (resourceId, relativePath) =>
           `${this.storageService.bookDocumentPrefix(resourceId)}/${relativePath}`,
+      },
+      [AD_RESOURCE_TYPE]: {
+        // ADS.MANAGE: whoever may edit an ad may attach its video; the ads
+        // module has no reason to grant the movie pipeline's permission.
+        permission: 'ADS.MANAGE',
+        maxFileSize: maxAdVideoUploadBytes,
+        assertExists: async (resourceId) => {
+          const ad = await this.prisma.advertisement.findUnique({
+            where: { id: resourceId },
+            select: { id: true, format: true },
+          });
+          if (!ad) throw new NotFoundException('Advertisement not found');
+          // A corner ad's picture has its own route; it never takes a video.
+          if (ad.format !== 'VIDEO') {
+            throw new BadRequestException(
+              'A corner ad takes a picture, not a video',
+            );
+          }
+        },
+        // Exactly one filename, so the attach step knows what to read and a
+        // bundle-shaped upload cannot smuggle a second file into staging.
+        buildKey: (resourceId, relativePath) => {
+          if (relativePath !== AD_VIDEO_FILENAME) {
+            throw new BadRequestException(
+              `An advertisement upload must be named "${AD_VIDEO_FILENAME}"`,
+            );
+          }
+          return this.storageService.adStagingKey(resourceId);
+        },
       },
     };
   }

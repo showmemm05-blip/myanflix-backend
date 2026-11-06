@@ -6,18 +6,23 @@ import {
   IsString,
   IsUUID,
   Matches,
+  Max,
   MaxLength,
   Min,
 } from 'class-validator';
 
 export class CreateDepositDto {
+  /** @Max is the Decimal(12,2) column ceiling — past it Postgres overflows (DB-007). */
   @Type(() => Number)
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0.01)
+  @Max(9_999_999_999.99)
   amount!: number;
 
+  /** Same cap as CreateManualDepositDto — stored verbatim and shown in the admin queue (SEC-028). */
   @IsString()
   @IsNotEmpty()
+  @MaxLength(60)
   paymentMethod!: string;
 
   /** The PaymentAccount.accountName the client's account picker selected — optional so older clients that haven't been updated still work. */

@@ -26,6 +26,7 @@ import { applyReceivedEvent } from './deposit-matcher';
 import { applySentEvent } from './withdrawal-matcher';
 import {
   BANK_TRANSACTION_LINK_INCLUDE,
+  clearDepositScreenshotReason,
   depositVerificationPayload,
 } from './deposit-risk';
 import { pushWithdrawalVerificationUpdates } from './withdrawal-risk';
@@ -54,6 +55,14 @@ const ACCOUNT_CACHE_TTL_MS = 60_000;
 
 /** The one currency every money field in this app is in. */
 const SUPPORTED_CURRENCY = 'MMK';
+
+/**
+ * DB-020: bank_transactions.amount is Decimal(12,2), so anything at or
+ * above 10^10 would overflow inside the per-event transaction and be
+ * answered `error` — which the phone retries for ever. The DTO already
+ * caps the decimals at two, so "more than this" is exactly "≥ 10^10".
+ */
+const MAX_BANK_EVENT_AMOUNT = 9_999_999_999.99;
 
 /** The legacy per-row upload routes — kept for the rollout window (see attachScreenshot). */
 export type LegacyBankScreenshotKind = 'deposits' | 'withdrawals';
@@ -149,6 +158,11 @@ export class BankEventsService implements OnModuleInit, OnModuleDestroy {
     }
     if (dto.txCode.slice(-6) !== dto.txCodeLast6) {
       return rejected('LAST6_MISMATCH');
+    }
+    // A permanent answer (the phone marks the row failed, never retried):
+    // no real KBZPay/WavePay transfer reaches this, only a parser slip.
+    if (dto.amount > MAX_BANK_EVENT_AMOUNT) {
+      return rejected('AMOUNT_OUT_OF_RANGE');
     }
     const account = await this.lookupAccount(dto.paymentAccountId);
     if (account.isActive === null) return rejected('UNKNOWN_PAYMENT_ACCOUNT');
@@ -418,6 +432,21 @@ export class BankEventsService implements OnModuleInit, OnModuleDestroy {
             tx,
           });
         }
+        // SEC-004: the deposit was claimed on the phone's text alone and
+        // waits in PENDING_REVIEW (NO_SCREENSHOT) — the picture is here
+        // now, so re-score it in the same transaction (a no-op when the
+        // reason is not there, e.g. the pointer was already set).
+        const rescored = await clearDepositScreenshotReason(
+          tx,
+          this.audit,
+          row.linkedDepositId,
+          {
+            ...metadata,
+            trigger: 'screenshot_attach',
+            bankTransactionId: row.id,
+          },
+        );
+        if (rescored) linked.depositId = row.linkedDepositId;
       } else if (row.linkedWithdrawalId) {
         const withdrawal = await tx.withdrawal.updateMany({
           where: { id: row.linkedWithdrawalId, transferScreenshotKey: null },

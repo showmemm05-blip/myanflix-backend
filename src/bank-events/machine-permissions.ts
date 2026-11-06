@@ -18,6 +18,8 @@ export const MACHINE_PERMISSION_KEY = 'machinePermission';
 /** The identity MachineTokenGuard attaches to `request.machine`. */
 export interface MachinePrincipal {
   kind: 'phone-monitor';
+  /** The monitor's X-Device-Serial — the one the token is pinned to (SEC-004). */
+  deviceSerial: string;
   permissions: readonly MachinePermission[];
 }
 

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { UploadStatus, VideoStatus } from '../generated/prisma/client';
 import { MinioService } from '../common/storage/minio.service';
 import {
+  AD_VIDEO_STAGING_ROOT,
   StorageService,
   VIDEO_REPLACE_STAGING_ROOT,
 } from '../common/storage/storage.service';
@@ -116,9 +117,15 @@ export class UploadCleanupService {
     const cutoffMs = Date.now() - REPLACE_STAGING_MAX_AGE_MS;
     let stale: string[];
     try {
-      const objects = await this.minioService.listObjects(
-        `${VIDEO_REPLACE_STAGING_ROOT}/`,
-      );
+      // The ad staging (temp/ads/<adId>/, the adVideoStaging class) has the
+      // same shape and the same declared 7 days, so it is swept here too.
+      const objects = (
+        await Promise.all(
+          [VIDEO_REPLACE_STAGING_ROOT, AD_VIDEO_STAGING_ROOT].map((root) =>
+            this.minioService.listObjects(`${root}/`),
+          ),
+        )
+      ).flat();
       stale = objects
         .filter(
           (object) =>

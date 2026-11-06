@@ -23,7 +23,8 @@ jest.mock('node:fs/promises', () => ({
 const probeVideoMock = probeVideo as jest.Mock;
 const transcodeToHlsMock = transcodeToHls as jest.Mock;
 const rmMock = rm as unknown as jest.Mock;
-void writeFile; // imported only so jest.mock('node:fs/promises') covers it; processVideo() calls it internally
+/** processVideo() writes exactly one local file: the master playlist. */
+const writeFileMock = writeFile as unknown as jest.Mock;
 
 describe('ProcessingService', () => {
   let service: ProcessingService;
@@ -33,7 +34,10 @@ describe('ProcessingService', () => {
     updateOriginalPath: jest.Mock;
     markReady: jest.Mock;
   };
-  let prisma: { movie: { update: jest.Mock; findUnique: jest.Mock } };
+  let prisma: {
+    movie: { update: jest.Mock; findUnique: jest.Mock };
+    video: { findUnique: jest.Mock };
+  };
   let minioService: {
     objectExists: jest.Mock;
     uploadFile: jest.Mock;
@@ -51,6 +55,11 @@ describe('ProcessingService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    // clearAllMocks() keeps a mockRejectedValue() a previous test installed
+    // on the module-level rm mock — under --randomize that leaked rejection
+    // broke whichever transcode test ran next (TEST-003). Every test starts
+    // from a clean scratch disk.
+    rmMock.mockReset().mockResolvedValue(undefined);
     // processVideo() logs the failure it is handling; keep test output readable.
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
@@ -68,6 +77,13 @@ describe('ProcessingService', () => {
         findUnique: jest
           .fn()
           .mockResolvedValue({ title: 'A Movie', status: 'DRAFT' }),
+      },
+      video: {
+        // As the classic flow creates the row: originalPath is the local
+        // scratch file until the pipeline archives it (updateOriginalPath).
+        findUnique: jest.fn().mockResolvedValue({
+          originalPath: '/storage/temp/videos/movie-1/original.mp4',
+        }),
       },
     };
     minioService = {
@@ -345,6 +361,189 @@ describe('ProcessingService', () => {
     });
   });
 
+  /**
+   * The widescreen ladder and the 480p-first master (owner, 2026-10-12). A
+   * rung is earned by the source's longer side reaching the box width (98%)
+   * OR its shorter side reaching the tier height; each rung is scaled to fit
+   * inside its 16:9 box; RESOLUTION states the real output size; and every
+   * master lists the 480p rung first, because native phone players start
+   * on the first variant.
+   */
+  describe('the rendition ladder and the master playlist', () => {
+    const MASTER_PATH = '/storage/temp/videos/movie-1/hls/master.m3u8';
+    const masterWritten = (): string => {
+      const call = writeFileMock.mock.calls.find(
+        ([path]) => path === MASTER_PATH,
+      );
+      expect(call).toBeDefined();
+      return call![1] as string;
+    };
+    const boxesTranscoded = (): string[] =>
+      transcodeToHlsMock.mock.calls.map(
+        ([options]) =>
+          `${(options as { targetWidth: number }).targetWidth}x${(options as { targetHeight: number }).targetHeight}`,
+      );
+
+    beforeEach(() => {
+      transcodeToHlsMock.mockResolvedValue(undefined);
+      minioService.objectExists.mockResolvedValue(false);
+    });
+
+    it('a 1920x800 widescreen film gets a real 1080p rung, every tier scaled into its own 16:9 box', async () => {
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 5400,
+        width: 1920,
+        height: 800,
+      });
+
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+
+      expect(boxesTranscoded()).toEqual([
+        '1920x1080',
+        '1280x720',
+        '854x480',
+        '640x360',
+        '426x240',
+      ]);
+      expect(transcodeToHlsMock).toHaveBeenCalledWith({
+        inputPath: '/storage/temp/videos/movie-1/original.mp4',
+        outputDir: '/storage/temp/videos/movie-1/hls/1080p',
+        segmentPattern:
+          '/storage/temp/videos/movie-1/hls/1080p/segment_%03d.ts',
+        playlistPath: '/storage/temp/videos/movie-1/hls/1080p/index.m3u8',
+        targetWidth: 1920,
+        targetHeight: 1080,
+        videoBitrate: '5000k',
+      });
+      expect(videosService.markReady).toHaveBeenCalledWith(
+        'video-1',
+        expect.objectContaining({
+          resolution: '1920x800',
+          renditions: expect.arrayContaining([
+            {
+              resolution: '1080p',
+              playlistPath: 'videos/movie-1/hls/1080p/index.m3u8',
+            },
+          ]),
+        }),
+      );
+    });
+
+    it('writes the master with the 480p rung first and RESOLUTION as the real output size, then uploads it', async () => {
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 5400,
+        width: 1920,
+        height: 800,
+      });
+
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+
+      expect(masterWritten()).toBe(
+        [
+          '#EXTM3U',
+          '#EXT-X-VERSION:3',
+          '#EXT-X-STREAM-INF:BANDWIDTH=1528000,RESOLUTION=854x356',
+          '480p/index.m3u8',
+          '#EXT-X-STREAM-INF:BANDWIDTH=5128000,RESOLUTION=1920x800',
+          '1080p/index.m3u8',
+          '#EXT-X-STREAM-INF:BANDWIDTH=2928000,RESOLUTION=1280x534',
+          '720p/index.m3u8',
+          '#EXT-X-STREAM-INF:BANDWIDTH=928000,RESOLUTION=640x266',
+          '360p/index.m3u8',
+          '#EXT-X-STREAM-INF:BANDWIDTH=528000,RESOLUTION=426x178',
+          '240p/index.m3u8',
+        ].join('\n') + '\n',
+      );
+      expect(minioService.uploadFile).toHaveBeenCalledWith(
+        'videos/movie-1/hls/master.m3u8',
+        MASTER_PATH,
+      );
+    });
+
+    it('a 16:9 720p source still gets 720p to 240p at the sizes it always had — only the order changed', async () => {
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 450,
+        width: 1280,
+        height: 720,
+      });
+
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+
+      expect(boxesTranscoded()).toEqual([
+        '1280x720',
+        '854x480',
+        '640x360',
+        '426x240',
+      ]);
+      expect(masterWritten()).toBe(
+        [
+          '#EXTM3U',
+          '#EXT-X-VERSION:3',
+          '#EXT-X-STREAM-INF:BANDWIDTH=1528000,RESOLUTION=854x480',
+          '480p/index.m3u8',
+          '#EXT-X-STREAM-INF:BANDWIDTH=2928000,RESOLUTION=1280x720',
+          '720p/index.m3u8',
+          '#EXT-X-STREAM-INF:BANDWIDTH=928000,RESOLUTION=640x360',
+          '360p/index.m3u8',
+          '#EXT-X-STREAM-INF:BANDWIDTH=528000,RESOLUTION=426x240',
+          '240p/index.m3u8',
+        ].join('\n') + '\n',
+      );
+    });
+
+    it('a vertical 1080x1920 source earns its rungs by height exactly as before, and the master states its real portrait sizes', async () => {
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 60,
+        width: 1080,
+        height: 1920,
+      });
+
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+
+      expect(transcodeToHlsMock).toHaveBeenCalledTimes(5);
+      expect(masterWritten()).toContain(
+        '#EXT-X-STREAM-INF:BANDWIDTH=1528000,RESOLUTION=270x480\n480p/index.m3u8\n' +
+          '#EXT-X-STREAM-INF:BANDWIDTH=5128000,RESOLUTION=608x1080\n1080p/index.m3u8\n' +
+          '#EXT-X-STREAM-INF:BANDWIDTH=2928000,RESOLUTION=406x720\n720p/index.m3u8\n',
+      );
+    });
+
+    it('a source too small for every rung falls back to the single 240p rung, as before', async () => {
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 30,
+        width: 200,
+        height: 100,
+      });
+
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+
+      expect(boxesTranscoded()).toEqual(['426x240']);
+      expect(masterWritten()).toBe(
+        '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=528000,RESOLUTION=426x214\n240p/index.m3u8\n',
+      );
+    });
+  });
+
   describe('isActivelyProcessing / active-job tracking', () => {
     it('reports a video as actively processing only while processVideo() is still running', async () => {
       probeVideoMock.mockResolvedValue({
@@ -413,7 +612,7 @@ describe('ProcessingService', () => {
       probeVideoMock.mockRejectedValue(new Error('ffprobe blew up'));
     });
 
-    it('records the failure and cleans up scratch files', async () => {
+    it('records the failure, clears the scratch renditions and KEEPS the un-archived original for Reprocess (STR-004)', async () => {
       await service.processVideo(
         'video-1',
         'movie-1',
@@ -428,10 +627,154 @@ describe('ProcessingService', () => {
         recursive: true,
         force: true,
       });
+      // The probe failed before the archive step, so the row still names
+      // the local file: it is the only copy there is.
+      expect(prisma.video.findUnique).toHaveBeenCalledWith({
+        where: { id: 'video-1' },
+        select: { originalPath: true },
+      });
+      expect(rmMock).not.toHaveBeenCalledWith(
+        '/storage/temp/videos/movie-1/original.mp4',
+        expect.anything(),
+      );
+    });
+
+    /**
+     * The STR-004 case proper: the archive upload (the first and longest
+     * MinIO transfer) is what failed, which is exactly the "dropped
+     * connection to the storage server" that Reprocess exists for — and
+     * Reprocess reads the local file when the row still points at it.
+     */
+    it('keeps the local original when archiving it to MinIO failed', async () => {
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 120,
+        width: 426,
+        height: 240,
+      });
+      minioService.uploadFile.mockRejectedValue(new Error('minio down'));
+
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+
+      expect(videosService.markFailed).toHaveBeenCalledWith(
+        'video-1',
+        'minio down',
+      );
+      expect(videosService.updateOriginalPath).not.toHaveBeenCalled();
+      expect(rmMock).toHaveBeenCalledWith('/storage/temp/videos/movie-1/hls', {
+        recursive: true,
+        force: true,
+      });
+      expect(rmMock).not.toHaveBeenCalledWith(
+        '/storage/temp/videos/movie-1/original.mp4',
+        expect.anything(),
+      );
+    });
+
+    it('a later run over that kept local original archives it (Reprocess after STR-004)', async () => {
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 120,
+        width: 426,
+        height: 240,
+      });
+      transcodeToHlsMock.mockResolvedValue(undefined);
+      minioService.objectExists.mockResolvedValue(false);
+
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+
+      expect(minioService.uploadFile).toHaveBeenCalledWith(
+        'videos/movie-1/original.mp4',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+      expect(videosService.updateOriginalPath).toHaveBeenCalledWith(
+        'video-1',
+        'videos/movie-1/original.mp4',
+      );
+      expect(videosService.markReady).toHaveBeenCalled();
+    });
+
+    it('deletes the local original once the row points at a MinIO key (archived; a later step failed)', async () => {
+      probeVideoMock.mockResolvedValue({
+        durationSeconds: 120,
+        width: 426,
+        height: 240,
+      });
+      transcodeToHlsMock.mockRejectedValue(new Error('ffmpeg exited with 1'));
+      prisma.video.findUnique.mockResolvedValue({
+        originalPath: 'videos/movie-1/original.mp4',
+      });
+
+      await service.processVideo(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+
+      expect(videosService.markFailed).toHaveBeenCalledWith(
+        'video-1',
+        'ffmpeg exited with 1',
+      );
       expect(rmMock).toHaveBeenCalledWith(
         '/storage/temp/videos/movie-1/original.mp4',
         { force: true },
       );
+    });
+
+    it('keeps the local original when the row cannot be read — the safe side', async () => {
+      prisma.video.findUnique.mockRejectedValue(new Error('pool timeout'));
+
+      await expect(
+        service.processVideo(
+          'video-1',
+          'movie-1',
+          '/storage/temp/videos/movie-1/original.mp4',
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(rmMock).toHaveBeenCalledWith('/storage/temp/videos/movie-1/hls', {
+        recursive: true,
+        force: true,
+      });
+      expect(rmMock).not.toHaveBeenCalledWith(
+        '/storage/temp/videos/movie-1/original.mp4',
+        expect.anything(),
+      );
+    });
+
+    /**
+     * The fire-and-forget callers used to see this rejection escape
+     * processVideo() with no catch, and an unhandled rejection is fatal in
+     * Node — one pool timeout on this first write took the API down
+     * (STR-009). It is now a failure like any other step.
+     */
+    it('a markProcessing failure is handled like any other step — processVideo resolves and records it (STR-009)', async () => {
+      videosService.markProcessing.mockRejectedValueOnce(new Error('db down'));
+
+      await expect(
+        service.processVideo(
+          'video-1',
+          'movie-1',
+          '/storage/temp/videos/movie-1/original.mp4',
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(probeVideoMock).not.toHaveBeenCalled();
+      expect(videosService.markFailed).toHaveBeenCalledWith(
+        'video-1',
+        'db down',
+      );
+      expect(prisma.movie.update).toHaveBeenCalledWith({
+        where: { id: 'movie-1' },
+        data: { status: 'DRAFT' },
+      });
+      expect(service.isActivelyProcessing('video-1')).toBe(false);
     });
 
     /**
@@ -464,6 +807,9 @@ describe('ProcessingService', () => {
           code: 'P2025',
         }),
       );
+      // The Video row went with its movie: nothing is left to reprocess, so
+      // the local original goes too.
+      prisma.video.findUnique.mockResolvedValue(null);
 
       await service.processVideo(
         'video-1',
@@ -489,12 +835,8 @@ describe('ProcessingService', () => {
       ).resolves.toBeUndefined();
     });
   });
-  describe('audit — SYSTEM rows with no actor', () => {
-    beforeEach(() => {
-      // The failure block above leaves rm() rejecting; a clean scratch dir here.
-      rmMock.mockResolvedValue(undefined);
-    });
 
+  describe('audit — SYSTEM rows with no actor', () => {
     it('auto-publish after a transcode is movie.publish by the system, after the status write', async () => {
       probeVideoMock.mockResolvedValue({
         durationSeconds: 120,
@@ -640,13 +982,19 @@ describe('ProcessingService', () => {
       expect(service.transcodeLoad).toEqual({ active: 0, queued: 0 });
     });
 
-    it('never releases a slot it did not take (markProcessing threw first)', async () => {
+    it('never releases a slot it did not take (markProcessing threw first — handled, no slot was held)', async () => {
       videosService.markProcessing.mockRejectedValueOnce(new Error('db down'));
 
+      // Handled inside the pipeline since STR-009: resolves, records the
+      // failure, and the slot it never acquired is not released either.
       await expect(
         service.processVideo('video-1', 'movie-1', '/in/1.mp4'),
-      ).rejects.toThrow('db down');
+      ).resolves.toBeUndefined();
 
+      expect(videosService.markFailed).toHaveBeenCalledWith(
+        'video-1',
+        'db down',
+      );
       expect(service.transcodeLoad).toEqual({ active: 0, queued: 0 });
       expect(service.isActivelyProcessing('video-1')).toBe(false);
     });

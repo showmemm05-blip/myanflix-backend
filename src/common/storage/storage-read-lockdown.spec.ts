@@ -57,6 +57,7 @@ const CACHE_SERVED_KEYS = [
   `audio/${ID}/hls/master.m3u8`,
   `subtitles/${ID}/${ID}.srt`,
   `books/${ID}/${ID}/${ID}/pages/page-001.webp`,
+  `ads/${ID}/v-c6592c79/video.mp4`,
 ];
 
 /** Keys only the backend reads, with its access key — no anonymous grant. */
@@ -66,6 +67,7 @@ const BACKEND_ONLY_KEYS = [
   `documents/books/${ID}/${ID}/${ID}/original.pdf`,
   `documents/bank-screenshots/transactions/${ID}/a3bc636e.png`,
   `temp/${ID}/part-source.bin`,
+  `temp/ads/${ID}/video.mp4`,
 ];
 
 interface PolicyStatement {

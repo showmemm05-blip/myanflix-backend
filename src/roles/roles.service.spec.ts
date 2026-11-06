@@ -171,11 +171,11 @@ describe('RolesService', () => {
   });
 
   describe('getCatalogue', () => {
-    it('returns all 22 modules and all 82 permissions for the matrix UI', () => {
+    it('returns all 24 modules and all 90 permissions for the matrix UI', () => {
       const catalogue = service.getCatalogue();
 
-      expect(catalogue.modules).toHaveLength(22);
-      expect(catalogue.permissions).toHaveLength(82);
+      expect(catalogue.modules).toHaveLength(24);
+      expect(catalogue.permissions).toHaveLength(90);
       expect(catalogue.modules[0]).toEqual({
         key: 'DASHBOARD',
         label: 'Dashboard',

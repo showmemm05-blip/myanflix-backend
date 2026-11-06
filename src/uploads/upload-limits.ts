@@ -27,6 +27,8 @@ const MB = 1024 * 1024;
 
 export const DEFAULT_MAX_VIDEO_UPLOAD_BYTES = 60 * GB;
 export const DEFAULT_MAX_DOCUMENT_UPLOAD_BYTES = 500 * MB;
+/** A pre-roll ad is seconds long; 200 MB is far above any sane H.264 encode of one. */
+export const DEFAULT_MAX_AD_VIDEO_UPLOAD_BYTES = 200 * MB;
 export const DEFAULT_MIN_FREE_DISK_BYTES = 2 * GB;
 export const DEFAULT_MAX_OPEN_SESSIONS_PER_MOVIE = 32;
 
@@ -43,6 +45,14 @@ export function maxVideoUploadBytes(): number {
   return positiveIntFromEnv(
     'UPLOAD_MAX_VIDEO_BYTES',
     DEFAULT_MAX_VIDEO_UPLOAD_BYTES,
+  );
+}
+
+/** Largest pre-roll ad MP4 (bytes) the "ad" upload type and the attach step accept. */
+export function maxAdVideoUploadBytes(): number {
+  return positiveIntFromEnv(
+    'UPLOAD_MAX_AD_VIDEO_BYTES',
+    DEFAULT_MAX_AD_VIDEO_UPLOAD_BYTES,
   );
 }
 

@@ -3,6 +3,8 @@ import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { PaymentAccountsModule } from '../payment-accounts/payment-accounts.module';
+import { BankEventsBindingController } from './bank-events-binding.controller';
+import { BankEventsBindingModule } from './bank-events-binding.module';
 import { BankEventsController } from './bank-events.controller';
 import { BankEventsService } from './bank-events.service';
 import { MachineTokenGuard } from './machine-token.guard';
@@ -14,13 +16,16 @@ import { MachineTokenGuard } from './machine-token.guard';
  * through DepositsService, so this module never forms a cycle with the
  * deposits/withdrawals modules that import the same risk helpers.
  * AuditService is global; MinioService/StorageService are provided
- * per-module like everywhere else.
+ * per-module like everywhere else. The device pin (SEC-004) comes from
+ * BankEventsBindingModule, shared with the realtime handshake;
+ * PermissionsGuard for the staff binding routes comes from the global
+ * RolesModule.
  */
 @Module({
   // PaymentAccountsModule only for PaymentAccountEvents (bam-16): its
   // imports (roles, realtime) never lead back here, so no cycle.
-  imports: [RealtimeModule, PaymentAccountsModule],
-  controllers: [BankEventsController],
+  imports: [RealtimeModule, PaymentAccountsModule, BankEventsBindingModule],
+  controllers: [BankEventsController, BankEventsBindingController],
   providers: [
     BankEventsService,
     MachineTokenGuard,

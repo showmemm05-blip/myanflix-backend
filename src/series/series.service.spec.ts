@@ -762,6 +762,47 @@ describe('SeriesService', () => {
     });
   });
 
+  describe('create / update — the series type (country)', () => {
+    const row = {
+      id: 'series-1',
+      title: 'A Show',
+      status: SeriesStatus.DRAFT,
+      posterUrl: null,
+      coverUrl: null,
+      categories: [],
+      actors: [],
+    };
+    const base = {
+      title: 'A Show',
+      description: 'd',
+      genre: 'Drama',
+      language: 'Burmese',
+      releaseYear: 2024,
+    };
+
+    it('create stores the picked type as sent', async () => {
+      prisma.series.create.mockResolvedValue(row);
+      await service.create({ ...base, country: 'Korean' }, ACTOR);
+      expect(prisma.series.create.mock.calls[0][0].data.country).toBe('Korean');
+    });
+
+    it('update stores an empty type ("Not set") as null', async () => {
+      prisma.series.findUnique.mockResolvedValue(row);
+      prisma.series.update.mockResolvedValue(row);
+      await service.update('series-1', { country: '' }, ACTOR);
+      expect(prisma.series.update.mock.calls[0][0].data.country).toBeNull();
+    });
+
+    it('update without a type leaves it alone', async () => {
+      prisma.series.findUnique.mockResolvedValue(row);
+      prisma.series.update.mockResolvedValue(row);
+      await service.update('series-1', { title: 'Renamed' }, ACTOR);
+      expect(prisma.series.update.mock.calls[0][0].data).not.toHaveProperty(
+        'country',
+      );
+    });
+  });
+
   describe('findAll — series-level visibility', () => {
     beforeEach(() => {
       prisma.series.findMany.mockResolvedValue([]);

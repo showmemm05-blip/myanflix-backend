@@ -19,7 +19,11 @@ import type { MinioService } from '../common/storage/minio.service';
 import { CommentStatus } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { PermissionResolverService } from '../roles/permission-resolver.service';
-import { CommentsService, REPLY_PREVIEW_LIMIT } from './comments.service';
+import {
+  CommentsService,
+  memberTagOf,
+  REPLY_PREVIEW_LIMIT,
+} from './comments.service';
 
 const URL = process.env.PARITY_DATABASE_URL;
 const describeDb = URL ? describe : describe.skip;
@@ -50,8 +54,10 @@ describeDb('comment reply preview parity on a real database', () => {
       {} as AuditService,
     );
 
+    // The user index leads the id, so the five `Member #<tag>` pseudonyms
+    // the thread shows (first characters of the id) tell the users apart.
     const users = Array.from({ length: 5 }, (_, i) => ({
-      id: `${RUN}-u${i}`,
+      id: `u${i}-${RUN}`,
       username: `${RUN}-u${i}`,
       password: 'x',
       phone: `+9597${String(i).padStart(7, '0')}`,
@@ -172,9 +178,14 @@ describeDb('comment reply preview parity on a real database', () => {
         expect(comment.replies.map((r) => r.body)).toEqual(
           old.map((r) => r.body),
         );
-        expect(comment.replies.map((r) => r.user.id)).toEqual(
-          old.map((r) => r.userId),
+        // Read as a guest: the author is the pseudonym, never the id.
+        expect(comment.replies.map((r) => r.user.memberTag)).toEqual(
+          old.map((r) => memberTagOf(r.userId)),
         );
+        for (const reply of comment.replies) {
+          expect(reply.user).not.toHaveProperty('id');
+          expect(reply.user).not.toHaveProperty('username');
+        }
         expect(comment.replyCount).toBe(total);
         expect(comment.hasMoreReplies).toBe(total > old.length);
         for (const reply of comment.replies) {

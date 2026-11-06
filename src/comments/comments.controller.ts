@@ -11,7 +11,7 @@ import {
   Query,
 } from '@nestjs/common';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { Public } from '../common/decorators/public.decorator';
+import { OptionalAuth } from '../common/decorators/optional-auth.decorator';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { CommentQueryDto } from './dto/comment-query.dto';
@@ -19,28 +19,36 @@ import { CreateCommentDto } from './dto/create-comment.dto';
 import { CommentsService } from './comments.service';
 
 /**
- * Reading a title's comments is public (the website shows the thread to
- * signed-out visitors); posting and deleting are not. Deletion is
- * self-or-moderator, which the service decides — see CommentsService.remove.
+ * Reading a title's comments needs no token (the website shows the thread
+ * to signed-out visitors) but honours one — @OptionalAuth(), not @Public(),
+ * so a signed-in reader's own comments come back flagged `isMine`. The
+ * thread is otherwise the same for everyone: no reader, token or not, gets
+ * another commenter's username or user id (SEC-007). Posting and deleting
+ * are authenticated. Deletion is self-or-moderator, which the service
+ * decides — see CommentsService.remove.
  */
 @Controller('comments')
 export class CommentsController {
   constructor(private readonly commentsService: CommentsService) {}
 
-  @Public()
+  @OptionalAuth()
   @Get()
-  findForTitle(@Query() query: CommentQueryDto) {
-    return this.commentsService.findForTitle(query);
+  findForTitle(
+    @Query() query: CommentQueryDto,
+    @CurrentUser() viewer?: AuthenticatedUser,
+  ) {
+    return this.commentsService.findForTitle(query, viewer?.id ?? null);
   }
 
   /** The replies beyond the first REPLY_PREVIEW_LIMIT a thread read carries. */
-  @Public()
+  @OptionalAuth()
   @Get(':id/replies')
   findReplies(
     @Param('id', ParseUUIDPipe) id: string,
     @Query() pagination: PaginationQueryDto,
+    @CurrentUser() viewer?: AuthenticatedUser,
   ) {
-    return this.commentsService.findReplies(id, pagination);
+    return this.commentsService.findReplies(id, pagination, viewer?.id ?? null);
   }
 
   @Post()

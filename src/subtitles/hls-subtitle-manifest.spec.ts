@@ -8,12 +8,15 @@ import {
   totalDurationFromMediaPlaylist,
   type SubtitleRendition,
 } from './hls-subtitle-manifest';
+import { buildMasterPlaylist } from '../processing/master-playlist';
+import { fitInsideBox, pickRenditions } from '../processing/rendition-tiers';
 
 /**
- * Byte-for-byte the master ffmpeg's buildMasterPlaylist() writes today
- * (and the shape the externally pre-transcoded bundles ship), so the
- * no-op and idempotence assertions below are about the real file, not a
- * convenient fiction.
+ * Byte-for-byte the master buildMasterPlaylist() wrote until 2026-10-12
+ * (highest rung first) — every title transcoded before then still has this
+ * shape in MinIO, and the externally pre-transcoded bundles shipped it too —
+ * so the no-op and idempotence assertions below are about a real file, not
+ * a convenient fiction. WIDESCREEN_MASTER is what the writer produces now.
  */
 const FFMPEG_MASTER = [
   '#EXTM3U',
@@ -25,6 +28,28 @@ const FFMPEG_MASTER = [
   '#EXT-X-STREAM-INF:BANDWIDTH=928000,RESOLUTION=640x360',
   '360p/index.m3u8',
   '#EXT-X-STREAM-INF:BANDWIDTH=528000,RESOLUTION=426x240',
+  '240p/index.m3u8',
+].join('\n') + '\n';
+
+/**
+ * What ProcessingService writes TODAY for a 1920x800 widescreen film: the
+ * 480p rung first (native phone players start on the first variant), then
+ * highest to lowest, each RESOLUTION the rung's real output size. Spelled
+ * out rather than generated so a change to the writer is caught here; the
+ * first widescreen test below pins it to the writer's actual output.
+ */
+const WIDESCREEN_MASTER = [
+  '#EXTM3U',
+  '#EXT-X-VERSION:3',
+  '#EXT-X-STREAM-INF:BANDWIDTH=1528000,RESOLUTION=854x356',
+  '480p/index.m3u8',
+  '#EXT-X-STREAM-INF:BANDWIDTH=5128000,RESOLUTION=1920x800',
+  '1080p/index.m3u8',
+  '#EXT-X-STREAM-INF:BANDWIDTH=2928000,RESOLUTION=1280x534',
+  '720p/index.m3u8',
+  '#EXT-X-STREAM-INF:BANDWIDTH=928000,RESOLUTION=640x266',
+  '360p/index.m3u8',
+  '#EXT-X-STREAM-INF:BANDWIDTH=528000,RESOLUTION=426x178',
   '240p/index.m3u8',
 ].join('\n') + '\n';
 
@@ -236,6 +261,57 @@ describe('rewriteMasterPlaylist', () => {
     });
   });
 
+  /**
+   * The master the classic flow writes since 2026-10-12 leads with 480p and
+   * states each rung's real (non-16:9) size. The rewrite must carry both
+   * through untouched: a phone starts on whichever variant is listed first,
+   * and a RESOLUTION "corrected" to the box would lie to the players'
+   * quality menus. It inserts the subtitle group and nothing else.
+   */
+  describe('a 480p-first widescreen master', () => {
+    it('is exactly what buildMasterPlaylist() writes today for a 1920x800 film', () => {
+      const variants = pickRenditions(1920, 800).map((tier) => ({
+        name: tier.name,
+        tierHeight: tier.height,
+        bandwidth: tier.bandwidth,
+        ...fitInsideBox(tier, 1920, 800),
+      }));
+
+      expect(buildMasterPlaylist(variants)).toBe(WIDESCREEN_MASTER);
+    });
+
+    it('keeps the variant order — the 480p start rung stays first — and every RESOLUTION as written; it never re-sorts', () => {
+      const master = rewriteMasterPlaylist(WIDESCREEN_MASTER, [
+        ENGLISH,
+        BURMESE,
+      ]);
+
+      expect(streamInfLines(master)).toEqual([
+        '#EXT-X-STREAM-INF:BANDWIDTH=1528000,RESOLUTION=854x356,SUBTITLES="subs"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=5128000,RESOLUTION=1920x800,SUBTITLES="subs"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=2928000,RESOLUTION=1280x534,SUBTITLES="subs"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=928000,RESOLUTION=640x266,SUBTITLES="subs"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=528000,RESOLUTION=426x178,SUBTITLES="subs"',
+      ]);
+      expect(
+        master.split('\n').filter((line) => line.endsWith('/index.m3u8')),
+      ).toEqual([
+        '480p/index.m3u8',
+        '1080p/index.m3u8',
+        '720p/index.m3u8',
+        '360p/index.m3u8',
+        '240p/index.m3u8',
+      ]);
+    });
+
+    it('restores it byte-for-byte when the last subtitle is deleted, and is idempotent in between', () => {
+      const withSubs = rewriteMasterPlaylist(WIDESCREEN_MASTER, [ENGLISH]);
+
+      expect(rewriteMasterPlaylist(withSubs, [ENGLISH])).toBe(withSubs);
+      expect(rewriteMasterPlaylist(withSubs, [])).toBe(WIDESCREEN_MASTER);
+    });
+  });
+
   describe('foreign playlists', () => {
     it('leaves a non-subtitle EXT-X-MEDIA group (e.g. audio) alone', () => {
       const withAudio =
@@ -306,6 +382,10 @@ describe('buildSubtitleMediaPlaylist', () => {
 describe('media timeline recovery', () => {
   it('finds the first variant URI in a master', () => {
     expect(firstVariantUri(FFMPEG_MASTER)).toBe('720p/index.m3u8');
+  });
+
+  it('finds the 480p start rung first in a widescreen master — the timeline is recovered from whichever variant leads', () => {
+    expect(firstVariantUri(WIDESCREEN_MASTER)).toBe('480p/index.m3u8');
   });
 
   it('returns null for a master with no variants at all', () => {

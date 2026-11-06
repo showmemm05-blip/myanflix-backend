@@ -29,13 +29,17 @@ export class CreatePaymentAccountDto {
   @MaxLength(60)
   subname?: string;
 
+  /** Shown to every customer in the deposit picker — capped like the
+   * withdrawal DTO's account fields (SEC-028). */
   @IsString()
   @IsNotEmpty()
+  @MaxLength(120)
   accountName!: string;
 
   /** Account number or phone number, depending on type. */
   @IsString()
   @IsNotEmpty()
+  @MaxLength(60)
   accountNumber!: string;
 
   /** Only meaningful for bank-transfer types — the admin UI shows/requires
@@ -44,6 +48,7 @@ export class CreatePaymentAccountDto {
    * tied to any one specific type value. */
   @IsOptional()
   @IsString()
+  @MaxLength(120)
   bankName?: string;
 
   @IsOptional()

@@ -683,7 +683,9 @@ describe('DepositsService', () => {
                 email: true,
               },
             },
-            bankTransaction: { select: { id: true, counterparty: true } },
+            bankTransaction: {
+              select: { id: true, counterparty: true, deviceSerial: true },
+            },
           },
         }),
       );
@@ -1039,7 +1041,9 @@ describe('DepositsService', () => {
                 email: true,
               },
             },
-            bankTransaction: { select: { id: true, counterparty: true } },
+            bankTransaction: {
+              select: { id: true, counterparty: true, deviceSerial: true },
+            },
           },
         }),
       );
@@ -1060,10 +1064,78 @@ describe('DepositsService', () => {
       prisma.deposit.updateMany.mockResolvedValue({ count: 0 });
 
       await expect(service.approve('deposit-1', admin)).rejects.toThrow(
-        ConflictException,
+        new ConflictException(
+          'This deposit has already been approved or rejected',
+        ),
       );
       expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
       expect(prisma.transaction.create).not.toHaveBeenCalled();
+    });
+
+    describe('DB-003: the claim is keyed on the bank-checked state read inside the transaction', () => {
+      it('a row the bank never checked claims with bankCheckedAt IS NULL', async () => {
+        primeApprove(makeDeposit({ bankCheckedAt: null }));
+
+        await service.approve('deposit-1', admin);
+
+        expect(prisma.deposit.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: {
+              id: 'deposit-1',
+              status: DepositStatus.PENDING,
+              bankCheckedAt: null,
+            },
+          }),
+        );
+      });
+
+      it('a bank-checked row claims with the exact bankCheckedAt it read', async () => {
+        const checkedAt = new Date('2026-10-09T03:00:00.000Z');
+        primeApprove(
+          makeDeposit({
+            receivingAmount: new Prisma.Decimal(5000),
+            bankCheckedAt: checkedAt,
+            matchStatus: 'MATCHED',
+          }),
+        );
+
+        await service.approve('deposit-1', admin);
+
+        expect(prisma.deposit.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: {
+              id: 'deposit-1',
+              status: DepositStatus.PENDING,
+              bankCheckedAt: checkedAt,
+            },
+          }),
+        );
+      });
+
+      it("the phone's event landed between the read and the claim: count 0 on a row that is still PENDING → 409 'reload', nothing credited, no audit row", async () => {
+        // Read: no bank values yet. Re-read after the failed claim: still
+        // PENDING (the matcher only set the bank columns), so the message
+        // must not claim the deposit was approved or rejected.
+        prisma.deposit.findUnique
+          .mockResolvedValueOnce(makeDeposit({ bankCheckedAt: null }))
+          .mockResolvedValueOnce({ status: DepositStatus.PENDING });
+        prisma.deposit.updateMany.mockResolvedValue({ count: 0 });
+
+        await expect(service.approve('deposit-1', admin)).rejects.toThrow(
+          new ConflictException(
+            'The deposit changed while you were approving — reload and try again',
+          ),
+        );
+        expect(prisma.deposit.updateMany).toHaveBeenCalledTimes(1);
+        expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();
+        expect(
+          paymentAccountLedgerService.syncDepositLink,
+        ).not.toHaveBeenCalled();
+        expect(prisma.transaction.create).not.toHaveBeenCalled();
+        expect(prisma.notification.create).not.toHaveBeenCalled();
+        expect(audit.record).not.toHaveBeenCalled();
+        expect(gateway.notifyUserBalanceUpdated).not.toHaveBeenCalled();
+      });
     });
 
     it('throws NotFoundException for a nonexistent deposit', async () => {
@@ -1537,7 +1609,9 @@ describe('DepositsService', () => {
                 email: true,
               },
             },
-            bankTransaction: { select: { id: true, counterparty: true } },
+            bankTransaction: {
+              select: { id: true, counterparty: true, deviceSerial: true },
+            },
           },
         }),
       );
@@ -1642,7 +1716,9 @@ describe('DepositsService', () => {
               email: true,
             },
           },
-          bankTransaction: { select: { id: true, counterparty: true } },
+          bankTransaction: {
+            select: { id: true, counterparty: true, deviceSerial: true },
+          },
         },
       });
       expect(walletService.creditWithinTransaction).not.toHaveBeenCalled();

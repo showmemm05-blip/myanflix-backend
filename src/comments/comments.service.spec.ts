@@ -29,6 +29,10 @@ import {
   COMMENT_RATE_MINUTE_CODE,
   COMMENT_RATE_MINUTE_MESSAGE,
   CommentsService,
+  MEMBER_LABEL_PREFIX,
+  MEMBER_TAG_LENGTH,
+  memberLabelOf,
+  memberTagOf,
   PUBLIC_COMMENT_LIMIT,
   REPLY_PREVIEW_LIMIT,
 } from './comments.service';
@@ -60,7 +64,6 @@ function createdRow(overrides: Record<string, unknown> = {}) {
     createdAt: new Date('2026-08-20T13:00:00.000Z'),
     user: {
       id: 'user-1',
-      username: 'blake',
       displayName: 'Blake',
       avatar: null,
     },
@@ -818,7 +821,6 @@ describe('CommentsService', () => {
           ...createdRow({
             user: {
               id: 'user-1',
-              username: 'blake',
               displayName: 'Blake',
               avatar: 'images/user/user-1/1757606400000.png',
             },
@@ -1130,6 +1132,195 @@ describe('CommentsService', () => {
       await expect(service.findReplies(PARENT_ID, {})).rejects.toThrow(
         NotFoundException,
       );
+    });
+  });
+
+  /**
+   * Security audit 2026-10-09, SEC-007. A phone sign-up's username is
+   * `user_<phone digits>`, and the public thread handed it — and the
+   * internal user id — to every reader. The author block now carries the
+   * display name or a `Member #<tag>` pseudonym, and the id only on the
+   * viewer's own comments. There is no staff view here: staff read
+   * usernames through TrackingReadService, never through this thread.
+   */
+  describe('author privacy — toView (SEC-007)', () => {
+    const AUTHOR_ID = '7c1e2f3a-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const OTHER_ID = '9d4b5c6e-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const STAFF_ID = 'e5f6a7b8-cccc-4ccc-8ccc-cccccccccccc';
+
+    /** A comment by a phone sign-up that never set a display name. */
+    function phoneAuthorRow(overrides: Record<string, unknown> = {}) {
+      return createdRow({
+        user: { id: AUTHOR_ID, displayName: null, avatar: null },
+        ...overrides,
+      });
+    }
+
+    /** The guest-safe author block of a comment by AUTHOR_ID. */
+    const anonymousAuthor = {
+      displayName: `${MEMBER_LABEL_PREFIX}7c1e`,
+      memberTag: '7c1e',
+      avatarUrl: null,
+    };
+
+    it("never selects the username — a phone account's username is its phone number", async () => {
+      await service.findForTitle({ movieId: MOVIE_ID });
+
+      const select = prisma.comment.findMany.mock.calls[0][0].select;
+      expect(select.user).toEqual({
+        select: { id: true, displayName: true, avatar: true },
+      });
+    });
+
+    it(`builds the pseudonym from the first ${MEMBER_TAG_LENGTH} characters of the user id`, () => {
+      expect(memberTagOf(AUTHOR_ID)).toBe('7c1e');
+      expect(memberLabelOf(AUTHOR_ID)).toBe('Member #7c1e');
+    });
+
+    it('for a guest: the pseudonym, no username, no user id, not mine', async () => {
+      prisma.comment.findMany.mockResolvedValueOnce([
+        { ...phoneAuthorRow(), _count: { replies: 0 } },
+      ]);
+
+      const [comment] = await service.findForTitle({ movieId: MOVIE_ID });
+
+      expect(comment.user).toEqual(anonymousAuthor);
+      expect(comment.user).not.toHaveProperty('username');
+      expect(comment.user).not.toHaveProperty('id');
+      expect(comment.isMine).toBe(false);
+      expect(JSON.stringify(comment)).not.toMatch(/user_\d/);
+    });
+
+    it('for another signed-in reader: exactly the guest shape', async () => {
+      prisma.comment.findMany.mockResolvedValueOnce([
+        { ...phoneAuthorRow(), _count: { replies: 0 } },
+      ]);
+
+      const [comment] = await service.findForTitle(
+        { movieId: MOVIE_ID },
+        OTHER_ID,
+      );
+
+      expect(comment.user).toEqual(anonymousAuthor);
+      expect(comment.isMine).toBe(false);
+    });
+
+    it('for a staff reader: the same — this thread has no staff view', async () => {
+      prisma.comment.findMany.mockResolvedValueOnce([
+        { ...phoneAuthorRow(), _count: { replies: 0 } },
+      ]);
+
+      const [comment] = await service.findForTitle(
+        { movieId: MOVIE_ID },
+        STAFF_ID,
+      );
+
+      expect(comment.user).toEqual(anonymousAuthor);
+      expect(comment.isMine).toBe(false);
+    });
+
+    it('for the author: isMine and the author id, still no username', async () => {
+      prisma.comment.findMany.mockResolvedValueOnce([
+        { ...phoneAuthorRow(), _count: { replies: 0 } },
+      ]);
+
+      const [comment] = await service.findForTitle(
+        { movieId: MOVIE_ID },
+        AUTHOR_ID,
+      );
+
+      expect(comment.user).toEqual({ ...anonymousAuthor, id: AUTHOR_ID });
+      expect(comment.user).not.toHaveProperty('username');
+      expect(comment.isMine).toBe(true);
+    });
+
+    it('shows the display name when there is one, with no member tag', async () => {
+      prisma.comment.findMany.mockResolvedValueOnce([
+        {
+          ...phoneAuthorRow({
+            user: { id: AUTHOR_ID, displayName: 'Blake', avatar: null },
+          }),
+          _count: { replies: 0 },
+        },
+      ]);
+
+      const [comment] = await service.findForTitle({ movieId: MOVIE_ID });
+
+      expect(comment.user).toEqual({
+        displayName: 'Blake',
+        memberTag: null,
+        avatarUrl: null,
+      });
+    });
+
+    it('treats a blank display name as none — the name is never an empty string', async () => {
+      prisma.comment.findMany.mockResolvedValueOnce([
+        {
+          ...phoneAuthorRow({
+            user: { id: AUTHOR_ID, displayName: '   ', avatar: null },
+          }),
+          _count: { replies: 0 },
+        },
+      ]);
+
+      const [comment] = await service.findForTitle({ movieId: MOVIE_ID });
+
+      expect(comment.user).toEqual(anonymousAuthor);
+    });
+
+    it("flags the viewer's own reply under someone else's comment", async () => {
+      prisma.comment.findMany.mockResolvedValueOnce([
+        {
+          ...createdRow({
+            id: 'theirs',
+            user: { id: OTHER_ID, displayName: null, avatar: null },
+          }),
+          _count: { replies: 1 },
+        },
+      ]);
+      prisma.comment.findMany.mockResolvedValueOnce([
+        phoneAuthorRow({ id: 'mine', parentId: 'theirs' }),
+      ]);
+
+      const [comment] = await service.findForTitle(
+        { movieId: MOVIE_ID },
+        AUTHOR_ID,
+      );
+
+      expect(comment.isMine).toBe(false);
+      expect(comment.user).not.toHaveProperty('id');
+      expect(comment.replies[0].isMine).toBe(true);
+      expect(comment.replies[0].user.id).toBe(AUTHOR_ID);
+    });
+
+    it("create returns the new comment as the author's own", async () => {
+      prisma.comment.create.mockResolvedValue(phoneAuthorRow());
+
+      const view = await service.create(AUTHOR_ID, {
+        movieId: MOVIE_ID,
+        body: 'Great',
+      });
+
+      expect(view.isMine).toBe(true);
+      expect(view.user).toEqual({ ...anonymousAuthor, id: AUTHOR_ID });
+      expect(view.user).not.toHaveProperty('username');
+    });
+
+    it('findReplies applies the same viewer rule', async () => {
+      prisma.comment.findUnique.mockResolvedValue({
+        id: PARENT_ID,
+        parentId: null,
+        status: CommentStatus.VISIBLE,
+      });
+      prisma.comment.findMany.mockResolvedValue([phoneAuthorRow()]);
+
+      const guest = await service.findReplies(PARENT_ID, {});
+      expect(guest.items[0].user).toEqual(anonymousAuthor);
+      expect(guest.items[0].isMine).toBe(false);
+
+      const own = await service.findReplies(PARENT_ID, {}, AUTHOR_ID);
+      expect(own.items[0].user).toEqual({ ...anonymousAuthor, id: AUTHOR_ID });
+      expect(own.items[0].isMine).toBe(true);
     });
   });
 

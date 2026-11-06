@@ -50,6 +50,23 @@ export interface StreamQualityInfo {
   url: string;
 }
 
+/**
+ * The one publish rule a regular viewer is held to, shared by streaming,
+ * watch-progress and the ad decisions (AdDecisionService) so none of
+ * them can disagree: the title must be PUBLISHED and, for an episode, so
+ * must its show — the same rule as MoviesService.findByIdOrThrow.
+ */
+export function isHiddenFromViewers(movie: {
+  status: MovieStatus;
+  seriesId: string | null;
+  series: { status: SeriesStatus } | null;
+}): boolean {
+  return (
+    movie.status !== MovieStatus.PUBLISHED ||
+    (movie.seriesId !== null && movie.series?.status !== SeriesStatus.PUBLISHED)
+  );
+}
+
 @Injectable()
 export class VideosService {
   private readonly logger = new Logger(VideosService.name);
@@ -384,11 +401,7 @@ export class VideosService {
     seriesId: string | null;
     series: { status: SeriesStatus } | null;
   }): boolean {
-    return (
-      movie.status !== MovieStatus.PUBLISHED ||
-      (movie.seriesId !== null &&
-        movie.series?.status !== SeriesStatus.PUBLISHED)
-    );
+    return isHiddenFromViewers(movie);
   }
 
   /** Watch history for a user (own profile, or an admin viewing any user). */

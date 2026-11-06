@@ -1,3 +1,6 @@
+// Must stay the FIRST import: it sets BANK_EVENTS_TOKEN before AppModule
+// (and its ConfigModule) is loaded, for the phone-monitor cases below.
+import { E2E_BANK_EVENTS_TOKEN } from './bank-events.e2e-env';
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
@@ -7,6 +10,7 @@ import type { App } from 'supertest/types';
 import { randomUUID } from 'node:crypto';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { MinioService } from '../src/common/storage/minio.service';
 import {
   BankTransactionState,
   DepositStatus,
@@ -18,6 +22,12 @@ import {
 const DUPLICATE_REFERENCE_MESSAGE =
   'A deposit with this transaction reference already exists';
 
+/** The 8-byte PNG signature plus padding — all the screenshot route sniffs. */
+const PNG = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.alloc(64, 1),
+]);
+
 describe('Deposits (e2e)', () => {
   let app: INestApplication<App>;
   let prisma: PrismaService;
@@ -26,9 +36,11 @@ describe('Deposits (e2e)', () => {
 
   let userId: string;
   let adminId: string;
+  let superAdminId: string;
   let paymentAccountId: string;
   let userToken: string;
   let adminToken: string;
+  let superAdminToken: string;
 
   /**
    * A phone-captured "You received …" notification, stored UNMATCHED the
@@ -120,6 +132,26 @@ describe('Deposits (e2e)', () => {
     });
     await prisma.wallet.create({ data: { userId: admin.id, balance: 0 } });
 
+    // The owner: resets the phone-monitor's device pin (SEC-004) —
+    // SETTINGS.MANAGE and the SUPER_ADMIN role itself, like the SMS reset.
+    const superAdminRole = await prisma.appRole.findUniqueOrThrow({
+      where: { key: Role.SUPER_ADMIN },
+    });
+    const superAdmin = await prisma.user.create({
+      data: {
+        username: `superadmin_${suffix}`,
+        password: 'unused-in-these-tests',
+        role: Role.SUPER_ADMIN,
+        appRoleId: superAdminRole.id,
+        status: UserStatus.ACTIVE,
+      },
+    });
+    await prisma.wallet.create({
+      data: { userId: superAdmin.id, balance: 0 },
+    });
+    // This suite owns bank_events_binding in the test database.
+    await prisma.bankEventsBinding.deleteMany({});
+
     // Destination account for the manual-deposit race cases (ADMIN holds
     // DEPOSITS.CREATE via the seeded app_roles).
     const paymentAccount = await prisma.paymentAccount.create({
@@ -134,9 +166,11 @@ describe('Deposits (e2e)', () => {
 
     userId = user.id;
     adminId = admin.id;
+    superAdminId = superAdmin.id;
     paymentAccountId = paymentAccount.id;
     userToken = await signToken(user.id);
     adminToken = await signToken(admin.id);
+    superAdminToken = await signToken(superAdmin.id);
   });
 
   afterAll(async () => {
@@ -144,26 +178,37 @@ describe('Deposits (e2e)', () => {
     // Ledger rows first: payment_account_transactions.paymentAccountId is
     // onDelete: Restrict, so the account cannot go before its entries.
     await prisma.bankTransaction.deleteMany({ where: { paymentAccountId } });
+    await prisma.bankEventsBinding.deleteMany({});
     await prisma.auditLog.deleteMany({
-      where: { OR: [{ actorId: adminId }, { actorId: userId }] },
+      where: {
+        OR: [
+          { actorId: adminId },
+          { actorId: userId },
+          { actorId: superAdminId },
+          // System rows of the phone-monitor cases (actor null).
+          { action: 'bank_events.rejected_device' },
+        ],
+      },
     });
     await prisma.paymentAccountTransaction.deleteMany({
       where: { paymentAccountId },
     });
     await prisma.paymentAccount.deleteMany({ where: { id: paymentAccountId } });
     await prisma.notification.deleteMany({
-      where: { userId: { in: [userId, adminId] } },
+      where: { userId: { in: [userId, adminId, superAdminId] } },
     });
     await prisma.transaction.deleteMany({
-      where: { userId: { in: [userId, adminId] } },
+      where: { userId: { in: [userId, adminId, superAdminId] } },
     });
     await prisma.deposit.deleteMany({
-      where: { userId: { in: [userId, adminId] } },
+      where: { userId: { in: [userId, adminId, superAdminId] } },
     });
     await prisma.wallet.deleteMany({
-      where: { userId: { in: [userId, adminId] } },
+      where: { userId: { in: [userId, adminId, superAdminId] } },
     });
-    await prisma.user.deleteMany({ where: { id: { in: [userId, adminId] } } });
+    await prisma.user.deleteMany({
+      where: { id: { in: [userId, adminId, superAdminId] } },
+    });
     await app.close();
   });
 
@@ -865,5 +910,412 @@ describe('Deposits (e2e)', () => {
       .set('Authorization', `Bearer ${userToken}`)
       .send({ amount: 3000, paymentMethod: 'KBZ Pay', reference: '001104' })
       .expect(201);
+  });
+  describe('SEC-004: the phone-monitor token is pinned to ONE device serial, and no green badge without a screenshot', () => {
+    /** The owner's phone-monitor (a uuid it generated once) and two intruders'. */
+    const MONITOR = randomUUID();
+    const OTHER_MONITOR = randomUUID();
+    const THIRD_MONITOR = randomUUID();
+    const eventKey = () => randomUUID().replace(/-/g, '').repeat(2);
+    const asMonitor = (serial?: string, token = E2E_BANK_EVENTS_TOKEN) => {
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${token}`,
+      };
+      if (serial) headers['X-Device-Serial'] = serial;
+      return headers;
+    };
+    const receivedEvent = (
+      reference: string,
+      amount: number,
+      idempotencyKey = eventKey(),
+    ) => ({
+      idempotencyKey,
+      deviceSerial: 'E2E-PHONE',
+      paymentAccountId,
+      direction: 'received',
+      amount,
+      currency: 'MMK',
+      txCode: `KBZ2026${reference}`,
+      txCodeLast6: reference,
+      occurredAt: new Date(Date.now() - 60_000).toISOString(),
+      postedAt: new Date().toISOString(),
+    });
+    const postEvents = (serial: string | undefined, events: unknown[]) =>
+      request(app.getHttpServer())
+        .post('/api/bank-events/match')
+        .set(asMonitor(serial))
+        .send({ events });
+    const listAccounts = (serial?: string, token?: string) =>
+      request(app.getHttpServer())
+        .get('/api/bank-events/accounts')
+        .set(asMonitor(serial, token));
+    const uploadScreenshot = (
+      serial: string | undefined,
+      transactionId: string,
+      idempotencyKey: string,
+    ) =>
+      request(app.getHttpServer())
+        .post(`/api/bank-events/transactions/${transactionId}/screenshot`)
+        .set(asMonitor(serial))
+        .field('idempotencyKey', idempotencyKey)
+        .field('deviceSerial', 'E2E-PHONE')
+        .attach('file', PNG, {
+          filename: 'shot.png',
+          contentType: 'image/png',
+        });
+    const bindingRow = () =>
+      prisma.bankEventsBinding.findUnique({ where: { id: 1 } });
+    const getBinding = (token?: string) => {
+      const call = request(app.getHttpServer()).get('/api/bank-events/binding');
+      return token ? call.set('Authorization', `Bearer ${token}`) : call;
+    };
+    const resetBinding = (token?: string) => {
+      const call = request(app.getHttpServer()).delete(
+        '/api/bank-events/binding',
+      );
+      return token ? call.set('Authorization', `Bearer ${token}`) : call;
+    };
+    const adminView = async (depositId: string) =>
+      (
+        await request(app.getHttpServer())
+          .get(`/api/deposits/${depositId}`)
+          .set('Authorization', `Bearer ${adminToken}`)
+          .expect(200)
+      ).body.data;
+
+    /**
+     * A FRESH customer per case: the suite's own burst of submissions by
+     * the shared user adds VELOCITY, and these cases assert the exact
+     * reason list (and a clean MATCHED). Cleaned up in afterAll.
+     */
+    const depositors: string[] = [];
+    const newDepositor = async () => {
+      const user = await prisma.user.create({
+        data: {
+          username: `sec004_${randomUUID().slice(0, 8)}`,
+          password: 'unused-in-these-tests',
+          role: Role.USER,
+          status: UserStatus.ACTIVE,
+        },
+      });
+      await prisma.wallet.create({ data: { userId: user.id, balance: 0 } });
+      depositors.push(user.id);
+      return { id: user.id, token: await signToken(user.id) };
+    };
+    const submitDeposit = async (
+      token: string,
+      reference: string,
+      amount: number,
+    ): Promise<string> => {
+      const res = await request(app.getHttpServer())
+        .post('/api/deposits')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ amount, paymentMethod: 'KBZ Pay', reference, paymentAccountId })
+        .expect(201);
+      return res.body.data.id as string;
+    };
+
+    let uploadSpy: jest.SpyInstance;
+    beforeAll(() => {
+      // No MinIO behind the e2e stack: the bytes are not the point here, the
+      // pointer and the re-score are. The route still sniffs the PNG header.
+      uploadSpy = jest
+        .spyOn(MinioService.prototype, 'uploadBuffer')
+        .mockResolvedValue(undefined);
+    });
+    afterAll(async () => {
+      uploadSpy.mockRestore();
+      await prisma.transaction.deleteMany({
+        where: { userId: { in: depositors } },
+      });
+      await prisma.deposit.deleteMany({
+        where: { userId: { in: depositors } },
+      });
+      await prisma.wallet.deleteMany({ where: { userId: { in: depositors } } });
+      await prisma.user.deleteMany({ where: { id: { in: depositors } } });
+    });
+
+    it('a right token with no (or a malformed) X-Device-Serial is 401 DEVICE_SERIAL_REQUIRED on every route, and pins nothing', async () => {
+      const calls = [
+        postEvents(undefined, [receivedEvent('003001', 1000)]),
+        listAccounts(undefined),
+        uploadScreenshot(undefined, randomUUID(), eventKey()),
+        listAccounts('short'),
+        listAccounts('has space in it'),
+      ];
+      for (const call of calls) {
+        const res = await call.expect(401);
+        expect(res.body).toEqual({
+          success: false,
+          message: 'DEVICE_SERIAL_REQUIRED',
+        });
+      }
+      // A wrong token never reaches the pin, with or without a serial.
+      const wrong = await listAccounts(MONITOR, 'not-the-token').expect(401);
+      expect(wrong.body.message).toBe('Invalid machine token');
+      expect(await bindingRow()).toBeNull();
+      expect(
+        await prisma.bankTransaction.count({
+          where: { txCodeLast6: '003001' },
+        }),
+      ).toBe(0);
+    });
+
+    it("the first monitor to present the token is pinned, and the owner's card names it (staff read: SETTINGS.VIEW)", async () => {
+      await listAccounts(MONITOR).expect(200);
+
+      expect(await bindingRow()).toMatchObject({
+        deviceSerial: MONITOR,
+        lastRejectedDeviceSerial: null,
+        lastRejectedAt: null,
+        rejectedCount: 0,
+      });
+      await getBinding().expect(401);
+      await getBinding(userToken).expect(403);
+      await getBinding(adminToken).expect(403);
+      const card = await getBinding(superAdminToken).expect(200);
+      expect(card.body.data).toMatchObject({
+        deviceSerial: MONITOR,
+        lastRejectedDeviceSerial: null,
+        lastRejectedAt: null,
+        rejectedCount: 0,
+        resetAt: null,
+      });
+      expect(Date.parse(card.body.data.pinnedAt)).not.toBeNaN();
+      // Posting again as the pinned monitor writes nothing new.
+      await listAccounts(MONITOR).expect(200);
+      expect((await bindingRow())!.rejectedCount).toBe(0);
+    });
+
+    it('a second monitor gets 401 DEVICE_SERIAL_REJECTED on every route, is noted for the card and audited as bank_events.rejected_device — the pinned monitor is unaffected', async () => {
+      const calls = [
+        postEvents(OTHER_MONITOR, [receivedEvent('003002', 1000)]),
+        listAccounts(OTHER_MONITOR),
+        uploadScreenshot(OTHER_MONITOR, randomUUID(), eventKey()),
+      ];
+      for (const call of calls) {
+        const res = await call.expect(401);
+        expect(res.body).toEqual({
+          success: false,
+          message: 'DEVICE_SERIAL_REJECTED',
+        });
+      }
+
+      expect(await bindingRow()).toMatchObject({
+        deviceSerial: MONITOR,
+        lastRejectedDeviceSerial: OTHER_MONITOR,
+        rejectedCount: 3,
+      });
+      // Three refusals within a second from ONE serial are one burst: one
+      // audit row (the counter above still says 3). A stray monitor on the
+      // un-throttled socket handshake cannot grow audit_logs without bound.
+      const audit = await prisma.auditLog.findMany({
+        where: { action: 'bank_events.rejected_device' },
+        orderBy: { createdAt: 'asc' },
+      });
+      expect(audit).toHaveLength(1);
+      expect(audit[0]).toMatchObject({
+        actorId: null,
+        category: 'SYSTEM',
+        targetType: 'bank_events',
+        targetId: null,
+        metadata: expect.objectContaining({
+          deviceSerial: OTHER_MONITOR,
+          pinnedDeviceSerial: MONITOR,
+        }),
+      });
+      const card = await getBinding(superAdminToken).expect(200);
+      expect(card.body.data).toMatchObject({
+        deviceSerial: MONITOR,
+        lastRejectedDeviceSerial: OTHER_MONITOR,
+        rejectedCount: 3,
+      });
+      expect(
+        Date.now() - Date.parse(card.body.data.lastRejectedAt),
+      ).toBeLessThan(10_000);
+      // Nothing of the intruder's was stored; the real monitor still posts.
+      expect(
+        await prisma.bankTransaction.count({
+          where: { txCodeLast6: '003002' },
+        }),
+      ).toBe(0);
+      await listAccounts(MONITOR).expect(200);
+
+      // A DIFFERENT serial is a new burst: its own audit row, counted too.
+      const third = await listAccounts(THIRD_MONITOR).expect(401);
+      expect(third.body.message).toBe('DEVICE_SERIAL_REJECTED');
+      const after = await prisma.auditLog.findMany({
+        where: { action: 'bank_events.rejected_device' },
+        orderBy: { createdAt: 'asc' },
+      });
+      expect(after).toHaveLength(2);
+      expect(after[1].metadata).toMatchObject({
+        deviceSerial: THIRD_MONITOR,
+        pinnedDeviceSerial: MONITOR,
+      });
+      expect(await bindingRow()).toMatchObject({
+        deviceSerial: MONITOR,
+        lastRejectedDeviceSerial: THIRD_MONITOR,
+        rejectedCount: 4,
+      });
+    });
+
+    it('reset: 401 without a token, 403 for a customer and for a plain admin; a super admin clears the pin (audited), the next monitor is pinned and the old one refused', async () => {
+      await resetBinding().expect(401);
+      await resetBinding(userToken).expect(403);
+      await resetBinding(adminToken).expect(403);
+      expect((await bindingRow())!.deviceSerial).toBe(MONITOR);
+
+      const reset = await resetBinding(superAdminToken).expect(200);
+      expect(reset.body.data).toMatchObject({
+        deviceSerial: null,
+        pinnedAt: null,
+        lastRejectedDeviceSerial: null,
+        lastRejectedAt: null,
+        rejectedCount: 0,
+      });
+      expect(Date.parse(reset.body.data.resetAt)).not.toBeNaN();
+      const audit = await prisma.auditLog.findMany({
+        where: { action: 'bank_events.binding_reset' },
+      });
+      expect(audit).toHaveLength(1);
+      expect(audit[0]).toMatchObject({
+        actorId: superAdminId,
+        category: 'SYSTEM',
+        targetType: 'bank_events',
+        before: expect.objectContaining({ deviceSerial: MONITOR }),
+        after: expect.objectContaining({ deviceSerial: null }),
+      });
+
+      // The reinstalled monitor (a new serial) registers; the old one is out.
+      await listAccounts(OTHER_MONITOR).expect(200);
+      expect((await bindingRow())!.deviceSerial).toBe(OTHER_MONITOR);
+      const refused = await listAccounts(MONITOR).expect(401);
+      expect(refused.body.message).toBe('DEVICE_SERIAL_REJECTED');
+      expect((await bindingRow())!.lastRejectedDeviceSerial).toBe(MONITOR);
+
+      // And back, so the rest of the story runs on MONITOR.
+      await resetBinding(superAdminToken).expect(200);
+      await listAccounts(MONITOR).expect(200);
+      expect((await bindingRow())!.deviceSerial).toBe(MONITOR);
+      await listAccounts(OTHER_MONITOR).expect(401);
+    });
+
+    it('no screenshot → the matched deposit waits in PENDING_REVIEW (NO_SCREENSHOT), and the screenshot upload promotes it to MATCHED / LOW', async () => {
+      const depositor = await newDepositor();
+      const depositId = await submitDeposit(depositor.token, '003101', 3000);
+      const key = eventKey();
+
+      const posted = await postEvents(MONITOR, [
+        receivedEvent('003101', 3000, key),
+      ]).expect(201);
+      const result = posted.body.data.results[0];
+      expect(result).toMatchObject({
+        idempotencyKey: key,
+        outcome: 'matched',
+        state: 'MATCHED',
+        depositId,
+        matchStatus: 'PENDING_REVIEW',
+        screenshotWanted: true,
+      });
+
+      let view = await adminView(depositId);
+      expect(view).toMatchObject({
+        matchStatus: 'PENDING_REVIEW',
+        riskLevel: 'LOW',
+        riskReasons: ['NO_SCREENSHOT'],
+        hasBankScreenshot: false,
+        receivingAmount: 3000,
+        bankTransactionId: result.transactionId,
+        bankDeviceSerial: 'E2E-PHONE',
+      });
+
+      const uploaded = await uploadScreenshot(
+        MONITOR,
+        result.transactionId,
+        key,
+      ).expect(201);
+      expect(uploaded.body.data).toEqual({ uploaded: true });
+      expect(uploadSpy).toHaveBeenCalled();
+
+      view = await adminView(depositId);
+      expect(view).toMatchObject({
+        matchStatus: 'MATCHED',
+        riskLevel: 'LOW',
+        riskReasons: [],
+        hasBankScreenshot: true,
+      });
+      const rescore = await prisma.auditLog.findMany({
+        where: { action: 'deposit.risk_update', targetId: depositId },
+      });
+      expect(rescore).toHaveLength(1);
+      expect(rescore[0]).toMatchObject({
+        actorId: null,
+        before: expect.objectContaining({ riskReasons: ['NO_SCREENSHOT'] }),
+        after: expect.objectContaining({
+          matchStatus: 'MATCHED',
+          riskReasons: [],
+        }),
+        metadata: expect.objectContaining({ trigger: 'screenshot_attach' }),
+      });
+
+      // A re-upload (the monitor's retry) changes nothing.
+      const again = await uploadScreenshot(
+        MONITOR,
+        result.transactionId,
+        key,
+      ).expect(201);
+      expect(again.body.data).toEqual({
+        uploaded: false,
+        alreadyUploaded: true,
+      });
+      expect((await adminView(depositId)).matchStatus).toBe('MATCHED');
+    });
+
+    it('screenshot before the deposit: the picture lands on the stored transaction, and the deposit submitted afterwards is MATCHED straight away', async () => {
+      const depositor = await newDepositor();
+      const key = eventKey();
+      const posted = await postEvents(MONITOR, [
+        receivedEvent('003102', 3500, key),
+      ]).expect(201);
+      expect(posted.body.data.results[0]).toMatchObject({
+        outcome: 'stored_unmatched',
+        screenshotWanted: true,
+      });
+      const transactionId = posted.body.data.results[0].transactionId;
+      await uploadScreenshot(MONITOR, transactionId, key).expect(201);
+
+      const depositId = await submitDeposit(depositor.token, '003102', 3500);
+      expect(await adminView(depositId)).toMatchObject({
+        matchStatus: 'MATCHED',
+        riskLevel: 'LOW',
+        riskReasons: [],
+        hasBankScreenshot: true,
+        bankTransactionId: transactionId,
+      });
+    });
+
+    it('a hard reason is not washed away by the picture: AMOUNT_MISMATCH + no screenshot is SUSPICIOUS, and stays SUSPICIOUS (AMOUNT_MISMATCH only) after the upload', async () => {
+      const depositor = await newDepositor();
+      const depositId = await submitDeposit(depositor.token, '003103', 9000);
+      const key = eventKey();
+      const posted = await postEvents(MONITOR, [
+        receivedEvent('003103', 1000, key),
+      ]).expect(201);
+      const result = posted.body.data.results[0];
+      expect(result.matchStatus).toBe('SUSPICIOUS');
+      expect((await adminView(depositId)).riskReasons).toEqual([
+        'AMOUNT_MISMATCH',
+        'NO_SCREENSHOT',
+      ]);
+
+      await uploadScreenshot(MONITOR, result.transactionId, key).expect(201);
+      expect(await adminView(depositId)).toMatchObject({
+        matchStatus: 'SUSPICIOUS',
+        riskLevel: 'HIGH',
+        riskReasons: ['AMOUNT_MISMATCH'],
+        hasBankScreenshot: true,
+      });
+    });
   });
 });

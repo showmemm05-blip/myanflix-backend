@@ -6,6 +6,7 @@ import {
   IsPositive,
   IsString,
   IsUUID,
+  Max,
   MaxLength,
 } from 'class-validator';
 import { WalletAdjustmentDirection } from '../../generated/prisma/client';
@@ -18,11 +19,13 @@ export class CreateWalletAdjustmentDto {
    * Always a positive magnitude — `direction` carries the sign. Capped at 2
    * decimal places to match every Decimal(12,2) money column: a sub-cent
    * amount would round differently at each write and leave an audit row
-   * where balanceBefore + amount ≠ balanceAfter.
+   * where balanceBefore + amount ≠ balanceAfter. @Max is that column's
+   * ceiling (DB-007) — past it Postgres overflows into a bare 500.
    */
   @Type(() => Number)
   @IsNumber({ maxDecimalPlaces: 2 })
   @IsPositive()
+  @Max(9_999_999_999.99)
   amount!: number;
 
   /**

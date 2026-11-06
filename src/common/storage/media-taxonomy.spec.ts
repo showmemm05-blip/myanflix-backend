@@ -15,7 +15,7 @@ import {
  * or reordered in a way the rest of the system has not been told about.
  */
 describe('IMAGE_PURPOSES', () => {
-  it('is the ten purpose folders, all lowercase and unique', () => {
+  it('is the twelve purpose folders, all lowercase and unique', () => {
     expect([...IMAGE_PURPOSES]).toEqual([
       'actor',
       'movie',
@@ -26,11 +26,15 @@ describe('IMAGE_PURPOSES', () => {
       'payment',
       'music',
       'promo',
+      'lottery',
+      'lottery_frame',
       'other',
     ]);
     expect(new Set(IMAGE_PURPOSES).size).toBe(IMAGE_PURPOSES.length);
     for (const purpose of IMAGE_PURPOSES) {
-      expect(purpose).toMatch(/^[a-z]+$/);
+      // Lowercase letters, an underscore allowed between words
+      // (lottery_frame): a folder name, so no slash, dot or upper case.
+      expect(purpose).toMatch(/^[a-z]+(?:_[a-z]+)*$/);
     }
   });
 
@@ -91,6 +95,7 @@ describe('MEDIA_CLASSES', () => {
     expect(expiring.map((mediaClass) => mediaClass.prefix)).toEqual([
       'temp/<sessionId>/',
       'temp/video-replace/<movieId>/',
+      'temp/ads/<adId>/',
     ]);
     for (const mediaClass of expiring) {
       expect(mediaClass.retention).toEqual({ kind: 'expires', afterDays: 7 });
@@ -125,7 +130,7 @@ describe('STREAM_SCOPE_PATTERNS', () => {
           new RegExp(`^(${mediaClass.scopePattern!.key})/(.+)$`).source,
       ),
     );
-    expect(STREAM_SCOPE_PATTERNS).toHaveLength(4);
+    expect(STREAM_SCOPE_PATTERNS).toHaveLength(5);
   });
 
   it('captures the scope prefix and the remainder separately', () => {
@@ -159,7 +164,8 @@ describe('NGINX_SCOPE_ALTERNATION', () => {
       'videos/[0-9a-f-]{36}/hls|' +
         'audio/[0-9a-f-]{36}/hls|' +
         'subtitles/[0-9a-f-]{36}|' +
-        'books/[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9a-f-]{36}/pages',
+        'books/[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9a-f-]{36}/pages|' +
+        'ads/[0-9a-f-]{36}',
     );
   });
 
@@ -200,6 +206,7 @@ describe('NGINX_SCOPE_ALTERNATION', () => {
 describe('OWN_KEY_PREFIXES', () => {
   it('is the top-level namespace of every class, deduplicated', () => {
     expect([...OWN_KEY_PREFIXES].sort()).toEqual([
+      'ads/',
       'audio/',
       'books/',
       'documents/',
@@ -230,6 +237,7 @@ describe('local scratch roots', () => {
       'videos',
       'audio',
       'documents/books',
+      'ads',
     ]);
   });
 });

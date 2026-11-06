@@ -112,6 +112,25 @@ describe('audit action catalogue', () => {
       'home_promo.delete',
       'home_promo.reorder',
       'home_settings.update',
+      'advertisement.create',
+      'advertisement.update',
+      'advertisement.delete',
+      'advertisement.video_attach',
+      'advertisement.image_attach',
+      'advertisement.upload_presign',
+      'advertisement.upload_multipart',
+      'advertisement_settings.update',
+      'lottery_dream.update',
+      'lottery_dream.import',
+      'lottery_draw.create',
+      'lottery_draw.update',
+      'lottery_draw.open',
+      'lottery_draw.pause',
+      'lottery_draw.close',
+      'lottery_draw.reopen',
+      'lottery_draw.off_sale',
+      'lottery_results.fetch',
+      'lottery_results.enter',
       // USERS
       'user.status_change',
       'user.role_change',
@@ -163,6 +182,11 @@ describe('audit action catalogue', () => {
       'payment_method_type.update',
       'payment_method_type.delete',
       'finance_settings.update',
+      'lottery_settings.update',
+      'lottery_draw.publish',
+      'lottery_claim.confirm',
+      'lottery_claim.reject',
+      'lottery_claim.reopen',
       'subscription_plan.create',
       'subscription_plan.update',
       // SYSTEM
@@ -171,6 +195,8 @@ describe('audit action catalogue', () => {
       'comment.delete',
       'feedback.status_change',
       'sms_gateway.binding_reset',
+      'bank_events.rejected_device',
+      'bank_events.binding_reset',
     ];
     expect([...AUDIT_ACTION_KEYS].sort()).toEqual([...expected].sort());
   });
@@ -182,6 +208,15 @@ describe('audit action catalogue', () => {
     expect(categoryOf('book_category.delete')).toBe(AuditCategory.CONTENT);
     expect(categoryOf('home_promo.reorder')).toBe(AuditCategory.CONTENT);
     expect(categoryOf('home_settings.update')).toBe(AuditCategory.CONTENT);
+    expect(categoryOf('lottery_dream.import')).toBe(AuditCategory.CONTENT);
+    expect(categoryOf('lottery_draw.off_sale')).toBe(AuditCategory.CONTENT);
+    expect(categoryOf('lottery_results.fetch')).toBe(AuditCategory.CONTENT);
+    expect(categoryOf('lottery_results.enter')).toBe(AuditCategory.CONTENT);
+    expect(categoryOf('lottery_settings.update')).toBe(AuditCategory.FINANCE);
+    expect(categoryOf('lottery_draw.publish')).toBe(AuditCategory.FINANCE);
+    expect(categoryOf('lottery_claim.confirm')).toBe(AuditCategory.FINANCE);
+    expect(categoryOf('lottery_claim.reject')).toBe(AuditCategory.FINANCE);
+    expect(categoryOf('lottery_claim.reopen')).toBe(AuditCategory.FINANCE);
     expect(categoryOf('user.wallet_adjust')).toBe(AuditCategory.USERS);
     expect(categoryOf('user.password_reset')).toBe(AuditCategory.USERS);
     expect(categoryOf('user.account_delete')).toBe(AuditCategory.USERS);
@@ -194,6 +229,10 @@ describe('audit action catalogue', () => {
     expect(categoryOf('comment.delete')).toBe(AuditCategory.SYSTEM);
     expect(categoryOf('feedback.status_change')).toBe(AuditCategory.SYSTEM);
     expect(categoryOf('sms_gateway.binding_reset')).toBe(AuditCategory.SYSTEM);
+    expect(categoryOf('bank_events.rejected_device')).toBe(
+      AuditCategory.SYSTEM,
+    );
+    expect(categoryOf('bank_events.binding_reset')).toBe(AuditCategory.SYSTEM);
   });
 
   it('isAuditAction / getAuditActionDefinition agree with the list', () => {

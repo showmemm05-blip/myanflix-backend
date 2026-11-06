@@ -36,7 +36,7 @@ export class StreamKeyNotSignable extends Error {
 }
 
 /**
- * The four signable scopes, generated from the media taxonomy and identical
+ * The five signable scopes, generated from the media taxonomy and identical
  * by construction to the `(?<scope>...)` alternation in both signed locations
  * of the nginx template:
  *
@@ -49,6 +49,8 @@ export class StreamKeyNotSignable extends Error {
  *                                       title, so /stream's subtitles[].url
  *                                       stays a working link
  *   books/<b>/<e>/<c>/pages           — one token per chapter of a reader
+ *   ads/<adId>                        — one token per pre-roll ad, covering
+ *                                       every v-<tag>/video.mp4 of it
  *
  * The trailing `(.+)` each pattern carries must be a real path remainder: no
  * empty segment, no `.` / `..` hops (isCleanRemainder below).

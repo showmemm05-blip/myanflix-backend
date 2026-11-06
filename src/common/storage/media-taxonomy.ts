@@ -31,6 +31,7 @@
  *   `images/` purpose folder)
  *     images/<purpose>/<id><ext>
  *     images/user/<userId>/<stamp><ext>
+ *     images/ad/<adId>/<tag><ext>
  *
  * TWO DELIBERATE EXCEPTIONS, both explained on their rows below:
  *   1. videos/<movieId>/hls/subs/ holds GENERATED subtitle renditions under
@@ -143,6 +144,24 @@ export const MEDIA_CLASSES: readonly MediaClass[] = [
       'deletion a real prefix delete. `user` is deliberately NOT an accepted ' +
       'value on POST /uploads/image — the purpose is hard-coded server-side ' +
       "in UsersService — so no staff upload can land in a user's folder.",
+  },
+  {
+    id: 'imageAd',
+    prefix: 'images/ad/<adId>/',
+    status: 'active',
+    visibility: 'public',
+    scopePattern: null,
+    retention: PERMANENT,
+    archivable: false,
+    localScratchRoot: null,
+    holds:
+      'Corner-ad pictures (PNG / JPEG / WebP / GIF, kept animated), one ' +
+      'folder per advertisement so deleting the ad is a prefix delete; the ' +
+      'filename is a random tag so a replaced picture never collides with ' +
+      "the cache server's entry for the old one. Public by key like every " +
+      'images/ folder — the picture is shown over the movie to any viewer. ' +
+      '`ad` is NOT an accepted value on POST /uploads/image: only ' +
+      'POST /ads/admin/:id/image (ADS.MANAGE) writes here.',
   },
   {
     id: 'videoOriginal',
@@ -380,6 +399,46 @@ export const MEDIA_CLASSES: readonly MediaClass[] = [
       "UploadCleanupService's sweep (MinIO's lifecycle rule only aborts " +
       'incomplete multipart uploads).',
   },
+  {
+    id: 'adVideoStaging',
+    prefix: 'temp/ads/<adId>/',
+    status: 'active',
+    visibility: 'private',
+    scopePattern: null,
+    retention: { kind: 'expires', afterDays: 7 },
+    archivable: false,
+    localScratchRoot: null,
+    holds:
+      'The admin-uploaded MP4 of one pre-roll ad (video.mp4, the "ad" ' +
+      'upload type) while it uploads and until POST /ads/admin/:id/video/attach ' +
+      'checks it (size, MP4 header, ffprobe duration), remuxes it for ' +
+      'fast start and writes it to ads/<adId>/v-<tag>/. Under temp/ for the ' +
+      'same reason as a replacement bundle: denied at the cache in BOTH ' +
+      'legacy modes and unsignable, so a half-uploaded or unchecked file ' +
+      'can never be served. Swept with the replace staging after 7 days.',
+  },
+  {
+    id: 'adVideo',
+    prefix: 'ads/<adId>/v-<tag>/',
+    status: 'active',
+    visibility: 'signed',
+    scopePattern: {
+      key: `ads/${UUID}`,
+      nginx: `ads/${NGINX_UUID}`,
+    },
+    retention: PERMANENT,
+    archivable: false,
+    localScratchRoot: 'ads',
+    holds:
+      'The ready-to-play MP4 of one pre-roll ad, at video.mp4 inside a fresh ' +
+      'v-<tag>/ folder per attach (the cache servers keep objects 7 days by ' +
+      'full path, so a replaced ad never reuses a key; the old folder is ' +
+      'deleted after the swap). Served through the generic signed location ' +
+      'with Range, like a segment; one token per ad, minted per request by ' +
+      'MinioService.signedPlaybackUrl for POST /ads/preroll and the admin ' +
+      'preview. The local scratch root holds the download + remux of one ' +
+      'attach run and is emptied in the same call.',
+  },
 ];
 
 /**
@@ -395,6 +454,17 @@ export const MEDIA_CLASSES: readonly MediaClass[] = [
  * `promo` holds the artwork of the admin "Home promos" page (hero slides,
  * the spotlight, coming-soon cards — HomePromo.imageUrl). Public by key like
  * every images/ folder, which is right: a promo is shown to guests.
+ *
+ * `lottery` holds the dream pictures of the Lottery dream books
+ * (LotteryDream.pictureUrl) and the draw pictures (LotteryDraw.pictureUrl)
+ * — public too, the dream books and the draws are open to guests.
+ *
+ * `lottery_frame` holds the ticket FRAME artwork (the printed background
+ * every ticket of a draw is drawn on: LotterySettings.frameUrl, copied to
+ * LotteryDraw.frameUrl at creation). Its own folder because it is the one
+ * image purpose stored at full print size (up to 4000 px and 25 MB, see
+ * ARTWORK_MAX_WIDTH and IMAGE_UPLOAD_MAX_BYTES) and because a frame must never be picked where a
+ * picture is wanted: the two DTOs check the folder, not just "ours".
  */
 export const IMAGE_PURPOSES = [
   'actor',
@@ -406,6 +476,8 @@ export const IMAGE_PURPOSES = [
   'payment',
   'music',
   'promo',
+  'lottery',
+  'lottery_frame',
   'other',
 ] as const;
 
@@ -413,6 +485,9 @@ export type ImagePurpose = (typeof IMAGE_PURPOSES)[number];
 
 /** The one purpose folder staff cannot upload into — see IMAGE_PURPOSES. */
 export const AVATAR_IMAGE_PURPOSE = 'user';
+
+/** The corner-ad pictures' folder — like `user`, not a POST /uploads/image purpose (see the imageAd class). */
+export const AD_IMAGE_FOLDER = 'ad';
 
 /** True for a value that names a real purpose folder. */
 export function isImagePurpose(value: unknown): value is ImagePurpose {

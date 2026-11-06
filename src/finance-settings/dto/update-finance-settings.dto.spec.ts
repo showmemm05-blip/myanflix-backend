@@ -77,3 +77,39 @@ describe('UpdateFinanceSettingsDto — maximums must be at least 1', () => {
     ]);
   });
 });
+
+/**
+ * DB-007: every limit lands in a Decimal(12,2) column, whose ceiling is
+ * 9 999 999 999.99 — a larger value used to overflow in Postgres and come
+ * back as a bare 500. The DTO now answers 400 instead.
+ */
+describe('UpdateFinanceSettingsDto — the Decimal(12,2) ceiling', () => {
+  it('accepts every limit at exactly the ceiling', async () => {
+    expect(
+      await failingFields({
+        minDepositAmount: 9_999_999_999.99,
+        maxDepositAmount: 9_999_999_999.99,
+        minWithdrawalAmount: 9_999_999_999.99,
+        maxWithdrawalAmount: 9_999_999_999.99,
+      }),
+    ).toEqual([]);
+  });
+
+  it('rejects a maximum of 10^10 (the first value Postgres cannot store)', async () => {
+    expect(
+      await failingFields({ ...VALID, maxDepositAmount: 10_000_000_000 }),
+    ).toEqual(['maxDepositAmount']);
+    expect(
+      await failingFields({ ...VALID, maxWithdrawalAmount: 10_000_000_000 }),
+    ).toEqual(['maxWithdrawalAmount']);
+  });
+
+  it('rejects an oversized minimum directly, before the min ≤ max rule in the service', async () => {
+    expect(await failingFields({ ...VALID, minDepositAmount: 1e13 })).toEqual([
+      'minDepositAmount',
+    ]);
+    expect(
+      await failingFields({ ...VALID, minWithdrawalAmount: '1e400' }),
+    ).toEqual(['minWithdrawalAmount']);
+  });
+});

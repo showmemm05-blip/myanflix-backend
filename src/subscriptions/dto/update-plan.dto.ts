@@ -1,6 +1,7 @@
 import {
   IsBoolean,
   IsInt,
+  IsNumber,
   IsString,
   Max,
   Min,
@@ -24,9 +25,12 @@ export class UpdatePlanDto {
   @MinLength(1)
   name?: string;
 
+  /** Same rules as CreatePlanDto.price (DB-007). */
   @ValidateIf((_, value) => value !== undefined)
   @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)
+  @Max(9_999_999_999.99)
   price?: number;
 
   @ValidateIf((_, value) => value !== undefined)

@@ -20,10 +20,16 @@ import { PermissionsGuard } from '../roles/guards/permissions.guard';
 import { InitUploadDto } from './dto/init-upload.dto';
 import { UploadImageDto } from './dto/upload-image.dto';
 import { ValidateExternalBundleDto } from './dto/validate-external-bundle.dto';
-import { UploadsService } from './uploads.service';
+import {
+  FRAME_IMAGE_UPLOAD_MAX_BYTES,
+  UploadsService,
+} from './uploads.service';
 
 const MAX_CHUNK_BYTES = 10 * 1024 * 1024; // safety cap, well above the 5 MB default chunk size
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+// The largest byte cap any image purpose has (the 25 MB ticket frame);
+// multer cannot read `purpose` before the file, so the per-purpose figure
+// (10 MB for everything else) is applied in UploadsService.saveImage.
+const MAX_IMAGE_BYTES = FRAME_IMAGE_UPLOAD_MAX_BYTES;
 
 @Controller('uploads')
 @UseGuards(PermissionsGuard)
@@ -46,6 +52,8 @@ export class UploadsController {
   // `purpose` (a required form field alongside `file`) is what decides the
   // images/<purpose>/ folder the object lands in — see UploadImageDto for
   // why it has no fallback. The response shape `{ url }` is unchanged.
+  // Size: a purpose's own byte cap is checked in saveImage (coded 413);
+  // the multer limit here only bounds what is read into memory at all.
   @Post('image')
   @UseInterceptors(
     FileInterceptor('file', { limits: { fileSize: MAX_IMAGE_BYTES } }),

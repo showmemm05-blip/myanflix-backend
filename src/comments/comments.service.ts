@@ -83,18 +83,56 @@ export interface PaginatedComments {
   limit: number;
 }
 
-/** Comment author as the clients render it — never the phone, never the IP. */
+/**
+ * Comment author as the clients render it — never the phone, never the IP,
+ * and never the username: a phone sign-up's username IS its phone number
+ * (`user_<digits>`, AuthService.createPhoneAccount), so it is not even
+ * selected here. The id is read for `isMine` and the pseudonym only; it
+ * leaves the service solely on the viewer's own comments (security audit
+ * 2026-10-09, SEC-007).
+ */
 const AUTHOR_SELECT = {
   id: true,
-  username: true,
   displayName: true,
   avatar: true,
 } as const;
 
+/**
+ * The pseudonym shown for an account that never set a display name:
+ * `Member #<tag>`, the tag being the first MEMBER_TAG_LENGTH characters of
+ * the user id — stable, so two such commenters in one thread stay apart,
+ * and nothing in it comes from the phone. The English label is built here
+ * so every client has a safe name to show; a client that translates the
+ * prefix rebuilds it from `memberTag`.
+ */
+export const MEMBER_LABEL_PREFIX = 'Member #';
+export const MEMBER_TAG_LENGTH = 4;
+
+export function memberTagOf(userId: string): string {
+  return userId.slice(0, MEMBER_TAG_LENGTH);
+}
+
+export function memberLabelOf(userId: string): string {
+  return `${MEMBER_LABEL_PREFIX}${memberTagOf(userId)}`;
+}
+
 export interface CommentAuthorView {
-  id: string;
-  username: string;
-  displayName: string | null;
+  /**
+   * The author's user id — present on the viewer's OWN comments only (see
+   * CommentView.isMine). A guest or another reader never gets it.
+   */
+  id?: string;
+  /**
+   * What the thread shows as the author's name: the account's display name
+   * when it has one, else the `Member #<tag>` pseudonym. Always a non-empty
+   * string, so a client has nothing to fall back to.
+   */
+  displayName: string;
+  /**
+   * The tag behind the `Member #<tag>` pseudonym, for a client that
+   * translates the prefix; null when `displayName` is the account's own.
+   */
+  memberTag: string | null;
   avatarUrl: string | null;
 }
 
@@ -103,6 +141,8 @@ export interface CommentView {
   body: string;
   createdAt: Date;
   user: CommentAuthorView;
+  /** True when the signed-in viewer wrote this comment; always false for a guest. */
+  isMine: boolean;
   /**
    * For a top-level comment: its first REPLY_PREVIEW_LIMIT visible replies,
    * oldest first. For a reply: always empty (one level only).
@@ -120,7 +160,6 @@ interface CommentRow {
   createdAt: Date;
   user: {
     id: string;
-    username: string;
     displayName: string | null;
     avatar: string | null;
   };
@@ -262,7 +301,8 @@ export class CommentsService {
       });
     });
 
-    return this.toView(created, []);
+    // The caller is the author, so this is their own comment (isMine).
+    return this.toView(created, userId, []);
   }
 
   /**
@@ -272,10 +312,17 @@ export class CommentsService {
    * new). Defaults to the first page of PUBLIC_COMMENT_LIMIT, which is what
    * the clients read.
    *
+   * `viewerId` is the signed-in reader, null for a guest: it only decides
+   * `isMine` (and with it which authors carry an id) — the thread itself is
+   * the same for everyone.
+   *
    * Hidden comments are filtered on both levels, so moderating a top-level
    * comment does not silently take its replies' visibility with it.
    */
-  async findForTitle(query: CommentQueryDto): Promise<CommentView[]> {
+  async findForTitle(
+    query: CommentQueryDto,
+    viewerId: string | null = null,
+  ): Promise<CommentView[]> {
     const movieId = query.movieId ?? null;
     const seriesId = query.seriesId ?? null;
     const bookId = query.bookId ?? null;
@@ -325,7 +372,10 @@ export class CommentsService {
     return comments.map((comment) =>
       this.toView(
         comment,
-        (previews.get(comment.id) ?? []).map((reply) => this.toView(reply, [])),
+        viewerId,
+        (previews.get(comment.id) ?? []).map((reply) =>
+          this.toView(reply, viewerId, []),
+        ),
         comment._count.replies,
       ),
     );
@@ -426,11 +476,12 @@ export class CommentsService {
    *
    * 404 for a comment that is missing, hidden, or itself a reply: a hidden
    * comment's replies are not shown in the thread either, and a reply has
-   * no replies of its own.
+   * no replies of its own. `viewerId` as in findForTitle.
    */
   async findReplies(
     parentId: string,
     pagination: PaginationQueryDto,
+    viewerId: string | null = null,
   ): Promise<PaginatedComments> {
     const page = pagination.page ?? 1;
     const limit = pagination.limit ?? REPLY_PREVIEW_LIMIT;
@@ -461,7 +512,7 @@ export class CommentsService {
     ]);
 
     return {
-      items: rows.map((row) => this.toView(row, [])),
+      items: rows.map((row) => this.toView(row, viewerId, [])),
       total,
       page,
       limit,
@@ -576,25 +627,35 @@ export class CommentsService {
     }
   }
 
+  /**
+   * The public shape of one comment. The author block is the same for every
+   * reader — display name or pseudonym, avatar — except that the viewer's
+   * own comments also carry the author id and `isMine`. A blank display
+   * name counts as none, so the pseudonym is never an empty string.
+   */
   private toView(
     row: CommentRow,
+    viewerId: string | null,
     replies: CommentView[],
     replyCount: number = replies.length,
   ): CommentView {
+    const isMine = viewerId !== null && row.user.id === viewerId;
+    const displayName = row.user.displayName?.trim() ?? '';
     return {
       id: row.id,
       body: row.body,
       createdAt: row.createdAt,
       user: {
-        id: row.user.id,
-        username: row.user.username,
-        displayName: row.user.displayName,
+        ...(isMine && { id: row.user.id }),
+        displayName: displayName || memberLabelOf(row.user.id),
+        memberTag: displayName ? null : memberTagOf(row.user.id),
         // `avatar` is a MinIO object key; the URL is derived per request so
         // it follows whatever host the client is talking to.
         avatarUrl: row.user.avatar
           ? this.minioService.playbackUrl(row.user.avatar)
           : null,
       },
+      isMine,
       replies,
       replyCount,
       hasMoreReplies: replyCount > replies.length,

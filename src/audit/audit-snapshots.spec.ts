@@ -7,6 +7,10 @@ import {
   HomePromoArtPreset,
   HomePromoCtaTarget,
   HomePromoKind,
+  LotteryClaimRejectReason,
+  LotteryClaimStatus,
+  LotteryDrawStatus,
+  LotteryDreamBook,
   MovieStatus,
   Prisma,
   Role,
@@ -23,6 +27,11 @@ import {
   homePromoSnapshot,
   homeSettingsSnapshot,
   levelSnapshot,
+  lotteryClaimSnapshot,
+  lotteryDrawSnapshot,
+  lotteryDreamSnapshot,
+  lotteryResultSnapshot,
+  lotterySettingsSnapshot,
   movieSnapshot,
   paymentAccountSnapshot,
   roleSnapshot,
@@ -311,6 +320,177 @@ describe('audit snapshot pickers', () => {
       playStoreUrl: null,
       gamesTeaserEnabled: false,
       gamesTeaserDateText: null,
+    });
+  });
+
+  it('lotteryDreamSnapshot keeps the address and the editable fields only', () => {
+    expect(
+      lotteryDreamSnapshot({
+        id: 'd1',
+        book: LotteryDreamBook.DREAM_1000,
+        number: '027',
+        nameEn: 'Snake',
+        isActive: true,
+        createdAt: new Date('2026-10-19T00:00:00Z'),
+      }),
+    ).toEqual({
+      book: 'DREAM_1000',
+      number: '027',
+      nameEn: 'Snake',
+      nameMy: null,
+      pictureUrl: null,
+      isActive: true,
+    });
+  });
+
+  it('lotteryDrawSnapshot keeps the setup and the life stamps, never the counters', () => {
+    expect(
+      lotteryDrawSnapshot({
+        id: 'draw-1',
+        drawNo: 24,
+        thaiDrawDate: new Date('2026-11-01T00:00:00Z'),
+        drawAt: new Date('2026-11-01T07:30:00Z'),
+        salesCloseAt: new Date('2026-11-01T06:30:00Z'),
+        status: LotteryDrawStatus.OPEN,
+        ticketPrice: new Prisma.Decimal(1000),
+        maxPerNumber: 20,
+        exchangeRate: null,
+        nextTicketSeq: 469,
+        createdByUserId: 'admin-1',
+        openedAt: new Date('2026-10-20T00:00:00Z'),
+      }),
+    ).toEqual({
+      drawNo: 24,
+      thaiDrawDate: new Date('2026-11-01T00:00:00Z'),
+      drawAt: new Date('2026-11-01T07:30:00Z'),
+      salesCloseAt: new Date('2026-11-01T06:30:00Z'),
+      status: 'OPEN',
+      ticketPrice: 1000,
+      maxPerNumber: 20,
+      exchangeRate: null,
+      pictureUrl: null,
+      frameUrl: null,
+      openedAt: new Date('2026-10-20T00:00:00Z'),
+      closedAt: null,
+      publishedAt: null,
+      winnersCount: null,
+      prizesPaidKs: null,
+    });
+    // Publish figures come out as numbers (phase 3).
+    expect(
+      lotteryDrawSnapshot({
+        winnersCount: 12,
+        prizesPaidKs: new Prisma.Decimal('1234000.5'),
+      }),
+    ).toEqual(
+      expect.objectContaining({ winnersCount: 12, prizesPaidKs: 1234000.5 }),
+    );
+  });
+
+  it('lotteryResultSnapshot keeps the status, the source and the sheet as key / baht / numbers, never the raw answer', () => {
+    expect(
+      lotteryResultSnapshot({
+        id: 'result-1',
+        drawId: 'draw-1',
+        status: 'FETCHED',
+        source: 'API',
+        sourceDate: '2026-11-01',
+        fetchedAt: new Date('2026-11-01T07:40:00Z'),
+        attempts: 3,
+        lastError: null,
+        raw: { status: 'success', response: { date: 'x' } },
+        groups: [
+          {
+            key: 'first',
+            name: 'First prize',
+            baht: 6000000,
+            count: 1,
+            digits: 6,
+            numbers: ['123456'],
+          },
+          { key: 'back2', baht: 2000, numbers: ['56', 7] },
+          'junk',
+          { noKey: true },
+        ],
+      }),
+    ).toEqual({
+      status: 'FETCHED',
+      source: 'API',
+      sourceDate: '2026-11-01',
+      fetchedAt: new Date('2026-11-01T07:40:00Z'),
+      attempts: 3,
+      lastError: null,
+      groups: [
+        { key: 'first', baht: 6000000, numbers: ['123456'] },
+        { key: 'back2', baht: 2000, numbers: ['56'] },
+      ],
+    });
+    // A row never touched: every field null, the sheet null rather than [].
+    expect(lotteryResultSnapshot({})).toEqual({
+      status: null,
+      source: null,
+      sourceDate: null,
+      fetchedAt: null,
+      attempts: null,
+      lastError: null,
+      groups: null,
+    });
+  });
+
+  it('lotterySettingsSnapshot keeps the four values as numbers and the ticket frame', () => {
+    expect(
+      lotterySettingsSnapshot({
+        id: 'settings-1',
+        ticketPrice: new Prisma.Decimal(1000),
+        maxPerNumber: 20,
+        exchangeRate: new Prisma.Decimal('75.5'),
+        salesCloseMinutesBefore: 60,
+        frameUrl: 'http://s3/movies/images/lottery_frame/f.png',
+        updatedByUserId: 'admin-1',
+      }),
+    ).toEqual({
+      ticketPrice: 1000,
+      maxPerNumber: 20,
+      exchangeRate: 75.5,
+      salesCloseMinutesBefore: 60,
+      frameUrl: 'http://s3/movies/images/lottery_frame/f.png',
+      resultsUrl: null,
+      claimDeadlineDays: null,
+    });
+  });
+
+  it('lotteryClaimSnapshot keeps the status, the figures as numbers, the times and the rejection — never the customer', () => {
+    expect(
+      lotteryClaimSnapshot({
+        id: 'claim-1',
+        drawId: 'draw-1',
+        userId: 'user-1',
+        status: LotteryClaimStatus.REJECTED,
+        ticketsCount: 3,
+        baht: new Prisma.Decimal('6000.00'),
+        ks: new Prisma.Decimal('450000.00'),
+        rate: new Prisma.Decimal('75.0000'),
+        requestedAt: new Date('2026-10-24T03:42:00Z'),
+        decidedAt: new Date('2026-10-24T09:10:00Z'),
+        decidedByUserId: 'admin-1',
+        rejectReason: LotteryClaimRejectReason.OTHER,
+        rejectNote: 'Ticket photo does not match',
+        transactionId: null,
+        paidAtPublish: false,
+      }),
+    ).toEqual({
+      status: 'REJECTED',
+      ticketsCount: 3,
+      baht: 6000,
+      ks: 450000,
+      rate: 75,
+      requestedAt: new Date('2026-10-24T03:42:00Z'),
+      decidedAt: new Date('2026-10-24T09:10:00Z'),
+      decidedByUserId: 'admin-1',
+      rejectReason: 'OTHER',
+      rejectNote: 'Ticket photo does not match',
+      transactionId: null,
+      paidAtPublish: false,
     });
   });
 

@@ -14,17 +14,40 @@ services:
       - postgres-data:/var/lib/postgresql/data
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
+    # "healthy" once Postgres accepts connections; the backend below waits
+    # for that (depends_on) instead of racing it on a cold start.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # Keep at most 5 files of 50 MB (250 MB) of container log instead of
+    # letting it grow until the disk the database lives on fills.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
 
   backend:
     build: .
     restart: unless-stopped
     depends_on:
-      - postgres
+      # Not just "start after": wait until pg_isready says yes, so the
+      # migration step never meets a Postgres that is still starting.
+      postgres:
+        condition: service_healthy
     environment:
       # postgres:5432 is this compose network's internal address for the
       # service above — always correct here regardless of what host/port the
       # outside world reaches it on.
       DATABASE_URL: postgresql://${POSTGRES_USER:-myanflix}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in backend/.env}@postgres:5432/${POSTGRES_DB:-myanflix}?schema=public
+      # Optional pool size (1-50; empty = 10). Every setting the app reads
+      # must be listed in this block or a value in .env never reaches the
+      # container — src/config/docker-compose-env.spec.ts fails when one is
+      # missing (OPS-001: eight keys were, until 2026-10-09).
+      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-}
       NODE_ENV: production
       PORT: 3001
       # Both required, 32+ random characters each, never a placeholder, never
@@ -133,6 +156,18 @@ services:
       SMS_DAILY_CAP: ${SMS_DAILY_CAP:-1000}
       SMS_DAILY_CAP_PER_PHONE: ${SMS_DAILY_CAP_PER_PHONE:-10}
       SMS_GATEWAY_OFFLINE_AFTER_SECONDS: ${SMS_GATEWAY_OFFLINE_AFTER_SECONDS:-90}
+      # Staff upload budgets, whole bytes; empty = the defaults .env.example
+      # lists (60 GB video, 500 MB document, 2 GB free disk, 32 sessions).
+      UPLOAD_MAX_VIDEO_BYTES: ${UPLOAD_MAX_VIDEO_BYTES:-}
+      UPLOAD_MAX_DOCUMENT_BYTES: ${UPLOAD_MAX_DOCUMENT_BYTES:-}
+      UPLOAD_MIN_FREE_DISK_BYTES: ${UPLOAD_MIN_FREE_DISK_BYTES:-}
+      UPLOAD_MAX_OPEN_SESSIONS_PER_MOVIE: ${UPLOAD_MAX_OPEN_SESSIONS_PER_MOVIE:-}
+      # Processing bounds: chapter PDFs converting at once (empty = 2), the
+      # longest one HLS rendition may transcode in minutes (empty = 360) and
+      # videos transcoding at once (1-8, empty = 1).
+      BOOK_CONVERSION_CONCURRENCY: ${BOOK_CONVERSION_CONCURRENCY:-}
+      FFMPEG_RENDITION_TIMEOUT_MINUTES: ${FFMPEG_RENDITION_TIMEOUT_MINUTES:-}
+      VIDEO_TRANSCODE_CONCURRENCY: ${VIDEO_TRANSCODE_CONCURRENCY:-}
     extra_hosts:
       # host.docker.internal is automatic on Docker Desktop (macOS/Windows);
       # this makes it also resolve on Linux Docker engines.
@@ -147,6 +182,34 @@ services:
       # that move also carries orphaned uploads/, videos/ and books/
       # directories, which are safe to delete once by hand.
       - backend-storage:/app/storage
+    # Asks the API itself (src/health): 200 while the database answers, 503
+    # once it does not. node:26-slim ships no curl/wget, so Node's own fetch
+    # does the asking. start_period covers `prisma migrate deploy` on a cold
+    # start. A failing check only marks the container "unhealthy" in
+    # `docker compose ps` — Docker does not restart it for that (DOCKER.md,
+    # "Health checks").
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3001/api/health').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    # Resource limits — deliberately NOT set yet. The right numbers must be
+    # measured against a real transcode (`docker stats` while a feature-length
+    # upload processes) and none has run since the 2026-10-08 wipe; a limit
+    # below ffmpeg's real peak would kill every transcode. Suggested starting
+    # point (audit OPS-004), to uncomment once measured:
+    # mem_limit: 4g
+    # pids_limit: 512
 
 volumes:
   postgres-data:

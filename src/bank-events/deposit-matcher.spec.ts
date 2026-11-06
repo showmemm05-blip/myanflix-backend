@@ -21,6 +21,8 @@ const KEY = 'a'.repeat(64);
 const ACCOUNT = '11111111-1111-4111-8111-111111111111';
 const BANK_AT = new Date('2026-09-18T09:00:00.000Z');
 const NOW = new Date('2026-09-18T09:00:30.000Z');
+/** The phone's screenshot, already stored on the transaction. */
+const SCREENSHOT_KEY = `documents/bank-screenshots/transactions/tx-1/${KEY}.png`;
 
 function makeTransaction(
   overrides: Partial<StoredBankTransaction> = {},
@@ -40,6 +42,14 @@ function makeTransaction(
     ...overrides,
   };
 }
+
+/**
+ * A transaction WITH its screenshot — the shape every "clean match" case
+ * below uses, because since SEC-004 a bank event with no picture behind it
+ * is a soft reason (NO_SCREENSHOT) and never MATCHED on its own.
+ */
+const withShot = (overrides: Partial<StoredBankTransaction> = {}) =>
+  makeTransaction({ screenshotKey: SCREENSHOT_KEY, ...overrides });
 
 /** A row as Q1 returns it (raw column shapes: Decimal + Date). */
 function openRow(overrides: Record<string, unknown> = {}) {
@@ -164,10 +174,10 @@ describe('applyReceivedEvent', () => {
     expect(outcome.transactionChanged).toBe(true);
   });
 
-  it("matches by the user's own last-6 (Q1), writes the bank values with MATCHED when every check passes, and links the row in the same transaction", async () => {
+  it("matches by the user's own last-6 (Q1), writes the bank values with MATCHED when every check passes (screenshot included), and links the row in the same transaction", async () => {
     tx.$queryRaw.mockResolvedValueOnce([openRow()]);
 
-    const outcome = await run();
+    const outcome = await run(withShot());
 
     expect(outcome.result).toEqual({
       idempotencyKey: KEY,
@@ -176,7 +186,7 @@ describe('applyReceivedEvent', () => {
       state: 'MATCHED',
       depositId: 'dep-1',
       matchStatus: BankMatchStatus.MATCHED,
-      screenshotWanted: true,
+      screenshotWanted: false,
     });
     expect(tx.deposit.updateMany).toHaveBeenCalledWith({
       where: { id: 'dep-1', status: 'PENDING', bankCheckedAt: null },
@@ -186,18 +196,17 @@ describe('applyReceivedEvent', () => {
         receivingTransactionTime: '15:30:00',
         receivingTransactionAt: BANK_AT,
         receivingEventKey: KEY,
+        receivingScreenshotKey: SCREENSHOT_KEY,
         bankCheckedAt: NOW,
         matchStatus: BankMatchStatus.MATCHED,
         riskLevel: BankRiskLevel.LOW,
         riskReasons: [],
       },
     });
-    // Never the ledger-driving columns; no screenshot pointer when the
-    // transaction holds none yet (the upload sets both later).
+    // Never the ledger-driving columns.
     const data = tx.deposit.updateMany.mock.calls[0][0].data;
     expect(data).not.toHaveProperty('receivingPaymentAccountId');
     expect(data).not.toHaveProperty('receivingAccountType');
-    expect(data).not.toHaveProperty('receivingScreenshotKey');
     expect(tx.bankTransaction.updateMany).toHaveBeenCalledWith({
       where: { id: 'tx-1', state: { in: ['UNMATCHED', 'AMBIGUOUS'] } },
       data: { state: 'MATCHED', linkedDepositId: 'dep-1', matchedAt: NOW },
@@ -243,6 +252,48 @@ describe('applyReceivedEvent', () => {
     expect(outcome.result.screenshotWanted).toBe(false);
   });
 
+  it('SEC-004: a transaction with no screenshot yet claims the row but only as PENDING_REVIEW / LOW (NO_SCREENSHOT) — never MATCHED on the phone text alone', async () => {
+    tx.$queryRaw.mockResolvedValueOnce([openRow()]);
+
+    const outcome = await run(makeTransaction());
+
+    expect(outcome.result).toEqual({
+      idempotencyKey: KEY,
+      outcome: 'matched',
+      transactionId: 'tx-1',
+      state: 'MATCHED',
+      depositId: 'dep-1',
+      matchStatus: BankMatchStatus.PENDING_REVIEW,
+      screenshotWanted: true,
+    });
+    // The bank values are written and the row is linked exactly as for a
+    // clean match; only the verdict waits for the picture. No screenshot
+    // pointer when the transaction holds none yet (the upload sets both).
+    const data = tx.deposit.updateMany.mock.calls[0][0].data;
+    expect(data).toMatchObject({
+      receivingAmount: new Prisma.Decimal(50000),
+      receivingEventKey: KEY,
+      bankCheckedAt: NOW,
+      matchStatus: BankMatchStatus.PENDING_REVIEW,
+      riskLevel: BankRiskLevel.LOW,
+      riskReasons: ['NO_SCREENSHOT'],
+    });
+    expect(data).not.toHaveProperty('receivingScreenshotKey');
+    expect(tx.bankTransaction.updateMany).toHaveBeenCalledWith({
+      where: { id: 'tx-1', state: { in: ['UNMATCHED', 'AMBIGUOUS'] } },
+      data: { state: 'MATCHED', linkedDepositId: 'dep-1', matchedAt: NOW },
+    });
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'deposit.bank_match',
+        metadata: expect.objectContaining({
+          matchStatus: BankMatchStatus.PENDING_REVIEW,
+          riskReasons: ['NO_SCREENSHOT'],
+        }),
+      }),
+    );
+  });
+
   it('spells the open-set predicate as literal SQL with only the values bound (what makes the partial index usable)', async () => {
     tx.$queryRaw.mockResolvedValueOnce([openRow()]);
     await run();
@@ -258,7 +309,7 @@ describe('applyReceivedEvent', () => {
       openRow({ amount: new Prisma.Decimal(45000) }),
     ]);
 
-    const outcome = await run();
+    const outcome = await run(withShot());
 
     expect(outcome.result.matchStatus).toBe(BankMatchStatus.SUSPICIOUS);
     expect(tx.deposit.updateMany).toHaveBeenCalledWith(
@@ -277,9 +328,7 @@ describe('applyReceivedEvent', () => {
       displayName = 'Ko Ko Aung';
       tx.$queryRaw.mockResolvedValueOnce([openRow()]);
 
-      const outcome = await run(
-        makeTransaction({ counterparty: 'MAUNG MAUNG' }),
-      );
+      const outcome = await run(withShot({ counterparty: 'MAUNG MAUNG' }));
 
       expect(outcome.result.outcome).toBe('matched');
       expect(outcome.result.matchStatus).toBe(BankMatchStatus.PENDING_REVIEW);
@@ -303,9 +352,7 @@ describe('applyReceivedEvent', () => {
       displayName = 'Ko Ko Aung';
       tx.$queryRaw.mockResolvedValueOnce([openRow()]);
 
-      const outcome = await run(
-        makeTransaction({ counterparty: 'U KO KO AUNG' }),
-      );
+      const outcome = await run(withShot({ counterparty: 'U KO KO AUNG' }));
 
       expect(outcome.result.matchStatus).toBe(BankMatchStatus.MATCHED);
     });
@@ -314,7 +361,7 @@ describe('applyReceivedEvent', () => {
       displayName = null;
       tx.$queryRaw.mockResolvedValueOnce([openRow()]);
       expect(
-        (await run(makeTransaction({ counterparty: 'MAUNG MAUNG' }))).result
+        (await run(withShot({ counterparty: 'MAUNG MAUNG' }))).result
           .matchStatus,
       ).toBe(BankMatchStatus.MATCHED);
 
@@ -322,7 +369,7 @@ describe('applyReceivedEvent', () => {
       tx.user.findUnique.mockClear();
       tx.$queryRaw.mockResolvedValueOnce([openRow()]);
       expect(
-        (await run(makeTransaction({ counterparty: null }))).result.matchStatus,
+        (await run(withShot({ counterparty: null }))).result.matchStatus,
       ).toBe(BankMatchStatus.MATCHED);
       expect(tx.user.findUnique).not.toHaveBeenCalled();
     });
@@ -335,7 +382,7 @@ describe('applyReceivedEvent', () => {
       }),
     ]);
 
-    const outcome = await run();
+    const outcome = await run(withShot());
 
     expect(outcome.result.matchStatus).toBe(BankMatchStatus.SUSPICIOUS);
     expect(tx.deposit.updateMany.mock.calls[0][0].data.riskReasons).toEqual([
@@ -358,7 +405,7 @@ describe('applyReceivedEvent', () => {
       },
     ];
 
-    const outcome = await run();
+    const outcome = await run(withShot());
 
     expect(tx.deposit.updateMany.mock.calls[0][0].data.riskReasons).toEqual([
       'DUPLICATE_REFERENCE',
@@ -389,7 +436,7 @@ describe('applyReceivedEvent', () => {
     tx.$queryRaw.mockResolvedValueOnce([openRow()]);
     recentCount = VELOCITY_LIMIT;
 
-    const outcome = await run();
+    const outcome = await run(withShot());
 
     expect(outcome.result.matchStatus).toBe(BankMatchStatus.PENDING_REVIEW);
     expect(tx.deposit.updateMany.mock.calls[0][0].data.riskReasons).toEqual([

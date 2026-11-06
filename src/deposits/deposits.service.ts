@@ -112,6 +112,14 @@ export const AMOUNT_MISMATCH_OVERRIDE_REQUIRED_MESSAGE =
 export const AMOUNT_MISMATCH_REASON_REQUIRED_MESSAGE =
   'A reason is required to credit the bank amount instead of the typed amount';
 
+/**
+ * DB-003: the phone's bank event landed on the row between the approval's
+ * read and its claim — the row is still PENDING, but it now carries bank
+ * values the staff member never saw. Shown verbatim by the admin's toast.
+ */
+export const DEPOSIT_CHANGED_DURING_APPROVAL_MESSAGE =
+  'The deposit changed while you were approving — reload and try again';
+
 function isUniqueViolation(error: unknown): boolean {
   return (
     error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -167,6 +175,8 @@ const BANK_EVENT_REASONS: readonly RiskReason[] = [
   'AMBIGUOUS_MATCH',
   // M-16: compares the transfer's sender name — gone once the transfer is.
   'COUNTERPARTY_MISMATCH',
+  // SEC-004: "the transfer has no picture yet" — gone once the transfer is.
+  'NO_SCREENSHOT',
 ];
 
 const ADMIN_USER_SELECT = {
@@ -787,8 +797,20 @@ export class DepositsService {
       // The row's amount becomes the credited amount, so the wallet, the
       // ledger, the user's own deposit history and the totals all tell the
       // same story; the typed amount survives in the audit row's "before".
+      //
+      // DB-003: the claim is keyed on the bank-checked state this
+      // transaction READ, not only on PENDING. The matcher's own claim
+      // (deposit-matcher.ts) sets bankCheckedAt under the row lock, so a
+      // phone event that lands between the read above and this write makes
+      // the re-checked row no longer match (Prisma renders null as IS NULL)
+      // — count 0, nothing credited, and the staff member reloads into the
+      // M-15 decision instead of the typed amount being credited past it.
       const claim = await tx.deposit.updateMany({
-        where: { id: depositId, status: DepositStatus.PENDING },
+        where: {
+          id: depositId,
+          status: DepositStatus.PENDING,
+          bankCheckedAt: deposit.bankCheckedAt,
+        },
         data: {
           status: DepositStatus.APPROVED,
           approvedByUserId: admin.id,
@@ -797,8 +819,16 @@ export class DepositsService {
         },
       });
       if (claim.count !== 1) {
+        // One primary-key read on the failure path only, to tell the two
+        // causes apart for the person clicking.
+        const current = await tx.deposit.findUnique({
+          where: { id: depositId },
+          select: { status: true },
+        });
         throw new ConflictException(
-          'This deposit has already been approved or rejected',
+          current?.status === DepositStatus.PENDING
+            ? DEPOSIT_CHANGED_DURING_APPROVAL_MESSAGE
+            : 'This deposit has already been approved or rejected',
         );
       }
       const credited = { ...deposit, amount: creditedAmount };
@@ -1729,7 +1759,11 @@ export class DepositsService {
       riskLevel?: BankRiskLevel | null;
       riskReasons?: string[];
       declaredTransferAt?: Date | null;
-      bankTransaction?: { id: string; counterparty?: string | null } | null;
+      bankTransaction?: {
+        id: string;
+        counterparty?: string | null;
+        deviceSerial?: string | null;
+      } | null;
     },
     now: Date = new Date(),
   ) {
@@ -1763,6 +1797,9 @@ export class DepositsService {
       // M-16: the bank's "from" name, beside the depositor's own name in
       // the verification dialog. Staff only — a user never sees it.
       bankCounterparty: deposit.bankTransaction?.counterparty ?? null,
+      // SEC-004: which phone captured the transfer — the dialog's "posted
+      // by phone" line. Staff only.
+      bankDeviceSerial: deposit.bankTransaction?.deviceSerial ?? null,
     };
   }
 }

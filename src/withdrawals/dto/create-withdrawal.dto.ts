@@ -4,15 +4,18 @@ import {
   IsNumber,
   IsOptional,
   IsString,
+  Max,
   MaxLength,
   Min,
 } from 'class-validator';
 import { normalizeCodeInput } from '../../withdrawal-code/withdrawal-code.rules';
 
 export class CreateWithdrawalDto {
+  /** @Max is the Decimal(12,2) column ceiling — past it Postgres overflows (DB-007). */
   @Type(() => Number)
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0.01)
+  @Max(9_999_999_999.99)
   amount!: number;
 
   /** e.g. "KBZPay", "Bank Account" — free string, not validated against a fixed catalog (see Withdrawal.accountType doc in schema.prisma). */

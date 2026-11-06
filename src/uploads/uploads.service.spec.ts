@@ -19,7 +19,11 @@ import {
 import { createReadStream, createWriteStream } from 'node:fs';
 import { PassThrough, Writable } from 'node:stream';
 import sharp from 'sharp';
-import { UploadsService, expectedChunkSize } from './uploads.service';
+import {
+  IMAGE_UPLOAD_UNSUPPORTED_TYPE_CODE,
+  UploadsService,
+  expectedChunkSize,
+} from './uploads.service';
 import { DEFAULT_MAX_VIDEO_UPLOAD_BYTES } from './upload-limits';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
@@ -266,7 +270,9 @@ describe('UploadsService', () => {
       fillMovieDurationIfUnknown: jest.fn().mockResolvedValue(true),
     };
     processingService = {
-      processVideo: jest.fn(),
+      // A promise, as the real one returns: both fire-and-forget call sites
+      // hang their STR-009 catch on it.
+      processVideo: jest.fn().mockResolvedValue(undefined),
       isActivelyProcessing: jest.fn().mockReturnValue(false),
       reserve: jest.fn().mockReturnValue(true),
       release: jest.fn(),
@@ -1054,6 +1060,109 @@ describe('UploadsService', () => {
         }),
       );
     });
+
+    /**
+     * The pipeline resumes per tier on object existence, so a classic
+     * upload onto a DRAFT/FAILED title that still had an earlier file's
+     * archived original and finished tiers under videos/<movieId>/ either
+     * published a MIXED package (tiers from two files) or never used the
+     * new file at all (STR-003). A fresh upload now starts from an empty
+     * prefix; reprocess (below) must keep relying on the resume.
+     */
+    it('a second classic upload clears the previous package under videos/<movieId>/ before the Video row and the transcode (STR-003)', async () => {
+      prisma.uploadSession.findUnique.mockResolvedValue(classicSession);
+      prisma.movie.findUnique.mockResolvedValue(movie(MovieStatus.DRAFT));
+
+      await service.completeUpload('session-1', ACTOR);
+
+      expect(minioService.deleteByPrefix).toHaveBeenCalledTimes(1);
+      expect(minioService.deleteByPrefix).toHaveBeenCalledWith(
+        'videos/movie-1/',
+      );
+      const clearedAt = minioService.deleteByPrefix.mock.invocationCallOrder[0];
+      expect(clearedAt).toBeLessThan(
+        videosService.create.mock.invocationCallOrder[0],
+      );
+      expect(clearedAt).toBeLessThan(
+        processingService.processVideo.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('a BUNDLE file complete never clears the prefix — it is one file of the package being assembled there', async () => {
+      prisma.movie.findUnique.mockResolvedValue(movie(MovieStatus.UPLOADING));
+
+      await service.completeUpload('session-1', ACTOR);
+
+      expect(minioService.deleteByPrefix).not.toHaveBeenCalled();
+    });
+
+    it('a storage error while clearing the previous package fails the complete before anything durable changes — the session stays resumable', async () => {
+      prisma.uploadSession.findUnique.mockResolvedValue(classicSession);
+      prisma.movie.findUnique.mockResolvedValue(movie(MovieStatus.DRAFT));
+      minioService.deleteByPrefix.mockRejectedValue(new Error('minio down'));
+
+      await expect(service.completeUpload('session-1', ACTOR)).rejects.toThrow(
+        'minio down',
+      );
+
+      expect(videosService.create).not.toHaveBeenCalled();
+      expect(prisma.uploadSession.update).not.toHaveBeenCalled();
+      expect(processingService.processVideo).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
+      // The chunks are still there for the retried complete.
+      expect(rmMock).not.toHaveBeenCalledWith(
+        '/storage/temp/uploads/session-1',
+        expect.anything(),
+      );
+    });
+
+    it("refuses a classic complete with 409 while the title's previous video is still transcoding here — nothing merged, nothing cleared, the session stays resumable", async () => {
+      prisma.uploadSession.findUnique.mockResolvedValue(classicSession);
+      // The movie stays DRAFT for the whole of a transcode, so the status
+      // gate alone lets this through.
+      prisma.movie.findUnique.mockResolvedValue(movie(MovieStatus.DRAFT));
+      videosService.findLatestForMovie.mockResolvedValue({
+        id: 'video-0',
+        status: VideoStatus.PROCESSING,
+      });
+      processingService.isActivelyProcessing.mockReturnValue(true);
+
+      await expect(service.completeUpload('session-1', ACTOR)).rejects.toThrow(
+        ConflictException,
+      );
+
+      expect(processingService.isActivelyProcessing).toHaveBeenCalledWith(
+        'video-0',
+      );
+      expect(createWriteStreamMock).not.toHaveBeenCalled();
+      expect(minioService.deleteByPrefix).not.toHaveBeenCalled();
+      expect(videosService.create).not.toHaveBeenCalled();
+      expect(prisma.uploadSession.update).not.toHaveBeenCalled();
+      expect(rmMock).not.toHaveBeenCalled();
+    });
+
+    /**
+     * processVideo() is fired and forgotten; a rejection that escaped it
+     * used to be an unhandled rejection, which is fatal in Node — the whole
+     * API process went down with every other upload in flight (STR-009).
+     */
+    it('a transcode that rejects after the response is logged, never an unhandled rejection (STR-009)', async () => {
+      const errorSpy = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation(() => undefined);
+      prisma.uploadSession.findUnique.mockResolvedValue(classicSession);
+      prisma.movie.findUnique.mockResolvedValue(movie(MovieStatus.DRAFT));
+      processingService.processVideo.mockRejectedValue(new Error('db down'));
+
+      await expect(service.completeUpload('session-1', ACTOR)).resolves.toEqual(
+        { videoId: 'video-1', status: undefined },
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('escaped the pipeline: db down'),
+      );
+    });
   });
 
   // The structure rules validate-external used to report are enforced by
@@ -1438,6 +1547,31 @@ describe('UploadsService', () => {
       await service.finalizeExternalUpload('movie-1', dto, ACTOR);
 
       expect(processingService.processVideo).not.toHaveBeenCalled();
+    });
+
+    /**
+     * The variant order of a master is decided by whoever WRITES it — the
+     * Transcoder for a bundle (480p first since 2026-10-12, the same rule
+     * as the classic flow's buildMasterPlaylist). Finalize only checks the
+     * uploaded master exists and reads its runtime; regenerating it from
+     * KNOWN_RENDITIONS would have to invent RESOLUTION and BANDWIDTH values.
+     */
+    it("trusts the bundle's own master.m3u8 — never writes, regenerates or re-orders one", async () => {
+      prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+      minioService.objectExists.mockResolvedValue(true);
+
+      await service.finalizeExternalUpload('movie-1', dto, ACTOR);
+
+      expect(minioService.objectExists).toHaveBeenCalledWith(
+        'videos/movie-1/hls/master.m3u8',
+      );
+      expect(
+        videoDurationService.recoverHlsDurationSeconds,
+      ).toHaveBeenCalledWith('videos/movie-1/hls/master.m3u8');
+      expect(minioService.uploadBuffer).not.toHaveBeenCalled();
+      expect(minioService.uploadFile).not.toHaveBeenCalled();
+      expect(minioService.copyObject).not.toHaveBeenCalled();
+      expect(writeFileMock).not.toHaveBeenCalled();
     });
 
     it(
@@ -1839,6 +1973,53 @@ describe('UploadsService', () => {
       expect(processingService.processVideo).toHaveBeenCalled();
     });
 
+    it('never clears videos/<movieId>/ the way a fresh classic upload does — only the versioned folder, when there is one (STR-003)', async () => {
+      accessMock.mockResolvedValue(undefined);
+      videosService.findLatestForMovie.mockResolvedValue({
+        id: 'video-1',
+        status: VideoStatus.FAILED,
+        originalPath: '/storage/temp/videos/movie-1/original.mp4',
+        originalFilename: 'movie.mp4',
+        hlsMasterPath: 'videos/movie-1/hls/v-abc123/master.m3u8',
+      });
+
+      await service.reprocessVideo('movie-1', ACTOR);
+
+      expect(minioService.deleteByPrefix).toHaveBeenCalledTimes(1);
+      expect(minioService.deleteByPrefix).not.toHaveBeenCalledWith(
+        'videos/movie-1/',
+      );
+      expect(processingService.processVideo).toHaveBeenCalledWith(
+        'video-1',
+        'movie-1',
+        '/storage/temp/videos/movie-1/original.mp4',
+      );
+    });
+
+    it('a transcode that rejects after the reprocess response is logged, never an unhandled rejection (STR-009)', async () => {
+      const errorSpy = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation(() => undefined);
+      accessMock.mockResolvedValue(undefined);
+      videosService.findLatestForMovie.mockResolvedValue({
+        id: 'video-1',
+        status: VideoStatus.FAILED,
+        originalPath: '/storage/temp/videos/movie-1/original.mp4',
+        originalFilename: 'movie.mp4',
+      });
+      processingService.processVideo.mockRejectedValue(new Error('db down'));
+
+      await expect(service.reprocessVideo('movie-1', ACTOR)).resolves.toEqual({
+        videoId: 'video-1',
+        status: VideoStatus.PROCESSING,
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('escaped the pipeline: db down'),
+      );
+    });
+
     it('treats a READY video with no master path at all as master-missing too', async () => {
       accessMock.mockResolvedValue(undefined);
       videosService.findLatestForMovie.mockResolvedValue({
@@ -1916,6 +2097,25 @@ describe('UploadsService', () => {
         );
       },
     );
+
+    it('answers 400, not a NoSuchKey 500, when the kept local original has since been swept (STR-004)', async () => {
+      accessMock.mockRejectedValue(new Error('ENOENT')); // swept after 24 h
+      videosService.findLatestForMovie.mockResolvedValue({
+        id: 'video-1',
+        status: VideoStatus.FAILED,
+        // Never archived: a local path, not an object key.
+        originalPath: '/storage/temp/videos/movie-1/original.mp4',
+        originalFilename: 'movie.mp4',
+      });
+
+      await expect(service.reprocessVideo('movie-1', ACTOR)).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(minioService.downloadFile).not.toHaveBeenCalled();
+      expect(processingService.processVideo).not.toHaveBeenCalled();
+      // The claim goes back, so a later reprocess is not refused as "active".
+      expect(processingService.release).toHaveBeenCalledWith('video-1');
+    });
 
     it('never re-uploads from the client — reprocessing only ever calls processVideo, never any upload-session logic', async () => {
       accessMock.mockResolvedValue(undefined);
@@ -2385,6 +2585,19 @@ describe('UploadsService', () => {
           });
         });
 
+        it('copies the staged master.m3u8 as it was uploaded — a server-side CopyObject, never a rewrite or a re-order', async () => {
+          await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(minioService.copyObject).toHaveBeenCalledWith(
+            `${STAGING}hls/master.m3u8`,
+            NEW_MASTER,
+            expect.any(Number),
+          );
+          expect(minioService.uploadBuffer).not.toHaveBeenCalled();
+          expect(minioService.uploadFile).not.toHaveBeenCalled();
+          expect(writeFileMock).not.toHaveBeenCalled();
+        });
+
         it('copies the HLS package into a FRESH hls/v-<tag>/ folder and the rest to the key a fresh upload would get, with the master strictly LAST', async () => {
           await service.finalizeReplace('movie-1', dto, ACTOR);
 
@@ -2752,6 +2965,30 @@ describe('UploadsService', () => {
           expect(result.deletedObjects).toBe(0);
           expect(prisma.video.update).toHaveBeenCalledTimes(1);
         });
+
+        /**
+         * The stale delete used to run BEFORE the row swap, so for the
+         * length of the delete batches /stream still signed the old master
+         * — now gone — and a process dying in between left the title
+         * pointing at deleted keys until an admin retried (STR-002).
+         */
+        it('deletes the stale package only AFTER the Video row points at the new one (STR-002)', async () => {
+          await service.finalizeReplace('movie-1', dto, ACTOR);
+
+          expect(prisma.video.update).toHaveBeenCalledTimes(1);
+          expect(minioService.deleteKeys).toHaveBeenCalledTimes(1);
+          const swappedAt = prisma.video.update.mock.invocationCallOrder[0];
+          const deletedAt = minioService.deleteKeys.mock.invocationCallOrder[0];
+          expect(swappedAt).toBeLessThan(deletedAt);
+          expect(prisma.$transaction.mock.invocationCallOrder[0]).toBeLessThan(
+            deletedAt,
+          );
+          // Every copy still precedes the swap: the row never names a key
+          // that is not there yet.
+          for (const at of minioService.copyObject.mock.invocationCallOrder) {
+            expect(at).toBeLessThan(swappedAt);
+          }
+        });
       });
 
       it('works the same on a READY_TO_PUBLISH and a FAILED movie, and the status still never changes', async () => {
@@ -2804,6 +3041,10 @@ describe('UploadsService', () => {
         );
         expect(result.videoId).toBe('video-new');
         expect(minioService.deleteKeys).toHaveBeenCalledWith([]);
+        // Same order as the update path (STR-002): the row first.
+        expect(prisma.video.create.mock.invocationCallOrder[0]).toBeLessThan(
+          minioService.deleteKeys.mock.invocationCallOrder[0],
+        );
         expect(audit.record).toHaveBeenCalledWith(
           expect.objectContaining({
             before: expect.objectContaining({ video: null, subtitles: [] }),
@@ -2922,11 +3163,24 @@ describe('UploadsService', () => {
   });
 
   describe('saveImage', () => {
+    // The type is read off the first bytes (see save-image-magic-bytes.spec),
+    // so each stub starts like the image it stands for; sharp's refusal to
+    // resize a bare header is logged and the bytes are stored as uploaded.
+    const PNG_STUB = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]);
+    const JPEG_STUB = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+    const WEBP_STUB = Buffer.from('RIFF\x24\x00\x00\x00WEBPVP8 ', 'latin1');
+
+    beforeEach(() => {
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    });
+
     it('files the image in the folder its purpose names — the purpose is never guessed or defaulted', async () => {
       const url = await service.saveImage(
         'actor',
         'portrait.png',
-        Buffer.from('bytes'),
+        PNG_STUB,
         ACTOR,
       );
 
@@ -2943,12 +3197,7 @@ describe('UploadsService', () => {
     });
 
     it('keeps every purpose in its own folder', async () => {
-      await service.saveImage(
-        'payment',
-        'kbzpay.webp',
-        Buffer.from('bytes'),
-        ACTOR,
-      );
+      await service.saveImage('payment', 'kbzpay.webp', WEBP_STUB, ACTOR);
 
       expect(minioService.uploadBuffer).toHaveBeenCalledWith(
         expect.stringContaining('images/payment/'),
@@ -2960,7 +3209,7 @@ describe('UploadsService', () => {
       await service.saveImage(
         'actor',
         'portrait.png',
-        Buffer.alloc(321),
+        Buffer.concat([PNG_STUB, Buffer.alloc(321 - PNG_STUB.length)]),
         ACTOR,
       );
 
@@ -2979,14 +3228,29 @@ describe('UploadsService', () => {
       );
     });
 
-    it('falls back to .jpg only for the EXTENSION when the uploaded filename has none', async () => {
-      await service.saveImage('movie', 'poster', Buffer.from('bytes'), ACTOR);
+    it('takes the EXTENSION from the bytes, never from the filename — a JPEG is .jpg whether it was named poster, poster.png or poster.svg', async () => {
+      for (const filename of ['poster', 'poster.png', 'poster.svg']) {
+        await service.saveImage('movie', filename, JPEG_STUB, ACTOR);
+      }
 
-      expect(storageService.imageObjectKey).toHaveBeenCalledWith(
-        'movie',
-        expect.any(String),
-        '.jpg',
-      );
+      expect(storageService.imageObjectKey).toHaveBeenCalledTimes(3);
+      for (const [purpose, , extension] of storageService.imageObjectKey.mock
+        .calls as [string, string, string][]) {
+        expect(purpose).toBe('movie');
+        expect(extension).toBe('.jpg');
+      }
+    });
+
+    it('refuses bytes that are not a JPEG / PNG / WebP / GIF with a 400 and stores nothing (SEC-019)', async () => {
+      await expect(
+        service.saveImage('movie', 'poster.jpg', Buffer.from('bytes'), ACTOR),
+      ).rejects.toMatchObject({
+        code: IMAGE_UPLOAD_UNSUPPORTED_TYPE_CODE,
+        status: 400,
+      });
+
+      expect(minioService.uploadBuffer).not.toHaveBeenCalled();
+      expect(audit.record).not.toHaveBeenCalled();
     });
   });
 
@@ -3064,6 +3328,35 @@ describe('UploadsService', () => {
 
       const meta = await sharp(stored()).metadata();
       expect(meta).toMatchObject({ format: 'png', width: 1920, height: 1080 });
+    });
+
+    it('a 3600 x 1880 lottery ticket frame (the 2x print size) is stored byte for byte; wider than 4000 px is brought to 4000', async () => {
+      const frame = await makeImage(3600, 1880, 'png');
+      await service.saveImage('lottery_frame', 'frame.png', frame, ACTOR);
+      expect(stored().equals(frame)).toBe(true);
+      const [key] = minioService.uploadBuffer.mock.calls[0] as [string];
+      expect(key).toMatch(/^images\/lottery_frame\/[0-9a-f-]{36}\.png$/);
+
+      minioService.uploadBuffer.mockClear();
+      await service.saveImage(
+        'lottery_frame',
+        'frame.png',
+        await makeImage(4800, 2507, 'png'),
+        ACTOR,
+      );
+      const meta = await sharp(stored()).metadata();
+      expect(meta).toMatchObject({ format: 'png', width: 4000, height: 2089 });
+
+      // A draw picture (purpose "lottery") keeps its small cap: the frame's
+      // size is the frame folder's alone.
+      minioService.uploadBuffer.mockClear();
+      await service.saveImage(
+        'lottery',
+        'picture.png',
+        await makeImage(1280, 976, 'png'),
+        ACTOR,
+      );
+      expect((await sharp(stored()).metadata()).width).toBe(1000);
     });
 
     it('a 4000 px wide portrait actor photo still stops at 1000 px (shown small / blurred, never edge to edge)', async () => {

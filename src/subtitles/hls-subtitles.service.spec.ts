@@ -25,6 +25,19 @@ const MASTER =
     '240p/index.m3u8',
   ].join('\n') + '\n';
 
+/** What the classic flow writes since 2026-10-12 for a 1920x800 film: the 480p rung first, each RESOLUTION the rung's real size. */
+const WIDESCREEN_MASTER =
+  [
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    '#EXT-X-STREAM-INF:BANDWIDTH=1528000,RESOLUTION=854x356',
+    '480p/index.m3u8',
+    '#EXT-X-STREAM-INF:BANDWIDTH=5128000,RESOLUTION=1920x800',
+    '1080p/index.m3u8',
+    '#EXT-X-STREAM-INF:BANDWIDTH=2928000,RESOLUTION=1280x534',
+    '720p/index.m3u8',
+  ].join('\n') + '\n';
+
 const SRT = ['1', '00:00:01,234 --> 00:00:03,456', 'Hello there.', ''].join(
   '\n',
 );
@@ -343,6 +356,82 @@ describe('HlsSubtitlesService', () => {
       expect(minioService.uploadBuffer).not.toHaveBeenCalled();
       expect(stored.get(MASTER_KEY)).toBe(MASTER);
       expect(result.masterUpdated).toBe(false);
+    });
+  });
+
+  /**
+   * The rewrite only ever INSERTS the subtitle group: the variant order
+   * (a phone starts on the first variant listed) and every RESOLUTION (the
+   * rung's real size, 854x356 for a widescreen film's 480p) must come out
+   * exactly as the writer put them — hls-subtitle-manifest.spec.ts pins the
+   * string work, this pins the storage round-trip.
+   */
+  describe('a 480p-first widescreen master — what the classic flow writes since 2026-10-12', () => {
+    beforeEach(() => {
+      stored.set(MASTER_KEY, WIDESCREEN_MASTER);
+      stored.set(
+        `videos/${MOVIE_ID}/hls/480p/index.m3u8`,
+        '#EXTM3U\n#EXTINF:6.000,\nsegment_000.ts\n#EXTINF:6.000,\nsegment_001.ts\n#EXTINF:3.500,\nsegment_002.ts\n#EXT-X-ENDLIST\n',
+      );
+      segments.set(
+        `videos/${MOVIE_ID}/hls/480p/segment_000.ts`,
+        tsPacketWithPts(INITIAL_PTS),
+      );
+    });
+
+    it('rewrites the master in MinIO with the variant order and every RESOLUTION exactly as written — the 480p start rung stays first', async () => {
+      await service.publishForVideo(VIDEO_ID);
+
+      const lines = written.get(MASTER_KEY)?.split('\n') ?? [];
+      expect(
+        lines.filter((line) => line.startsWith('#EXT-X-STREAM-INF:')),
+      ).toEqual([
+        '#EXT-X-STREAM-INF:BANDWIDTH=1528000,RESOLUTION=854x356,SUBTITLES="subs"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=5128000,RESOLUTION=1920x800,SUBTITLES="subs"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=2928000,RESOLUTION=1280x534,SUBTITLES="subs"',
+      ]);
+      expect(lines.filter((line) => line.endsWith('/index.m3u8'))).toEqual([
+        '480p/index.m3u8',
+        '1080p/index.m3u8',
+        '720p/index.m3u8',
+      ]);
+      // The group is declared once, before the variants that reference it.
+      expect(
+        lines.filter((line) => line.startsWith('#EXT-X-MEDIA:')),
+      ).toHaveLength(1);
+      expect(
+        lines.findIndex((line) => line.startsWith('#EXT-X-MEDIA:')),
+      ).toBeLessThan(
+        lines.findIndex((line) => line.startsWith('#EXT-X-STREAM-INF:')),
+      );
+    });
+
+    it('recovers the timeline from the leading 480p variant and its first segment', async () => {
+      await service.publishForVideo(VIDEO_ID);
+
+      expect(minioService.readText).toHaveBeenCalledWith(
+        `videos/${MOVIE_ID}/hls/480p/index.m3u8`,
+      );
+      expect(minioService.readBytes).toHaveBeenCalledWith(
+        `videos/${MOVIE_ID}/hls/480p/segment_000.ts`,
+        expect.any(Number),
+      );
+      expect(
+        written.get(`videos/${MOVIE_ID}/hls/subs/${SUBTITLE_ID}.m3u8`),
+      ).toContain('#EXT-X-TARGETDURATION:16');
+      expect(
+        written.get(`videos/${MOVIE_ID}/hls/subs/${SUBTITLE_ID}.vtt`),
+      ).toContain(hlsTimestampMap(INITIAL_PTS));
+    });
+
+    it('restores the widescreen master byte-for-byte once its last subtitle is gone', async () => {
+      await service.publishForVideo(VIDEO_ID);
+      expect(stored.get(MASTER_KEY)).not.toBe(WIDESCREEN_MASTER);
+      prisma.subtitle.findMany.mockResolvedValue([]);
+
+      await service.publishForVideo(VIDEO_ID);
+
+      expect(stored.get(MASTER_KEY)).toBe(WIDESCREEN_MASTER);
     });
   });
 

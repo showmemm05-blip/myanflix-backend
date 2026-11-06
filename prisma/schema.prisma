@@ -156,6 +156,10 @@ enum TransactionType {
   /// to the balance, debit removes from it.
   ADJUSTMENT_CREDIT
   ADJUSTMENT_DEBIT
+  /// A lottery ticket purchase (one row per purchase, the whole total) and
+  /// a lottery prize paid into the wallet (phase 3). See LotteryPurchase.
+  LOTTERY_PURCHASE
+  LOTTERY_PRIZE
 }
 
 /// Ledger entry type for a single PaymentAccount's own audit trail — distinct
@@ -419,6 +423,19 @@ model User {
   auditLogs                           AuditLog[]
   homePromosCreated                   HomePromo[]                 @relation("HomePromoCreatedBy")
   homeSettingsUpdates                 HomeSettings[]              @relation("HomeSettingsUpdatedBy")
+  lotterySettingsUpdates              LotterySettings[]           @relation("LotterySettingsUpdatedBy")
+  lotteryDrawsCreated                 LotteryDraw[]               @relation("LotteryDrawCreatedBy")
+  lotteryPurchases                    LotteryPurchase[]           @relation("LotteryPurchaseUser")
+  lotteryTickets                      LotteryTicket[]             @relation("LotteryTicketUser")
+  lotteryDrawsPublished               LotteryDraw[]               @relation("LotteryDrawPublishedBy")
+  lotteryResultsEntered               LotteryResult[]             @relation("LotteryResultEnteredBy")
+  lotteryPayouts                      LotteryPayout[]             @relation("LotteryPayoutUser")
+  lotteryActivities                   LotteryActivity[]           @relation("LotteryActivityUser")
+  lotteryClaims                       LotteryClaim[]              @relation("LotteryClaimUser")
+  lotteryClaimsDecided                LotteryClaim[]              @relation("LotteryClaimDecidedBy")
+  advertisementsCreated               Advertisement[]             @relation("AdvertisementCreatedBy")
+  advertisementPlaybacks              AdvertisementPlayback[]     @relation("AdvertisementPlaybackUser")
+  adSettingsUpdates                   AdSettings[]                @relation("AdSettingsUpdatedBy")
 
   @@index([appRoleId])
   /// Sign-up range counts on the analytics dashboard.
@@ -631,6 +648,34 @@ model SmsGatewayBinding {
   @@map("sms_gateway_binding")
 }
 
+/// The ONE phone-monitor PC the shared BANK_EVENTS_TOKEN is bound to
+/// (audit 2026-10-09, SEC-004 / DB-015). A single row (id 1), the exact
+/// twin of SmsGatewayBinding: the first X-Device-Serial that presents the
+/// right token is pinned here; every other serial is refused with 401,
+/// recorded as a rejection (and an audit row) so the admin card can warn.
+/// A super admin clears the pin (DELETE /bank-events/binding) after the
+/// monitor is reinstalled or moved to another PC; the next monitor to
+/// present the token is then pinned.
+model BankEventsBinding {
+  id                       Int       @id @default(1)
+  /// The pinned monitor's serial; null while nothing is pinned (fresh
+  /// install, or right after a staff reset).
+  deviceSerial             String?
+  pinnedAt                 DateTime?
+  /// The last monitor that presented the right token under another serial.
+  lastRejectedDeviceSerial String?
+  lastRejectedAt           DateTime?
+  /// Refusals since the pin was set (cleared by a reset).
+  rejectedCount            Int       @default(0)
+  /// The last staff reset: when and by which user id.
+  resetAt                  DateTime?
+  resetById                String?
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+
+  @@map("bank_events_binding")
+}
+
 // ---------------------------------------------------------------------------
 // Catalog
 // ---------------------------------------------------------------------------
@@ -657,6 +702,10 @@ model Movie {
   /// forms treat them as optional, and the filter UI for each auto-hides
   /// until the facets endpoint reports at least one real value.
   director      String?
+  /// The movie TYPE the admin picks (owner, 2026-10-27): "English", "Korean",
+  /// "Chinese", "Thai", "Japanese", "Indian", "Myanmar" or "Other", shown as
+  /// "Korean movie". It lives in this column (until then an unused free-text
+  /// country) so nothing moved; the clients' labels key on these words.
   country       String?
   ageRating     AgeRating?
   /// For an episode (seriesId set), this is vestigial and never consulted —
@@ -671,15 +720,17 @@ model Movie {
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
 
-  categories     Category[]
-  actors         Actor[]
-  videos         Video[]
-  purchases      Purchase[]
-  watchHistory   WatchHistory[]
-  watchActivity  WatchActivity[]
-  comments       Comment[]
-  uploadSessions UploadSession[]
-  series         Series?         @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  categories             Category[]
+  actors                 Actor[]
+  videos                 Video[]
+  purchases              Purchase[]
+  watchHistory           WatchHistory[]
+  watchActivity          WatchActivity[]
+  comments               Comment[]
+  uploadSessions         UploadSession[]
+  advertisementTargets   AdvertisementMovie[]
+  advertisementPlaybacks AdvertisementPlayback[]
+  series                 Series?                 @relation(fields: [seriesId], references: [id], onDelete: Cascade)
 
   @@index([status])
   @@index([seriesId, seasonNumber, episodeNumber])
@@ -691,6 +742,9 @@ model Movie {
   /// renders as-is. Reads `limit` entries and stops instead of sorting the
   /// whole catalogue (and its episodes) on every page.
   @@index([status, createdAt(sort: Desc), id(sort: Desc)], map: "movies_standalone_recent_idx", where: raw("\"seriesId\" IS NULL"))
+  // Search-box indexes (ILIKE '%term%' via pg_trgm) — see migration 20261103090000.
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "movies_title_trgm_idx")
+  @@index([description(ops: raw("gin_trgm_ops"))], type: Gin, map: "movies_description_trgm_idx")
   @@map("movies")
 }
 
@@ -707,6 +761,9 @@ model Series {
   coverUrl    String?
   genre       String
   language    String
+  /// The series TYPE — the same words as Movie.country, shown as "Korean
+  /// series". Null = not set. Episodes do not copy it: they follow the show.
+  country     String?
   releaseYear Int
   /// Admin-set 0–10 rating, same meaning as Movie.rating: 0 = not rated yet.
   rating      Float        @default(0)
@@ -731,6 +788,9 @@ model Series {
 
   // Ends in id to match every series list order ([createdAt desc, id desc]).
   @@index([status, createdAt(sort: Desc), id(sort: Desc)])
+  // Search-box indexes (ILIKE '%term%' via pg_trgm) — see migration 20261103090000.
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "series_title_trgm_idx")
+  @@index([description(ops: raw("gin_trgm_ops"))], type: Gin, map: "series_description_trgm_idx")
   @@map("series")
 }
 
@@ -786,6 +846,8 @@ model Actor {
   movies Movie[]
   series Series[]
 
+  // Search-box indexes (ILIKE '%term%' via pg_trgm) — see migration 20261103090000.
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "actors_name_trgm_idx")
   @@map("actors")
 }
 
@@ -826,6 +888,10 @@ model Book {
 
   @@index([type])
   @@index([authorId])
+  // Search-box indexes (ILIKE '%term%' via pg_trgm) — see migration 20261103090000.
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "books_title_trgm_idx")
+  @@index([author(ops: raw("gin_trgm_ops"))], type: Gin, map: "books_author_trgm_idx")
+  @@index([description(ops: raw("gin_trgm_ops"))], type: Gin, map: "books_description_trgm_idx")
   @@map("books")
 }
 
@@ -845,6 +911,8 @@ model BookAuthor {
 
   books Book[]
 
+  // Search-box indexes (ILIKE '%term%' via pg_trgm) — see migration 20261103090000.
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "book_authors_name_trgm_idx")
   @@map("book_authors")
 }
 
@@ -1244,6 +1312,14 @@ model Transaction {
   walletAdjustment WalletAdjustment?
   /// Back-relation only: the withdrawal whose held money this row records (C-4).
   heldWithdrawal   Withdrawal?       @relation("WithdrawalHold")
+  /// Back-relation only: the lottery purchase this LOTTERY_PURCHASE row paid for.
+  lotteryPurchase  LotteryPurchase?
+  /// Back-relation only: the lottery prize this LOTTERY_PRIZE row paid (phase 3,
+  /// one row per ticket for the draws paid at publish before 2026-10-24).
+  lotteryPayout    LotteryPayout?
+  /// Back-relation only: the prize claim this LOTTERY_PRIZE row paid (one
+  /// row per confirmed claim, covering every ticket in it).
+  lotteryClaim     LotteryClaim?
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([createdAt])
@@ -2272,4 +2348,652 @@ model HomeSettings {
 
   @@index([updatedByUserId])
   @@map("home_settings")
+}
+
+/// The two "dream books" of the Lottery app: one dream for every 3-digit
+/// number 000-999 (Dream 1000) and one for every 2-digit number 00-99
+/// (Dream 100). On the wire the book is the string "1000" or "100".
+enum LotteryDreamBook {
+  DREAM_1000
+  DREAM_100
+}
+
+/// One dream of a dream book (lottery backend phase 1, 2026-10-19). All
+/// 1,100 rows exist from the migration on, numbers only; staff fill the
+/// names in by editing or by importing a spreadsheet, and upload pictures.
+/// A row with no name at all is hidden from customers; a named row with no
+/// picture is shown with a placeholder.
+model LotteryDream {
+  id         String           @id @default(uuid())
+  book       LotteryDreamBook
+  /// Zero-padded: "027" in the 1000 book, "07" in the 100 book.
+  number     String           @db.VarChar(3)
+  nameEn     String?
+  nameMy     String?
+  /// Absolute URL of one of our own uploads (images/lottery/...), stored
+  /// canonical and re-hosted per request like every other image URL.
+  pictureUrl String?
+  isActive   Boolean          @default(true)
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  @@unique([book, number])
+  @@map("lottery_dreams")
+}
+
+/// Where a draw is in its life (lottery backend phase 2, 2026-10-19):
+/// SCHEDULED (made, not selling) -> OPEN (selling) <-> PAUSED (selling
+/// stopped for a while) -> CLOSED (sales over, by staff or by the minute
+/// cron once salesCloseAt passes) -> PUBLISHED (winning numbers in,
+/// phase 3). Purchases are only taken while OPEN and before salesCloseAt.
+enum LotteryDrawStatus {
+  SCHEDULED
+  OPEN
+  PAUSED
+  CLOSED
+  PUBLISHED
+}
+
+/// WAITING until the draw is published (phase 3), then WON or NOT_WON.
+enum LotteryTicketStatus {
+  WAITING
+  WON
+  NOT_WON
+}
+
+/// A purchase is paid the moment it exists (one wallet debit in the same
+/// transaction); the enum leaves room for a refund state later.
+enum LotteryPurchaseStatus {
+  PAID
+}
+
+/// Where a draw's winning numbers are (lottery backend phase 3,
+/// 2026-10-19): PENDING (nothing yet — the source has not published this
+/// date, or nobody has entered them) -> FETCHED (a full sheet is in, from
+/// the API or by hand, waiting for "Publish and pay winners") ->
+/// PUBLISHED (tickets marked, prizes paid, locked). FAILED = the last
+/// fetch errored (the five-minute cron retries; the sheet is still empty).
+enum LotteryResultStatus {
+  PENDING
+  FETCHED
+  PUBLISHED
+  FAILED
+}
+
+/// Who supplied the sheet: the configured results source, or a staff
+/// member typing the numbers in because the source was down.
+enum LotteryResultSource {
+  API
+  MANUAL
+}
+
+/// The life of one awarded prize (since 2026-10-24): UNCLAIMED when the
+/// publish awards it (no money moves), REQUESTED once the customer asks for
+/// payment (the payout then carries its claimId), PAID when a staff member
+/// confirms the claim, REJECTED when they refuse it (reopenable), EXPIRED
+/// when the draw's claim deadline passed while it was still UNCLAIMED. The
+/// draws published before the change were paid at publish and stay PAID.
+enum LotteryPayoutStatus {
+  PAID
+  UNCLAIMED
+  REQUESTED
+  REJECTED
+  EXPIRED
+}
+
+/// One prize claim: REQUESTED by the customer, then PAID or REJECTED by a
+/// staff member (REJECTED can go back to REQUESTED with "Review again").
+enum LotteryClaimStatus {
+  REQUESTED
+  PAID
+  REJECTED
+}
+
+/// Why a claim was rejected — the preset list the admin picks from; OTHER
+/// needs a note.
+enum LotteryClaimRejectReason {
+  SUSPICIOUS_ACCOUNT
+  DUPLICATE_REQUEST
+  TICKET_UNDER_REVIEW
+  OTHER
+}
+
+/// The single global row of lottery settings (finance_settings precedent).
+/// ticketPrice and maxPerNumber are COPIED into a draw when it is created,
+/// so a change here never touches a draw already on sale; exchangeRate
+/// (Ks per Baht) is copied at publish time in phase 3;
+/// salesCloseMinutesBefore is the default gap between sales close and the
+/// Thai draw (14:30 Asia/Bangkok), overridable per draw. resultsUrl is
+/// where the winning numbers are fetched from (phase 3); null = fetching
+/// off, the sheet is entered by hand.
+model LotterySettings {
+  id                      String   @id @default(uuid())
+  ticketPrice             Decimal  @default(1000) @db.Decimal(12, 2)
+  maxPerNumber            Int      @default(20)
+  exchangeRate            Decimal  @default(75) @db.Decimal(12, 4)
+  salesCloseMinutesBefore Int      @default(60)
+  /// The ticket frame every NEW draw is created with (copied into the draw
+  /// like ticketPrice). One of our own uploads (images/lottery_frame/...),
+  /// stored canonical; null = the app's built-in frame.
+  frameUrl                String?
+  /// The results source URL (http/https). "{date}" in it is replaced with
+  /// the draw date as YYYYMMDD; without it the URL answers the LATEST draw
+  /// and the fetched date must match. Null = no fetching, manual entry only.
+  resultsUrl              String?
+  /// Which parser reads the source's answer; only "thai_lotto_json" exists.
+  resultsSourceKind       String   @default("thai_lotto_json")
+  /// How many days after publishing a prize may still be requested; copied
+  /// into the draw as claimDeadlineAt when it is published. 1..730.
+  claimDeadlineDays       Int      @default(90)
+  updatedByUserId         String?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  updatedBy User? @relation("LotterySettingsUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([updatedByUserId])
+  @@map("lottery_settings")
+}
+
+/// One Thai lottery draw as sold here. `drawNo` is our own running number
+/// (ticket numbers carry it: MFL-<drawNo>-<seq>); `thaiDrawDate` is the
+/// Thai calendar date, `drawAt` that date at 14:30 Asia/Bangkok in UTC,
+/// `salesCloseAt` when selling stops. Price and per-number limit are the
+/// settings' values at creation. `nextTicketSeq` is bumped under the draw's
+/// row lock by every purchase, so ticket numbers never collide.
+model LotteryDraw {
+  id                String            @id @default(uuid())
+  drawNo            Int               @unique
+  thaiDrawDate      DateTime          @db.Date
+  drawAt            DateTime
+  salesCloseAt      DateTime
+  status            LotteryDrawStatus @default(SCHEDULED)
+  ticketPrice       Decimal           @db.Decimal(12, 2)
+  maxPerNumber      Int
+  /// Ks per Baht, copied from the settings when the results are published (phase 3).
+  exchangeRate      Decimal?          @db.Decimal(12, 4)
+  /// One of our own uploads (images/lottery/...), stored canonical. Locked once a ticket exists.
+  pictureUrl        String?
+  /// The ticket frame this draw's tickets are drawn on, copied from the
+  /// settings at creation (images/lottery_frame/..., canonical; null = the
+  /// app's built-in frame). Locked once a ticket exists: a sold ticket keeps
+  /// the look it was sold with.
+  frameUrl          String?
+  nextTicketSeq     Int               @default(1)
+  openedAt          DateTime?
+  closedAt          DateTime?
+  publishedAt       DateTime?
+  /// Set by "Publish results" (phase 3) from lottery_payouts: how many
+  /// tickets won and, since 2026-10-24, the Ks AWARDED in all
+  /// (prizeTotalKs) against the Ks actually PAID so far (prizesPaidKs, 0 at
+  /// publish, added to by every confirmed claim). Null until published.
+  winnersCount      Int?
+  prizesPaidKs      Decimal?          @db.Decimal(12, 2)
+  prizeTotalKs      Decimal?          @db.Decimal(12, 2)
+  /// Until when a prize of this draw may still be requested (publishedAt +
+  /// the settings' claimDeadlineDays, copied like ticketPrice); an UNCLAIMED
+  /// payout past it is EXPIRED by the hourly cron. Null until published.
+  claimDeadlineAt   DateTime?
+  publishedByUserId String?
+  createdByUserId   String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  createdBy      User?                  @relation("LotteryDrawCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  publishedBy    User?                  @relation("LotteryDrawPublishedBy", fields: [publishedByUserId], references: [id], onDelete: SetNull)
+  offSaleNumbers LotteryOffSaleNumber[]
+  purchases      LotteryPurchase[]
+  tickets        LotteryTicket[]
+  result         LotteryResult?
+  payouts        LotteryPayout[]
+  claims         LotteryClaim[]
+
+  /// The "current draw" lookups: by status, nearest draw first.
+  @@index([status, drawAt])
+  @@index([createdByUserId])
+  @@index([publishedByUserId])
+  @@map("lottery_draws")
+}
+
+/// A 6-digit number staff took off sale for one draw (PUT .../off-sale
+/// replaces the whole list). Tickets already sold for it stay valid.
+model LotteryOffSaleNumber {
+  id        String   @id @default(uuid())
+  drawId    String
+  number    String   @db.VarChar(6)
+  createdAt DateTime @default(now())
+
+  draw LotteryDraw @relation(fields: [drawId], references: [id], onDelete: Cascade)
+
+  @@unique([drawId, number])
+  @@map("lottery_off_sale_numbers")
+}
+
+/// One checkout: several numbers with quantities, one wallet debit for the
+/// total, one LOTTERY_PURCHASE transaction, one ticket row per ticket.
+/// `ref` is what the customer quotes ("LP-261019-0042": Myanmar date +
+/// the lottery_purchase_ref_seq sequence). `idempotencyKey` is the app's
+/// per-checkout uuid: a replay returns this row and never charges twice.
+/// Money rows restrict user deletion like transactions do.
+model LotteryPurchase {
+  id             String                @id @default(uuid())
+  ref            String                @unique
+  userId         String
+  drawId         String
+  idempotencyKey String
+  total          Decimal               @db.Decimal(12, 2)
+  /// The draw's ticket price at the time, so the lines can be re-priced for display.
+  unitPrice      Decimal               @db.Decimal(12, 2)
+  status         LotteryPurchaseStatus @default(PAID)
+  transactionId  String?               @unique
+  createdAt      DateTime              @default(now())
+
+  user        User                  @relation("LotteryPurchaseUser", fields: [userId], references: [id], onDelete: Restrict)
+  draw        LotteryDraw           @relation(fields: [drawId], references: [id], onDelete: Restrict)
+  transaction Transaction?          @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  lines       LotteryPurchaseLine[]
+  tickets     LotteryTicket[]
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([drawId])
+  /// Period scans of Lottery > Analytics (purchases between two instants).
+  @@index([createdAt])
+  @@map("lottery_purchases")
+}
+
+/// One number of a purchase and how many tickets of it were bought.
+model LotteryPurchaseLine {
+  id         String @id @default(uuid())
+  purchaseId String
+  number     String @db.VarChar(6)
+  quantity   Int
+
+  purchase LotteryPurchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+
+  @@unique([purchaseId, number])
+  @@map("lottery_purchase_lines")
+}
+
+/// One ticket (spec rule: one row per ticket, never a quantity). `ticketNo`
+/// is "MFL-<drawNo>-<seq padded to 6>", `seq` taken from the draw's
+/// nextTicketSeq under its row lock. `status` and `prizeKs` are set when
+/// the draw is published (phase 3).
+model LotteryTicket {
+  id         String              @id @default(uuid())
+  ticketNo   String              @unique
+  drawId     String
+  purchaseId String
+  userId     String
+  number     String              @db.VarChar(6)
+  seq        Int
+  status     LotteryTicketStatus @default(WAITING)
+  prizeKs    Decimal?            @db.Decimal(12, 2)
+  createdAt  DateTime            @default(now())
+
+  draw     LotteryDraw     @relation(fields: [drawId], references: [id], onDelete: Restrict)
+  purchase LotteryPurchase @relation(fields: [purchaseId], references: [id], onDelete: Restrict)
+  user     User            @relation("LotteryTicketUser", fields: [userId], references: [id], onDelete: Restrict)
+  /// Back-relation only: the prize paid for this ticket (phase 3), if it won.
+  payout   LotteryPayout?
+
+  @@unique([drawId, seq])
+  /// Held-count lookups (how many of one number a draw has sold / a customer holds).
+  @@index([drawId, number])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, drawId])
+  /// Period scans of Lottery > Analytics (tickets sold between two instants).
+  @@index([createdAt])
+  @@map("lottery_tickets")
+}
+
+/// One draw's winning numbers (lottery backend phase 3, 2026-10-19): one
+/// row per draw, made on demand (PENDING, empty sheet) and filled by the
+/// five-minute cron / "Fetch now" from the results source, or by a staff
+/// member by hand. `groups` is the sheet — nine entries in the fixed order
+/// first, nearFirst, second, third, fourth, fifth, front3, back3, back2,
+/// each { key, name, baht, count, digits, numbers[] } (prize-groups.ts);
+/// `raw` is the source's answer exactly as received, for a later look;
+/// `sourceDate` the date the source said it was showing. Once the draw is
+/// published the sheet is locked.
+model LotteryResult {
+  id              String               @id @default(uuid())
+  drawId          String               @unique
+  status          LotteryResultStatus  @default(PENDING)
+  source          LotteryResultSource?
+  fetchedAt       DateTime?
+  enteredByUserId String?
+  raw             Json?
+  groups          Json                 @default("[]")
+  sourceDate      String?
+  lastError       String?
+  attempts        Int                  @default(0)
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  draw      LotteryDraw @relation(fields: [drawId], references: [id], onDelete: Cascade)
+  enteredBy User?       @relation("LotteryResultEnteredBy", fields: [enteredByUserId], references: [id], onDelete: SetNull)
+
+  @@index([enteredByUserId])
+  @@map("lottery_results")
+}
+
+/// One prize paid for one winning ticket (phase 3): the groups it won
+/// ([{ key, baht, ks }]), the Baht total, the Ks paid (= baht × rate, 2 dp)
+/// and the rate used, plus the LOTTERY_PRIZE wallet transaction. One row
+/// per ticket (ticketId unique), so a publish that is run again skips the
+/// tickets already paid. Money rows never cascade from a user delete.
+model LotteryPayout {
+  id            String              @id @default(uuid())
+  drawId        String
+  ticketId      String              @unique
+  userId        String
+  groups        Json
+  baht          Decimal             @db.Decimal(12, 2)
+  ks            Decimal             @db.Decimal(12, 2)
+  rate          Decimal             @db.Decimal(12, 4)
+  /// The LOTTERY_PRIZE row of a prize paid AT PUBLISH (before 2026-10-24,
+  /// one per ticket). A prize paid through a claim leaves this null: the
+  /// claim's one transaction covers every ticket in it (lottery_claims.
+  /// transactionId) and this column is unique per transaction.
+  transactionId String?             @unique
+  status        LotteryPayoutStatus @default(UNCLAIMED)
+  /// The claim this prize was requested under; null while UNCLAIMED or EXPIRED.
+  claimId       String?
+  createdAt     DateTime            @default(now())
+
+  draw        LotteryDraw   @relation(fields: [drawId], references: [id], onDelete: Restrict)
+  ticket      LotteryTicket @relation(fields: [ticketId], references: [id], onDelete: Restrict)
+  user        User          @relation("LotteryPayoutUser", fields: [userId], references: [id], onDelete: Restrict)
+  transaction Transaction?  @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  claim       LotteryClaim? @relation(fields: [claimId], references: [id], onDelete: SetNull)
+
+  @@index([drawId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([claimId])
+  /// The admin draw page's claims strip and the summary tiles: counts and Ks per status.
+  @@index([drawId, status])
+  @@map("lottery_payouts")
+}
+
+/// One prize claim (2026-10-24): ONE per customer per draw, bundling every
+/// winning ticket they hold in it (the payouts carrying its claimId). The
+/// customer creates it REQUESTED from the app; a staff member with
+/// LOTTERY.CLAIMS_CONFIRM confirms it (one wallet credit for `ks`, one
+/// LOTTERY_PRIZE transaction, payouts PAID) or rejects it with a reason the
+/// customer sees (reopenable). `paidAtPublish` marks the claims the
+/// migration backfilled for the draws paid at publish before the change.
+/// Money rows never cascade from a user delete.
+model LotteryClaim {
+  id              String                    @id @default(uuid())
+  drawId          String
+  userId          String
+  status          LotteryClaimStatus        @default(REQUESTED)
+  ticketsCount    Int
+  baht            Decimal                   @db.Decimal(12, 2)
+  ks              Decimal                   @db.Decimal(12, 2)
+  /// Ks per Baht the figures use — the draw's exchangeRate at request time.
+  rate            Decimal                   @db.Decimal(12, 4)
+  requestedAt     DateTime
+  /// When it was confirmed or rejected, and by whom; cleared by "Review again".
+  decidedAt       DateTime?
+  decidedByUserId String?
+  rejectReason    LotteryClaimRejectReason?
+  rejectNote      String?                   @db.VarChar(300)
+  /// The one LOTTERY_PRIZE row a confirm wrote; null for a backfilled claim
+  /// (its payouts carry their own) and for a 0 Ks claim.
+  transactionId   String?                   @unique
+  paidAtPublish   Boolean                   @default(false)
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+
+  draw        LotteryDraw     @relation(fields: [drawId], references: [id], onDelete: Restrict)
+  user        User            @relation("LotteryClaimUser", fields: [userId], references: [id], onDelete: Restrict)
+  decidedBy   User?           @relation("LotteryClaimDecidedBy", fields: [decidedByUserId], references: [id], onDelete: SetNull)
+  transaction Transaction?    @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  payouts     LotteryPayout[]
+
+  @@unique([drawId, userId])
+  /// The admin "Prize claims" page: the waiting list oldest first, the paid / rejected tabs.
+  @@index([status, requestedAt])
+  /// The customer's own claims, newest first.
+  @@index([userId, requestedAt(sort: Desc)])
+  @@index([decidedByUserId])
+  @@map("lottery_claims")
+}
+
+/// Lottery presence (2026-10-23): one row per signed-in user per client
+/// platform per MYANMAR hour while they are inside the Lottery — the app
+/// pings POST /lottery/activity (LotteryActivityService, one write per user
+/// per minute). Feeds the "active users" series of Lottery > Analytics;
+/// guests never ping, so they are not counted. Not draw-scoped: a ping has
+/// no draw.
+model LotteryActivity {
+  id        String         @id @default(uuid())
+  userId    String
+  platform  ClientPlatform @default(UNKNOWN)
+  /// Start of the MYANMAR hour (UTC+6:30) the ping fell in, stored as the
+  /// UTC instant — so :30 past the UTC hour (13:30 UTC = 20:00 MMT). Unlike
+  /// WatchActivity.hourStart (UTC top of the hour): the analytics bucket
+  /// everything in Myanmar time, and this way `hourStart + 390 min` is an
+  /// exact MMT hour, in step with the tickets and purchases beside it.
+  hourStart DateTime
+  /// How many pings landed in this bucket.
+  pings     Int            @default(1)
+  firstAt   DateTime
+  lastAt    DateTime
+
+  user User @relation("LotteryActivityUser", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, platform, hourStart])
+  /// Period scans and "when did tracking start".
+  @@index([hourStart])
+  @@index([userId])
+  @@map("lottery_activity")
+}
+
+/// Which titles a pre-roll ad plays before: every movie (episodes included),
+/// or only the rows in advertisement_movies.
+enum AdvertisementTargetType {
+  ALL
+  SELECTED
+}
+
+/// What kind of ad a row is (2026-11-04): a VIDEO ad plays before the
+/// movie and/or at the mid-roll breaks; a CORNER ad is a small picture shown
+/// in the top-right corner while the movie plays. Fixed at creation.
+enum AdvertisementFormat {
+  VIDEO
+  CORNER
+}
+
+/// Where one decided play happened (advertisement_playbacks.placement):
+/// before the movie, at a mid-roll break, or as the corner picture.
+enum AdvertisementPlacement {
+  PREROLL
+  MIDROLL
+  CORNER
+}
+
+/// Who gets the in-movie ads (mid-roll breaks + corner pictures):
+/// everyone, or only viewers without an active subscription. The ad before
+/// the movie plays for everyone either way.
+enum AdvertisementAudience {
+  ALL
+  NON_PREMIUM
+}
+
+/// One decided pre-roll play (advertisement_playbacks). PENDING = decided,
+/// the player has not reported a first frame yet; STARTED = first frame (the
+/// one impression); COMPLETED / SKIPPED end a STARTED play; FAILED = the
+/// player could not load or finish it (before or after the first frame);
+/// ABANDONED = a PENDING row superseded by a newer decision for the same
+/// viewer and title. Order matters for nothing.
+enum AdvertisementPlaybackStatus {
+  PENDING
+  STARTED
+  COMPLETED
+  SKIPPED
+  FAILED
+  ABANDONED
+}
+
+/// A pre-roll video advertisement (admin "Advertisements" page, 2026-11-04):
+/// a short MP4 that plays inside the player before a movie starts. The
+/// backend picks one per play (POST /ads/preroll) from the active rows
+/// whose schedule, daily window and target fit; the player reports
+/// started / completed / skipped / failed into advertisement_playbacks.
+model Advertisement {
+  id                          String                  @id @default(uuid())
+  title                       String
+  description                 String?
+  /// Canonical MinIO key `ads/<id>/v-<tag>/video.mp4`, never an absolute
+  /// URL (the signed playback URL is minted per request). Null until
+  /// POST /ads/admin/:id/video/attach lands a file; an ad without a video
+  /// cannot be switched on.
+  videoKey                    String?
+  videoBytes                  Int?
+  videoEtag                   String?
+  /// Whole seconds from ffprobe at attach time; the player's countdown and
+  /// the skipAfterSeconds rule key on it.
+  durationSeconds             Int?
+  videoAttachedAt             DateTime?
+  isActive                    Boolean                 @default(true)
+  startsAt                    DateTime?
+  endsAt                      DateTime?
+  /// Daily window as minutes after midnight (0..1439) read in
+  /// tzOffsetMinutes; both null = all day; start > end wraps past midnight.
+  dailyStartMinutes           Int?
+  dailyEndMinutes             Int?
+  /// Fixed UTC offset the daily window is read in. 390 = Myanmar (no DST).
+  tzOffsetMinutes             Int                     @default(390)
+  targetType                  AdvertisementTargetType @default(ALL)
+  /// Higher plays first when several ads qualify.
+  priority                    Int                     @default(0)
+  isSkippable                 Boolean                 @default(false)
+  /// Required when isSkippable, null otherwise; must be < durationSeconds.
+  skipAfterSeconds            Int?
+  /// Minimum minutes between two impressions of THIS ad for one viewer; null = none.
+  frequencyLimitMinutes       Int?
+  /// Impressions of this ad one viewer may get per Myanmar day; null = unlimited.
+  maxImpressionsPerUserPerDay Int?
+  /// VIDEO (an MP4 before the movie / at breaks) or CORNER (a picture in the
+  /// corner while the movie plays). Fixed at creation.
+  format                      AdvertisementFormat     @default(VIDEO)
+  /// VIDEO only: plays before the movie (every ad made before breaks existed).
+  playsBeforeMovie            Boolean                 @default(true)
+  /// VIDEO only: plays at the mid-roll breaks.
+  playsAtBreaks               Boolean                 @default(false)
+  /// CORNER only: canonical MinIO key `images/ad/<id>/<tag><ext>` (public;
+  /// the URL is built per request). Null until POST /ads/admin/:id/image.
+  imageKey                    String?
+  imageBytes                  Int?
+  imageWidth                  Int?
+  imageHeight                 Int?
+  imageAttachedAt             DateTime?
+  /// CORNER only: an http(s) page a tap opens; null = picture only.
+  linkUrl                     String?
+  /// CORNER only: seconds visible per showing; null = until the viewer closes it.
+  cornerShowSeconds           Int?
+  /// CORNER only: minutes WATCHED after it leaves before it comes back; null = once.
+  cornerRepeatMinutes         Int?
+  /// CORNER only: the viewer may close it (always true for "until closed").
+  cornerClosable              Boolean                 @default(true)
+  createdById                 String?
+  createdAt                   DateTime                @default(now())
+  updatedAt                   DateTime                @updatedAt
+
+  createdBy User?                   @relation("AdvertisementCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  movies    AdvertisementMovie[]
+  playbacks AdvertisementPlayback[]
+
+  /// The preroll decision: the active rows, best priority first.
+  @@index([isActive, priority(sort: Desc)])
+  @@index([createdById])
+  @@map("advertisements")
+}
+
+/// One selected title of a SELECTED ad. The list is replaced whole on every
+/// save (like a draw's off-sale numbers), so no row is ever edited in place.
+model AdvertisementMovie {
+  id              String   @id @default(uuid())
+  advertisementId String
+  movieId         String
+  createdAt       DateTime @default(now())
+
+  advertisement Advertisement @relation(fields: [advertisementId], references: [id], onDelete: Cascade)
+  movie         Movie         @relation(fields: [movieId], references: [id], onDelete: Cascade)
+
+  @@unique([advertisementId, movieId])
+  @@index([movieId])
+  @@map("advertisement_movies")
+}
+
+/// One decided pre-roll play: created PENDING by POST /ads/preroll, moved
+/// forward by the player's events (POST /ads/playbacks/:id/events). The row
+/// IS the impression id; `startedAt` not null = one impression, whatever
+/// happened after. Timestamps are always the server's.
+model AdvertisementPlayback {
+  id              String                      @id @default(uuid())
+  advertisementId String
+  userId          String
+  movieId         String
+  /// From the X-Client-Platform header at decision time, never the body.
+  platform        ClientPlatform              @default(UNKNOWN)
+  status          AdvertisementPlaybackStatus @default(PENDING)
+  startedAt       DateTime?
+  completedAt     DateTime?
+  skippedAt       DateTime?
+  failedAt        DateTime?
+  /// Player position (seconds) when skipped / failed.
+  positionSeconds Int?
+  /// Before the movie, at a break, or the corner picture (2026-11-04).
+  placement       AdvertisementPlacement      @default(PREROLL)
+  /// MIDROLL only: the movie second the break sits at (k × interval) —
+  /// a position, so an interval change never renames a played break.
+  breakAtSeconds  Int?
+  /// CORNER only: how many times it came back after the first showing.
+  repeatCount     Int                         @default(0)
+  /// CORNER only: taps on its link.
+  clickCount      Int                         @default(0)
+  createdAt       DateTime                    @default(now())
+  updatedAt       DateTime                    @updatedAt
+
+  advertisement Advertisement @relation(fields: [advertisementId], references: [id], onDelete: Cascade)
+  user          User          @relation("AdvertisementPlaybackUser", fields: [userId], references: [id], onDelete: Cascade)
+  movie         Movie         @relation(fields: [movieId], references: [id], onDelete: Cascade)
+
+  /// Frequency / daily caps: one viewer's impressions of one ad.
+  @@index([userId, advertisementId, startedAt])
+  /// Analytics: per ad and by date, both on the impression instant.
+  @@index([advertisementId, startedAt])
+  @@index([startedAt])
+  @@index([movieId])
+  /// One viewer's recent rows for one title: the replay rule, the open
+  /// decisions handed back on a refresh, and the breaks already played.
+  @@index([userId, movieId, createdAt])
+  /// The analytics' "failed to load" figure (failed before a first frame).
+  @@index([failedAt], map: "advertisement_playbacks_load_failed_idx", where: raw("\"startedAt\" IS NULL AND \"status\" = 'FAILED'"))
+  @@map("advertisement_playbacks")
+}
+
+/// The admin "Advertisements" page's playback rules (2026-11-04): one global
+/// row, created on the first PUT /ads/admin/settings (reads fall back to the
+/// defaults below until then).
+model AdSettings {
+  id                     String                @id @default(uuid())
+  /// Master switch: false = no ads of any kind anywhere (2026-11-04).
+  adsEnabled             Boolean               @default(true)
+  /// Mid-roll breaks every this many minutes of MOVIE position; 0 = off.
+  midrollIntervalMinutes Int                   @default(0)
+  /// Who gets the breaks and the corner pictures.
+  duringMovieAudience    AdvertisementAudience @default(ALL)
+  updatedByUserId        String?
+  createdAt              DateTime              @default(now())
+  updatedAt              DateTime              @updatedAt
+
+  updatedBy User? @relation("AdSettingsUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([updatedByUserId])
+  @@map("ad_settings")
 }

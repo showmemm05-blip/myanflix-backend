@@ -47,14 +47,14 @@ import { BankEventsModule } from './bank-events/bank-events.module';
 import { BankTransactionsModule } from './bank-transactions/bank-transactions.module';
 import { SmsGatewayModule } from './sms-gateway/sms-gateway.module';
 import { HomeModule } from './home/home.module';
+import { LotteryModule } from './lottery/lottery.module';
+import { AdsModule } from './ads/ads.module';
+import { HealthModule } from './health/health.module';
 
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { AppThrottlerGuard } from './common/throttling/app-throttler.guard';
 import { buildThrottlerOptions } from './common/throttling/throttling.config';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
-
-import { AppController } from './app.controller';
-import { AppService } from './app.service';
 
 @Module({
   imports: [
@@ -113,10 +113,21 @@ import { AppService } from './app.service';
     // The home showcase: public GET /home/showcase + the staff "Home promos"
     // routes (2026-10-08).
     HomeModule,
+    // The Lottery (2026-10-19). Phase 1: the public dream books + the staff
+    // /lottery/admin/dreams routes. Phase 2: the public draws, the staff
+    // /lottery/admin/draws + /lottery/admin/settings routes, the minute cron
+    // that closes sales, and the customer's /lottery/purchases + /lottery/tickets.
+    LotteryModule,
+    // Pre-roll video ads (2026-11-04): the staff /ads/admin routes (list,
+    // form, video attach, analytics) and the viewer's POST /ads/preroll +
+    // playback events.
+    AdsModule,
+    // GET /api/health — 200 while the database answers, 503 once it does
+    // not; what the compose healthcheck and the admin's network check poll
+    // (2026-10-09, OPS-005). Replaces the old AppController/AppService.
+    HealthModule,
   ],
-  controllers: [AppController],
   providers: [
-    AppService,
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     // Keep this AFTER JwtAuthGuard: on a signed-in route with
     // @ThrottleAuth() (POST /withdrawals, the withdrawal-code routes) the

@@ -4,6 +4,7 @@ import { mkdir } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 
 import {
+  AD_IMAGE_FOLDER,
   AVATAR_IMAGE_PURPOSE,
   ImagePurpose,
   LOCAL_SCRATCH_ROOT,
@@ -19,6 +20,19 @@ export type BankScreenshotKind = 'deposits' | 'withdrawals' | 'transactions';
  * cleanup sweep can list the whole root without knowing a movie id.
  */
 export const VIDEO_REPLACE_STAGING_ROOT = 'temp/video-replace';
+
+/**
+ * Root of the `adVideoStaging` class: the "ad" upload type lands a pre-roll
+ * ad's MP4 here until POST /ads/admin/:id/video/attach checks it and moves
+ * it under AD_VIDEO_ROOT. Swept with the replace staging (same age).
+ */
+export const AD_VIDEO_STAGING_ROOT = 'temp/ads';
+
+/** Root of the `adVideo` class: ads/<adId>/v-<tag>/video.mp4, the served file. */
+export const AD_VIDEO_ROOT = 'ads';
+
+/** The one filename the "ad" upload type accepts and the attach step reads. */
+export const AD_VIDEO_FILENAME = 'video.mp4';
 
 /**
  * The ONLY place that builds a path or an object key. The shapes themselves
@@ -254,6 +268,44 @@ export class StorageService {
    */
   videoReplaceStagingKey(movieId: string, relativePath: string): string {
     return `${this.videoReplaceStagingPrefix(movieId)}/${relativePath}`;
+  }
+
+  /** Everything one pre-roll ad has in storage (every v-<tag>/ package). */
+  adPrefix(adId: string): string {
+    return `${AD_VIDEO_ROOT}/${adId}`;
+  }
+
+  /** One attach's package: ads/<adId>/v-<tag>/video.mp4 (the `adVideo` class). */
+  adVideoKey(adId: string, tag: string): string {
+    return `${this.adPrefix(adId)}/v-${tag}/${AD_VIDEO_FILENAME}`;
+  }
+
+  /** Where the "ad" upload type stages an ad's MP4 (the `adVideoStaging` class). */
+  adStagingPrefix(adId: string): string {
+    return `${AD_VIDEO_STAGING_ROOT}/${adId}`;
+  }
+
+  adStagingKey(adId: string): string {
+    return `${this.adStagingPrefix(adId)}/${AD_VIDEO_FILENAME}`;
+  }
+
+  /** Every corner picture one ad ever had (the `imageAd` class). */
+  adImagePrefix(adId: string): string {
+    return `images/${AD_IMAGE_FOLDER}/${adId}`;
+  }
+
+  /**
+   * One corner picture: images/ad/<adId>/<tag><ext>. The tag is random so a
+   * replaced picture lands on a NEW key (the cache server keeps the old
+   * bytes for days).
+   */
+  adImageKey(adId: string, tag: string, extension: string): string {
+    return `${this.adImagePrefix(adId)}/${tag}${extension}`;
+  }
+
+  /** Local scratch for one attach run (download + faststart remux); removed when the run ends. */
+  adScratchDir(adId: string, runId: string): string {
+    return join(this.scratchRoot, 'ads', adId, runId);
   }
 
   /**

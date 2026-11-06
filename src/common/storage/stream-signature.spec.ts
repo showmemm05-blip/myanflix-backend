@@ -108,6 +108,13 @@ describe('scopeForKey', () => {
     );
   });
 
+  it('signs a pre-roll ad by its ad id, never its staging copy', () => {
+    expect(scopeForKey(`ads/${MOVIE_ID}/v-c6592c79/video.mp4`)).toBe(
+      `ads/${MOVIE_ID}`,
+    );
+    expect(() => scopeForKey(`temp/ads/${MOVIE_ID}/video.mp4`)).toThrow();
+  });
+
   it('no longer signs the retired videos/<movieId>/subtitles/* shape', () => {
     // Nothing can land there any more — the bulk flow routes `subtitles/`
     // paths to the movie-keyed namespace above — so the videos arm lost its

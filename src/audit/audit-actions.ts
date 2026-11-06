@@ -45,12 +45,28 @@ export const AUDIT_TARGET_TYPES = [
   'feedback',
   /** The OTP SMS gateway phone (its token-to-device pin). */
   'sms_gateway',
+  /** The phone-monitor's bank-events token (its token-to-device pin, SEC-004). */
+  'bank_events',
   /** A still image uploaded through POST /uploads/image — no owner row exists yet, so targetId is null and metadata carries the key. */
   'image',
   /** A slide / spotlight / coming-soon card on the admin "Home promos" page. */
   'home_promo',
   /** The single home settings row (web address, store links, games teaser). */
   'home_settings',
+  /** One pre-roll video ad on the admin "Advertisements" page. */
+  'advertisement',
+  /** The single playback-rules row of the "Advertisements" page. */
+  'advertisement_settings',
+  /** One dream of a Lottery dream book (admin "Lottery > Dreams" page). */
+  'lottery_dream',
+  /** One Thai lottery draw as sold here (admin "Lottery > Draws" page). */
+  'lottery_draw',
+  /** The single lottery settings row (ticket price, per-number limit, exchange rate, sales-close gap). */
+  'lottery_settings',
+  /** One draw's winning numbers (the sheet fetched from the results source or entered by hand). */
+  'lottery_results',
+  /** One customer's prize claim for one draw (admin "Lottery > Prize claims" page). */
+  'lottery_claim',
 ] as const;
 
 export type AuditTargetType = (typeof AUDIT_TARGET_TYPES)[number];
@@ -195,6 +211,62 @@ export const AUDIT_ACTIONS = [
   define('home_promo.reorder', CONTENT, 'home_promo'),
   define('home_settings.update', CONTENT, 'home_settings'),
 
+  /**
+   * Pre-roll video ads (2026-11-04). create / update / delete are the
+   * admin form; video_attach is POST /ads/admin/:id/video/attach landing a
+   * checked MP4 (metadata: bytes, duration, the key replaced);
+   * upload_presign / upload_multipart are the direct-to-MinIO upload steps
+   * of the "ad" resource type, filed by MultipartUploadService exactly as
+   * the movie and book uploads are. Viewer playback events are never
+   * audited (USER actors are skipped).
+   */
+  define('advertisement.create', CONTENT, 'advertisement'),
+  define('advertisement.update', CONTENT, 'advertisement'),
+  define('advertisement.delete', CONTENT, 'advertisement'),
+  define('advertisement.video_attach', CONTENT, 'advertisement'),
+  define('advertisement.image_attach', CONTENT, 'advertisement'),
+  define('advertisement.upload_presign', CONTENT, 'advertisement'),
+  define('advertisement.upload_multipart', CONTENT, 'advertisement'),
+  /** The playback rules (today: minutes before the same title shows an ad again). */
+  define('advertisement_settings.update', CONTENT, 'advertisement_settings'),
+
+  /**
+   * The admin "Lottery > Dreams" page. update carries the
+   * lotteryDreamSnapshot before/after; import is ONE row per applied
+   * spreadsheet (targetId null, metadata: the file name and the
+   * total / updated / unchanged / error counts). A dry run writes nothing.
+   */
+  define('lottery_dream.update', CONTENT, 'lottery_dream'),
+  define('lottery_dream.import', CONTENT, 'lottery_dream'),
+
+  /**
+   * The admin "Lottery > Draws" page. create / update carry the
+   * lotteryDrawSnapshot; open / pause / close / reopen are the status
+   * changes (close is also written by the minute cron as a system row,
+   * actor null, metadata.trigger = 'sales_close'; reopen puts a CLOSED
+   * draw back on sale while its close time is still ahead and no sheet is
+   * in); off_sale is ONE row per saved list (metadata: before / after /
+   * added / removed counts).
+   */
+  define('lottery_draw.create', CONTENT, 'lottery_draw'),
+  define('lottery_draw.update', CONTENT, 'lottery_draw'),
+  define('lottery_draw.open', CONTENT, 'lottery_draw'),
+  define('lottery_draw.pause', CONTENT, 'lottery_draw'),
+  define('lottery_draw.close', CONTENT, 'lottery_draw'),
+  define('lottery_draw.reopen', CONTENT, 'lottery_draw'),
+  define('lottery_draw.off_sale', CONTENT, 'lottery_draw'),
+
+  /**
+   * A draw's winning numbers (phase 3). fetch is written when the sheet
+   * arrives from the results source — by the five-minute cron as a
+   * system row (actor null, metadata.trigger = 'cron') or by "Fetch now"
+   * (the staff member, trigger 'manual'); enter when a staff member types
+   * the sheet in (before/after carry the lotteryResultSnapshot, metadata
+   * the note). A fetch that found nothing new writes no row.
+   */
+  define('lottery_results.fetch', CONTENT, 'lottery_results'),
+  define('lottery_results.enter', CONTENT, 'lottery_results'),
+
   // --- USERS --------------------------------------------------------------
   define('user.status_change', USERS, 'user'),
   define('user.role_change', USERS, 'user'),
@@ -296,6 +368,29 @@ export const AUDIT_ACTIONS = [
   define('payment_method_type.delete', FINANCE, 'payment_method_type'),
 
   define('finance_settings.update', FINANCE, 'finance_settings'),
+  /** The lottery's money settings (ticket price, exchange rate, …) — before/after snapshots. */
+  define('lottery_settings.update', FINANCE, 'lottery_settings'),
+  /**
+   * "Publish results" (phase 3): the draw's tickets are marked and every
+   * prize is AWARDED (payouts UNCLAIMED — since 2026-10-24 nobody is paid
+   * here; the draws published before that were). ONE row per publish,
+   * before/after the lotteryDrawSnapshot, metadata { winners,
+   * prizeTotalKs, prizesPaidKs, rate, source }. Kept under FINANCE: it
+   * fixes what the draw owes.
+   */
+  define('lottery_draw.publish', FINANCE, 'lottery_draw'),
+  /**
+   * The admin "Lottery > Prize claims" page (2026-10-24). confirm is the
+   * ONE wallet credit for a customer's claim (before/after the
+   * lotteryClaimSnapshot, metadata { drawNo, ticketsCount, ks,
+   * transactionId }); reject refuses it with a reason the customer sees
+   * (metadata { drawNo, reason }); reopen puts a rejected claim back in the
+   * waiting list (metadata { drawNo, previousReason }). Filed under FINANCE
+   * like a deposit decision.
+   */
+  define('lottery_claim.confirm', FINANCE, 'lottery_claim'),
+  define('lottery_claim.reject', FINANCE, 'lottery_claim'),
+  define('lottery_claim.reopen', FINANCE, 'lottery_claim'),
 
   define('subscription_plan.create', FINANCE, 'subscription_plan'),
   define('subscription_plan.update', FINANCE, 'subscription_plan'),
@@ -312,6 +407,19 @@ export const AUDIT_ACTIONS = [
    * (DELETE /sms-gateway/binding); before/after carry the pinned device id.
    */
   define('sms_gateway.binding_reset', SYSTEM, 'sms_gateway'),
+  /**
+   * A phone-monitor presented the right BANK_EVENTS_TOKEN under a serial
+   * other than the pinned one and was refused (SEC-004). A system row
+   * (actor null); metadata carries both serials. One row per burst: a
+   * repeat from the same serial within a minute is counted on the binding
+   * row, not re-audited.
+   */
+  define('bank_events.rejected_device', SYSTEM, 'bank_events'),
+  /**
+   * A super admin cleared the device pin of the bank-events token
+   * (DELETE /bank-events/binding); before/after carry the pinned serial.
+   */
+  define('bank_events.binding_reset', SYSTEM, 'bank_events'),
 ] as const satisfies readonly AuditActionDefinition[];
 
 /** Every action key, as a literal union — a typo is a compile error. */

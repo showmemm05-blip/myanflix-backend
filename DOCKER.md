@@ -62,6 +62,76 @@ holds in-flight uploads and the current transcode job now, not what's
 actually streamed. Playback URLs point at `STREAM_PUBLIC_BASE_URL`
 (`../cacheserver`), never at this backend or MinIO directly.
 
+## Health checks, start order and log rotation
+
+`GET /api/health` asks the database (`SELECT 1`, 2 s limit): **200**
+`{ "status": "ok", "db": true }` while Postgres answers, **503**
+`{ "status": "degraded", "db": false }` when it does not (inside the usual
+`success: false` error envelope, `code: "HEALTH_DEGRADED"`). No login, never
+rate limited. Until 2026-10-09 it answered "ok" with Postgres stopped
+(audit OPS-005). Only the database is probed: MinIO and the cache server run
+on other machines, and restarting the API cannot fix an outage there.
+
+Every container in the five compose projects carries a `healthcheck`
+(OPS-004): Postgres `pg_isready`; the API `GET /api/health` through Node's
+own `fetch` (the image has no curl); the admin's `/login` and the website's
+`/` the same way; MinIO its `/minio/health/live`; both nginx services
+`nginx -t` plus one local request nginx answers itself. See the state with:
+
+```bash
+docker compose ps                                                    # STATUS: (healthy) / (unhealthy)
+docker inspect --format '{{.State.Health.Status}}' backend-backend-1
+docker inspect --format '{{json .State.Health.Log}}' backend-backend-1   # the last 5 probes
+```
+
+What a failing check does, and does not do: the container is marked
+**unhealthy** (above, and in `docker events`); the API's `depends_on` waits
+for Postgres to be **healthy** before `prisma migrate deploy` runs; and that
+is all — Docker (without Swarm) never restarts a container for being
+unhealthy. `restart: unless-stopped` still covers a crash. The API's check
+ignores failures during its 90 s `start_period`, room for the migrations.
+`depends_on` orders `docker compose up` only: after a host reboot the
+restart policy brings both containers up on its own, and an API that comes
+up before Postgres fails its migration step and is restarted by that policy
+a few seconds later — the same as before.
+To act on "unhealthy" automatically the owner can add one cron line on the
+VPS, e.g. `*/5 * * * * docker ps -q --filter health=unhealthy | xargs -r
+docker restart` — not added here, because a restart loop during a long
+migration would be worse than a visible unhealthy state.
+
+**Log rotation.** Every service carries the cache server's `logging` block
+(json-file, 5 files × 50 MB), so no container can fill the disk with its
+log. On the VPSes also make that the engine default, so a container created
+outside these files is capped too — `/etc/docker/daemon.json` (root; then
+`sudo systemctl restart docker`; applies to containers created afterwards):
+
+```json
+{ "log-driver": "json-file", "log-opts": { "max-size": "50m", "max-file": "5" } }
+```
+
+**Memory/PID limits** are deliberately not set: the right `mem_limit` for
+the API depends on a measured transcode of a real file (`docker stats` while
+one processes), and none has run since the 2026-10-08 wipe. The suggested
+values sit in `docker-compose.yml` as a commented block under the
+healthcheck.
+
+**A setting must be listed twice.** A value in `backend/.env` reaches the
+container only through the `environment:` block of `docker-compose.yml`
+(the image carries no `.env`). Eight documented settings were missing from
+that block until 2026-10-09 — `DATABASE_POOL_MAX`, the four `UPLOAD_*`
+budgets, `BOOK_CONVERSION_CONCURRENCY`, `FFMPEG_RENDITION_TIMEOUT_MINUTES`,
+`VIDEO_TRANSCODE_CONCURRENCY` (audit OPS-001) — so typing them into `.env`
+changed nothing. They are forwarded now as `KEY: ${KEY:-}` (empty = the
+code's default, exactly as before), and `src/config/docker-compose-env.spec.ts`
+fails the unit tests whenever a key documented in `.env.example` is not in
+the block. After editing `.env`, `docker compose up -d` recreates the
+container with the new values.
+
+**Proving the 503** (on a throwaway stack only, never the real one): start a
+scratch Postgres and the API against it; `curl -i localhost:<port>/api/health`
+→ 200; `pg_ctl stop` → 503 with `"db": false`; `pg_ctl start` → 200 again,
+no API restart needed. Done 2026-10-09 on a scratch cluster.
+
 ## Moving to the real VPS
 
 Same image, same compose file — just:

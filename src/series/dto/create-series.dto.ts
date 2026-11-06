@@ -45,6 +45,16 @@ export class CreateSeriesDto {
   @MaxLength(64)
   language!: string;
 
+  /**
+   * The series TYPE ("Korean", "English"… — see Movie.country). Optional; an
+   * empty string clears it (the service stores null). UpdateSeriesDto
+   * inherits it via PartialType.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  country?: string;
+
   @Type(() => Number)
   @IsInt()
   @Min(1888)

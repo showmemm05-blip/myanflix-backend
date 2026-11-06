@@ -31,6 +31,12 @@ import {
   type PermissionSubject,
 } from '../roles/permission-resolver.service';
 import type { Permission } from '../roles/permission-catalogue';
+import {
+  BankEventsDeviceBindingService,
+  DEVICE_SERIAL_REJECTED,
+  DEVICE_SERIAL_REQUIRED,
+  isDeviceSerial,
+} from '../bank-events/bank-events-device-binding.service';
 
 /**
  * H-3: the permissions that gate a realtime room. Every staff event goes to
@@ -131,6 +137,8 @@ export interface DepositVerificationPayload {
   bankTransactionId: string | null;
   /** The bank's "from" name (M-16) — beside the depositor's own name in the dialog. */
   bankCounterparty: string | null;
+  /** The phone that captured that row (SEC-004) — the dialog's "posted by phone" line. */
+  bankDeviceSerial: string | null;
 }
 
 export interface WithdrawalVerificationPayload {
@@ -337,6 +345,7 @@ export class RealtimeGateway
     private readonly peakUsersService: PeakUsersService,
     private readonly permissionResolver: PermissionResolverService,
     private readonly sessions: SessionRevocationService,
+    private readonly bankEventsBinding: BankEventsDeviceBindingService,
   ) {}
 
   /**
@@ -369,6 +378,15 @@ export class RealtimeGateway
         const expected = this.configService.get<string>('BANK_EVENTS_TOKEN');
         if (!expected || !tokensMatch(machineToken, expected)) {
           throw new Error('Machine token rejected');
+        }
+        // SEC-004: the same device pin as the HTTP routes (MachineTokenGuard)
+        // — after the token check, so a wrong token never pins anything.
+        const deviceSerial: unknown = client.handshake.auth?.['deviceSerial'];
+        if (!isDeviceSerial(deviceSerial)) {
+          throw new Error(DEVICE_SERIAL_REQUIRED);
+        }
+        if (!(await this.bankEventsBinding.admit(deviceSerial.trim()))) {
+          throw new Error(DEVICE_SERIAL_REJECTED);
         }
         (client.data as SocketData).machine = 'phone-monitor';
         await client.join(bankMonitorRoom());

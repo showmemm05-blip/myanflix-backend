@@ -462,11 +462,24 @@ export class SeriesService {
     };
   }
 
+  /**
+   * The type clears by submitting an empty string (the admin's "Not set"),
+   * which must persist as NULL — the clients show a type only when there is
+   * one. Only touches the key when present, so a partial update leaves it.
+   */
+  private withNormalizedCountry<T extends { country?: string | null }>(
+    data: T,
+  ): T {
+    return typeof data.country === 'string' && data.country.trim() === ''
+      ? { ...data, country: null }
+      : data;
+  }
+
   async create(dto: CreateSeriesDto, actor: AuthenticatedUser) {
     const { categoryIds, actorIds, ...data } = dto;
     const created = await this.prisma.series.create({
       data: {
-        ...this.withCanonicalImageUrls(data),
+        ...this.withNormalizedCountry(this.withCanonicalImageUrls(data)),
         categories: categoryIds
           ? { connect: categoryIds.map((id) => ({ id })) }
           : undefined,
@@ -494,7 +507,7 @@ export class SeriesService {
     const updated = await this.prisma.series.update({
       where: { id },
       data: {
-        ...this.withCanonicalImageUrls(data),
+        ...this.withNormalizedCountry(this.withCanonicalImageUrls(data)),
         categories: categoryIds
           ? { set: categoryIds.map((cid) => ({ id: cid })) }
           : undefined,

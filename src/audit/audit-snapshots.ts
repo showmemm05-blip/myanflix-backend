@@ -15,7 +15,14 @@ import type {
   Feedback,
   FinanceSettings,
   HomePromo,
+  Advertisement,
+  AdSettings,
   HomeSettings,
+  LotteryClaim,
+  LotteryDraw,
+  LotteryDream,
+  LotteryResult,
+  LotterySettings,
   Movie,
   PaymentAccount,
   PaymentMethodType,
@@ -132,6 +139,7 @@ export function seriesSnapshot(series: SeriesSnapshotInput): Snapshot {
     description: nullIfUndefined(series.description),
     genre: nullIfUndefined(series.genre),
     language: nullIfUndefined(series.language),
+    country: nullIfUndefined(series.country),
     releaseYear: nullIfUndefined(series.releaseYear),
     rating: nullIfUndefined(series.rating),
     accessType: nullIfUndefined(series.accessType),
@@ -501,6 +509,175 @@ export function homePromoSnapshot(promo: Partial<HomePromo>): Snapshot {
     endsAt: nullIfUndefined(promo.endsAt),
     isActive: nullIfUndefined(promo.isActive),
     sortOrder: nullIfUndefined(promo.sortOrder),
+  };
+}
+
+/**
+ * Every editable field of a pre-roll ad plus what the attach step set
+ * (the key, size and duration — all short, nothing secret). `movieIds`
+ * is the SELECTED list, sorted so two saves with the same titles compare
+ * equal whatever order the admin clicked them in.
+ */
+export function advertisementSnapshot(
+  ad: Partial<Advertisement> & { movieIds?: readonly string[] },
+): Snapshot {
+  return {
+    title: nullIfUndefined(ad.title),
+    description: nullIfUndefined(ad.description),
+    videoKey: nullIfUndefined(ad.videoKey),
+    videoBytes: nullIfUndefined(ad.videoBytes),
+    durationSeconds: nullIfUndefined(ad.durationSeconds),
+    isActive: nullIfUndefined(ad.isActive),
+    startsAt: nullIfUndefined(ad.startsAt),
+    endsAt: nullIfUndefined(ad.endsAt),
+    dailyStartMinutes: nullIfUndefined(ad.dailyStartMinutes),
+    dailyEndMinutes: nullIfUndefined(ad.dailyEndMinutes),
+    tzOffsetMinutes: nullIfUndefined(ad.tzOffsetMinutes),
+    targetType: nullIfUndefined(ad.targetType),
+    movieIds: ad.movieIds === undefined ? null : [...ad.movieIds].sort(),
+    priority: nullIfUndefined(ad.priority),
+    isSkippable: nullIfUndefined(ad.isSkippable),
+    skipAfterSeconds: nullIfUndefined(ad.skipAfterSeconds),
+    frequencyLimitMinutes: nullIfUndefined(ad.frequencyLimitMinutes),
+    maxImpressionsPerUserPerDay: nullIfUndefined(
+      ad.maxImpressionsPerUserPerDay,
+    ),
+    format: nullIfUndefined(ad.format),
+    playsBeforeMovie: nullIfUndefined(ad.playsBeforeMovie),
+    playsAtBreaks: nullIfUndefined(ad.playsAtBreaks),
+    imageKey: nullIfUndefined(ad.imageKey),
+    imageBytes: nullIfUndefined(ad.imageBytes),
+    linkUrl: nullIfUndefined(ad.linkUrl),
+    cornerShowSeconds: nullIfUndefined(ad.cornerShowSeconds),
+    cornerRepeatMinutes: nullIfUndefined(ad.cornerRepeatMinutes),
+    cornerClosable: nullIfUndefined(ad.cornerClosable),
+  };
+}
+
+/** The Advertisements page's playback rules. */
+export function adSettingsSnapshot(settings: Partial<AdSettings>): Snapshot {
+  return {
+    adsEnabled: nullIfUndefined(settings.adsEnabled),
+    midrollIntervalMinutes: nullIfUndefined(settings.midrollIntervalMinutes),
+    duringMovieAudience: nullIfUndefined(settings.duringMovieAudience),
+  };
+}
+
+/** A dream's editable fields plus its fixed address (book + number). */
+export function lotteryDreamSnapshot(dream: Partial<LotteryDream>): Snapshot {
+  return {
+    book: nullIfUndefined(dream.book),
+    number: nullIfUndefined(dream.number),
+    nameEn: nullIfUndefined(dream.nameEn),
+    nameMy: nullIfUndefined(dream.nameMy),
+    pictureUrl: nullIfUndefined(dream.pictureUrl),
+    isActive: nullIfUndefined(dream.isActive),
+  };
+}
+
+/**
+ * A draw's setup and its life stamps. The counters (nextTicketSeq) and
+ * the creator are bookkeeping, not something staff edit, so they stay out.
+ */
+export function lotteryDrawSnapshot(draw: Partial<LotteryDraw>): Snapshot {
+  return {
+    drawNo: nullIfUndefined(draw.drawNo),
+    thaiDrawDate: nullIfUndefined(draw.thaiDrawDate),
+    drawAt: nullIfUndefined(draw.drawAt),
+    salesCloseAt: nullIfUndefined(draw.salesCloseAt),
+    status: nullIfUndefined(draw.status),
+    ticketPrice: money(draw.ticketPrice),
+    maxPerNumber: nullIfUndefined(draw.maxPerNumber),
+    exchangeRate: money(draw.exchangeRate),
+    pictureUrl: nullIfUndefined(draw.pictureUrl),
+    frameUrl: nullIfUndefined(draw.frameUrl),
+    openedAt: nullIfUndefined(draw.openedAt),
+    closedAt: nullIfUndefined(draw.closedAt),
+    publishedAt: nullIfUndefined(draw.publishedAt),
+    winnersCount: nullIfUndefined(draw.winnersCount),
+    prizesPaidKs: money(draw.prizesPaidKs),
+  };
+}
+
+export function lotterySettingsSnapshot(
+  settings: Partial<LotterySettings>,
+): Snapshot {
+  return {
+    ticketPrice: money(settings.ticketPrice),
+    maxPerNumber: nullIfUndefined(settings.maxPerNumber),
+    exchangeRate: money(settings.exchangeRate),
+    salesCloseMinutesBefore: nullIfUndefined(settings.salesCloseMinutesBefore),
+    frameUrl: nullIfUndefined(settings.frameUrl),
+    resultsUrl: nullIfUndefined(settings.resultsUrl),
+    claimDeadlineDays: nullIfUndefined(settings.claimDeadlineDays),
+  };
+}
+
+/**
+ * One prize claim (lottery_claims): its status, figures, times and the
+ * rejection — what the confirm / reject / reopen rows diff. Never the
+ * customer's own fields (the target label names them).
+ */
+export function lotteryClaimSnapshot(claim: Partial<LotteryClaim>): Snapshot {
+  return {
+    status: nullIfUndefined(claim.status),
+    ticketsCount: nullIfUndefined(claim.ticketsCount),
+    baht: money(claim.baht),
+    ks: money(claim.ks),
+    rate: money(claim.rate),
+    requestedAt: nullIfUndefined(claim.requestedAt),
+    decidedAt: nullIfUndefined(claim.decidedAt),
+    decidedByUserId: nullIfUndefined(claim.decidedByUserId),
+    rejectReason: nullIfUndefined(claim.rejectReason),
+    rejectNote: nullIfUndefined(claim.rejectNote),
+    transactionId: nullIfUndefined(claim.transactionId),
+    paidAtPublish: nullIfUndefined(claim.paidAtPublish),
+  };
+}
+
+/** One group of a stored sheet as the audit log keeps it: the key, the Baht prize and the numbers. */
+interface ResultGroupLike {
+  key: string;
+  baht: number;
+  numbers: string[];
+}
+
+function resultGroups(value: unknown): ResultGroupLike[] | null {
+  if (!Array.isArray(value)) return null;
+  const groups: ResultGroupLike[] = [];
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null) continue;
+    const group = item as Record<string, unknown>;
+    if (typeof group.key !== 'string' || !Array.isArray(group.numbers))
+      continue;
+    groups.push({
+      key: group.key,
+      baht: typeof group.baht === 'number' ? group.baht : 0,
+      numbers: group.numbers.filter(
+        (number): number is string => typeof number === 'string',
+      ),
+    });
+  }
+  return groups;
+}
+
+/**
+ * A draw's winning numbers: the status, where they came from and the
+ * sheet itself (key, Baht, numbers per group — the numbers ARE the
+ * point of this row). The source's raw answer stays out; it is in the
+ * results row for anyone who needs it.
+ */
+export function lotteryResultSnapshot(
+  result: Partial<LotteryResult>,
+): Snapshot {
+  return {
+    status: nullIfUndefined(result.status),
+    source: nullIfUndefined(result.source),
+    sourceDate: nullIfUndefined(result.sourceDate),
+    fetchedAt: nullIfUndefined(result.fetchedAt),
+    attempts: nullIfUndefined(result.attempts),
+    lastError: nullIfUndefined(result.lastError),
+    groups: resultGroups(result.groups),
   };
 }
 

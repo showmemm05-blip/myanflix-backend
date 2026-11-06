@@ -10,6 +10,7 @@ import {
   NO_BANK_TRANSACTION_AFTER_MS,
   RISK_REASONS,
   RISK_REASON_WEIGHTS,
+  SCREENSHOT_REASONS,
   VELOCITY_LIMIT,
   WITHDRAWAL_PAYOUT_WINDOW_MS,
   amountsEqual,
@@ -28,6 +29,7 @@ import {
   replaceReasonClass,
   riskLevelForScore,
   riskScore,
+  screenshotReasons,
   scoreVerification,
   velocityReasons,
   verificationView,
@@ -393,5 +395,44 @@ describe('yangonTimeOfDay', () => {
     expect(yangonTimeOfDay(at('2026-09-18T00:26:02.000Z'))).toBe('06:56:02');
     // Crosses midnight in Yangon.
     expect(yangonTimeOfDay(at('2026-09-18T17:35:00.000Z'))).toBe('00:05:00');
+  });
+});
+
+describe('screenshotReasons (SEC-004)', () => {
+  it('flags a bank event with no picture behind it, and nothing once the key is set', () => {
+    expect(screenshotReasons(null)).toEqual(['NO_SCREENSHOT']);
+    expect(screenshotReasons(undefined)).toEqual(['NO_SCREENSHOT']);
+    expect(screenshotReasons('')).toEqual(['NO_SCREENSHOT']);
+    expect(
+      screenshotReasons('documents/bank-screenshots/transactions/tx-1/k.png'),
+    ).toEqual([]);
+  });
+
+  it('is SOFT: on its own the row is PENDING_REVIEW / LOW with bank values — never MATCHED, never SUSPICIOUS', () => {
+    expect(HARD_REASONS.has('NO_SCREENSHOT')).toBe(false);
+    expect(RISK_REASON_WEIGHTS.NO_SCREENSHOT).toBeLessThan(30);
+    expect(scoreVerification(['NO_SCREENSHOT'], true)).toEqual({
+      matchStatus: BankMatchStatus.PENDING_REVIEW,
+      riskLevel: BankRiskLevel.LOW,
+      riskReasons: ['NO_SCREENSHOT'],
+    });
+  });
+
+  it('is its own class: the upload swaps it out and keeps every other reason', () => {
+    expect(SCREENSHOT_REASONS).toEqual(['NO_SCREENSHOT']);
+    expect(
+      replaceReasonClass(
+        ['NO_SCREENSHOT', 'VELOCITY', 'COUNTERPARTY_MISMATCH'],
+        SCREENSHOT_REASONS,
+        [],
+      ),
+    ).toEqual(['COUNTERPARTY_MISMATCH', 'VELOCITY']);
+    expect(
+      replaceReasonClass(['NO_SCREENSHOT'], SCREENSHOT_REASONS, []),
+    ).toEqual([]);
+    // A clean row with its picture: back to the green badge.
+    expect(scoreVerification([], true).matchStatus).toBe(
+      BankMatchStatus.MATCHED,
+    );
   });
 });

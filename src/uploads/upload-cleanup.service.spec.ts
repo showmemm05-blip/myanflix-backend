@@ -241,6 +241,7 @@ describe('UploadCleanupService', () => {
         '/storage/temp/videos',
         '/storage/temp/audio',
         '/storage/temp/documents/books',
+        '/storage/temp/ads',
       ]);
     });
 
@@ -264,35 +265,52 @@ describe('UploadCleanupService', () => {
     const DAYS = 24 * HOURS;
 
     it('deletes only the staged objects older than the 7-day expiry the taxonomy declares', async () => {
-      minioService.listObjects.mockResolvedValue([
-        {
-          key: 'temp/video-replace/movie-1/hls/720p/segment_000.ts',
-          lastModified: new Date(Date.now() - 8 * DAYS),
-        },
-        {
-          key: 'temp/video-replace/movie-1/original.mp4',
-          lastModified: new Date(Date.now() - 7 * DAYS - HOURS),
-        },
-        {
-          key: 'temp/video-replace/movie-2/hls/master.m3u8',
-          lastModified: new Date(Date.now() - 2 * HOURS), // an upload in progress
-        },
-        {
-          key: 'temp/video-replace/movie-3/x.ts',
-          lastModified: undefined, // no stamp = unknown age, never guessed
-        },
-      ]);
+      // Two staging roots share the sweep: the replacement bundles and the
+      // pre-roll ad uploads (temp/ads/, 2026-11-04), each listed on its own.
+      minioService.listObjects.mockImplementation(async (prefix: string) =>
+        prefix === 'temp/video-replace/'
+          ? [
+              {
+                key: 'temp/video-replace/movie-1/hls/720p/segment_000.ts',
+                lastModified: new Date(Date.now() - 8 * DAYS),
+              },
+              {
+                key: 'temp/video-replace/movie-1/original.mp4',
+                lastModified: new Date(Date.now() - 7 * DAYS - HOURS),
+              },
+              {
+                key: 'temp/video-replace/movie-2/hls/master.m3u8',
+                lastModified: new Date(Date.now() - 2 * HOURS), // an upload in progress
+              },
+              {
+                key: 'temp/video-replace/movie-3/x.ts',
+                lastModified: undefined, // no stamp = unknown age, never guessed
+              },
+            ]
+          : [
+              {
+                key: 'temp/ads/ad-1/video.mp4',
+                lastModified: new Date(Date.now() - 9 * DAYS),
+              },
+              {
+                key: 'temp/ads/ad-2/video.mp4',
+                lastModified: new Date(Date.now() - HOURS),
+              },
+            ],
+      );
 
       const removed = await service.sweepAbandonedReplaceStaging();
 
       expect(minioService.listObjects).toHaveBeenCalledWith(
         'temp/video-replace/',
       );
+      expect(minioService.listObjects).toHaveBeenCalledWith('temp/ads/');
       expect(minioService.deleteKeys).toHaveBeenCalledWith([
         'temp/video-replace/movie-1/hls/720p/segment_000.ts',
         'temp/video-replace/movie-1/original.mp4',
+        'temp/ads/ad-1/video.mp4',
       ]);
-      expect(removed).toBe(2);
+      expect(removed).toBe(3);
     });
 
     it('sends no delete at all when nothing is old enough', async () => {
@@ -314,12 +332,16 @@ describe('UploadCleanupService', () => {
     });
 
     it('runs as the last step of the 3 AM multipart sweep', async () => {
-      minioService.listObjects.mockResolvedValue([
-        {
-          key: 'temp/video-replace/movie-1/original.mp4',
-          lastModified: new Date(Date.now() - 9 * DAYS),
-        },
-      ]);
+      minioService.listObjects.mockImplementation(async (prefix: string) =>
+        prefix === 'temp/video-replace/'
+          ? [
+              {
+                key: 'temp/video-replace/movie-1/original.mp4',
+                lastModified: new Date(Date.now() - 9 * DAYS),
+              },
+            ]
+          : [],
+      );
 
       await service.sweepAbandonedMultipartUploads();
 

@@ -49,6 +49,14 @@ interface MovieItem {
   seriesId: string | null;
 }
 
+/** One comment of `GET /comments`, as far as the author-privacy checks read it. */
+interface CommentItem {
+  id: string;
+  isMine: boolean;
+  user: Record<string, unknown>;
+  replies: CommentItem[];
+}
+
 /**
  * Guest access to the catalogue: the real AppModule (global JwtAuthGuard +
  * real JwtStrategy) against the isolated e2e database. Proves that a
@@ -72,6 +80,9 @@ describe('Guest catalogue (e2e)', () => {
   let hiddenEpisodeId: string;
   let actorId: string;
   let categoryId: string;
+  let commenterId: string;
+  let commenterDigits: string;
+  let commentId: string;
 
   const movieBase = {
     description: 'guest catalogue fixture',
@@ -197,10 +208,44 @@ describe('Guest catalogue (e2e)', () => {
       },
     });
     hiddenEpisodeId = hiddenEpisode.id;
+
+    // A phone sign-up exactly as AuthService.createPhoneAccount makes one:
+    // the username IS the phone's digits and no display name was ever set.
+    // Its comment on the published movie is what the author-privacy checks
+    // below read (SEC-007); the admin's reply makes the replies route and
+    // the "someone else's comment" case real too.
+    commenterDigits = `9597${String(Date.now()).slice(-7)}`;
+    const commenter = await prisma.user.create({
+      data: {
+        username: `user_${commenterDigits}`,
+        password: 'unused-in-these-tests',
+        phone: `+${commenterDigits}`,
+        role: Role.USER,
+        status: UserStatus.ACTIVE,
+      },
+    });
+    commenterId = commenter.id;
+    const comment = await prisma.comment.create({
+      data: {
+        userId: commenterId,
+        movieId: publishedMovieId,
+        body: 'guest catalogue comment fixture',
+      },
+    });
+    commentId = comment.id;
+    await prisma.comment.create({
+      data: {
+        userId: adminId,
+        movieId: publishedMovieId,
+        parentId: commentId,
+        body: 'guest catalogue reply fixture',
+      },
+    });
   });
 
   afterAll(async () => {
     // Isolated test database — safe to hard-delete everything this suite made.
+    await prisma.comment.deleteMany({ where: { movieId: publishedMovieId } });
     await prisma.movie.deleteMany({
       where: {
         id: {
@@ -213,7 +258,9 @@ describe('Guest catalogue (e2e)', () => {
     });
     await prisma.actor.deleteMany({ where: { id: actorId } });
     await prisma.category.deleteMany({ where: { id: categoryId } });
-    await prisma.user.deleteMany({ where: { id: adminId } });
+    await prisma.user.deleteMany({
+      where: { id: { in: [adminId, commenterId] } },
+    });
     await app.close();
   });
 
@@ -404,6 +451,106 @@ describe('Guest catalogue (e2e)', () => {
       expect(forbiddenKeysIn(body)).toEqual([]);
 
       await api().get(`/api/series/${draftSeriesId}/episodes`).expect(404);
+    });
+  });
+
+  /**
+   * Security audit 2026-10-09, SEC-007: the public thread used to carry
+   * every commenter's username — for a phone sign-up, the phone number —
+   * and user id. Now an author is a display name or a `Member #<tag>`
+   * pseudonym, and the id rides along only on the reader's own comments.
+   */
+  describe('GET /comments', () => {
+    const memberTag = () => commenterId.slice(0, 4);
+
+    /** Every key and value of the response, as one string to search. */
+    const feedText = (body: unknown) => JSON.stringify(body);
+
+    function findFixture(body: Envelope<CommentItem[]>): CommentItem {
+      const comment = body.data.find((c) => c.id === commentId);
+      expect(comment).toBeDefined();
+      return comment!;
+    }
+
+    it('without a token: 200, and no author carries a username, a user id or a phone number', async () => {
+      const res = await api()
+        .get('/api/comments')
+        .query({ movieId: publishedMovieId });
+      expect(res.status).toBe(200);
+
+      const body = res.body as Envelope<CommentItem[]>;
+      const comment = findFixture(body);
+      expect(comment.user).toEqual({
+        displayName: `Member #${memberTag()}`,
+        memberTag: memberTag(),
+        avatarUrl: null,
+      });
+      expect(comment.isMine).toBe(false);
+      expect(comment.replies[0].user).not.toHaveProperty('id');
+      expect(comment.replies[0].isMine).toBe(false);
+      // Not as a key, not inside any value: no `user_<digits>` username,
+      // not the phone's digits, not the internal user id.
+      expect([...collectKeys(body)]).not.toContain('username');
+      expect(feedText(body)).not.toMatch(/user_\d/);
+      expect(feedText(body)).not.toContain(commenterDigits);
+      expect(feedText(body)).not.toContain(commenterId);
+    });
+
+    it('/:id/replies without a token: the same author shape', async () => {
+      const res = await api().get(`/api/comments/${commentId}/replies`);
+      expect(res.status).toBe(200);
+
+      const body = res.body as Envelope<{ items: CommentItem[] }>;
+      expect(body.data.items).toHaveLength(1);
+      expect(body.data.items[0].user).not.toHaveProperty('username');
+      expect(body.data.items[0].user).not.toHaveProperty('id');
+      expect(body.data.items[0].isMine).toBe(false);
+      expect(feedText(body)).not.toMatch(/user_\d/);
+      expect(feedText(body)).not.toContain(adminId);
+    });
+
+    it("with the author's own token: isMine and the author id, still no username", async () => {
+      const res = await api()
+        .get('/api/comments')
+        .query({ movieId: publishedMovieId })
+        .set('Authorization', `Bearer ${await signToken(commenterId)}`);
+      expect(res.status).toBe(200);
+
+      const body = res.body as Envelope<CommentItem[]>;
+      const comment = findFixture(body);
+      expect(comment.isMine).toBe(true);
+      expect(comment.user.id).toBe(commenterId);
+      expect(comment.user.displayName).toBe(`Member #${memberTag()}`);
+      // The admin's reply is still someone else's comment to them.
+      expect(comment.replies[0].isMine).toBe(false);
+      expect(comment.replies[0].user).not.toHaveProperty('id');
+      expect([...collectKeys(body)]).not.toContain('username');
+      expect(feedText(body)).not.toMatch(/user_\d/);
+      expect(feedText(body)).not.toContain(commenterDigits);
+    });
+
+    it('with an admin token: no staff view here — the same anonymous thread', async () => {
+      const res = await api()
+        .get('/api/comments')
+        .query({ movieId: publishedMovieId })
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(res.status).toBe(200);
+
+      const body = res.body as Envelope<CommentItem[]>;
+      const comment = findFixture(body);
+      expect(comment.isMine).toBe(false);
+      expect(comment.user).not.toHaveProperty('id');
+      expect([...collectKeys(body)]).not.toContain('username');
+      expect(feedText(body)).not.toContain(commenterDigits);
+      expect(feedText(body)).not.toContain(commenterId);
+    });
+
+    it('with a bad token: 401, not a silent guest downgrade', async () => {
+      await api()
+        .get('/api/comments')
+        .query({ movieId: publishedMovieId })
+        .set('Authorization', 'Bearer not-a-real-token')
+        .expect(401);
     });
   });
 

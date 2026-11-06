@@ -19,7 +19,7 @@ import {
 } from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { basename, extname, join } from 'node:path';
+import { basename, extname, isAbsolute, join } from 'node:path';
 import sharp from 'sharp';
 import {
   MovieStatus,
@@ -33,6 +33,11 @@ import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { StorageService } from '../common/storage/storage.service';
 import { MinioService } from '../common/storage/minio.service';
 import type { ImagePurpose } from '../common/storage/media-taxonomy';
+import { CodedHttpException } from '../common/errors/coded-http.exception';
+import {
+  sniffImageType,
+  type ImageMimeType,
+} from '../common/utils/image-magic-bytes';
 import { VideosService } from '../videos/videos.service';
 import { VideoDurationService } from '../videos/video-duration.service';
 import { ProcessingService } from '../processing/processing.service';
@@ -129,7 +134,48 @@ const ARTWORK_MAX_WIDTH: Partial<
   // Home promo art fills the full-bleed home hero on desktop, like a
   // movie backdrop, and a phone-width poster slot otherwise.
   promo: { portrait: 1300, landscape: 1920 },
+  // A dream picture is a card thumbnail (the Lottery dream books), shown
+  // small like a headshot.
+  lottery: { portrait: 1000, landscape: 1000 },
+  // The ticket frame is print artwork: the whole ticket (1800 x 940 at 1x,
+  // 3600 x 1880 at 2x) is drawn on it and every text layer is placed by
+  // fractions of its size, so it is kept at up to 4000 px either way.
+  lottery_frame: { portrait: 4000, landscape: 4000 },
 };
+
+/**
+ * The most bytes POST /uploads/image accepts, per purpose. Every purpose
+ * keeps the 10 MB the route always had, except the ticket frame: a 3600 x
+ * 1880 PNG with real artwork is 6-8 MB and a richer one goes past 10 MB, so
+ * the purpose the pixel cap above was raised for gets 25 MB. The route's
+ * multer limit is the largest of these (so no purpose can smuggle more
+ * past it); saveImage() applies the purpose's own figure with a coded 413
+ * before the bytes are sniffed, resized or stored.
+ */
+export const IMAGE_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+export const FRAME_IMAGE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
+
+/** The byte cap for one purpose — see IMAGE_UPLOAD_MAX_BYTES. */
+export function imageUploadByteLimit(purpose: ImagePurpose): number {
+  return purpose === 'lottery_frame'
+    ? FRAME_IMAGE_UPLOAD_MAX_BYTES
+    : IMAGE_UPLOAD_MAX_BYTES;
+}
+
+/** The 413 a staff image upload gets when it is over its purpose's byte cap. */
+export const IMAGE_UPLOAD_TOO_LARGE_CODE = 'IMAGE_UPLOAD_TOO_LARGE';
+export function imageUploadTooLargeMessage(maxBytes: number): string {
+  return `The image is too large — up to ${Math.round(maxBytes / (1024 * 1024))} MB is allowed`;
+}
+
+/**
+ * The 400 a staff image upload gets when its bytes are not a JPEG, PNG,
+ * WebP or GIF — whatever the filename or Content-Type claimed (SEC-019).
+ */
+export const IMAGE_UPLOAD_UNSUPPORTED_TYPE_CODE =
+  'IMAGE_UPLOAD_UNSUPPORTED_TYPE';
+export const IMAGE_UPLOAD_UNSUPPORTED_TYPE_MESSAGE =
+  'Only JPEG, PNG, WebP or GIF images are allowed';
 
 /** The exact byte length chunk `chunkNumber` of a session must have: the chunk size, or the remainder for the last one. */
 export function expectedChunkSize(
@@ -578,6 +624,19 @@ export class UploadsService {
       );
     }
 
+    // The title's previous file can still be transcoding in this process:
+    // the classic gate admits DRAFT, and a movie stays DRAFT for the whole
+    // of its transcode (only the Video row reads PROCESSING). A second
+    // complete now would merge onto the very scratch file ffmpeg is
+    // reading and — the prefix clear below — pull the package out from
+    // under that run. 409 before the merge; the session stays resumable.
+    const latest = await this.videosService.findLatestForMovie(session.movieId);
+    if (latest && this.processingService.isActivelyProcessing(latest.id)) {
+      throw new ConflictException(
+        'This movie is still being transcoded — wait for it to finish before completing a new upload',
+      );
+    }
+
     const extension = extname(session.filename) || '.mp4';
     const originalPath = this.storageService.originalVideoPath(
       session.movieId,
@@ -588,6 +647,19 @@ export class UploadsService {
     );
     await this.mergeChunks(uploadId, session.totalChunks, originalPath);
     await this.assertMergedSize(uploadId, originalPath, session.fileSize);
+
+    // A fresh file for this title. Whatever an earlier attempt left under
+    // videos/<movieId>/ — an archived original, finished renditions, a
+    // replaced hls/v-<tag>/ package — goes first: the pipeline resumes per
+    // tier on object existence, so it would otherwise keep the OLD file's
+    // tiers next to the new file's (a mixed package) or skip the new file
+    // altogether (STR-003). Reprocess never comes through here; it re-feeds
+    // the same original and relies on exactly that resume. Runs before
+    // anything durable changes, so a storage error leaves the session
+    // resumable and a retried complete simply repeats it.
+    await this.minioService.deleteByPrefix(
+      `${this.storageService.videoKeyPrefix(session.movieId)}/`,
+    );
 
     const video = await this.videosService.create({
       movieId: session.movieId,
@@ -623,12 +695,19 @@ export class UploadsService {
       },
     });
 
-    // Kick off transcoding without blocking the HTTP response.
-    void this.processingService.processVideo(
-      video.id,
-      session.movieId,
-      originalPath,
-    );
+    // Kick off transcoding without blocking the HTTP response. The pipeline
+    // records its own failures; the catch is the belt-and-braces for
+    // anything that still escapes it, because an unhandled rejection here
+    // would take the whole API process down (STR-009).
+    void this.processingService
+      .processVideo(video.id, session.movieId, originalPath)
+      .catch((error: unknown) =>
+        this.logger.error(
+          `Transcode of video ${video.id} (movie ${session.movieId}) escaped the pipeline: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ),
+      );
 
     return { videoId: video.id, status: video.status };
   }
@@ -1060,10 +1139,10 @@ export class UploadsService {
    * video. Validates the staged files (same structure + existence checks as
    * finalize, against the STAGING keys), copies them to their final keys —
    * the HLS package into a fresh videos/<movieId>/hls/v-<tag>/ folder —
-   * with the master last, deletes whatever old object the new bundle does
-   * not carry (which is the whole previous package), rewrites the Video row
-   * in place and recreates its Subtitle rows exactly as finalize creates
-   * them. Parallel calls for one movie join a single run.
+   * with the master last, rewrites the Video row in place, only then
+   * deletes whatever old object the new bundle does not carry (which is the
+   * whole previous package), and recreates its Subtitle rows exactly as
+   * finalize creates them. Parallel calls for one movie join a single run.
    */
   async finalizeReplace(
     movieId: string,
@@ -1142,7 +1221,7 @@ export class UploadsService {
     }
 
     // 3. Snapshot before anything is written: the title's current keys (so
-    // step 5 can delete exactly the stale ones) and the rows for the audit.
+    // step 7 can delete exactly the stale ones) and the rows for the audit.
     const videoPrefix = `${this.storageService.videoKeyPrefix(movieId)}/`;
     const subtitlePrefix = `${this.storageService.subtitleSourcePrefix(movieId)}/`;
     const oldKeys = new Set<string>([
@@ -1185,12 +1264,12 @@ export class UploadsService {
     // why it can never go over the old keys — while the original and the
     // subtitle sources take the SAME key the "movie" registry entry gives a
     // fresh upload (subtitles leave videos/ for subtitles/<movieId>/). The
-    // old package is untouched until step 7 points the row at the new one,
+    // old package is untouched until step 6 points the row at the new one,
     // so the title keeps playing throughout; the master goes last so a
     // player can only see a master whose every referenced file already
     // exists. This is the ONE step that can leave a partial state — see the
     // catch (a retry mints a new tag, and the half-written folder is swept
-    // as stale by the retry's own step 5, being none of ITS final keys).
+    // as stale by the retry's own step 7, being none of ITS final keys).
     const versionTag = this.hlsVersionTag();
     const newFinalKeys = new Set<string>();
     let copiedObjects = 0;
@@ -1271,35 +1350,13 @@ export class UploadsService {
       throw new BadGatewayException(failureReason);
     }
 
-    // 5. Delete what the new bundle does not carry: the WHOLE previous HLS
-    // package (its master, every rendition, its subs/* renditions — none of
-    // those keys is reused, because the new package sits in its own v-<tag>
-    // folder; a second replace sweeps the previous v-<tag> folder the same
-    // way), the old original when its extension changed, and every old
-    // subtitle SOURCE the bundle does not re-supply (bundle-uploaded and
-    // single-uploaded alike — the rows are replaced below the same way).
-    // A failure here is a storage leak, not a broken title: logged, counted,
-    // and the swap goes on.
-    const staleKeys = [...oldKeys].filter((key) => !newFinalKeys.has(key));
-    let deletedObjects = 0;
-    try {
-      await this.minioService.deleteKeys(staleKeys);
-      deletedObjects = staleKeys.length;
-    } catch (error) {
-      this.logger.warn(
-        `Video replace for movie ${movieId}: could not delete ${staleKeys.length} stale object(s) — ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
-
-    // 6. Runtime from the HLS now at the FINAL (versioned) master key. Never
+    // 5. Runtime from the HLS now at the FINAL (versioned) master key. Never
     // throws.
     const masterKey = this.storageService.hlsMasterKey(movieId, versionTag);
     const durationSeconds =
       await this.videoDurationService.recoverHlsDurationSeconds(masterKey);
 
-    // 7. The Video row, rewritten IN PLACE so its id (the subtitles' FK,
+    // 6. The Video row, rewritten IN PLACE so its id (the subtitles' FK,
     // SubtitleManager's videoId) stays stable and "latest row = served row"
     // keeps holding; created only when the title never had one. The old
     // Subtitle rows go in the same transaction. hlsMasterPath and every
@@ -1328,11 +1385,37 @@ export class UploadsService {
       return row;
     });
 
+    // 7. Delete what the new bundle does not carry: the WHOLE previous HLS
+    // package (its master, every rendition, its subs/* renditions — none of
+    // those keys is reused, because the new package sits in its own v-<tag>
+    // folder; a second replace sweeps the previous v-<tag> folder the same
+    // way), the old original when its extension changed, and every old
+    // subtitle SOURCE the bundle does not re-supply (bundle-uploaded and
+    // single-uploaded alike — the rows are replaced below the same way).
+    // Strictly AFTER step 6: the row now points at the new package, so a
+    // viewer asking for /stream from here on gets the new master. Deleting
+    // first left the title pointing at missing keys for the length of the
+    // delete batches — and until an admin retried, if the process died in
+    // between (STR-002). A failure here is a storage leak, not a broken
+    // title: logged, counted, and the swap goes on.
+    const staleKeys = [...oldKeys].filter((key) => !newFinalKeys.has(key));
+    let deletedObjects = 0;
+    try {
+      await this.minioService.deleteKeys(staleKeys);
+      deletedObjects = staleKeys.length;
+    } catch (error) {
+      this.logger.warn(
+        `Video replace for movie ${movieId}: could not delete ${staleKeys.length} stale object(s) — ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
     // 8. New Subtitle rows, derived exactly as finalize derives them. Once
     // they all exist, ONE publish rewrites the (new) master with the
     // subtitle group, writing the renditions BESIDE it — videos/<id>/hls/v-<tag>/subs/<newId>.{vtt,
     // m3u8} — because HlsSubtitlesService derives their keys from the row's
-    // hlsMasterPath just written in step 7, and the master names them by
+    // hlsMasterPath just written in step 6, and the master names them by
     // the relative URI `subs/<id>.m3u8`.
     const createdSubtitles: Array<{
       id: string;
@@ -1632,6 +1715,14 @@ export class UploadsService {
    * under images/ it lands in and is validated by UploadImageDto — there is
    * no default, because an image in the wrong folder is invisible to the
    * prefix-based cleanup paths that are supposed to find it later.
+   *
+   * What the file IS comes from its first bytes — never from the client's
+   * filename or Content-Type, both of which it controls. Anything that is
+   * not a JPEG, PNG, WebP or GIF by its magic bytes is refused with a 400
+   * before a single byte lands under the public images/ folder and before
+   * sharp opens it (SEC-008, SEC-019); the stored extension is the one the
+   * bytes say, so a PDF renamed to poster.jpg can neither be stored nor
+   * be served as anything.
    */
   async saveImage(
     purpose: ImagePurpose,
@@ -1639,16 +1730,35 @@ export class UploadsService {
     buffer: Buffer,
     actor: AuthenticatedUser,
   ): Promise<string> {
-    const extension = extname(originalFilename) || '.jpg';
+    // The purpose's own byte cap first: the route's multer limit is the
+    // largest cap of any purpose, so a 20 MB poster gets this far and is
+    // refused here, before its bytes are sniffed, opened or stored.
+    const maxBytes = imageUploadByteLimit(purpose);
+    if (buffer.length > maxBytes) {
+      throw new CodedHttpException(
+        HttpStatus.PAYLOAD_TOO_LARGE,
+        IMAGE_UPLOAD_TOO_LARGE_CODE,
+        imageUploadTooLargeMessage(maxBytes),
+        { maxBytes },
+      );
+    }
+    const image = sniffImageType(buffer);
+    if (!image) {
+      throw new CodedHttpException(
+        HttpStatus.BAD_REQUEST,
+        IMAGE_UPLOAD_UNSUPPORTED_TYPE_CODE,
+        IMAGE_UPLOAD_UNSUPPORTED_TYPE_MESSAGE,
+      );
+    }
     const key = this.storageService.imageObjectKey(
       purpose,
       randomUUID(),
-      extension,
+      image.extension,
     );
     // Artwork is shrunk to a sensible display size before it is stored;
     // anything else (and anything sharp cannot read) is stored exactly as
     // uploaded, as it always was. Same key, same URL, same response.
-    const stored = await this.downscaleArtwork(purpose, buffer);
+    const stored = await this.downscaleArtwork(purpose, buffer, image.mimetype);
     await this.minioService.uploadBuffer(key, stored);
     // No owner row exists yet (the image is uploaded before the movie /
     // actor / category it belongs to is created), so the row names the
@@ -1681,13 +1791,20 @@ export class UploadsService {
    * data, or over sharp's default input-pixel limit — the decompression
    * bomb guard, deliberately left at its default) is returned unchanged,
    * which is exactly what was stored before this existed.
+   *
+   * `mimetype` is what saveImage read off the magic bytes, so sharp only
+   * ever opens a file that starts like a JPEG, PNG or WebP: a GIF is never
+   * resized (every frame is kept) and so is not opened at all, and nothing
+   * that failed the byte check gets this far (SEC-008).
    */
   private async downscaleArtwork(
     purpose: ImagePurpose,
     buffer: Buffer,
+    mimetype: ImageMimeType,
   ): Promise<Buffer> {
     const rule = ARTWORK_MAX_WIDTH[purpose];
     if (!rule) return buffer;
+    if (mimetype === 'image/gif') return buffer;
     try {
       const meta = await sharp(buffer).metadata();
       const format = meta.format;
@@ -1813,8 +1930,17 @@ export class UploadsService {
     await this.sweepVersionedPackage(video.hlsMasterPath);
 
     // Fire-and-forget, matching the exact same pattern completeUpload() uses
-    // to kick off processing after a normal upload.
-    void this.processingService.processVideo(video.id, movieId, inputPath);
+    // to kick off processing after a normal upload — catch included, so an
+    // escaped rejection is a log line, never a dead process (STR-009).
+    void this.processingService
+      .processVideo(video.id, movieId, inputPath)
+      .catch((error: unknown) =>
+        this.logger.error(
+          `Transcode of video ${video.id} (movie ${movieId}) escaped the pipeline: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ),
+      );
 
     // Who restarted the pipeline. Its outcome is recorded by ProcessingService
     // as a system row (transcode_complete / transcode_failed).
@@ -1834,10 +1960,11 @@ export class UploadsService {
 
   /**
    * A failed Video's originalPath is either still a local scratch path (the
-   * failure happened before/at archiving, so cleanupScratch() never got a
-   * chance to remove it) or already a MinIO object key (archiving
-   * succeeded; a later rendition or ffmpeg step is what failed) — in which
-   * case it needs to be pulled back down before ffmpeg can read it again.
+   * failure happened before/at archiving — ProcessingService keeps that
+   * only copy on purpose, see its cleanupScratch, STR-004) or already a
+   * MinIO object key (archiving succeeded; a later rendition or ffmpeg step
+   * is what failed) — in which case it needs to be pulled back down before
+   * ffmpeg can read it again.
    */
   private async resolveOriginalForReprocessing(
     movieId: string,
@@ -1845,6 +1972,16 @@ export class UploadsService {
   ): Promise<string> {
     if (await this.pathExistsLocally(video.originalPath)) {
       return video.originalPath;
+    }
+
+    // A kept local original is swept after 24 h; the row then names a path
+    // that is gone and was never a key the store could answer for — a
+    // clear 400, not downloadFile's NoSuchKey 500. Scratch paths are
+    // absolute (StorageService.root), object keys never are.
+    if (isAbsolute(video.originalPath)) {
+      throw new BadRequestException(
+        'The original file is no longer on the server — a new upload is required',
+      );
     }
 
     const extension = extname(video.originalFilename) || '.mp4';

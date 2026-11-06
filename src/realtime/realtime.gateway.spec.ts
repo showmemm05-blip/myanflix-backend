@@ -16,7 +16,12 @@ import {
   seededRoleRow,
   type TestRoleRow,
 } from '../../test/seeded-permission-resolver';
+import { BankEventsDeviceBindingService } from '../bank-events/bank-events-device-binding.service';
 import { RealtimeGateway } from './realtime.gateway';
+
+/** The phone-monitor's stable serial (SEC-004) — admitted unless a test says otherwise. */
+const MACHINE_SERIAL = '3f2c9a4e-8b1d-4c6f-9e2a-7d5b1c0e4f38';
+const bankEventsBinding = { admit: jest.fn() };
 
 /** The four built-in roles with their REAL seeded permission sets. */
 const SEEDED_ROWS: TestRoleRow[] = [
@@ -32,6 +37,7 @@ const SEEDED_ROWS: TestRoleRow[] = [
  */
 function accessProviders(rows: TestRoleRow[] = SEEDED_ROWS) {
   const events = new Subject<AccountAccessEvent>();
+  bankEventsBinding.admit.mockReset().mockResolvedValue(true);
   return {
     events,
     providers: [
@@ -43,6 +49,8 @@ function accessProviders(rows: TestRoleRow[] = SEEDED_ROWS) {
         provide: SessionRevocationService,
         useValue: { events: events.asObservable() },
       },
+      // SEC-004: the phone-monitor's device pin, checked on its handshake.
+      { provide: BankEventsDeviceBindingService, useValue: bankEventsBinding },
     ],
   };
 }
@@ -414,12 +422,16 @@ describe('RealtimeGateway — machine (phone-monitor) sockets', () => {
   let peakUsersService: { recordConcurrent: jest.Mock };
   let env: Record<string, string | undefined>;
 
-  function makeMachineSocket(id: string, machineToken: unknown): Socket {
+  function makeMachineSocket(
+    id: string,
+    machineToken: unknown,
+    deviceSerial: unknown = MACHINE_SERIAL,
+  ): Socket {
     return {
       id,
       data: {},
       handshake: {
-        auth: { machineToken, platform: 'phone-monitor' },
+        auth: { machineToken, platform: 'phone-monitor', deviceSerial },
         headers: {},
       },
       join: jest.fn().mockResolvedValue(undefined),
@@ -474,6 +486,37 @@ describe('RealtimeGateway — machine (phone-monitor) sockets', () => {
     await gateway.handleConnection(socket);
     expect(socket.disconnect).toHaveBeenCalledWith(true);
     expect(socket.join).not.toHaveBeenCalled();
+    // A wrong token never reaches the pin — it must not pin anything.
+    expect(bankEventsBinding.admit).not.toHaveBeenCalled();
+  });
+
+  it('SEC-004: admits the pinned monitor serial and disconnects a handshake without one (DEVICE_SERIAL_REQUIRED)', async () => {
+    const pinned = makeMachineSocket('m1', MACHINE_TOKEN);
+    await gateway.handleConnection(pinned);
+    expect(bankEventsBinding.admit).toHaveBeenCalledWith(MACHINE_SERIAL);
+    expect(pinned.join).toHaveBeenCalledWith('bank-monitors');
+
+    // `null` stands for a handshake without the key (an older monitor build):
+    // the gateway reads `auth.deviceSerial` and any non-serial value is the
+    // same refusal. (undefined would pick the fixture's default serial.)
+    for (const serial of [null, '', 'short', 42, 'x'.repeat(65)]) {
+      bankEventsBinding.admit.mockClear();
+      const socket = makeMachineSocket('m2', MACHINE_TOKEN, serial);
+      await gateway.handleConnection(socket);
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+      expect(socket.join).not.toHaveBeenCalled();
+      expect(bankEventsBinding.admit).not.toHaveBeenCalled();
+    }
+  });
+
+  it('SEC-004: disconnects a second monitor the pin refuses (DEVICE_SERIAL_REJECTED)', async () => {
+    bankEventsBinding.admit.mockResolvedValueOnce(false);
+    const socket = makeMachineSocket('m3', MACHINE_TOKEN, 'OTHER-MONITOR-01');
+    await gateway.handleConnection(socket);
+    expect(bankEventsBinding.admit).toHaveBeenCalledWith('OTHER-MONITOR-01');
+    expect(socket.disconnect).toHaveBeenCalledWith(true);
+    expect(socket.join).not.toHaveBeenCalled();
+    expect(socket.data.machine).toBeUndefined();
   });
 
   it('refuses every machine handshake while BANK_EVENTS_TOKEN is unset (ingestion off)', async () => {

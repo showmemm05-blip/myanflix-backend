@@ -102,6 +102,7 @@ export const RISK_REASONS = [
   'NO_BANK_TRANSACTION',
   'VELOCITY',
   'COUNTERPARTY_MISMATCH',
+  'NO_SCREENSHOT',
 ] as const;
 
 export type RiskReason = (typeof RISK_REASONS)[number];
@@ -110,7 +111,8 @@ export type RiskReason = (typeof RISK_REASONS)[number];
  * Deterministic weights. Hard reasons are the ones that cannot be honest
  * (or, for a payout, that could mean money went out twice); soft reasons
  * are "look at this" — a reused reference, an ambiguous transfer, a long
- * gap, a burst of submissions, silence from the bank.
+ * gap, a burst of submissions, silence from the bank, a bank event with no
+ * picture behind it yet.
  */
 export const RISK_REASON_WEIGHTS: Readonly<Record<RiskReason, number>> = {
   SHARED_REFERENCE_ACROSS_USERS: 70,
@@ -124,6 +126,7 @@ export const RISK_REASON_WEIGHTS: Readonly<Record<RiskReason, number>> = {
   NO_BANK_TRANSACTION: 30,
   VELOCITY: 20,
   COUNTERPARTY_MISMATCH: 20,
+  NO_SCREENSHOT: 20,
 };
 
 export const HARD_REASONS: ReadonlySet<RiskReason> = new Set<RiskReason>([
@@ -148,6 +151,14 @@ export const REFERENCE_TWIN_REASONS: readonly RiskReason[] = [
 export const PAYOUT_CODE_TWIN_REASONS: readonly RiskReason[] = [
   'DUPLICATE_PAYOUT_CODE',
 ];
+
+/**
+ * The class the screenshot upload clears (SEC-004): a deposit matched from
+ * a bank event that had no picture yet carries NO_SCREENSHOT, and the
+ * moment the phone's screenshot lands on the linked transaction exactly
+ * this class is swapped out — every other stored reason is kept.
+ */
+export const SCREENSHOT_REASONS: readonly RiskReason[] = ['NO_SCREENSHOT'];
 
 /** Read-time only — never stored, so nothing ever has to sweep it. */
 export const READ_TIME_ONLY_REASONS: ReadonlySet<RiskReason> =
@@ -249,7 +260,10 @@ export interface VerificationScore {
  *   any hard reason                  → SUSPICIOUS / by score
  *   only soft reasons                → PENDING_REVIEW / by score
  * MATCHED therefore requires every exact check to have passed AND an empty
- * reason list — exactly as decided with the owner.
+ * reason list — exactly as decided with the owner. Since SEC-004 a bank
+ * event with no screenshot behind it is a soft reason (NO_SCREENSHOT,
+ * screenshotReasons), so a deposit is never MATCHED / LOW on the phone's
+ * text alone: it waits in PENDING_REVIEW until the picture arrives.
  */
 export function scoreVerification(
   reasons: Iterable<string>,
@@ -406,6 +420,20 @@ export function counterpartyReasons(
   return counterpartyMatches(counterparty, name)
     ? []
     : ['COUNTERPARTY_MISMATCH'];
+}
+
+/**
+ * NO_SCREENSHOT — the bank event that claimed this deposit has no picture
+ * behind it (yet). Soft, never a block (SEC-004 / DB-015): with nothing but
+ * the phone-monitor's token a forged event used to end in MATCHED / LOW, so
+ * the green badge now waits for the screenshot. The upload clears the
+ * class (SCREENSHOT_REASONS); a bank app that blocks screenshots leaves
+ * the row in PENDING_REVIEW for a human to clear.
+ */
+export function screenshotReasons(
+  screenshotKey: string | null | undefined,
+): RiskReason[] {
+  return screenshotKey ? [] : ['NO_SCREENSHOT'];
 }
 
 // ---------------------------------------------------------------------------

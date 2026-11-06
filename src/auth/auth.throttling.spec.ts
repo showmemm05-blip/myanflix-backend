@@ -93,10 +93,20 @@ describe('Auth rate limiting', () => {
       }),
     );
     await app.init();
+    // Listening ONCE, on loopback. Handed a server that is not listening,
+    // supertest listens on a fresh ephemeral port for every single request
+    // and closes it afterwards — up to 301 listen/close cycles per test —
+    // and a request caught in that churn while a loaded runner pushed the
+    // test past its budget was the "socket hang up" of TEST-024. Every
+    // request below is awaited before afterEach closes the app, which is
+    // what releases the port.
+    await app.listen(0, '127.0.0.1');
   }
 
   afterEach(async () => {
-    await app.close();
+    // Optional so a boot() that threw cannot hide its error behind a
+    // TypeError from here.
+    await app?.close();
   });
 
   const otp = (phone: string, ip?: string) => {

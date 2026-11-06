@@ -74,6 +74,7 @@ describe('BankEventsService', () => {
       findUnique: jest.Mock;
       findMany: jest.Mock;
       updateMany: jest.Mock;
+      update: jest.Mock;
     };
     withdrawal: {
       findUnique: jest.Mock;
@@ -107,6 +108,8 @@ describe('BankEventsService', () => {
         findUnique: jest.fn().mockResolvedValue(null),
         findMany: jest.fn().mockResolvedValue([]),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        // The SEC-004 re-score after a screenshot lands (updateDepositRisk).
+        update: jest.fn().mockResolvedValue({}),
       },
       withdrawal: {
         findUnique: jest.fn().mockResolvedValue(null),
@@ -165,6 +168,10 @@ describe('BankEventsService', () => {
     it.each([
       ['UNSUPPORTED_CURRENCY', { currency: 'USD' }],
       ['LAST6_MISMATCH', { txCodeLast6: 'AB12CE' }],
+      // DB-020: at or above 10^10 the Decimal(12,2) insert would overflow
+      // into `error`, which the phone retries for ever; `rejected` is final.
+      ['AMOUNT_OUT_OF_RANGE', { amount: 10_000_000_000 }],
+      ['AMOUNT_OUT_OF_RANGE', { amount: 12_345_678_901.5 }],
     ])('rejects %s and stores nothing', async (reason, overrides) => {
       const { results } = await service.processBatch({
         events: [event(overrides)],
@@ -174,6 +181,14 @@ describe('BankEventsService', () => {
       ]);
       expect(prisma.$transaction).not.toHaveBeenCalled();
       expect(prisma.bankTransaction.create).not.toHaveBeenCalled();
+    });
+
+    it('still stores an amount of exactly the Decimal(12,2) ceiling, 9 999 999 999.99', async () => {
+      const { results } = await service.processBatch({
+        events: [event({ amount: 9_999_999_999.99 })],
+      });
+      expect(results[0].outcome).toBe('stored_unmatched');
+      expect(prisma.bankTransaction.create).toHaveBeenCalledTimes(1);
     });
 
     it('rejects an unknown or inactive payment account', async () => {
@@ -392,14 +407,23 @@ describe('BankEventsService', () => {
       });
     });
 
-    it('stores, claims the open deposit by last-6, links both ways, and pushes the deposit + the transaction only after the transaction', async () => {
+    /**
+     * One open deposit for the event's last-6, as Q1 returns it, and the
+     * matched row as the after-commit push reads it back. `screenshotKey`
+     * is what the stored transaction holds when the event is processed —
+     * since SEC-004 that decides MATCHED vs PENDING_REVIEW (NO_SCREENSHOT).
+     */
+    function armClaim(screenshotKey: string | null) {
+      // Submitted 30 s after the bank's time (storedRow: now − 60 s), so no
+      // timing reason gets in the way of the verdict under test.
+      const submittedAt = new Date(Date.now() - 30_000);
       prisma.$queryRaw.mockResolvedValueOnce([
         {
           id: 'dep-1',
           userId: 'user-1',
           amount: '50000.00',
           reference: 'AB12CD',
-          createdAt: '2026-09-18T09:01:00.000Z',
+          createdAt: submittedAt.toISOString(),
           declaredTransferAt: null,
           matchStatus: 'UNVERIFIED',
           riskLevel: null,
@@ -409,18 +433,18 @@ describe('BankEventsService', () => {
       const full = {
         id: 'dep-1',
         status: 'PENDING',
-        createdAt: new Date('2026-09-18T09:01:00.000Z'),
+        createdAt: submittedAt,
         bankCheckedAt: new Date(),
-        matchStatus: 'MATCHED',
+        matchStatus: screenshotKey ? 'MATCHED' : 'PENDING_REVIEW',
         riskLevel: 'LOW',
-        riskReasons: [],
+        riskReasons: screenshotKey ? [] : ['NO_SCREENSHOT'],
         // A real Prisma row carries Decimals; the audit snapshot reads them.
         amount: new Prisma.Decimal(50000),
         receivingAmount: new Prisma.Decimal(50000),
         receivingTransactionCode: 'AB12CD',
         receivingTransactionAt: new Date('2026-09-18T09:00:00.000Z'),
-        receivingScreenshotKey: null,
-        bankTransaction: { id: 'tx-1' },
+        receivingScreenshotKey: screenshotKey,
+        bankTransaction: { id: 'tx-1', deviceSerial: 'PIXEL10' },
       };
       (prisma.deposit as Record<string, jest.Mock>).findUniqueOrThrow = jest
         .fn()
@@ -437,6 +461,9 @@ describe('BankEventsService', () => {
               : [],
           ),
       );
+      prisma.bankTransaction.create.mockResolvedValue(
+        storedRow({ screenshotKey }),
+      );
       prisma.bankTransaction.findUnique.mockImplementation(
         (args: { where: Record<string, unknown> }) =>
           Promise.resolve(
@@ -445,10 +472,15 @@ describe('BankEventsService', () => {
                   state: 'MATCHED',
                   linkedDepositId: 'dep-1',
                   matchedAt: new Date(),
+                  screenshotKey,
                 })
               : null,
           ),
       );
+    }
+
+    it('stores, claims the open deposit by last-6, links both ways, and pushes the deposit + the transaction only after the transaction — PENDING_REVIEW (NO_SCREENSHOT) while the phone has sent no picture (SEC-004)', async () => {
+      armClaim(null);
 
       const { results } = await service.processBatch({ events: [event()] });
 
@@ -457,8 +489,19 @@ describe('BankEventsService', () => {
         transactionId: 'tx-1',
         state: 'MATCHED',
         depositId: 'dep-1',
+        matchStatus: 'PENDING_REVIEW',
         screenshotWanted: true,
       });
+      expect(prisma.deposit.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'dep-1', status: 'PENDING', bankCheckedAt: null },
+          data: expect.objectContaining({
+            matchStatus: 'PENDING_REVIEW',
+            riskLevel: 'LOW',
+            riskReasons: ['NO_SCREENSHOT'],
+          }),
+        }),
+      );
       expect(prisma.bankTransaction.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
@@ -472,10 +515,12 @@ describe('BankEventsService', () => {
       ).toHaveBeenCalledWith(
         expect.objectContaining({
           id: 'dep-1',
-          matchStatus: 'MATCHED',
+          matchStatus: 'PENDING_REVIEW',
+          riskReasons: ['NO_SCREENSHOT'],
           hasBankScreenshot: false,
           receivingTransactionCode: 'AB12CD',
           bankTransactionId: 'tx-1',
+          bankDeviceSerial: 'PIXEL10',
         }),
       );
       expect(gateway.notifyAdminsBankTransactionCreated).toHaveBeenCalledWith(
@@ -484,6 +529,43 @@ describe('BankEventsService', () => {
           state: 'MATCHED',
           view: 'MATCHED',
           linkedDepositId: 'dep-1',
+        }),
+      );
+    });
+
+    it('a re-posted event whose screenshot is already stored claims the open deposit as MATCHED / LOW straight away', async () => {
+      const objectKey = `documents/bank-screenshots/transactions/tx-1/${KEY}.png`;
+      armClaim(objectKey);
+      // The key was stored by an earlier post (the screenshot arrived before
+      // the deposit); the matcher re-runs on the stored, still-UNMATCHED row.
+      prisma.bankTransaction.findUnique.mockImplementationOnce(() =>
+        Promise.resolve(storedRow({ screenshotKey: objectKey })),
+      );
+
+      const { results } = await service.processBatch({ events: [event()] });
+
+      expect(results[0]).toMatchObject({
+        outcome: 'matched',
+        matchStatus: 'MATCHED',
+        screenshotWanted: false,
+      });
+      expect(prisma.deposit.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            receivingScreenshotKey: objectKey,
+            matchStatus: 'MATCHED',
+            riskLevel: 'LOW',
+            riskReasons: [],
+          }),
+        }),
+      );
+      expect(
+        gateway.notifyAdminsDepositVerificationUpdated,
+      ).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'dep-1',
+          matchStatus: 'MATCHED',
+          hasBankScreenshot: true,
         }),
       );
     });
@@ -585,7 +667,7 @@ describe('BankEventsService', () => {
       );
     });
 
-    it('propagates the SAME key onto the linked deposit (guarded, audited) and pushes the deposit too', async () => {
+    it('propagates the SAME key onto the linked deposit (guarded, audited), clears NO_SCREENSHOT → MATCHED / LOW (SEC-004, audited risk_update) and pushes the deposit too', async () => {
       prisma.bankTransaction.findUnique
         .mockResolvedValueOnce(
           storedRow({ state: 'MATCHED', linkedDepositId: 'dep-1' }),
@@ -597,6 +679,18 @@ describe('BankEventsService', () => {
             screenshotKey: objectKey,
           }),
         );
+      // The deposit was claimed on the phone's text alone and is waiting.
+      prisma.deposit.findUnique.mockResolvedValueOnce({
+        id: 'dep-1',
+        userId: 'user-1',
+        amount: new Prisma.Decimal(50000),
+        reference: 'AB12CD',
+        status: 'PENDING',
+        bankCheckedAt: new Date(),
+        matchStatus: 'PENDING_REVIEW',
+        riskLevel: 'LOW',
+        riskReasons: ['NO_SCREENSHOT'],
+      });
       prisma.deposit.findMany.mockResolvedValue([
         {
           id: 'dep-1',
@@ -610,7 +704,7 @@ describe('BankEventsService', () => {
           receivingTransactionCode: 'AB12CD',
           receivingTransactionAt: new Date(),
           receivingScreenshotKey: objectKey,
-          bankTransaction: { id: 'tx-1' },
+          bankTransaction: { id: 'tx-1', deviceSerial: 'PIXEL10' },
         },
       ]);
 
@@ -628,11 +722,84 @@ describe('BankEventsService', () => {
           target: { type: 'deposit', id: 'dep-1' },
         }),
       );
+      // The picture is here: the row earns its green badge, in the same
+      // transaction, and the change is audited with its trigger.
+      expect(prisma.deposit.update).toHaveBeenCalledWith({
+        where: { id: 'dep-1' },
+        data: {
+          matchStatus: 'MATCHED',
+          riskLevel: 'LOW',
+          riskReasons: [],
+        },
+      });
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'deposit.risk_update',
+          actor: null,
+          target: { type: 'deposit', id: 'dep-1' },
+          before: expect.objectContaining({
+            matchStatus: 'PENDING_REVIEW',
+            riskReasons: ['NO_SCREENSHOT'],
+          }),
+          after: { matchStatus: 'MATCHED', riskLevel: 'LOW', riskReasons: [] },
+          metadata: expect.objectContaining({
+            trigger: 'screenshot_attach',
+            bankTransactionId: 'tx-1',
+            deviceSerial: 'PIXEL10',
+          }),
+          tx: prisma,
+        }),
+      );
       expect(
         gateway.notifyAdminsDepositVerificationUpdated,
       ).toHaveBeenCalledWith(
-        expect.objectContaining({ id: 'dep-1', hasBankScreenshot: true }),
+        expect.objectContaining({
+          id: 'dep-1',
+          hasBankScreenshot: true,
+          matchStatus: 'MATCHED',
+          bankDeviceSerial: 'PIXEL10',
+        }),
       );
+    });
+
+    it('the picture clears only its own class: a hard reason keeps the row SUSPICIOUS after the upload', async () => {
+      prisma.bankTransaction.findUnique
+        .mockResolvedValueOnce(
+          storedRow({ state: 'MATCHED', linkedDepositId: 'dep-1' }),
+        )
+        .mockResolvedValueOnce(
+          storedRow({
+            state: 'MATCHED',
+            linkedDepositId: 'dep-1',
+            screenshotKey: objectKey,
+          }),
+        );
+      // AMOUNT_MISMATCH + NO_SCREENSHOT: the picture clears only its own
+      // class — the hard reason keeps the row SUSPICIOUS.
+      prisma.deposit.findUnique.mockResolvedValueOnce({
+        id: 'dep-1',
+        userId: 'user-1',
+        amount: new Prisma.Decimal(50000),
+        reference: 'AB12CD',
+        status: 'PENDING',
+        bankCheckedAt: new Date(),
+        matchStatus: 'SUSPICIOUS',
+        riskLevel: 'HIGH',
+        riskReasons: ['AMOUNT_MISMATCH', 'NO_SCREENSHOT'],
+      });
+
+      await expect(
+        service.attachTransactionScreenshot('tx-1', dto, file(PNG)),
+      ).resolves.toEqual({ uploaded: true });
+
+      expect(prisma.deposit.update).toHaveBeenCalledWith({
+        where: { id: 'dep-1' },
+        data: {
+          matchStatus: 'SUSPICIOUS',
+          riskLevel: 'HIGH',
+          riskReasons: ['AMOUNT_MISMATCH'],
+        },
+      });
     });
 
     it('mirrors onto a linked withdrawal with the transfer* column', async () => {
@@ -681,7 +848,13 @@ describe('BankEventsService', () => {
         `documents/bank-screenshots/transactions/tx-1/${KEY}.png`,
         PNG,
       );
-      expect(prisma.deposit.findUnique).not.toHaveBeenCalled();
+      // Never the legacy per-row lookup (the one that selects the row's own
+      // event key); the only deposit read is the SEC-004 re-score by id.
+      for (const [args] of prisma.deposit.findUnique.mock.calls as [
+        { select?: Record<string, unknown> },
+      ][]) {
+        expect(args.select).not.toHaveProperty('receivingEventKey');
+      }
     });
 
     it('falls back to the pre-bank_transactions behaviour for a key with no stored row: 404 / 409 / per-row key', async () => {

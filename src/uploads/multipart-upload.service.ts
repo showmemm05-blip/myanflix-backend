@@ -10,6 +10,7 @@ import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { MinioService } from '../common/storage/minio.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
+  AD_RESOURCE_TYPE,
   MOVIE_REPLACE_RESOURCE_TYPE,
   ResourceUploadTypeRegistry,
 } from './resource-upload-type.registry';
@@ -45,11 +46,16 @@ type UploadedPart = { partNumber: number; etag: string; size: number };
 function auditActionFor(
   resourceType: string,
   step: 'presign' | 'multipart',
-): { action: AuditAction; targetType: 'movie' | 'book' } {
+): {
+  action: AuditAction;
+  targetType: 'movie' | 'book' | 'advertisement';
+} {
   const family =
     resourceType === 'movie' || resourceType === MOVIE_REPLACE_RESOURCE_TYPE
       ? 'movie'
-      : 'book';
+      : resourceType === AD_RESOURCE_TYPE
+        ? 'advertisement'
+        : 'book';
   return {
     action: `${family}.upload_${step}` as AuditAction,
     targetType: family,

@@ -8,6 +8,7 @@ import { requestHostContext } from '../../common/storage/request-host.context';
 import {
   CreatePaymentMethodTypeDto,
   isOwnUploadedImageUrl,
+  ownUploadedImagePurpose,
 } from './create-payment-method-type.dto';
 import { UpdatePaymentMethodTypeDto } from './update-payment-method-type.dto';
 
@@ -156,6 +157,28 @@ describe('logoUrl is validated as one of our uploaded images (create and update 
       isOwnUploadedImageUrl:
         'logoUrl must be the URL of an image uploaded through POST /uploads/image',
     });
+  });
+
+  it('ownUploadedImagePurpose names the purpose folder of an own upload, null otherwise', () => {
+    expect(
+      ownUploadedImagePurpose(
+        'http://192.168.1.5:8080/movies/images/lottery_frame/f.png',
+      ),
+    ).toBe('lottery_frame');
+    expect(
+      ownUploadedImagePurpose(
+        'http://192.168.1.5:8080/movies/images/payment/kbz.png',
+      ),
+    ).toBe('payment');
+    for (const value of [
+      'http://192.168.1.5:8080/movies/images/poster/kbz.png',
+      'https://evil.example/beacon.gif',
+      'http://192.168.1.5:8080/movies/images/payment/',
+      null,
+      42,
+    ]) {
+      expect(ownUploadedImagePurpose(value)).toBeNull();
+    }
   });
 
   it('honours a non-default MINIO_BUCKET the same way MinioService does', () => {

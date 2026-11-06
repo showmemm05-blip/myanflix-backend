@@ -95,6 +95,28 @@ export const SYSTEM_ROLE_SEEDS: SystemRoleSeed[] = [
       // day-to-day operations, like subscription plans.
       'HOME.VIEW',
       'HOME.MANAGE',
+      // Added by the advertisements migration (2026-11-04).
+      'ADS.VIEW',
+      'ADS.MANAGE',
+      // Added by the `lottery_dreams` migration, which INSERTs exactly these
+      // two rows for this role — the dream books are day-to-day operations
+      // too.
+      'LOTTERY.VIEW',
+      'LOTTERY.DREAMS_MANAGE',
+      // Added by the `lottery_draws` migration, which INSERTs exactly these
+      // two rows for this role — draws and prices are day-to-day
+      // operations like deposits and subscription plans.
+      'LOTTERY.DRAWS_MANAGE',
+      'LOTTERY.SETTINGS_MANAGE',
+      // Added by the `lottery_results` migration, which INSERTs exactly
+      // this one row for this role — fetching, entering and publishing a
+      // draw's results is day-to-day operations like approving a
+      // withdrawal.
+      'LOTTERY.RESULTS_PUBLISH',
+      // Added by the `lottery_claims` migration, which INSERTs exactly this
+      // one row for this role — confirming a customer's prize claim (the
+      // wallet credit) is day-to-day operations like approving a deposit.
+      'LOTTERY.CLAIMS_CONFIRM',
     ],
   },
   {
