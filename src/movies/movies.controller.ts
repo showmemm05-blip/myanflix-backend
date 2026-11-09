@@ -127,6 +127,10 @@ export class MoviesController {
    * the runtime the uploader probed from the bundle, when it could), status
    * UPLOADING. Everything else is filled in later via PUT /movies/:id once
    * the upload finishes and the admin edits it.
+   *
+   * With `sourceName` (the raw folder name) a standalone movie is born with
+   * the name and year read out of it, so the `title` in the response can
+   * differ from the one that was sent — the admin shows the returned one.
    */
   @Post('upload-placeholder')
   @UseGuards(PermissionsGuard)
@@ -144,7 +148,7 @@ export class MoviesController {
             episodeNumber: dto.episodeNumber!,
           }
         : undefined,
-      { duration: dto.duration },
+      { duration: dto.duration, sourceName: dto.sourceName },
       user,
     );
     return MovieResponseDto.fromEntity(movie, this.resolveImageUrl);

@@ -198,6 +198,23 @@ enum AgeRating {
   NC17
 }
 
+/// Where a standalone movie stands with its TMDB details lookup (2026-11-06).
+/// NONE = never looked up (every row that predates the feature, every
+/// episode, and every upload made while TMDB_API_KEY is missing). PENDING =
+/// a lookup is running in the background. MATCHED = linked to one TMDB entry
+/// and filled. NEEDS_PICK = several candidates, staff choose in Ready to
+/// publish. NOT_FOUND = TMDB had nothing. FAILED = the lookup could not
+/// finish (the reason is in Movie.tmdbError). It never touches Movie.status:
+/// nothing is published by a lookup.
+enum TmdbLookupStatus {
+  NONE
+  PENDING
+  MATCHED
+  NEEDS_PICK
+  NOT_FOUND
+  FAILED
+}
+
 enum TransactionStatus {
   PENDING
   COMPLETED
@@ -686,9 +703,13 @@ model BankEventsBinding {
 /// streaming) is keyed on movieId, and an episode needs every bit of it
 /// unchanged. Series-ness is purely additive metadata on top.
 model Movie {
-  id            String      @id @default(uuid())
+  id            String           @id @default(uuid())
   title         String
   description   String
+  /// Burmese description, typed by staff (2026-11-06). Null = none; the
+  /// clients fall back to `description`, which stays the English / default
+  /// text. Episodes are Movie rows, so they carry it too.
+  descriptionMm String?
   posterUrl     String?
   coverUrl      String?
   thumbnailUrl  String?
@@ -696,7 +717,7 @@ model Movie {
   language      String
   releaseYear   Int
   duration      Int // minutes
-  rating        Float       @default(0)
+  rating        Float            @default(0)
   /// Optional catalog metadata added for the filter system (2026-09). All
   /// three are nullable — existing rows simply have no value, the admin
   /// forms treat them as optional, and the filter UI for each auto-hides
@@ -711,14 +732,32 @@ model Movie {
   /// For an episode (seriesId set), this is vestigial and never consulted —
   /// access is always inherited from the parent series' own accessType, the
   /// same way isPremium used to be inherited before this field existed.
-  accessType    AccessType  @default(SUBSCRIPTION)
-  status        MovieStatus @default(DRAFT)
+  accessType    AccessType       @default(SUBSCRIPTION)
+  status        MovieStatus      @default(DRAFT)
   /// Set only for episodes — null means a standalone movie.
   seriesId      String?
   seasonNumber  Int?
   episodeNumber Int?
-  createdAt     DateTime    @default(now())
-  updatedAt     DateTime    @updatedAt
+  /// Raw folder name of the bulk upload this title came from, kept so staff
+  /// can see what the TMDB search started from. Staff-only: never part of
+  /// MovieResponseDto. Null for episodes and for rows made any other way.
+  sourceName    String?
+  /// TMDB movie id this title is linked to. Null = not linked. Episodes:
+  /// always null (they are not looked up).
+  tmdbId        Int?
+  tmdbStatus    TmdbLookupStatus @default(NONE)
+  /// Why the last lookup FAILED: unreachable | rate_limited | key_rejected |
+  /// interrupted | internal. Null in every other status.
+  tmdbError     String?
+  /// When TMDB data was last fetched for this title (TMDB's terms forbid
+  /// keeping its data longer than 6 months).
+  tmdbFetchedAt DateTime?
+  /// The last value written automatically, per field, so a refill can tell
+  /// "still what TMDB put there" from "changed by staff" — shape in
+  /// docs/movie-details-tmdb-2026-11-06/PLAN.md 4.3. Staff-only.
+  tmdbAuto      Json?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
 
   categories             Category[]
   actors                 Actor[]
@@ -742,9 +781,13 @@ model Movie {
   /// renders as-is. Reads `limit` entries and stops instead of sorting the
   /// whole catalogue (and its episodes) on every page.
   @@index([status, createdAt(sort: Desc), id(sort: Desc)], map: "movies_standalone_recent_idx", where: raw("\"seriesId\" IS NULL"))
-  // Search-box indexes (ILIKE '%term%' via pg_trgm) — see migration 20261103090000.
+  /// "Which of our titles already uses this TMDB entry" (the pick-a-match list).
+  @@index([tmdbId])
+  // Search-box indexes (ILIKE '%term%' via pg_trgm) — see migration 20261103090000
+  // (descriptionMm: 20261106120000).
   @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "movies_title_trgm_idx")
   @@index([description(ops: raw("gin_trgm_ops"))], type: Gin, map: "movies_description_trgm_idx")
+  @@index([descriptionMm(ops: raw("gin_trgm_ops"))], type: Gin, map: "movies_description_mm_trgm_idx")
   @@map("movies")
 }
 
@@ -754,28 +797,39 @@ model Movie {
 /// path can ever orphan an episode into the standalone movies list. Storage
 /// cleanup for those episodes lives in SeriesService.remove().
 model Series {
-  id          String       @id @default(uuid())
-  title       String
-  description String
-  posterUrl   String?
-  coverUrl    String?
-  genre       String
-  language    String
+  id            String       @id @default(uuid())
+  title         String
+  description   String
+  /// Burmese description, typed by staff — same rule as Movie.descriptionMm.
+  descriptionMm String?
+  posterUrl     String?
+  coverUrl      String?
+  genre         String
+  language      String
   /// The series TYPE — the same words as Movie.country, shown as "Korean
   /// series". Null = not set. Episodes do not copy it: they follow the show.
-  country     String?
-  releaseYear Int
+  country       String?
+  releaseYear   Int
   /// Admin-set 0–10 rating, same meaning as Movie.rating: 0 = not rated yet.
-  rating      Float        @default(0)
+  rating        Float        @default(0)
   /// The whole show is one product — episodes are never gated individually;
   /// this accessType governs every season and episode, including ones added
   /// later. An episode's own Movie.accessType is never consulted.
-  accessType  AccessType   @default(SUBSCRIPTION)
+  accessType    AccessType   @default(SUBSCRIPTION)
   /// Show-level visibility: regular users only ever see PUBLISHED series.
   /// New series start DRAFT and go live only via an explicit admin publish.
-  status      SeriesStatus @default(DRAFT)
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
+  status        SeriesStatus @default(DRAFT)
+  /// TMDB TV id this show is linked to. Null = not linked. Staff-only, like
+  /// the two columns below: all three are removed from every series
+  /// response (toSeriesResponse). No status column — a show's lookup is
+  /// always started by staff and answered in the same request.
+  tmdbId        Int?
+  /// When TMDB data was last fetched for this show (the 6-month term).
+  tmdbFetchedAt DateTime?
+  /// The last value written automatically, per field — see Movie.tmdbAuto.
+  tmdbAuto      Json?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
 
   episodes   Movie[]
   categories Category[]
@@ -788,9 +842,13 @@ model Series {
 
   // Ends in id to match every series list order ([createdAt desc, id desc]).
   @@index([status, createdAt(sort: Desc), id(sort: Desc)])
-  // Search-box indexes (ILIKE '%term%' via pg_trgm) — see migration 20261103090000.
+  /// "Do we already have this TMDB show" (creating a series from TMDB).
+  @@index([tmdbId])
+  // Search-box indexes (ILIKE '%term%' via pg_trgm) — see migration 20261103090000
+  // (descriptionMm: 20261106120000).
   @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "series_title_trgm_idx")
   @@index([description(ops: raw("gin_trgm_ops"))], type: Gin, map: "series_description_trgm_idx")
+  @@index([descriptionMm(ops: raw("gin_trgm_ops"))], type: Gin, map: "series_description_mm_trgm_idx")
   @@map("series")
 }
 
@@ -834,14 +892,18 @@ model Category {
 /// implicit join, so it can never drift from the truth the way a cached
 /// counter does.
 model Actor {
-  id        String   @id @default(uuid())
-  name      String   @unique
+  id           String   @id @default(uuid())
+  name         String   @unique
   /// Headshot, persisted as an absolute URL like Movie.posterUrl (and
   /// re-hosted per request through MinioService.imageUrl). Optional: a cast
   /// list is useful before anyone has found photographs for it.
-  imageUrl  String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  imageUrl     String?
+  /// TMDB person id, set when the actor was matched to or created by a TMDB
+  /// fill (2026-11-06). Unique, so one TMDB person is one Actor row; null for
+  /// every actor staff typed by hand. Staff-only: not in ActorResponseDto.
+  tmdbPersonId Int?     @unique
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
   movies Movie[]
   series Series[]

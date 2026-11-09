@@ -3,6 +3,7 @@ import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { AccessType, MovieStatus } from '../../generated/prisma/client';
 import { CreateMovieDto } from './create-movie.dto';
+import { CreateUploadPlaceholderDto } from './create-upload-placeholder.dto';
 import { UpdateMovieDto } from './update-movie.dto';
 
 /**
@@ -87,5 +88,121 @@ describe('UpdateMovieDto — rating', () => {
     const instance = plainToInstance(UpdateMovieDto, { title: 'T' });
     expect(instance.rating).toBeUndefined();
     expect(await validate(instance)).toHaveLength(0);
+  });
+});
+
+/**
+ * One description per language (owner, 2026-11-06). The DTOs only bound the
+ * two texts; "at least one of them" is the service's rule, because on an
+ * update it depends on what the row already holds.
+ */
+describe('CreateMovieDto / UpdateMovieDto — the description in each language', () => {
+  const required = {
+    title: 'T',
+    genre: 'Drama',
+    language: 'en',
+    releaseYear: 2024,
+    duration: 100,
+  };
+  const problems = async (dto: object) =>
+    (await validate(dto)).map((error) => error.property);
+
+  it('create accepts both texts, and a Burmese-only title (an empty English text)', async () => {
+    expect(
+      await problems(
+        plainToInstance(CreateMovieDto, {
+          ...required,
+          description: 'A thief.',
+          descriptionMm: 'သူခိုးတစ်ယောက်',
+        }),
+      ),
+    ).toEqual([]);
+    expect(
+      await problems(
+        plainToInstance(CreateMovieDto, {
+          ...required,
+          description: '',
+          descriptionMm: 'သူခိုးတစ်ယောက်',
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('create still needs the description field itself — it may be empty, not missing', async () => {
+    expect(await problems(plainToInstance(CreateMovieDto, required))).toEqual([
+      'description',
+    ]);
+  });
+
+  it('descriptionMm is optional, and "" is accepted so the box can be cleared', async () => {
+    expect(
+      await problems(plainToInstance(UpdateMovieDto, { descriptionMm: '' })),
+    ).toEqual([]);
+    expect(await problems(plainToInstance(UpdateMovieDto, {}))).toEqual([]);
+    expect(
+      plainToInstance(UpdateMovieDto, { title: 'T' }).descriptionMm,
+    ).toBeUndefined();
+  });
+
+  it('update accepts an empty English description (the Burmese one may be the only one)', async () => {
+    expect(
+      await problems(plainToInstance(UpdateMovieDto, { description: '' })),
+    ).toEqual([]);
+  });
+
+  it.each(['description', 'descriptionMm'])(
+    '%s takes 4000 characters and refuses 4001',
+    async (field) => {
+      expect(
+        await problems(
+          plainToInstance(UpdateMovieDto, { [field]: 'မ'.repeat(4000) }),
+        ),
+      ).toEqual([]);
+      expect(
+        await problems(
+          plainToInstance(UpdateMovieDto, { [field]: 'မ'.repeat(4001) }),
+        ),
+      ).toEqual([field]);
+    },
+  );
+
+  it.each([42, ['x'], { text: 'x' }])(
+    'refuses a descriptionMm that is not text (%p)',
+    async (descriptionMm) => {
+      expect(
+        await problems(plainToInstance(UpdateMovieDto, { descriptionMm })),
+      ).toEqual(['descriptionMm']);
+    },
+  );
+});
+
+describe('CreateUploadPlaceholderDto — the folder name', () => {
+  const problems = async (body: object) =>
+    (await validate(plainToInstance(CreateUploadPlaceholderDto, body))).map(
+      (error) => error.property,
+    );
+
+  it('is optional — an admin build that predates it sends only the title', async () => {
+    expect(await problems({ title: 'Inception 2010' })).toEqual([]);
+  });
+
+  it('accepts a raw folder name of up to 255 characters, dots and brackets included', async () => {
+    expect(
+      await problems({
+        title: 'Inception 2010 1080p BluRay x264 YIFY',
+        sourceName: 'Inception.2010.1080p.BluRay.x264-[YIFY]',
+      }),
+    ).toEqual([]);
+    expect(await problems({ title: 'T', sourceName: 'x'.repeat(255) })).toEqual(
+      [],
+    );
+  });
+
+  it.each([
+    ['256 characters', 'x'.repeat(256)],
+    ['a number', 2010],
+    ['a list', ['Inception']],
+  ])('refuses %s', async (_what, sourceName) => {
+    expect(await problems({ title: 'T', sourceName })).toEqual(['sourceName']);
   });
 });

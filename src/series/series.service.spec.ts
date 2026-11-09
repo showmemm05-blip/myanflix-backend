@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { NotFoundException } from '@nestjs/common';
+import { Logger, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   SeriesService,
@@ -9,6 +9,7 @@ import {
   seriesSearchOr,
 } from './series.service';
 import { SeriesSort } from './dto/series-query.dto';
+import { DESCRIPTION_REQUIRED_CODE } from '../movies/description-languages';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
@@ -49,6 +50,7 @@ describe('SeriesService', () => {
 
   let minioService: {
     imageUrl: jest.Mock;
+    canonicalImageUrl: jest.Mock;
     keyFromPublicUrl: jest.Mock;
     deleteByPrefix: jest.Mock;
     deleteObject: jest.Mock;
@@ -65,6 +67,9 @@ describe('SeriesService', () => {
         const match = /\/movies\/(.+)$/.exec(url);
         return match ? `http://current-host:8080/movies/${match[1]}` : url;
       }),
+      // What is stored is what was sent; the real canonical form is proven
+      // in minio.service.spec.ts.
+      canonicalImageUrl: jest.fn((url: string | null) => url),
       // Mirrors the real keyFromPublicUrl(): recovers the object key from a
       // URL under our bucket, null for anything external.
       keyFromPublicUrl: jest.fn((url: string) => {
@@ -803,6 +808,398 @@ describe('SeriesService', () => {
     });
   });
 
+  /**
+   * A series response is the stored row passed through, and guests read it.
+   * The TMDB bookkeeping is staff-only (read through the /tmdb routes), so
+   * it must be gone from EVERY path that returns a show.
+   */
+  describe('series responses never carry tmdbId, tmdbFetchedAt or tmdbAuto', () => {
+    const linked = {
+      id: 'series-1',
+      title: 'Stranger Things',
+      description: 'A town.',
+      descriptionMm: 'မြို့ငယ်လေးတစ်မြို့',
+      status: SeriesStatus.PUBLISHED,
+      posterUrl: null,
+      coverUrl: null,
+      tmdbId: 66732,
+      tmdbFetchedAt: new Date('2026-11-06T00:00:00.000Z'),
+      tmdbAuto: { v: 1, title: 'Stranger Things', releaseYear: 2016 },
+      categories: [],
+      actors: [],
+    };
+    const expectNoTmdb = (response: object) => {
+      expect(response).not.toHaveProperty('tmdbId');
+      expect(response).not.toHaveProperty('tmdbFetchedAt');
+      expect(response).not.toHaveProperty('tmdbAuto');
+      expect(Object.keys(response).filter((key) => /tmdb/i.test(key))).toEqual(
+        [],
+      );
+      // What a client does read is still there.
+      expect(response).toMatchObject({
+        id: 'series-1',
+        title: 'Stranger Things',
+        description: 'A town.',
+        descriptionMm: 'မြို့ငယ်လေးတစ်မြို့',
+      });
+    };
+
+    it('the list (guests, users and staff alike)', async () => {
+      prisma.series.findMany.mockResolvedValue([
+        { ...linked, _count: { episodes: 8 } },
+      ]);
+      prisma.series.count.mockResolvedValue(1);
+
+      for (const role of [Role.USER, Role.ADMIN]) {
+        const { items } = await service.findAll({}, role);
+        expectNoTmdb(items[0]);
+        expect(items[0].episodeCount).toBe(8);
+      }
+    });
+
+    it('the relevance-sorted list', async () => {
+      prisma.series.count.mockResolvedValueOnce(1).mockResolvedValueOnce(0);
+      prisma.series.findMany.mockResolvedValue([
+        { ...linked, _count: { episodes: 8 } },
+      ]);
+
+      const { items } = await service.findAll(
+        { search: 'stranger', sort: SeriesSort.RELEVANCE },
+        Role.USER,
+      );
+
+      expectNoTmdb(items[0]);
+    });
+
+    it('the detail a viewer opens, and the one staff open', async () => {
+      prisma.series.findUnique.mockResolvedValue(linked);
+
+      expectNoTmdb(
+        await service.getForViewer('series-1', undefined, Role.USER),
+      );
+      expectNoTmdb(await service.findByIdOrThrow('series-1'));
+    });
+
+    it('the row create returns', async () => {
+      prisma.series.create.mockResolvedValue(linked);
+
+      expectNoTmdb(
+        await service.create(
+          {
+            title: 'Stranger Things',
+            description: 'A town.',
+            genre: 'Drama',
+            language: 'English',
+            releaseYear: 2016,
+          },
+          ACTOR,
+        ),
+      );
+    });
+
+    it('the row update returns', async () => {
+      prisma.series.findUnique.mockResolvedValue(linked);
+      prisma.series.update.mockResolvedValue(linked);
+
+      expectNoTmdb(
+        await service.update('series-1', { title: 'Stranger Things' }, ACTOR),
+      );
+    });
+
+    it('the row publish / unpublish returns', async () => {
+      prisma.series.findUnique.mockResolvedValue({
+        ...linked,
+        status: SeriesStatus.DRAFT,
+      });
+      prisma.series.update.mockResolvedValue(linked);
+
+      expectNoTmdb(
+        await service.updateStatus('series-1', SeriesStatus.PUBLISHED, ACTOR),
+      );
+    });
+
+    it('never changes the stored row it was given', async () => {
+      const row = { ...linked };
+      prisma.series.findUnique.mockResolvedValue(row);
+
+      await service.findByIdOrThrow('series-1');
+
+      expect(row.tmdbId).toBe(66732);
+      expect(row.tmdbAuto).toEqual(linked.tmdbAuto);
+    });
+  });
+
+  describe('create / update — the description in each language', () => {
+    const row = {
+      id: 'series-1',
+      title: 'A Show',
+      description: 'A town.',
+      descriptionMm: null as string | null,
+      status: SeriesStatus.DRAFT,
+      posterUrl: null,
+      coverUrl: null,
+      categories: [],
+      actors: [],
+    };
+    const base = {
+      title: 'A Show',
+      genre: 'Drama',
+      language: 'English',
+      releaseYear: 2016,
+    };
+    const createData = () =>
+      prisma.series.create.mock.calls[0][0].data as Record<string, unknown>;
+    const updateData = () =>
+      prisma.series.update.mock.calls[0][0].data as Record<string, unknown>;
+
+    beforeEach(() => {
+      prisma.series.create.mockResolvedValue(row);
+      prisma.series.update.mockResolvedValue(row);
+    });
+
+    it('create stores both texts as sent, and a Burmese-only show is allowed', async () => {
+      await service.create(
+        { ...base, description: 'A town.', descriptionMm: 'မြို့ငယ်လေး' },
+        ACTOR,
+      );
+      expect(createData()).toMatchObject({
+        description: 'A town.',
+        descriptionMm: 'မြို့ငယ်လေး',
+      });
+
+      prisma.series.create.mockClear();
+      await service.create(
+        { ...base, description: '', descriptionMm: 'မြို့ငယ်လေး' },
+        ACTOR,
+      );
+      expect(createData()).toMatchObject({
+        description: '',
+        descriptionMm: 'မြို့ငယ်လေး',
+      });
+    });
+
+    it.each(['', '   '])(
+      'create stores a blank Burmese description (%p) as NULL, so the clients fall back to English',
+      async (descriptionMm) => {
+        await service.create(
+          { ...base, description: 'A town.', descriptionMm },
+          ACTOR,
+        );
+        expect(createData().descriptionMm).toBeNull();
+      },
+    );
+
+    it('create without a Burmese description leaves the column to its default', async () => {
+      await service.create({ ...base, description: 'A town.' }, ACTOR);
+      expect(createData()).not.toHaveProperty('descriptionMm');
+    });
+
+    it.each([
+      ['neither given', { description: '' }],
+      ['both blank', { description: ' ', descriptionMm: '  ' }],
+    ])(
+      'create refuses a show with no description in either language (%s) and writes nothing',
+      async (_why, descriptions) => {
+        await expect(
+          service.create({ ...base, ...descriptions }, ACTOR),
+        ).rejects.toMatchObject({
+          code: DESCRIPTION_REQUIRED_CODE,
+          status: 400,
+        });
+        expect(prisma.series.create).not.toHaveBeenCalled();
+      },
+    );
+
+    it('update stores a blanked Burmese description as NULL', async () => {
+      prisma.series.findUnique.mockResolvedValue({
+        ...row,
+        descriptionMm: 'မြို့ငယ်လေး',
+      });
+
+      await service.update('series-1', { descriptionMm: '' }, ACTOR);
+
+      expect(updateData().descriptionMm).toBeNull();
+    });
+
+    it('update lets the English text be blanked while a Burmese one stays, or arrives in the same save', async () => {
+      prisma.series.findUnique.mockResolvedValue({
+        ...row,
+        descriptionMm: 'မြို့ငယ်လေး',
+      });
+      await service.update('series-1', { description: '' }, ACTOR);
+      expect(updateData()).toMatchObject({ description: '' });
+      expect(updateData()).not.toHaveProperty('descriptionMm');
+
+      prisma.series.update.mockClear();
+      prisma.series.findUnique.mockResolvedValue(row);
+      await service.update(
+        'series-1',
+        { description: '', descriptionMm: 'မြို့ငယ်လေး' },
+        ACTOR,
+      );
+      expect(updateData()).toMatchObject({
+        description: '',
+        descriptionMm: 'မြို့ငယ်လေး',
+      });
+    });
+
+    it.each([
+      [
+        'blanking the only description',
+        { description: 'A town.', descriptionMm: null },
+        { description: '' },
+      ],
+      [
+        'blanking the Burmese text of a Burmese-only show',
+        { description: '', descriptionMm: 'မြို့ငယ်လေး' },
+        { descriptionMm: ' ' },
+      ],
+      [
+        'blanking both at once',
+        { description: 'A town.', descriptionMm: 'မြို့ငယ်လေး' },
+        { description: '', descriptionMm: '' },
+      ],
+    ])(
+      'update refuses %s — a show keeps a description in at least one language — and writes nothing',
+      async (_why, stored, change) => {
+        prisma.series.findUnique.mockResolvedValue({ ...row, ...stored });
+
+        await expect(
+          service.update('series-1', change, ACTOR),
+        ).rejects.toMatchObject({
+          code: DESCRIPTION_REQUIRED_CODE,
+          status: 400,
+        });
+        expect(prisma.series.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it('update never refuses a save that touches neither description — a show created from TMDB may have none yet', async () => {
+      prisma.series.findUnique.mockResolvedValue({
+        ...row,
+        description: '',
+        descriptionMm: null,
+      });
+
+      await service.update('series-1', { genre: 'Sci-Fi' }, ACTOR);
+
+      expect(updateData()).toMatchObject({ genre: 'Sci-Fi' });
+      expect(updateData()).not.toHaveProperty('description');
+      expect(updateData()).not.toHaveProperty('descriptionMm');
+    });
+  });
+
+  describe('update — a TMDB picture that leaves a show is deleted', () => {
+    const TMDB_POSTER =
+      'images/series/tmdb-0b5e7c1a-3d2f-4e8a-9b6c-1f2e3d4c5b6a.jpg';
+    const TMDB_COVER =
+      'images/series/tmdb-1f2e3d4c-3d2f-4e8a-9b6c-0b5e7c1a5b6a.jpg';
+    const STAFF_POSTER =
+      'images/series/7c1a0b5e-3d2f-4e8a-9b6c-1f2e3d4c5b6a.jpg';
+    const NEW_POSTER = 'images/series/2e3d4c5b-3d2f-4e8a-9b6c-0b5e7c1a1f6a.jpg';
+    const at = (key: string, host = 'cdn.example') =>
+      `https://${host}/movies/${key}`;
+
+    const stored = {
+      id: 'series-1',
+      title: 'Stranger Things',
+      description: 'A town.',
+      descriptionMm: null,
+      status: SeriesStatus.DRAFT,
+      posterUrl: at(TMDB_POSTER),
+      coverUrl: at(TMDB_COVER),
+      categories: [],
+      actors: [],
+    };
+
+    beforeEach(() => {
+      prisma.series.findUnique.mockResolvedValue(stored);
+    });
+
+    it('deletes the TMDB poster a staff upload replaced — after the row is written — and keeps the banner', async () => {
+      prisma.series.update.mockResolvedValue({
+        ...stored,
+        posterUrl: at(NEW_POSTER),
+      });
+
+      await service.update('series-1', { posterUrl: at(NEW_POSTER) }, ACTOR);
+
+      expect(minioService.deleteObject).toHaveBeenCalledTimes(1);
+      expect(minioService.deleteObject).toHaveBeenCalledWith(TMDB_POSTER);
+      expect(prisma.series.update.mock.invocationCallOrder[0]).toBeLessThan(
+        minioService.deleteObject.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('leaves a replaced STAFF picture alone — only TMDB pictures are cleaned up', async () => {
+      prisma.series.findUnique.mockResolvedValue({
+        ...stored,
+        posterUrl: at(STAFF_POSTER),
+      });
+      prisma.series.update.mockResolvedValue({
+        ...stored,
+        posterUrl: at(NEW_POSTER),
+      });
+
+      await service.update('series-1', { posterUrl: at(NEW_POSTER) }, ACTOR);
+
+      expect(minioService.deleteObject).not.toHaveBeenCalled();
+    });
+
+    it('deletes nothing when the form echoes the same pictures back, even under another host', async () => {
+      prisma.series.update.mockResolvedValue({
+        ...stored,
+        posterUrl: at(TMDB_POSTER, 'localhost:8080'),
+        coverUrl: at(TMDB_COVER, 'localhost:8080'),
+      });
+
+      await service.update(
+        'series-1',
+        {
+          title: 'Stranger Things',
+          posterUrl: at(TMDB_POSTER, 'localhost:8080'),
+          coverUrl: at(TMDB_COVER, 'localhost:8080'),
+        },
+        ACTOR,
+      );
+
+      expect(minioService.deleteObject).not.toHaveBeenCalled();
+    });
+
+    it('a delete that fails is logged and the save still succeeds', async () => {
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      minioService.deleteObject.mockRejectedValue(new Error('storage is down'));
+      prisma.series.update.mockResolvedValue({
+        ...stored,
+        posterUrl: at(NEW_POSTER),
+      });
+
+      await expect(
+        service.update('series-1', { posterUrl: at(NEW_POSTER) }, ACTOR),
+      ).resolves.toMatchObject({ id: 'series-1' });
+
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining(
+          `Failed to delete the replaced TMDB image ${TMDB_POSTER} of series series-1`,
+        ),
+      );
+      warn.mockRestore();
+    });
+
+    it('publishing a show never deletes its pictures', async () => {
+      prisma.series.update.mockResolvedValue({
+        ...stored,
+        status: SeriesStatus.PUBLISHED,
+      });
+
+      await service.updateStatus('series-1', SeriesStatus.PUBLISHED, ACTOR);
+
+      expect(minioService.deleteObject).not.toHaveBeenCalled();
+    });
+  });
+
   describe('findAll — series-level visibility', () => {
     beforeEach(() => {
       prisma.series.findMany.mockResolvedValue([]);
@@ -868,13 +1265,17 @@ describe('SeriesService', () => {
       expect(findManyArgs().orderBy).toEqual(expected);
     });
 
-    it('search ORs title+description on plain sorts', async () => {
+    it('search ORs title+description (either language) on plain sorts', async () => {
       await service.findAll({ search: 'thrones' }, Role.USER);
       const where = findManyArgs().where as { OR: unknown };
       expect(where.OR).toEqual([
         { title: { contains: 'thrones', mode: 'insensitive' } },
         { description: { contains: 'thrones', mode: 'insensitive' } },
+        { descriptionMm: { contains: 'thrones', mode: 'insensitive' } },
       ]);
+      // The count runs over the same predicate, so the total includes a
+      // show found only by its Burmese description.
+      expect(prisma.series.count.mock.calls[0][0].where.OR).toEqual(where.OR);
     });
 
     it('relevance without a term falls back to the default sort', async () => {
@@ -899,6 +1300,13 @@ describe('SeriesService', () => {
       const [tier1Call, tier2Call] = prisma.series.count.mock.calls;
       expect(tier1Call[0].where.AND).toContainEqual(titleCond);
       expect(tier2Call[0].where.AND).toContainEqual({ NOT: titleCond });
+      // Tier 2 is a description match in either language.
+      expect(tier2Call[0].where.AND).toContainEqual({
+        OR: [
+          { description: { contains: 'thrones', mode: 'insensitive' } },
+          { descriptionMm: { contains: 'thrones', mode: 'insensitive' } },
+        ],
+      });
     });
 
     it('search (top-level OR) and actorIds (under AND) compose instead of overwriting each other', async () => {
@@ -1374,7 +1782,12 @@ describe('buildSeriesWhere', () => {
   it('never includes the search term — the caller applies it (OR vs relevance tiers)', () => {
     const where = buildSeriesWhere({ search: 'thrones' }, Role.USER);
     expect(where.OR).toBeUndefined();
-    expect(seriesSearchOr('thrones')).toHaveLength(2);
+    // One branch per searched column: title, description, Burmese description.
+    expect(seriesSearchOr('thrones')).toEqual([
+      { title: { contains: 'thrones', mode: 'insensitive' } },
+      { description: { contains: 'thrones', mode: 'insensitive' } },
+      { descriptionMm: { contains: 'thrones', mode: 'insensitive' } },
+    ]);
   });
 
   it('actorIds: show-level OR episode-level credit, placed under AND so the search OR can coexist', () => {

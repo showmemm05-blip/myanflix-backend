@@ -18,12 +18,7 @@ import {
 } from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { PassThrough, Writable } from 'node:stream';
-import sharp from 'sharp';
-import {
-  IMAGE_UPLOAD_UNSUPPORTED_TYPE_CODE,
-  UploadsService,
-  expectedChunkSize,
-} from './uploads.service';
+import { UploadsService, expectedChunkSize } from './uploads.service';
 import { DEFAULT_MAX_VIDEO_UPLOAD_BYTES } from './upload-limits';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
@@ -33,6 +28,8 @@ import { VideoDurationService } from '../videos/video-duration.service';
 import { ProcessingService } from '../processing/processing.service';
 import { SubtitlesService } from '../subtitles/subtitles.service';
 import { AuditService } from '../audit/audit.service';
+import { ImageStoreService } from '../images/image-store.service';
+import { TmdbLookupService } from '../tmdb/tmdb-lookup.service';
 import { ResourceUploadTypeRegistry } from './resource-upload-type.registry';
 import {
   MovieStatus,
@@ -127,7 +124,6 @@ describe('UploadsService', () => {
     hlsPackagePrefix: jest.Mock;
     hlsMasterKey: jest.Mock;
     hlsRenditionKeyPrefix: jest.Mock;
-    imageObjectKey: jest.Mock;
     videoKeyPrefix: jest.Mock;
     subtitleSourcePrefix: jest.Mock;
     videoReplaceStagingPrefix: jest.Mock;
@@ -138,7 +134,6 @@ describe('UploadsService', () => {
     objectExists: jest.Mock;
     uploadFile: jest.Mock;
     uploadBuffer: jest.Mock;
-    publicUrl: jest.Mock;
     listKeys: jest.Mock;
     listObjects: jest.Mock;
     copyObject: jest.Mock;
@@ -166,10 +161,14 @@ describe('UploadsService', () => {
   };
   let audit: { record: jest.Mock };
   let resourceTypes: { resolve: jest.Mock; assertFileSizeAllowed: jest.Mock };
+  let imageStore: { save: jest.Mock };
+  let tmdbLookup: { afterUpload: jest.Mock };
 
   beforeEach(async () => {
     jest.clearAllMocks();
     audit = { record: jest.fn().mockResolvedValue(undefined) };
+    imageStore = { save: jest.fn() };
+    tmdbLookup = { afterUpload: jest.fn().mockResolvedValue(undefined) };
     // A roomy scratch disk by default — 1 TB free in 4 KB blocks.
     statfsMock.mockResolvedValue({ bavail: 268_435_456n, bsize: 4096n });
 
@@ -241,17 +240,12 @@ describe('UploadsService', () => {
         (movieId: string, name: string, tag?: string) =>
           `${storageService.hlsPackagePrefix(movieId, tag)}/${name}`,
       ),
-      imageObjectKey: jest.fn(
-        (purpose: string, imageId: string, ext: string) =>
-          `images/${purpose}/${imageId}${ext}`,
-      ),
     };
     minioService = {
       downloadFile: jest.fn().mockResolvedValue(undefined),
       objectExists: jest.fn().mockResolvedValue(true),
       uploadFile: jest.fn().mockResolvedValue(undefined),
       uploadBuffer: jest.fn().mockResolvedValue(undefined),
-      publicUrl: jest.fn((key: string) => `https://cdn.example/${key}`),
       listKeys: jest.fn().mockResolvedValue([]),
       listObjects: jest.fn().mockResolvedValue([]),
       copyObject: jest.fn().mockResolvedValue(undefined),
@@ -312,6 +306,8 @@ describe('UploadsService', () => {
         { provide: SubtitlesService, useValue: subtitlesService },
         { provide: AuditService, useValue: audit },
         { provide: ResourceUploadTypeRegistry, useValue: resourceTypes },
+        { provide: ImageStoreService, useValue: imageStore },
+        { provide: TmdbLookupService, useValue: tmdbLookup },
       ],
     }).compile();
 
@@ -1854,6 +1850,112 @@ describe('UploadsService', () => {
         },
       );
     });
+
+    // The TMDB lookup (docs/movie-details-tmdb-2026-11-06/PLAN.md 2.12 and
+    // 5.2): started as the last step of a finalize that really flipped the
+    // movie, never awaited, and never able to fail or change the upload.
+    describe('the TMDB lookup hook', () => {
+      it("starts the lookup, in the uploader's name, after the READY_TO_PUBLISH flip and its audit row", async () => {
+        prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+        const order: string[] = [];
+        audit.record.mockImplementation(async () => {
+          order.push('audit');
+        });
+        tmdbLookup.afterUpload.mockImplementation(async () => {
+          order.push('lookup');
+        });
+
+        await service.finalizeExternalUpload('movie-1', dto, ACTOR);
+
+        expect(tmdbLookup.afterUpload).toHaveBeenCalledTimes(1);
+        expect(tmdbLookup.afterUpload).toHaveBeenCalledWith('movie-1', ACTOR);
+        expect(order).toEqual(['audit', 'lookup']);
+      });
+
+      it('does not wait for the lookup: the finalize answers while the lookup is still running', async () => {
+        prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+        let finishLookup: () => void = () => undefined;
+        tmdbLookup.afterUpload.mockReturnValue(
+          new Promise<void>((resolve) => {
+            finishLookup = resolve;
+          }),
+        );
+
+        await expect(
+          service.finalizeExternalUpload('movie-1', dto, ACTOR),
+        ).resolves.toEqual({ videoId: 'video-1', status: VideoStatus.READY });
+
+        expect(tmdbLookup.afterUpload).toHaveBeenCalledTimes(1);
+        finishLookup();
+      });
+
+      it('a lookup that rejects never fails the upload and is never an unhandled rejection', async () => {
+        prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+        tmdbLookup.afterUpload.mockRejectedValue(new Error('TMDB is down'));
+
+        await expect(
+          service.finalizeExternalUpload('movie-1', dto, ACTOR),
+        ).resolves.toEqual({ videoId: 'video-1', status: VideoStatus.READY });
+        // Let the rejection reach its catch; an unhandled one would fail
+        // the run.
+        await new Promise((resolve) => setImmediate(resolve));
+
+        expect(prisma.movie.updateMany).toHaveBeenCalledWith({
+          where: { id: 'movie-1', status: 'UPLOADING' },
+          data: { status: 'READY_TO_PUBLISH' },
+        });
+      });
+
+      it('a lookup that throws on the spot never fails the upload either', async () => {
+        prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+        tmdbLookup.afterUpload.mockImplementation(() => {
+          throw new Error('broken');
+        });
+
+        await expect(
+          service.finalizeExternalUpload('movie-1', dto, ACTOR),
+        ).resolves.toEqual({ videoId: 'video-1', status: VideoStatus.READY });
+      });
+
+      it('is not started by a replay — the movie was already finalized', async () => {
+        prisma.movie.findUnique.mockResolvedValue(
+          movieWithStatus(MovieStatus.READY_TO_PUBLISH),
+        );
+        videosService.findLatestForMovie.mockResolvedValue({
+          id: 'video-9',
+          status: VideoStatus.READY,
+        });
+
+        await service.finalizeExternalUpload('movie-1', dto, ACTOR);
+
+        expect(tmdbLookup.afterUpload).not.toHaveBeenCalled();
+      });
+
+      it('is not started when the status flip was skipped — an admin moved the movie meanwhile', async () => {
+        prisma.movie.findUnique
+          .mockResolvedValueOnce(uploadingMovie)
+          .mockResolvedValueOnce({ status: MovieStatus.PUBLISHED });
+        prisma.movie.updateMany.mockResolvedValue({ count: 0 });
+
+        await service.finalizeExternalUpload('movie-1', dto, ACTOR);
+
+        expect(tmdbLookup.afterUpload).not.toHaveBeenCalled();
+      });
+
+      it('is not started for a bundle that was refused', async () => {
+        prisma.movie.findUnique.mockResolvedValue(uploadingMovie);
+
+        await expect(
+          service.finalizeExternalUpload(
+            'movie-1',
+            { relativePaths: ['nope.txt'] },
+            ACTOR,
+          ),
+        ).rejects.toThrow(BadRequestException);
+
+        expect(tmdbLookup.afterUpload).not.toHaveBeenCalled();
+      });
+    });
   });
 
   describe('reprocessVideo', () => {
@@ -3163,259 +3265,40 @@ describe('UploadsService', () => {
   });
 
   describe('saveImage', () => {
-    // The type is read off the first bytes (see save-image-magic-bytes.spec),
-    // so each stub starts like the image it stands for; sharp's refusal to
-    // resize a bare header is logged and the bytes are stored as uploaded.
-    const PNG_STUB = Buffer.from([
-      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-    ]);
-    const JPEG_STUB = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
-    const WEBP_STUB = Buffer.from('RIFF\x24\x00\x00\x00WEBPVP8 ', 'latin1');
+    // What a stored image must be (byte cap, magic bytes, resize, audit row)
+    // is ImageStoreService's contract, proven in src/images/*.spec.ts; the
+    // route's own promise is only that a staff upload goes through it, with
+    // no source mark.
+    it('hands the upload to the shared image store and returns its URL', async () => {
+      const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      imageStore.save.mockResolvedValue(
+        'https://cdn.example/images/actor/abc.png',
+      );
 
-    beforeEach(() => {
-      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-    });
-
-    it('files the image in the folder its purpose names — the purpose is never guessed or defaulted', async () => {
       const url = await service.saveImage(
         'actor',
         'portrait.png',
-        PNG_STUB,
+        bytes,
         ACTOR,
       );
 
-      expect(storageService.imageObjectKey).toHaveBeenCalledWith(
-        'actor',
-        expect.any(String),
-        '.png',
-      );
-      expect(minioService.uploadBuffer).toHaveBeenCalledWith(
-        expect.stringMatching(/^images\/actor\/[0-9a-f-]{36}\.png$/),
-        expect.any(Buffer),
-      );
-      expect(url).toMatch(/^https:\/\/cdn\.example\/images\/actor\//);
-    });
-
-    it('keeps every purpose in its own folder', async () => {
-      await service.saveImage('payment', 'kbzpay.webp', WEBP_STUB, ACTOR);
-
-      expect(minioService.uploadBuffer).toHaveBeenCalledWith(
-        expect.stringContaining('images/payment/'),
-        expect.any(Buffer),
-      );
-    });
-
-    it('records the upload against the staff member with the purpose, key and size (M-22)', async () => {
-      await service.saveImage(
+      expect(imageStore.save).toHaveBeenCalledTimes(1);
+      expect(imageStore.save).toHaveBeenCalledWith(
         'actor',
         'portrait.png',
-        Buffer.concat([PNG_STUB, Buffer.alloc(321 - PNG_STUB.length)]),
+        bytes,
         ACTOR,
       );
-
-      expect(audit.record).toHaveBeenCalledWith(
-        expect.objectContaining({
-          action: 'image.upload',
-          actor: ACTOR,
-          target: expect.objectContaining({ type: 'image', id: null }),
-          metadata: expect.objectContaining({
-            purpose: 'actor',
-            key: expect.stringMatching(/^images\/actor\/[0-9a-f-]{36}\.png$/),
-            originalFilename: 'portrait.png',
-            fileSize: 321,
-          }),
-        }),
-      );
+      expect(url).toBe('https://cdn.example/images/actor/abc.png');
     });
 
-    it('takes the EXTENSION from the bytes, never from the filename — a JPEG is .jpg whether it was named poster, poster.png or poster.svg', async () => {
-      for (const filename of ['poster', 'poster.png', 'poster.svg']) {
-        await service.saveImage('movie', filename, JPEG_STUB, ACTOR);
-      }
-
-      expect(storageService.imageObjectKey).toHaveBeenCalledTimes(3);
-      for (const [purpose, , extension] of storageService.imageObjectKey.mock
-        .calls as [string, string, string][]) {
-        expect(purpose).toBe('movie');
-        expect(extension).toBe('.jpg');
-      }
-    });
-
-    it('refuses bytes that are not a JPEG / PNG / WebP / GIF with a 400 and stores nothing (SEC-019)', async () => {
-      await expect(
-        service.saveImage('movie', 'poster.jpg', Buffer.from('bytes'), ACTOR),
-      ).rejects.toMatchObject({
-        code: IMAGE_UPLOAD_UNSUPPORTED_TYPE_CODE,
-        status: 400,
-      });
-
-      expect(minioService.uploadBuffer).not.toHaveBeenCalled();
-      expect(audit.record).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('saveImage — artwork is shrunk to a display size before it is stored', () => {
-    /** A real encoded image of the given size, made with sharp itself. */
-    const makeImage = (
-      width: number,
-      height: number,
-      format: 'jpeg' | 'png' | 'webp',
-    ) =>
-      sharp({
-        create: {
-          width,
-          height,
-          channels: 3,
-          background: { r: 200, g: 40, b: 40 },
-        },
-      })
-        .toFormat(format)
-        .toBuffer();
-    const stored = () => minioService.uploadBuffer.mock.calls[0][1] as Buffer;
-
-    beforeEach(() => {
-      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-    });
-
-    it('a 4000 px wide portrait JPEG poster comes out at most 1300 px wide (phone title page width) and still JPEG, at the same key and URL', async () => {
-      const original = await makeImage(4000, 6000, 'jpeg');
-
-      const url = await service.saveImage(
-        'movie',
-        'poster.jpg',
-        original,
-        ACTOR,
-      );
-
-      const meta = await sharp(stored()).metadata();
-      expect(meta.format).toBe('jpeg');
-      expect(meta.width).toBe(1300);
-      expect(meta.height).toBe(1950);
-      expect(stored().length).toBeLessThan(original.length);
-      const [key] = minioService.uploadBuffer.mock.calls[0] as [string];
-      expect(key).toMatch(/^images\/movie\/[0-9a-f-]{36}\.jpg$/);
-      expect(url).toBe(`https://cdn.example/${key}`);
-      // The audit row keeps both sizes.
-      expect(audit.record).toHaveBeenCalledWith(
-        expect.objectContaining({
-          metadata: expect.objectContaining({
-            fileSize: stored().length,
-            originalSize: original.length,
-          }),
-        }),
-      );
-    });
-
-    it('a square 5000 px WebP poster becomes 1300 x 1300 WebP', async () => {
-      await service.saveImage(
-        'series',
-        'poster.webp',
-        await makeImage(5000, 5000, 'webp'),
-        ACTOR,
-      );
-
-      const meta = await sharp(stored()).metadata();
-      expect(meta).toMatchObject({ format: 'webp', width: 1300, height: 1300 });
-    });
-
-    it('a landscape cover keeps up to 1920 px (it fills a desktop hero), and PNG stays PNG', async () => {
-      await service.saveImage(
-        'movie',
-        'cover.png',
-        await makeImage(3840, 2160, 'png'),
-        ACTOR,
-      );
-
-      const meta = await sharp(stored()).metadata();
-      expect(meta).toMatchObject({ format: 'png', width: 1920, height: 1080 });
-    });
-
-    it('a 3600 x 1880 lottery ticket frame (the 2x print size) is stored byte for byte; wider than 4000 px is brought to 4000', async () => {
-      const frame = await makeImage(3600, 1880, 'png');
-      await service.saveImage('lottery_frame', 'frame.png', frame, ACTOR);
-      expect(stored().equals(frame)).toBe(true);
-      const [key] = minioService.uploadBuffer.mock.calls[0] as [string];
-      expect(key).toMatch(/^images\/lottery_frame\/[0-9a-f-]{36}\.png$/);
-
-      minioService.uploadBuffer.mockClear();
-      await service.saveImage(
-        'lottery_frame',
-        'frame.png',
-        await makeImage(4800, 2507, 'png'),
-        ACTOR,
-      );
-      const meta = await sharp(stored()).metadata();
-      expect(meta).toMatchObject({ format: 'png', width: 4000, height: 2089 });
-
-      // A draw picture (purpose "lottery") keeps its small cap: the frame's
-      // size is the frame folder's alone.
-      minioService.uploadBuffer.mockClear();
-      await service.saveImage(
-        'lottery',
-        'picture.png',
-        await makeImage(1280, 976, 'png'),
-        ACTOR,
-      );
-      expect((await sharp(stored()).metadata()).width).toBe(1000);
-    });
-
-    it('a 4000 px wide portrait actor photo still stops at 1000 px (shown small / blurred, never edge to edge)', async () => {
-      await service.saveImage(
-        'actor',
-        'headshot.jpg',
-        await makeImage(4000, 6000, 'jpeg'),
-        ACTOR,
-      );
-
-      const meta = await sharp(stored()).metadata();
-      expect(meta).toMatchObject({ format: 'jpeg', width: 1000, height: 1500 });
-    });
-
-    it('stores an image that is already small enough byte-for-byte as uploaded', async () => {
-      const original = await makeImage(800, 1200, 'jpeg');
-
-      await service.saveImage('movie', 'poster.jpg', original, ACTOR);
-
-      expect(stored()).toBe(original);
-    });
-
-    it('falls back to the original bytes when sharp cannot read the image (broken file)', async () => {
-      const broken = Buffer.concat([
-        Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
-        Buffer.from('definitely not the rest of a jpeg'),
-      ]);
+    it('lets a refusal from the image store through unchanged', async () => {
+      const refusal = new BadRequestException('not an image');
+      imageStore.save.mockRejectedValue(refusal);
 
       await expect(
-        service.saveImage('movie', 'poster.jpg', broken, ACTOR),
-      ).resolves.toMatch(/^https:\/\/cdn\.example\/images\/movie\//);
-
-      expect(stored()).toBe(broken);
-      expect(audit.record).toHaveBeenCalledWith(
-        expect.objectContaining({
-          metadata: expect.objectContaining({
-            fileSize: broken.length,
-            originalSize: broken.length,
-          }),
-        }),
-      );
-    });
-
-    it('never touches a purpose that is not artwork (payment logos and QR codes keep every pixel)', async () => {
-      const original = await makeImage(3000, 3000, 'png');
-
-      await service.saveImage('payment', 'qr.png', original, ACTOR);
-
-      expect(stored()).toBe(original);
-    });
-
-    it('leaves formats other than JPEG / PNG / WebP alone (e.g. GIF)', async () => {
-      const gif = await makeImage(3000, 3000, 'png').then((png) =>
-        sharp(png).gif().toBuffer(),
-      );
-
-      await service.saveImage('movie', 'poster.gif', gif, ACTOR);
-
-      expect(stored()).toBe(gif);
+        service.saveImage('movie', 'poster.jpg', Buffer.from('x'), ACTOR),
+      ).rejects.toBe(refusal);
     });
   });
 

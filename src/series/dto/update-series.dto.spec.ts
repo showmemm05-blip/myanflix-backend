@@ -86,3 +86,75 @@ describe('UpdateSeriesDto — rating', () => {
     expect(await validate(instance)).toHaveLength(0);
   });
 });
+
+/** Same contract as the movie DTOs: both texts bounded here, "at least one" in the service. */
+describe('CreateSeriesDto / UpdateSeriesDto — the description in each language', () => {
+  const required = {
+    title: 'T',
+    genre: 'Drama',
+    language: 'en',
+    releaseYear: 2024,
+  };
+  const problems = async (dto: object) =>
+    (await validate(dto)).map((error) => error.property);
+
+  it('create accepts both texts, and a Burmese-only show (an empty English text)', async () => {
+    expect(
+      await problems(
+        plainToInstance(CreateSeriesDto, {
+          ...required,
+          description: 'A town.',
+          descriptionMm: 'မြို့ငယ်လေးတစ်မြို့',
+        }),
+      ),
+    ).toEqual([]);
+    expect(
+      await problems(
+        plainToInstance(CreateSeriesDto, {
+          ...required,
+          description: '',
+          descriptionMm: 'မြို့ငယ်လေးတစ်မြို့',
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('create still needs the description field itself — it may be empty, not missing', async () => {
+    expect(await problems(plainToInstance(CreateSeriesDto, required))).toEqual([
+      'description',
+    ]);
+  });
+
+  it('update accepts an empty English description and a cleared Burmese one', async () => {
+    expect(
+      await problems(
+        plainToInstance(UpdateSeriesDto, {
+          description: '',
+          descriptionMm: '',
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it.each(['description', 'descriptionMm'])(
+    '%s takes 4000 characters and refuses 4001',
+    async (field) => {
+      expect(
+        await problems(
+          plainToInstance(UpdateSeriesDto, { [field]: 'မ'.repeat(4000) }),
+        ),
+      ).toEqual([]);
+      expect(
+        await problems(
+          plainToInstance(UpdateSeriesDto, { [field]: 'မ'.repeat(4001) }),
+        ),
+      ).toEqual([field]);
+    },
+  );
+
+  it('refuses a descriptionMm that is not text', async () => {
+    expect(
+      await problems(plainToInstance(UpdateSeriesDto, { descriptionMm: 7 })),
+    ).toEqual(['descriptionMm']);
+  });
+});

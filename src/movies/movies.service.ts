@@ -18,12 +18,19 @@ import type { AuditAction } from '../audit/audit-actions';
 import { movieSnapshot } from '../audit/audit-snapshots';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
 import { decimalToNumber } from '../common/utils/decimal.util';
+import { parseSourceName } from '../common/utils/source-name.util';
 import { computeTwoTierSlice } from '../common/utils/two-tier-page.util';
 import {
   facetStringFilter,
   numberRange,
 } from '../common/utils/facet-filter.util';
 import type { PaginationQueryDto } from '../common/dto/pagination-query.dto';
+import { replacedTmdbImageKeys } from '../images/image-source';
+import {
+  assertDescriptionInSomeLanguage,
+  assertDescriptionKeptInSomeLanguage,
+  blankToNull,
+} from './description-languages';
 import type { MovieQualitySource } from './dto/movie-response.dto';
 import type { CreateMovieDto } from './dto/create-movie.dto';
 import type { UpdateMovieDto } from './dto/update-movie.dto';
@@ -126,13 +133,21 @@ export function toFacetValues(
   );
 }
 
-/** The search predicate — title OR description, case-insensitive. */
+/**
+ * The search predicate — title OR description in either language,
+ * case-insensitive. Every branch has its own trigram index (an OR only uses
+ * indexes when all of its branches have one).
+ */
 export function movieSearchOr(search: string): Prisma.MovieWhereInput[] {
   return [
     { title: { contains: search, mode: 'insensitive' } },
     { description: { contains: search, mode: 'insensitive' } },
+    { descriptionMm: { contains: search, mode: 'insensitive' } },
   ];
 }
+
+/** The stored image fields of a movie row — what a replaced TMDB picture is looked for in. */
+const MOVIE_IMAGE_FIELDS = ['posterUrl', 'coverUrl', 'thumbnailUrl'] as const;
 
 /**
  * Builds the catalog `where` from the canonical query — everything EXCEPT
@@ -343,11 +358,12 @@ export class MoviesService {
   /**
    * The relevance sort: two-tier deterministic ranking over the real search
    * predicate — title matches (tier 1) strictly before description-only
-   * matches (tier 2), each tier in recentlyAdded order. No faked scores, and
-   * no Prisma full-text preview features (the generated client has no
-   * `_relevance` orderBy). The tiers are disjoint by construction
-   * (tier 2 excludes title matches), so count1 + count2 equals the plain
-   * OR-count every other path reports for the same query.
+   * matches (tier 2: the English or the Burmese description), each tier in
+   * recentlyAdded order. No faked scores, and no Prisma full-text preview
+   * features (the generated client has no `_relevance` orderBy). The tiers
+   * are disjoint by construction (tier 2 excludes title matches), so
+   * count1 + count2 equals the plain OR-count every other path reports for
+   * the same query.
    */
   private async findRelevancePage(
     base: Prisma.MovieWhereInput,
@@ -359,7 +375,10 @@ export class MoviesService {
       title: { contains: search, mode: 'insensitive' },
     };
     const descriptionMatch: Prisma.MovieWhereInput = {
-      description: { contains: search, mode: 'insensitive' },
+      OR: [
+        { description: { contains: search, mode: 'insensitive' } },
+        { descriptionMm: { contains: search, mode: 'insensitive' } },
+      ],
     };
     const tier1: Prisma.MovieWhereInput = { AND: [base, titleMatch] };
     const tier2: Prisma.MovieWhereInput = {
@@ -652,28 +671,36 @@ export class MoviesService {
   /**
    * The admin's optional-metadata fields clear by submitting an empty
    * string (a blanked text input), which must persist as NULL — an empty
-   * string would count as a real facet value and un-hide the filter.
-   * Only touches keys that are present, so a partial update leaves absent
-   * fields alone.
+   * string would count as a real facet value and un-hide the filter, and an
+   * empty Burmese description would stop the clients falling back to the
+   * English one. Only touches keys that are present, so a partial update
+   * leaves absent fields alone.
    */
   private withNormalizedOptionalMetadata<
-    T extends { director?: string | null; country?: string | null },
+    T extends {
+      director?: string | null;
+      country?: string | null;
+      descriptionMm?: string | null;
+    },
   >(data: T): T {
-    const emptyToNull = (value: string | null | undefined) =>
-      typeof value === 'string' && value.trim() === '' ? null : value;
     return {
       ...data,
       ...(data.director !== undefined
-        ? { director: emptyToNull(data.director) }
+        ? { director: blankToNull(data.director) }
         : {}),
       ...(data.country !== undefined
-        ? { country: emptyToNull(data.country) }
+        ? { country: blankToNull(data.country) }
+        : {}),
+      ...(data.descriptionMm !== undefined
+        ? { descriptionMm: blankToNull(data.descriptionMm) }
         : {}),
     };
   }
 
   async create(dto: CreateMovieDto, actor: AuthenticatedUser): Promise<Movie> {
     const { categoryIds, actorIds, ...data } = dto;
+    // One language is enough, none is not — before anything is written.
+    assertDescriptionInSomeLanguage(data.description, data.descriptionMm);
     const created = await this.prisma.movie.create({
       data: {
         ...this.withNormalizedOptionalMetadata(
@@ -715,13 +742,25 @@ export class MoviesService {
    * the human-over-automatic rule trivially true: there is no existing value
    * to overwrite. Absent, the row is born with the 0 sentinel exactly as
    * before and finalize/backfill may fill it later.
+   *
+   * `options.sourceName` is the raw folder name (standalone movies only; an
+   * episode ignores it). When it is sent, the row keeps it and is born with
+   * the name and year read out of it — `Inception.2010.1080p.BluRay` becomes
+   * "Inception", 2010 — falling back to the title the admin sent when the
+   * folder name holds no name at all.
+   *
+   * Every standalone placeholder also records the title and year it was
+   * born with in `tmdbAuto` (shape: PLAN.md 4.3 of
+   * docs/movie-details-tmdb-2026-11-06). That baseline is what lets the
+   * first TMDB fill replace them with TMDB's own — and only while staff
+   * have not edited them. An episode gets none: episodes are not looked up.
    */
   async createUploadPlaceholder(
     title: string,
     series:
       | { seriesId: string; seasonNumber: number; episodeNumber: number }
       | undefined,
-    options: { duration?: number } | undefined,
+    options: { duration?: number; sourceName?: string } | undefined,
     actor: AuthenticatedUser,
   ): Promise<Movie> {
     let inherited: {
@@ -741,19 +780,38 @@ export class MoviesService {
       };
     }
 
+    const currentYear = new Date().getFullYear();
+    // A blank folder name is no folder name.
+    const sourceName = series
+      ? undefined
+      : options?.sourceName?.trim() || undefined;
+    let bornTitle = title;
+    let bornYear = inherited?.releaseYear ?? currentYear;
+    if (sourceName) {
+      const parsed = parseSourceName(sourceName, currentYear);
+      bornTitle = parsed.query || title;
+      bornYear = parsed.year ?? currentYear;
+    }
+
     const created = await this.prisma.movie.create({
       data: {
-        title,
+        title: bornTitle,
         description: '',
         genre: inherited?.genre ?? '',
         language: inherited?.language ?? '',
-        releaseYear: inherited?.releaseYear ?? new Date().getFullYear(),
+        releaseYear: bornYear,
         duration: options?.duration ?? 0,
         accessType: AccessType.SUBSCRIPTION,
         status: MovieStatus.UPLOADING,
         seriesId: series?.seriesId,
         seasonNumber: series?.seasonNumber,
         episodeNumber: series?.episodeNumber,
+        ...(series
+          ? {}
+          : {
+              sourceName,
+              tmdbAuto: { v: 1, title: bornTitle, releaseYear: bornYear },
+            }),
       },
     });
 
@@ -784,6 +842,9 @@ export class MoviesService {
     });
     if (!before) throw new NotFoundException('Movie not found');
     const { categoryIds, actorIds, ...data } = dto;
+    // Only when this save touches a description: the row must keep one in
+    // some language afterwards. Nothing has been written yet.
+    assertDescriptionKeptInSomeLanguage(data, before);
 
     const updated = await this.prisma.movie.update({
       where: { id },
@@ -803,6 +864,12 @@ export class MoviesService {
       include: CATALOG_INCLUDE,
     });
 
+    // A picture that came from TMDB and was just replaced (staff uploaded
+    // their own) or cleared has nothing pointing at it any more — the same
+    // clean-up ActorsService.update does for a replaced headshot. Staff
+    // pictures are left alone, as before.
+    await this.deleteReplacedTmdbImages(id, before, updated);
+
     // One row per save: a status flip decides the action, the diff carries
     // every other field that changed along with it.
     await this.audit.record({
@@ -815,6 +882,34 @@ export class MoviesService {
     });
 
     return updated;
+  }
+
+  /**
+   * Best-effort removal of the TMDB pictures an update took off a movie —
+   * see replacedTmdbImageKeys for which ones. Runs after the row is
+   * written and never throws: an object left behind is only orphaned bytes
+   * (and findable by its tmdb- name), not a failed save.
+   */
+  private async deleteReplacedTmdbImages(
+    movieId: string,
+    before: Pick<Movie, (typeof MOVIE_IMAGE_FIELDS)[number]>,
+    after: Pick<Movie, (typeof MOVIE_IMAGE_FIELDS)[number]>,
+  ): Promise<void> {
+    const keys = replacedTmdbImageKeys(
+      before,
+      after,
+      MOVIE_IMAGE_FIELDS,
+      (url) => this.minioService.keyFromPublicUrl(url),
+    );
+    for (const key of keys) {
+      try {
+        await this.minioService.deleteObject(key);
+      } catch (error) {
+        this.logger.warn(
+          `Failed to delete the replaced TMDB image ${key} of movie ${movieId}: ${(error as Error).message}`,
+        );
+      }
+    }
   }
 
   /**

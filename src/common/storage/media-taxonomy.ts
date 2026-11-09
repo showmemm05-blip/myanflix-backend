@@ -124,7 +124,10 @@ export const MEDIA_CLASSES: readonly MediaClass[] = [
       'Every uploaded still image, foldered by purpose (see IMAGE_PURPOSES). ' +
       'Flat <uuid><ext> filename inside each purpose folder — images are ' +
       'uploaded BEFORE their owner row exists, so no owner id is available ' +
-      'at write time. Public and unsigned by design: no signable scope, and ' +
+      'at write time. A picture the backend fetched from TMDB (movie, series ' +
+      'and actor folders) is named tmdb-<uuid><ext>: that prefix is the only ' +
+      'mark telling it from a staff upload, and what finds every TMDB ' +
+      'picture again. Public and unsigned by design: no signable scope, and ' +
       'images/ is deliberately absent from the cache server deny map so the ' +
       'catalogue stays browsable without a token.',
   },

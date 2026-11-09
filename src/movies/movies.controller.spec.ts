@@ -400,7 +400,7 @@ describe('MoviesController — publish/unpublish gate (F11)', () => {
       expect(moviesService.createUploadPlaceholder).toHaveBeenCalledWith(
         'Bulk Title',
         undefined,
-        { duration: 91 },
+        { duration: 91, sourceName: undefined },
         expect.objectContaining({ id: 'admin-1' }),
       );
     });
@@ -414,7 +414,7 @@ describe('MoviesController — publish/unpublish gate (F11)', () => {
       expect(moviesService.createUploadPlaceholder).toHaveBeenCalledWith(
         'Bulk Title',
         undefined,
-        { duration: undefined },
+        { duration: undefined, sourceName: undefined },
         expect.objectContaining({ id: 'admin-1' }),
       );
     });
@@ -435,6 +435,119 @@ describe('MoviesController — publish/unpublish gate (F11)', () => {
         expect(moviesService.createUploadPlaceholder).not.toHaveBeenCalled();
       },
     );
+  });
+
+  describe('POST /movies/upload-placeholder — the folder name', () => {
+    it('hands the raw folder name to the service next to the title the admin derived', async () => {
+      await request(app.getHttpServer())
+        .post('/movies/upload-placeholder')
+        .send({
+          title: 'Inception 2010 1080p BluRay x264 YIFY',
+          sourceName: 'Inception.2010.1080p.BluRay.x264-YIFY',
+          duration: 148,
+        })
+        .expect(201);
+
+      expect(moviesService.createUploadPlaceholder).toHaveBeenCalledWith(
+        'Inception 2010 1080p BluRay x264 YIFY',
+        undefined,
+        { duration: 148, sourceName: 'Inception.2010.1080p.BluRay.x264-YIFY' },
+        expect.objectContaining({ id: 'admin-1' }),
+      );
+    });
+
+    it('answers with the title the SERVER gave the row, and never with the folder name or a TMDB column', async () => {
+      moviesService.createUploadPlaceholder.mockResolvedValue({
+        ...movieRow,
+        title: 'Inception',
+        releaseYear: 2010,
+        status: MovieStatus.UPLOADING,
+        descriptionMm: null,
+        sourceName: 'Inception.2010.1080p.BluRay.x264-YIFY',
+        tmdbId: null,
+        tmdbStatus: 'NONE',
+        tmdbError: null,
+        tmdbFetchedAt: null,
+        tmdbAuto: { v: 1, title: 'Inception', releaseYear: 2010 },
+      });
+
+      const res = await request(app.getHttpServer())
+        .post('/movies/upload-placeholder')
+        .send({
+          title: 'Inception 2010 1080p BluRay x264 YIFY',
+          sourceName: 'Inception.2010.1080p.BluRay.x264-YIFY',
+        })
+        .expect(201);
+
+      const body = res.body as Record<string, unknown>;
+      expect(body).toMatchObject({
+        title: 'Inception',
+        releaseYear: 2010,
+        descriptionMm: null,
+      });
+      expect(body).not.toHaveProperty('sourceName');
+      expect(Object.keys(body).filter((key) => /tmdb/i.test(key))).toEqual([]);
+    });
+
+    it('rejects a folder name longer than 255 characters with 400 before the service runs', async () => {
+      await request(app.getHttpServer())
+        .post('/movies/upload-placeholder')
+        .send({ title: 'Bulk Title', sourceName: 'x'.repeat(256) })
+        .expect(400);
+
+      expect(moviesService.createUploadPlaceholder).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('the description in each language, through the real ValidationPipe', () => {
+    it('PUT accepts a Burmese description and hands it to the service', async () => {
+      await request(app.getHttpServer())
+        .put(`/movies/${MOVIE_ID}`)
+        .send({ descriptionMm: 'သူခိုးတစ်ယောက်' })
+        .expect(200);
+
+      expect(moviesService.update).toHaveBeenCalledWith(
+        MOVIE_ID,
+        { descriptionMm: 'သူခိုးတစ်ယောက်' },
+        expect.objectContaining({ id: 'admin-1' }),
+      );
+    });
+
+    it('PUT lets an empty English description through to the service, which decides whether one language is left', async () => {
+      await request(app.getHttpServer())
+        .put(`/movies/${MOVIE_ID}`)
+        .send({ description: '', descriptionMm: 'သူခိုးတစ်ယောက်' })
+        .expect(200);
+
+      expect(moviesService.update).toHaveBeenCalledWith(
+        MOVIE_ID,
+        { description: '', descriptionMm: 'သူခိုးတစ်ယောက်' },
+        expect.objectContaining({ id: 'admin-1' }),
+      );
+    });
+
+    it('PUT rejects a Burmese description over 4000 characters with 400', async () => {
+      await request(app.getHttpServer())
+        .put(`/movies/${MOVIE_ID}`)
+        .send({ descriptionMm: 'မ'.repeat(4001) })
+        .expect(400);
+
+      expect(moviesService.update).not.toHaveBeenCalled();
+    });
+
+    it('every movie response carries descriptionMm', async () => {
+      moviesService.update.mockResolvedValue({
+        ...movieRow,
+        descriptionMm: 'သူခိုးတစ်ယောက်',
+      });
+
+      const res = await request(app.getHttpServer())
+        .put(`/movies/${MOVIE_ID}`)
+        .send({ descriptionMm: 'သူခိုးတစ်ယောက်' })
+        .expect(200);
+
+      expect(res.body).toMatchObject({ descriptionMm: 'သူခိုးတစ်ယောက်' });
+    });
   });
 
   describe('POST /movies/durations/backfill', () => {

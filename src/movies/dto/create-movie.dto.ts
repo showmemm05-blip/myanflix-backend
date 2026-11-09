@@ -22,10 +22,25 @@ export class CreateMovieDto {
   @MaxLength(200)
   title!: string;
 
+  /**
+   * The English / default description. May be empty when a Burmese one is
+   * given (owner, 2026-11-06: one language is enough), so there is no
+   * minimum length here — the service refuses a save that would leave the
+   * title with neither (src/movies/description-languages.ts).
+   */
   @IsString()
-  @MinLength(1)
   @MaxLength(4000)
   description!: string;
+
+  /**
+   * The Burmese description, typed by staff. Optional; '' or only spaces
+   * clears it (the service stores null, the way it does for director and
+   * country). UpdateMovieDto inherits it via PartialType.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(4000)
+  descriptionMm?: string;
 
   @IsOptional()
   @IsUrl({ require_tld: false })

@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { NotFoundException } from '@nestjs/common';
+import { Logger, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   CATALOG_INCLUDE,
@@ -10,6 +10,7 @@ import {
   statusDerivedAuditAction,
 } from './movies.service';
 import { MovieSort } from './dto/movie-query.dto';
+import { DESCRIPTION_REQUIRED_CODE } from './description-languages';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../common/storage/minio.service';
 import { StorageService } from '../common/storage/storage.service';
@@ -231,6 +232,166 @@ describe('MoviesService', () => {
       expect(callData.seasonNumber).toBeUndefined();
       expect(callData.episodeNumber).toBeUndefined();
       expect(prisma.series.findUnique).not.toHaveBeenCalled();
+    });
+
+    describe('the folder name (sourceName)', () => {
+      const thisYear = new Date().getFullYear();
+      const bornWith = () =>
+        prisma.movie.create.mock.calls[0][0].data as Record<string, unknown>;
+
+      beforeEach(() => {
+        prisma.movie.create.mockResolvedValue({ id: 'movie-1' });
+      });
+
+      it('a standalone movie is born with the name and year read out of the folder name, keeps that name, and records both as the baseline', async () => {
+        await service.createUploadPlaceholder(
+          'Inception 2010 1080p BluRay x264 YIFY',
+          undefined,
+          { sourceName: 'Inception.2010.1080p.BluRay.x264-YIFY' },
+          ACTOR,
+        );
+
+        expect(bornWith()).toMatchObject({
+          title: 'Inception',
+          releaseYear: 2010,
+          sourceName: 'Inception.2010.1080p.BluRay.x264-YIFY',
+          // What the first TMDB fill may replace, as long as staff have not
+          // edited it since.
+          tmdbAuto: { v: 1, title: 'Inception', releaseYear: 2010 },
+          status: MovieStatus.UPLOADING,
+        });
+      });
+
+      it('a folder name without a year is born in the current year', async () => {
+        await service.createUploadPlaceholder(
+          'the great escape',
+          undefined,
+          { sourceName: 'the_great_escape' },
+          ACTOR,
+        );
+
+        expect(bornWith()).toMatchObject({
+          title: 'the great escape',
+          releaseYear: thisYear,
+          sourceName: 'the_great_escape',
+          tmdbAuto: { v: 1, title: 'the great escape', releaseYear: thisYear },
+        });
+      });
+
+      it('falls back to the title the admin sent when the folder name holds no name at all', async () => {
+        await service.createUploadPlaceholder(
+          'YTS x',
+          undefined,
+          { sourceName: '[YTS] (x)' },
+          ACTOR,
+        );
+
+        expect(bornWith()).toMatchObject({
+          title: 'YTS x',
+          releaseYear: thisYear,
+          sourceName: '[YTS] (x)',
+          tmdbAuto: { v: 1, title: 'YTS x', releaseYear: thisYear },
+        });
+      });
+
+      it('never gives a title longer than the 200 characters a title may have', async () => {
+        await service.createUploadPlaceholder(
+          'x',
+          undefined,
+          { sourceName: `${'Word.'.repeat(50)}2015` },
+          ACTOR,
+        );
+
+        const title = bornWith().title as string;
+        expect(title.length).toBeLessThanOrEqual(200);
+        expect(title.startsWith('Word Word')).toBe(true);
+        expect(bornWith().releaseYear).toBe(2015);
+      });
+
+      it('keeps the folder name without its outer blanks, and treats a blank one as none', async () => {
+        await service.createUploadPlaceholder(
+          'Oldboy 2003',
+          undefined,
+          { sourceName: '  Oldboy.2003  ' },
+          ACTOR,
+        );
+        expect(bornWith().sourceName).toBe('Oldboy.2003');
+
+        prisma.movie.create.mockClear();
+        await service.createUploadPlaceholder(
+          'Sent Title',
+          undefined,
+          { sourceName: '   ' },
+          ACTOR,
+        );
+        expect(bornWith().sourceName).toBeUndefined();
+        expect(bornWith().title).toBe('Sent Title');
+      });
+
+      it('without a folder name (an admin build that predates it): the title as sent, this year, and still a baseline', async () => {
+        await service.createUploadPlaceholder(
+          'Inception 2010 1080p BluRay',
+          undefined,
+          { duration: 148 },
+          ACTOR,
+        );
+
+        expect(bornWith()).toMatchObject({
+          title: 'Inception 2010 1080p BluRay',
+          releaseYear: thisYear,
+          duration: 148,
+          tmdbAuto: {
+            v: 1,
+            title: 'Inception 2010 1080p BluRay',
+            releaseYear: thisYear,
+          },
+        });
+        expect(bornWith().sourceName).toBeUndefined();
+      });
+
+      it('an episode ignores the folder name: the title as sent, the year of its show, no folder name and no baseline', async () => {
+        prisma.series.findUnique.mockResolvedValue({
+          id: 'series-1',
+          genre: 'Drama',
+          language: 'Korean',
+          releaseYear: 2016,
+        });
+
+        await service.createUploadPlaceholder(
+          'S01E03 1080p',
+          { seriesId: 'series-1', seasonNumber: 1, episodeNumber: 3 },
+          { sourceName: 'Some.Show.S01E03.2019.1080p.WEB-DL' },
+          ACTOR,
+        );
+
+        expect(bornWith()).toMatchObject({
+          title: 'S01E03 1080p',
+          releaseYear: 2016,
+          seriesId: 'series-1',
+        });
+        // Episodes are never looked up on TMDB.
+        expect(bornWith()).not.toHaveProperty('sourceName');
+        expect(bornWith()).not.toHaveProperty('tmdbAuto');
+      });
+
+      it('never writes the lookup state itself — a row is born NONE / not linked by the column defaults', async () => {
+        await service.createUploadPlaceholder(
+          'Inception',
+          undefined,
+          { sourceName: 'Inception (2010)' },
+          ACTOR,
+        );
+
+        for (const key of [
+          'tmdbId',
+          'tmdbStatus',
+          'tmdbError',
+          'tmdbFetchedAt',
+          'descriptionMm',
+        ]) {
+          expect(bornWith()).not.toHaveProperty(key);
+        }
+      });
     });
   });
 
@@ -761,6 +922,21 @@ describe('MoviesService — catalog sort paths, facets, and metadata normalizati
       );
     });
 
+    it('the search matches the title and the description in either language', async () => {
+      await service.findAll({ search: 'သူခိုး' }, Role.USER);
+
+      expect(prisma.movie.findMany.mock.calls[0][0].where.OR).toEqual([
+        { title: { contains: 'သူခိုး', mode: 'insensitive' } },
+        { description: { contains: 'သူခိုး', mode: 'insensitive' } },
+        { descriptionMm: { contains: 'သူခိုး', mode: 'insensitive' } },
+      ]);
+      // The count runs over the same predicate, so the total includes a
+      // title found only by its Burmese description.
+      expect(prisma.movie.count.mock.calls[0][0].where.OR).toEqual(
+        movieSearchOr('သူခိုး'),
+      );
+    });
+
     it('still loads CATALOG_INCLUDE on the page query', async () => {
       await service.findAll({ sort: MovieSort.NEWEST }, Role.USER);
       expect(prisma.movie.findMany.mock.calls[0][0].include).toMatchObject({
@@ -782,7 +958,7 @@ describe('MoviesService — catalog sort paths, facets, and metadata normalizati
       expect(result.total).toBe(5);
     });
 
-    it('tier 1 is base+title-contains; tier 2 is base+description-contains AND NOT title-contains (disjoint by construction)', async () => {
+    it('tier 1 is base+title-contains; tier 2 is base+description-contains (either language) AND NOT title-contains (disjoint by construction)', async () => {
       prisma.movie.count.mockResolvedValueOnce(1).mockResolvedValueOnce(1);
       prisma.movie.findMany.mockResolvedValue([]);
 
@@ -798,7 +974,12 @@ describe('MoviesService — catalog sort paths, facets, and metadata normalizati
       expect(tier2Count[0].where).toEqual({
         AND: [
           base,
-          { description: { contains: 'dota', mode: 'insensitive' } },
+          {
+            OR: [
+              { description: { contains: 'dota', mode: 'insensitive' } },
+              { descriptionMm: { contains: 'dota', mode: 'insensitive' } },
+            ],
+          },
           { NOT: titleCond },
         ],
       });
@@ -1227,6 +1408,186 @@ describe('MoviesService — catalog sort paths, facets, and metadata normalizati
       });
     });
   });
+
+  describe('the description in each language', () => {
+    const base = {
+      title: 'T',
+      genre: 'Action',
+      language: 'Burmese',
+      releaseYear: 2026,
+      duration: 100,
+    };
+    const createData = () =>
+      prisma.movie.create.mock.calls[0][0].data as Record<string, unknown>;
+    const updateData = () =>
+      prisma.movie.update.mock.calls[0][0].data as Record<string, unknown>;
+
+    it('create: stores both texts as sent', async () => {
+      await service.create(
+        { ...base, description: 'A thief.', descriptionMm: 'သူခိုးတစ်ယောက်' },
+        ACTOR,
+      );
+
+      expect(createData()).toMatchObject({
+        description: 'A thief.',
+        descriptionMm: 'သူခိုးတစ်ယောက်',
+      });
+    });
+
+    it('create: a Burmese-only title is allowed — one language is enough', async () => {
+      await service.create(
+        { ...base, description: '', descriptionMm: 'သူခိုးတစ်ယောက်' },
+        ACTOR,
+      );
+
+      expect(createData()).toMatchObject({
+        description: '',
+        descriptionMm: 'သူခိုးတစ်ယောက်',
+      });
+    });
+
+    it.each(['', '   '])(
+      'create: a blank Burmese description (%p) is stored as NULL, so the clients fall back to English',
+      async (descriptionMm) => {
+        await service.create(
+          { ...base, description: 'A thief.', descriptionMm },
+          ACTOR,
+        );
+
+        expect(createData().descriptionMm).toBeNull();
+      },
+    );
+
+    it('create: leaves the Burmese description out when the request has none', async () => {
+      await service.create({ ...base, description: 'A thief.' }, ACTOR);
+
+      expect('descriptionMm' in createData()).toBe(false);
+    });
+
+    it.each([
+      ['neither given', { description: '' }],
+      ['both blank', { description: '  ', descriptionMm: ' ' }],
+    ])(
+      'create: refuses a title with no description in either language (%s) and writes nothing',
+      async (_why, descriptions) => {
+        await expect(
+          service.create({ ...base, ...descriptions }, ACTOR),
+        ).rejects.toMatchObject({
+          code: DESCRIPTION_REQUIRED_CODE,
+          status: 400,
+        });
+
+        expect(prisma.movie.create).not.toHaveBeenCalled();
+      },
+    );
+
+    it('update: a blanked Burmese description persists as NULL', async () => {
+      prisma.movie.findUnique.mockResolvedValue({
+        id: 'movie-1',
+        description: 'A thief.',
+        descriptionMm: 'သူခိုးတစ်ယောက်',
+      });
+
+      await service.update('movie-1', { descriptionMm: '  ' }, ACTOR);
+
+      expect(updateData().descriptionMm).toBeNull();
+    });
+
+    it('update: the English text may be blanked while a Burmese one stays', async () => {
+      prisma.movie.findUnique.mockResolvedValue({
+        id: 'movie-1',
+        description: 'A thief.',
+        descriptionMm: 'သူခိုးတစ်ယောက်',
+      });
+
+      await service.update('movie-1', { description: '' }, ACTOR);
+
+      expect(updateData()).toMatchObject({ description: '' });
+      expect('descriptionMm' in updateData()).toBe(false);
+    });
+
+    it('update: both may change in one save, as long as one has text', async () => {
+      prisma.movie.findUnique.mockResolvedValue({
+        id: 'movie-1',
+        description: 'A thief.',
+        descriptionMm: null,
+      });
+
+      await service.update(
+        'movie-1',
+        { description: '', descriptionMm: 'သူခိုးတစ်ယောက်' },
+        ACTOR,
+      );
+
+      expect(updateData()).toMatchObject({
+        description: '',
+        descriptionMm: 'သူခိုးတစ်ယောက်',
+      });
+    });
+
+    it.each([
+      [
+        'blanking the only description',
+        { description: 'A thief.', descriptionMm: null },
+        { description: '' },
+      ],
+      [
+        'blanking the Burmese text of a Burmese-only title',
+        { description: '', descriptionMm: 'သူခိုးတစ်ယောက်' },
+        { descriptionMm: '' },
+      ],
+      [
+        'blanking both at once',
+        { description: 'A thief.', descriptionMm: 'သူခိုးတစ်ယောက်' },
+        { description: ' ', descriptionMm: '' },
+      ],
+    ])(
+      'update: refuses %s — a title keeps a description in at least one language — and writes nothing',
+      async (_why, stored, change) => {
+        prisma.movie.findUnique.mockResolvedValue({ id: 'movie-1', ...stored });
+
+        await expect(
+          service.update('movie-1', change, ACTOR),
+        ).rejects.toMatchObject({
+          code: DESCRIPTION_REQUIRED_CODE,
+          status: 400,
+        });
+
+        expect(prisma.movie.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it('update: a save that touches neither description is never refused — a fresh upload has none yet and must stay editable', async () => {
+      prisma.movie.findUnique.mockResolvedValue({
+        id: 'movie-1',
+        description: '',
+        descriptionMm: null,
+      });
+
+      await service.update(
+        'movie-1',
+        { genre: 'Drama', status: MovieStatus.PUBLISHED },
+        ACTOR,
+      );
+
+      expect(updateData()).toMatchObject({
+        genre: 'Drama',
+        status: MovieStatus.PUBLISHED,
+      });
+      expect('description' in updateData()).toBe(false);
+      expect('descriptionMm' in updateData()).toBe(false);
+    });
+  });
+});
+
+describe('movieSearchOr', () => {
+  it('has one branch per searched column — title, description, Burmese description — each with its own trigram index', () => {
+    expect(movieSearchOr('dota')).toEqual([
+      { title: { contains: 'dota', mode: 'insensitive' } },
+      { description: { contains: 'dota', mode: 'insensitive' } },
+      { descriptionMm: { contains: 'dota', mode: 'insensitive' } },
+    ]);
+  });
 });
 
 describe('statusDerivedAuditAction — one rule for movies and series', () => {
@@ -1337,7 +1698,7 @@ describe('MoviesService — audit rows', () => {
     await service.create(
       {
         title: 'New',
-        description: '',
+        description: 'A film',
         genre: 'Drama',
         language: 'en',
         releaseYear: 2024,
@@ -1448,6 +1809,42 @@ describe('MoviesService — audit rows', () => {
     },
   );
 
+  it('a Burmese-only edit still leaves a row: the snapshots carry descriptionMm', async () => {
+    prisma.movie.findUnique.mockResolvedValue({
+      ...stored,
+      description: 'A film',
+      descriptionMm: null,
+    });
+    prisma.movie.update.mockResolvedValue({
+      ...stored,
+      description: 'A film',
+      descriptionMm: 'ရုပ်ရှင်တစ်ကား',
+    });
+
+    await service.update('movie-1', { descriptionMm: 'ရုပ်ရှင်တစ်ကား' }, ACTOR);
+
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'movie.update',
+        before: expect.objectContaining({ descriptionMm: null }),
+        after: expect.objectContaining({ descriptionMm: 'ရုပ်ရှင်တစ်ကား' }),
+      }),
+    );
+  });
+
+  it('a refused save (no description left in any language) leaves no audit row', async () => {
+    prisma.movie.findUnique.mockResolvedValue({
+      ...stored,
+      description: 'A film',
+      descriptionMm: null,
+    });
+
+    await expect(
+      service.update('movie-1', { description: '' }, ACTOR),
+    ).rejects.toMatchObject({ code: DESCRIPTION_REQUIRED_CODE });
+    expect(audit.record).not.toHaveBeenCalled();
+  });
+
   it('update 404s before touching the audit log', async () => {
     prisma.movie.findUnique.mockResolvedValue(null);
 
@@ -1488,6 +1885,159 @@ describe('MoviesService — audit rows', () => {
     // The delete happened before the row was written.
     expect(prisma.movie.delete.mock.invocationCallOrder[0]).toBeLessThan(
       audit.record.mock.invocationCallOrder[0],
+    );
+  });
+});
+
+describe('MoviesService — a TMDB picture that leaves a movie is deleted', () => {
+  let service: MoviesService;
+  let audit: { record: jest.Mock };
+  let prisma: { movie: { findUnique: jest.Mock; update: jest.Mock } };
+  let minioService: {
+    canonicalImageUrl: jest.Mock;
+    keyFromPublicUrl: jest.Mock;
+    deleteObject: jest.Mock;
+  };
+
+  const TMDB_POSTER =
+    'images/movie/tmdb-0b5e7c1a-3d2f-4e8a-9b6c-1f2e3d4c5b6a.jpg';
+  const TMDB_COVER =
+    'images/movie/tmdb-1f2e3d4c-3d2f-4e8a-9b6c-0b5e7c1a5b6a.jpg';
+  const STAFF_POSTER = 'images/movie/7c1a0b5e-3d2f-4e8a-9b6c-1f2e3d4c5b6a.jpg';
+  const NEW_POSTER = 'images/movie/2e3d4c5b-3d2f-4e8a-9b6c-0b5e7c1a1f6a.jpg';
+  const at = (key: string, host = 'cdn.example') =>
+    `https://${host}/movies/${key}`;
+
+  const stored = {
+    id: 'movie-1',
+    title: 'Inception',
+    description: 'A thief.',
+    descriptionMm: null,
+    status: MovieStatus.READY_TO_PUBLISH,
+    seriesId: null,
+    posterUrl: at(TMDB_POSTER),
+    coverUrl: at(TMDB_COVER),
+    thumbnailUrl: null,
+    categories: [],
+    actors: [],
+  };
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
+    prisma = { movie: { findUnique: jest.fn(), update: jest.fn() } };
+    minioService = {
+      canonicalImageUrl: jest.fn((url: string | null) => url),
+      // Mirrors the real keyFromPublicUrl(): the key is everything after
+      // the bucket segment, whatever the host.
+      keyFromPublicUrl: jest.fn(
+        (url: string) => /\/movies\/(.+)$/.exec(url)?.[1] ?? null,
+      ),
+      deleteObject: jest.fn().mockResolvedValue(undefined),
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        MoviesService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: AuditService, useValue: audit },
+        { provide: MinioService, useValue: minioService },
+        StorageService,
+        { provide: ConfigService, useValue: { get: () => undefined } },
+        {
+          provide: TrackingService,
+          useValue: { recordSearch: jest.fn(), fireAndForget: jest.fn() },
+        },
+      ],
+    }).compile();
+
+    service = module.get(MoviesService);
+    prisma.movie.findUnique.mockResolvedValue(stored);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('deletes the TMDB poster a staff upload replaced — after the row is written — and nothing else', async () => {
+    prisma.movie.update.mockResolvedValue({
+      ...stored,
+      posterUrl: at(NEW_POSTER),
+    });
+
+    await service.update('movie-1', { posterUrl: at(NEW_POSTER) }, ACTOR);
+
+    expect(minioService.deleteObject).toHaveBeenCalledTimes(1);
+    expect(minioService.deleteObject).toHaveBeenCalledWith(TMDB_POSTER);
+    expect(prisma.movie.update.mock.invocationCallOrder[0]).toBeLessThan(
+      minioService.deleteObject.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('deletes both when the poster and the banner are replaced in one save', async () => {
+    prisma.movie.update.mockResolvedValue({
+      ...stored,
+      posterUrl: at(NEW_POSTER),
+      coverUrl: null,
+    });
+
+    await service.update('movie-1', { posterUrl: at(NEW_POSTER) }, ACTOR);
+
+    expect(
+      minioService.deleteObject.mock.calls.map(([key]) => key as string).sort(),
+    ).toEqual([TMDB_POSTER, TMDB_COVER].sort());
+  });
+
+  it('leaves a replaced STAFF picture alone — only TMDB pictures are cleaned up', async () => {
+    prisma.movie.findUnique.mockResolvedValue({
+      ...stored,
+      posterUrl: at(STAFF_POSTER),
+    });
+    prisma.movie.update.mockResolvedValue({
+      ...stored,
+      posterUrl: at(NEW_POSTER),
+    });
+
+    await service.update('movie-1', { posterUrl: at(NEW_POSTER) }, ACTOR);
+
+    expect(minioService.deleteObject).not.toHaveBeenCalled();
+  });
+
+  it('deletes nothing when the pictures did not change (the admin echoes them back, even under another host)', async () => {
+    prisma.movie.update.mockResolvedValue({
+      ...stored,
+      title: 'Renamed',
+      posterUrl: at(TMDB_POSTER, '192.168.1.20:8080'),
+    });
+
+    await service.update(
+      'movie-1',
+      { title: 'Renamed', posterUrl: at(TMDB_POSTER, '192.168.1.20:8080') },
+      ACTOR,
+    );
+
+    expect(minioService.deleteObject).not.toHaveBeenCalled();
+  });
+
+  it('a delete that fails is logged and the save still succeeds, audit row included', async () => {
+    const warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    minioService.deleteObject.mockRejectedValue(new Error('storage is down'));
+    const updated = { ...stored, posterUrl: at(NEW_POSTER) };
+    prisma.movie.update.mockResolvedValue(updated);
+
+    await expect(
+      service.update('movie-1', { posterUrl: at(NEW_POSTER) }, ACTOR),
+    ).resolves.toBe(updated);
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        `Failed to delete the replaced TMDB image ${TMDB_POSTER} of movie movie-1`,
+      ),
+    );
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'movie.update' }),
     );
   });
 });

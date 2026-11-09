@@ -36,6 +36,11 @@ export interface ShowcaseTitle {
   title: string;
   /** At most DESCRIPTION_PREVIEW characters, whitespace collapsed. */
   description: string;
+  /**
+   * The Burmese description, shortened the same way. Null when the title
+   * has none — the client then shows `description` — and always for a book.
+   */
+  descriptionMm: string | null;
   posterUrl: string | null;
   coverUrl: string | null;
   /** Movies only. */
@@ -56,17 +61,82 @@ export interface ShowcaseTitle {
 
 export const DESCRIPTION_PREVIEW = 300;
 
+/**
+ * Unicode's own "one character to a reader" splitter. A Burmese consonant
+ * and the marks written on it are several code units but one character; a
+ * cut between them leaves a letter with its marks torn off.
+ */
+const GRAPHEMES =
+  typeof Intl.Segmenter === 'function'
+    ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+    : null;
+
+function* graphemes(text: string): Generator<string> {
+  if (!GRAPHEMES) {
+    // A runtime without the segmenter: whole code points, which
+    // readerCharacters still joins to the letter they belong to.
+    yield* text;
+    return;
+  }
+  for (const { segment } of GRAPHEMES.segment(text)) yield segment;
+}
+
+const STARTS_WITH_MARK = /^\p{M}/u;
+
+/** The Burmese stacking sign: the consonant after it is written beneath the one before. */
+const STACKING_SIGN = '\u1039';
+
+/**
+ * The pieces a preview may be cut between. Unicode's splitter is not quite
+ * enough for Burmese: it lets the vowel sign aa (ာ / ါ) and the visarga (း)
+ * stand alone, and it splits a stacked pair after the stacking sign. So a
+ * piece that starts with a mark, or follows a stacking sign, stays with the
+ * letter before it.
+ */
+function* readerCharacters(text: string): Generator<string> {
+  let letter = '';
+  for (const piece of graphemes(text)) {
+    if (
+      letter !== '' &&
+      (STARTS_WITH_MARK.test(piece) || letter.endsWith(STACKING_SIGN))
+    ) {
+      letter += piece;
+      continue;
+    }
+    if (letter !== '') yield letter;
+    letter = piece;
+  }
+  if (letter !== '') yield letter;
+}
+
+/**
+ * Whitespace collapsed, and at most DESCRIPTION_PREVIEW UTF-16 units: a
+ * longer text keeps the whole characters that fit in one unit less and
+ * ends in an ellipsis. For plain Latin text that is exactly the first 299
+ * letters, as it always was; Burmese is never cut in the middle of a letter.
+ */
 export function descriptionPreview(text: string | null | undefined): string {
   const flat = (text ?? '').replace(/\s+/g, ' ').trim();
-  return flat.length > DESCRIPTION_PREVIEW
-    ? `${flat.slice(0, DESCRIPTION_PREVIEW - 1)}…`
-    : flat;
+  if (flat.length <= DESCRIPTION_PREVIEW) return flat;
+
+  let kept = '';
+  for (const character of readerCharacters(flat)) {
+    if (kept.length + character.length > DESCRIPTION_PREVIEW - 1) break;
+    kept += character;
+  }
+  return `${kept}…`;
+}
+
+/** The preview of an optional text — null when there is none (a blank one counts as none). */
+function optionalPreview(text: string | null | undefined): string | null {
+  return descriptionPreview(text) || null;
 }
 
 export const MOVIE_CARD_SELECT = {
   id: true,
   title: true,
   description: true,
+  descriptionMm: true,
   posterUrl: true,
   coverUrl: true,
   thumbnailUrl: true,
@@ -82,6 +152,7 @@ export const SERIES_CARD_SELECT = {
   id: true,
   title: true,
   description: true,
+  descriptionMm: true,
   posterUrl: true,
   coverUrl: true,
   genre: true,
@@ -112,6 +183,7 @@ export function movieCard(row: MovieCardRow): ShowcaseTitle {
     id: row.id,
     title: row.title,
     description: descriptionPreview(row.description),
+    descriptionMm: optionalPreview(row.descriptionMm),
     posterUrl: row.posterUrl,
     coverUrl: row.coverUrl,
     thumbnailUrl: row.thumbnailUrl,
@@ -131,6 +203,7 @@ export function seriesCard(row: SeriesCardRow): ShowcaseTitle {
     id: row.id,
     title: row.title,
     description: descriptionPreview(row.description),
+    descriptionMm: optionalPreview(row.descriptionMm),
     posterUrl: row.posterUrl,
     coverUrl: row.coverUrl,
     thumbnailUrl: null,
@@ -150,6 +223,8 @@ export function bookCard(row: BookCardRow): ShowcaseTitle {
     id: row.id,
     title: row.title,
     description: descriptionPreview(row.description),
+    // A book has a single description: Book has no Burmese column.
+    descriptionMm: null,
     posterUrl: null,
     coverUrl: row.coverUrl,
     thumbnailUrl: null,

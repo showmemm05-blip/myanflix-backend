@@ -70,6 +70,13 @@ export type ImageUrlResolver = (
   url: string | null | undefined,
 ) => string | null;
 
+/**
+ * The shape every movie / episode response has — guests included. It is a
+ * whitelist on purpose: a column added to Movie reaches a client only by
+ * being listed here, which is what keeps the staff-only ones (`sourceName`
+ * and every `tmdb*` column) out of it. Staff read TMDB state through the
+ * /tmdb routes instead.
+ */
 export class MovieResponseDto {
   static fromEntity(
     movie: MovieWithCategories,
@@ -79,6 +86,9 @@ export class MovieResponseDto {
       id: movie.id,
       title: movie.title,
       description: movie.description,
+      // Both languages always go out; the client shows the one for its app
+      // language and falls back to the other. Null = no Burmese text.
+      descriptionMm: movie.descriptionMm ?? null,
       posterUrl: resolveImageUrl(movie.posterUrl),
       coverUrl: resolveImageUrl(movie.coverUrl),
       thumbnailUrl: resolveImageUrl(movie.thumbnailUrl),

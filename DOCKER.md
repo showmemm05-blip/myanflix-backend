@@ -376,3 +376,39 @@ fills in `http://localhost:8080` when `STREAM_PUBLIC_BASE_URL` is left out, so
 the cache address alone can look local on a real server. Never put
 `OTP_DEV_CODE` in a server's `.env`, even so. Delete the line (or leave it empty) and recreate the container to go
 back to real codes.
+
+## Movie details from TMDB (`TMDB_API_KEY`)
+
+When a folder upload finishes, the backend can look the film up on TMDB and
+fill in its details (name, description, year, genre, poster, banner, cast);
+staff can do the same for a series from the admin. It needs one line in
+`backend/.env`, then the backend container recreated:
+
+```
+TMDB_API_KEY=<the value from themoviedb.org, Settings -> API>
+```
+
+Either credential TMDB gives out works: the "API Key" (32 hex characters) or
+the "API Read Access Token" (the long one). Only the backend reads it; it
+never reaches a browser and is never written to a log.
+
+- **Empty or missing = the feature is off, and nothing else changes.** Uploads
+  work exactly as before, no lookup runs, `GET /api/tmdb/status` answers
+  `configured: false`, every other `/api/tmdb` route answers 503
+  `TMDB_NOT_CONFIGURED` (except `GET /api/tmdb/movies/state`, which only
+  reads our own database, so staff can still see an upload's folder name),
+  and the admin shows "TMDB is not connected".
+- **A wrong value never stops the backend from starting.** It shows up in the
+  admin as "Key not accepted" (Settings, Connections tab).
+- **The backend must be able to reach** `api.themoviedb.org` and
+  `image.tmdb.org` over https (outbound only). If it cannot, lookups show
+  "Couldn't reach TMDB"; uploads are not affected.
+- Pictures from TMDB are saved into our own storage under `images/movie/`,
+  `images/series/` and `images/actor/` with a file name that starts with
+  `tmdb-`, so viewers never load anything from TMDB's servers.
+- A lookup lives in the backend's memory. A restart during one leaves the
+  title on "Interrupted" with a **Try again** button in the admin.
+
+TMDB's free plan is for projects that do not earn money, asks for the TMDB
+credit in the apps, and forbids keeping its data longer than 6 months. See
+`docs/movie-details-tmdb-2026-11-06/BUILD.md`.

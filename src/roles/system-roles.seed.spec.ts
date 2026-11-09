@@ -981,6 +981,67 @@ const POST_RBAC_GUARDED_ROUTES: PostRbacRoute[] = [
     granular: ['ADS.MANAGE'],
     allowed: STAFF_ONLY,
   },
+  // movie and series details from TMDB (2026-11-06). No new permission:
+  // each route asks for what the same work needs by hand — VIEW to read,
+  // EDIT to search and review, and MEDIA.UPLOAD on top wherever pictures
+  // are saved into storage (lookup, apply, a series created from TMDB).
+  // CONTENT_UPLOADER holds all of them, so the role that uploads a film
+  // can also fill its details.
+  {
+    route: 'GET /tmdb/status',
+    granular: ['MOVIES.VIEW'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'GET /tmdb/search/movie',
+    granular: ['MOVIES.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'GET /tmdb/search/tv',
+    granular: ['SERIES.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'GET /tmdb/movies/state',
+    granular: ['MOVIES.VIEW'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'POST /tmdb/movies/:id/lookup',
+    granular: ['MOVIES.EDIT', 'MEDIA.UPLOAD'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'POST /tmdb/movies/:id/preview',
+    granular: ['MOVIES.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'POST /tmdb/movies/:id/apply',
+    granular: ['MOVIES.EDIT', 'MEDIA.UPLOAD'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'GET /tmdb/series/:id/state',
+    granular: ['SERIES.VIEW'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'POST /tmdb/series',
+    granular: ['SERIES.CREATE', 'MEDIA.UPLOAD'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'POST /tmdb/series/:id/preview',
+    granular: ['SERIES.EDIT'],
+    allowed: CONTENT_STAFF,
+  },
+  {
+    route: 'POST /tmdb/series/:id/apply',
+    granular: ['SERIES.EDIT', 'MEDIA.UPLOAD'],
+    allowed: CONTENT_STAFF,
+  },
 ];
 
 const seedFor = (role: Role) => {
@@ -1189,12 +1250,20 @@ describe('System role seeds — routes added after the RBAC migration', () => {
    *   corner picture, delete and save the rules (MANAGE). The viewer's POST
    *   /ads/session, /ads/midroll, /ads/preroll and playback events are
    *   signed-in only.
+   * + 11 TMDB details — the connection status and the movie states
+   *   (MOVIES.VIEW), the two searches and the two reviews (EDIT of their
+   *   catalogue), the series state (SERIES.VIEW), and the four that save
+   *   pictures: lookup and apply for a movie, apply for a series, a series
+   *   created from TMDB (EDIT or CREATE, plus MEDIA.UPLOAD).
+   *
+   * Six of them ask for more than one permission: the two Tracking
+   * moderation PATCHes and those four TMDB routes.
    */
   it('covers every post-migration permission-gated route', () => {
-    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(90);
+    expect(POST_RBAC_GUARDED_ROUTES).toHaveLength(101);
     expect(
       POST_RBAC_GUARDED_ROUTES.filter((r) => r.granular.length > 1),
-    ).toHaveLength(2);
+    ).toHaveLength(6);
   });
 
   // 117 / 114 since the two unused /uploads routes were removed (perf audit
@@ -1206,10 +1275,11 @@ describe('System role seeds — routes added after the RBAC migration', () => {
   // routes (2026-10-20, phase 3 B); 153 / 150 with the six lottery prize
   // claims admin routes (2026-10-24); 162 / 159 with the nine advertisement
   // admin routes (2026-11-04); 164 / 161 with the two playback-rules routes
-  // (2026-11-04); 165 / 162 with the corner-picture route (2026-11-04).
-  it('leaves the backend with 165 routes in the two tables, 162 permission-gated', () => {
+  // (2026-11-04); 165 / 162 with the corner-picture route (2026-11-04);
+  // 176 / 173 with the eleven TMDB routes (2026-11-06).
+  it('leaves the backend with 176 routes in the two tables, 173 permission-gated', () => {
     const gatedLegacy = GUARDED_ROUTES.filter((r) => r.granular !== null);
-    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(162);
-    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(165);
+    expect(gatedLegacy.length + POST_RBAC_GUARDED_ROUTES.length).toBe(173);
+    expect(GUARDED_ROUTES.length + POST_RBAC_GUARDED_ROUTES.length).toBe(176);
   });
 });

@@ -109,6 +109,10 @@ services:
       # backend exchanges server-side. Empty = code path answers 503; the
       # ID-token (`credential`) path and phone login are unaffected.
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      # TMDB credential for "movie details from TMDB" (the API Key or the API
+      # Read Access Token). Empty = feature off: uploads work as before and
+      # the admin shows "TMDB is not connected". Only the backend reads it.
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
       # API rate limiting kill switch — "true" disables it. Never in prod.
       THROTTLE_DISABLED: ${THROTTLE_DISABLED:-false}
       # Only a connection FROM these IPs may set X-Forwarded-For — for rate

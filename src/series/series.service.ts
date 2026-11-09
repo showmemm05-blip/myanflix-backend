@@ -15,6 +15,12 @@ import {
   toFacetValues,
   type FacetValue,
 } from '../movies/movies.service';
+import {
+  assertDescriptionInSomeLanguage,
+  assertDescriptionKeptInSomeLanguage,
+  blankToNull,
+} from '../movies/description-languages';
+import { replacedTmdbImageKeys } from '../images/image-source';
 import { AuditService } from '../audit/audit.service';
 import { seriesSnapshot } from '../audit/audit-snapshots';
 import type { AuthenticatedUser } from '../auth/types/authenticated-user.type';
@@ -29,13 +35,12 @@ import type { CreateSeriesDto } from './dto/create-series.dto';
 import type { EpisodeQueryDto } from './dto/episode-query.dto';
 import type { UpdateSeriesDto } from './dto/update-series.dto';
 import { SeriesSort, type SeriesQueryDto } from './dto/series-query.dto';
+import {
+  toSeriesResponse,
+  type SeriesResponse,
+} from './dto/series-response.dto';
 
-/** A cast entry as every series response carries it — same shape as MovieResponseDto.actors. */
-export interface SeriesActorRef {
-  id: string;
-  name: string;
-  imageUrl: string | null;
-}
+export type { SeriesActorRef } from './dto/series-response.dto';
 
 /** A stored series row with the relations every read path loads. */
 type SeriesWithRelations = Series & {
@@ -44,9 +49,7 @@ type SeriesWithRelations = Series & {
 };
 
 /** The re-hosted view of SeriesWithRelations — what leaves the service. */
-type SeriesWithCategories = Omit<SeriesWithRelations, 'actors'> & {
-  actors: SeriesActorRef[];
-};
+type SeriesWithCategories = SeriesResponse<SeriesWithRelations>;
 
 /**
  * The relations a series carries on every read — list rows, detail, and
@@ -130,13 +133,21 @@ export function seriesCastWhere(actorIds: string[]): Prisma.SeriesWhereInput {
   };
 }
 
-/** The series search predicate — title OR description, case-insensitive. */
+/**
+ * The series search predicate — title OR description in either language,
+ * case-insensitive. Every branch has its own trigram index, like
+ * movieSearchOr.
+ */
 export function seriesSearchOr(search: string): Prisma.SeriesWhereInput[] {
   return [
     { title: { contains: search, mode: 'insensitive' } },
     { description: { contains: search, mode: 'insensitive' } },
+    { descriptionMm: { contains: search, mode: 'insensitive' } },
   ];
 }
+
+/** The stored image fields of a series row — what a replaced TMDB picture is looked for in. */
+const SERIES_IMAGE_FIELDS = ['posterUrl', 'coverUrl'] as const;
 
 /**
  * orderBy for the plain series sorts (the subset — see SeriesSort). Every
@@ -205,6 +216,10 @@ export class SeriesService {
    * networks. Every read path re-hosts them against the current request —
    * see MinioService.imageUrl. Purely a read-time derivation; the stored
    * values are never touched.
+   *
+   * Every row this service returns leaves through here, which is also what
+   * keeps the staff-only TMDB columns out of every series response — see
+   * toSeriesResponse.
    */
   private withImageUrls<
     T extends {
@@ -212,20 +227,8 @@ export class SeriesService {
       coverUrl: string | null;
       actors?: Actor[];
     },
-  >(series: T): Omit<T, 'actors'> & { actors: SeriesActorRef[] } {
-    return {
-      ...series,
-      posterUrl: this.minioService.imageUrl(series.posterUrl),
-      coverUrl: this.minioService.imageUrl(series.coverUrl),
-      // The cast trimmed to what a client renders, headshots re-hosted —
-      // the exact shape MovieResponseDto.actors has, so the clients share
-      // one type for both.
-      actors: (series.actors ?? []).map((a) => ({
-        id: a.id,
-        name: a.name,
-        imageUrl: this.minioService.imageUrl(a.imageUrl),
-      })),
-    };
+  >(series: T): SeriesResponse<T> {
+    return toSeriesResponse(series, (url) => this.minioService.imageUrl(url));
   }
 
   async findAll(query: SeriesQueryDto, viewerRole: Role) {
@@ -291,8 +294,12 @@ export class SeriesService {
     const titleMatch: Prisma.SeriesWhereInput = {
       title: { contains: search, mode: 'insensitive' },
     };
+    // Tier 2 is a description match in either language.
     const descriptionMatch: Prisma.SeriesWhereInput = {
-      description: { contains: search, mode: 'insensitive' },
+      OR: [
+        { description: { contains: search, mode: 'insensitive' } },
+        { descriptionMm: { contains: search, mode: 'insensitive' } },
+      ],
     };
     const tier1: Prisma.SeriesWhereInput = { AND: [base, titleMatch] };
     const tier2: Prisma.SeriesWhereInput = {
@@ -465,21 +472,31 @@ export class SeriesService {
   /**
    * The type clears by submitting an empty string (the admin's "Not set"),
    * which must persist as NULL — the clients show a type only when there is
-   * one. Only touches the key when present, so a partial update leaves it.
+   * one. The Burmese description clears the same way, and must be NULL for
+   * the clients to fall back to the English one. Only touches a key when it
+   * is present, so a partial update leaves the others alone.
    */
-  private withNormalizedCountry<T extends { country?: string | null }>(
-    data: T,
-  ): T {
-    return typeof data.country === 'string' && data.country.trim() === ''
-      ? { ...data, country: null }
-      : data;
+  private withNormalizedOptionalText<
+    T extends { country?: string | null; descriptionMm?: string | null },
+  >(data: T): T {
+    return {
+      ...data,
+      ...(data.country !== undefined
+        ? { country: blankToNull(data.country) }
+        : {}),
+      ...(data.descriptionMm !== undefined
+        ? { descriptionMm: blankToNull(data.descriptionMm) }
+        : {}),
+    };
   }
 
   async create(dto: CreateSeriesDto, actor: AuthenticatedUser) {
     const { categoryIds, actorIds, ...data } = dto;
+    // One language is enough, none is not — before anything is written.
+    assertDescriptionInSomeLanguage(data.description, data.descriptionMm);
     const created = await this.prisma.series.create({
       data: {
-        ...this.withNormalizedCountry(this.withCanonicalImageUrls(data)),
+        ...this.withNormalizedOptionalText(this.withCanonicalImageUrls(data)),
         categories: categoryIds
           ? { connect: categoryIds.map((id) => ({ id })) }
           : undefined,
@@ -504,10 +521,13 @@ export class SeriesService {
     // The stored row, not the re-hosted view: image URLs must diff as saved.
     const before = await this.findStoredOrThrow(id);
     const { categoryIds, actorIds, ...data } = dto;
+    // Only when this save touches a description: the show must keep one in
+    // some language afterwards. Nothing has been written yet.
+    assertDescriptionKeptInSomeLanguage(data, before);
     const updated = await this.prisma.series.update({
       where: { id },
       data: {
-        ...this.withNormalizedCountry(this.withCanonicalImageUrls(data)),
+        ...this.withNormalizedOptionalText(this.withCanonicalImageUrls(data)),
         categories: categoryIds
           ? { set: categoryIds.map((cid) => ({ id: cid })) }
           : undefined,
@@ -520,6 +540,11 @@ export class SeriesService {
       include: SERIES_INCLUDE,
     });
 
+    // A poster or banner that came from TMDB and was just replaced (staff
+    // uploaded their own) or cleared has nothing pointing at it any more.
+    // Staff pictures are left alone, as before.
+    await this.deleteReplacedTmdbImages(id, before, updated);
+
     await this.audit.record({
       action: 'series.update',
       actor,
@@ -529,6 +554,33 @@ export class SeriesService {
     });
 
     return this.withImageUrls(updated);
+  }
+
+  /**
+   * Best-effort removal of the TMDB pictures an update took off a show —
+   * see replacedTmdbImageKeys for which ones. Runs after the row is
+   * written and never throws, like MoviesService.deleteReplacedTmdbImages.
+   */
+  private async deleteReplacedTmdbImages(
+    seriesId: string,
+    before: Pick<Series, (typeof SERIES_IMAGE_FIELDS)[number]>,
+    after: Pick<Series, (typeof SERIES_IMAGE_FIELDS)[number]>,
+  ): Promise<void> {
+    const keys = replacedTmdbImageKeys(
+      before,
+      after,
+      SERIES_IMAGE_FIELDS,
+      (url) => this.minioService.keyFromPublicUrl(url),
+    );
+    for (const key of keys) {
+      try {
+        await this.minioService.deleteObject(key);
+      } catch (error) {
+        this.logger.warn(
+          `Failed to delete the replaced TMDB image ${key} of series ${seriesId}: ${(error as Error).message}`,
+        );
+      }
+    }
   }
 
   /**

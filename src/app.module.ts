@@ -49,6 +49,7 @@ import { SmsGatewayModule } from './sms-gateway/sms-gateway.module';
 import { HomeModule } from './home/home.module';
 import { LotteryModule } from './lottery/lottery.module';
 import { AdsModule } from './ads/ads.module';
+import { TmdbModule } from './tmdb/tmdb.module';
 import { HealthModule } from './health/health.module';
 
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
@@ -122,6 +123,12 @@ import { ResponseInterceptor } from './common/interceptors/response.interceptor'
     // form, video attach, analytics) and the viewer's POST /ads/preroll +
     // playback events.
     AdsModule,
+    // Movie and series details from TMDB (2026-11-06): the staff /tmdb
+    // routes (status, search, review, apply, a series created from TMDB).
+    // Also reached through UploadsModule, which starts a lookup when a
+    // folder upload finishes; listed so the routes do not depend on that
+    // chain. Off, with every upload unchanged, while TMDB_API_KEY is unset.
+    TmdbModule,
     // GET /api/health — 200 while the database answers, 503 once it does
     // not; what the compose healthcheck and the admin's network check poll
     // (2026-10-09, OPS-005). Replaces the old AppController/AppService.

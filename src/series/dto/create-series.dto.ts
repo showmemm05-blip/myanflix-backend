@@ -22,10 +22,24 @@ export class CreateSeriesDto {
   @MaxLength(200)
   title!: string;
 
+  /**
+   * The English / default description — same contract as
+   * CreateMovieDto.description: it may be empty when a Burmese one is given,
+   * and the service refuses a save that would leave the show with neither.
+   */
   @IsString()
-  @MinLength(1)
   @MaxLength(4000)
   description!: string;
+
+  /**
+   * The Burmese description, typed by staff. Optional; '' or only spaces
+   * clears it (the service stores null). UpdateSeriesDto inherits it via
+   * PartialType.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(4000)
+  descriptionMm?: string;
 
   @IsOptional()
   @IsUrl({ require_tld: false })

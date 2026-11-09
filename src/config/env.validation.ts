@@ -155,6 +155,24 @@ class EnvironmentVariables {
   @IsString()
   GOOGLE_CLIENT_SECRET?: string;
 
+  /**
+   * The TMDB credential behind "movie details from TMDB" (src/tmdb), added
+   * by the owner. Either of the two TMDB gives out works: the v3 "API Key"
+   * (32 hex characters, sent as the `api_key` query parameter) or the "API
+   * Read Access Token" (anything else, sent as `Authorization: Bearer`).
+   * Unset or '' = the feature is off and nothing else changes: uploads
+   * behave exactly as before, no lookup runs, and every /tmdb route except
+   * GET /tmdb/status and GET /tmdb/movies/state (which reads only our own
+   * rows) answers 503 TMDB_NOT_CONFIGURED. No format rule on
+   * purpose — a mistyped value must show up as "key not accepted" in the
+   * admin, never stop the backend from booting. Read only by the backend:
+   * it never reaches a browser and is never logged.
+   */
+  @Transform(emptyAsUndefined)
+  @IsOptional()
+  @IsString()
+  TMDB_API_KEY?: string;
+
   @IsOptional()
   @IsString()
   STORAGE_PATH: string = './storage';

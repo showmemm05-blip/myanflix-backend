@@ -452,6 +452,45 @@ describe('validateEnv', () => {
     });
   });
 
+  describe('TMDB_API_KEY (movie details from TMDB)', () => {
+    it('is optional everywhere, and an empty value counts as unset (compose default `${TMDB_API_KEY:-}`) — the feature is then simply off', () => {
+      expect(validateEnv(base).TMDB_API_KEY).toBeUndefined();
+      expect(
+        validateEnv({ ...base, TMDB_API_KEY: '' }).TMDB_API_KEY,
+      ).toBeUndefined();
+      // A real deployment boots without it too.
+      expect(validateEnv(production).TMDB_API_KEY).toBeUndefined();
+      expect(
+        validateEnv({ ...production, TMDB_API_KEY: '' }).TMDB_API_KEY,
+      ).toBeUndefined();
+    });
+
+    it.each([
+      ['a v3 API key (32 hex characters)', '0123456789abcdef0123456789abcdef'],
+      [
+        'an API Read Access Token',
+        'eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJ1bml0LXRlc3QifQ.c2lnbmF0dXJl',
+      ],
+      // No format rule on purpose: a mistyped value must show up as "key
+      // not accepted" in the admin, never stop the backend from booting.
+      ['anything else, even a mistyped value', 'not-a-real-key'],
+    ])('keeps %s exactly as given', (_what, value) => {
+      expect(validateEnv({ ...base, TMDB_API_KEY: value }).TMDB_API_KEY).toBe(
+        value,
+      );
+      expect(
+        validateEnv({ ...production, TMDB_API_KEY: value }).TMDB_API_KEY,
+      ).toBe(value);
+    });
+
+    it('a 32-digit key stays text — it is never read as a number', () => {
+      const digits = '01234567890123456789012345678901';
+      expect(validateEnv({ ...base, TMDB_API_KEY: digits }).TMDB_API_KEY).toBe(
+        digits,
+      );
+    });
+  });
+
   describe('WITHDRAWAL_CODE_PEPPER', () => {
     it('is optional in development, and an empty value counts as unset', () => {
       expect(validateEnv(base).WITHDRAWAL_CODE_PEPPER).toBeUndefined();

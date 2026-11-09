@@ -6,28 +6,24 @@ import {
   IMAGE_UPLOAD_TOO_LARGE_CODE,
   IMAGE_UPLOAD_UNSUPPORTED_TYPE_CODE,
   IMAGE_UPLOAD_UNSUPPORTED_TYPE_MESSAGE,
-  UploadsService,
+  ImageStoreService,
   imageUploadByteLimit,
   imageUploadTooLargeMessage,
-} from './uploads.service';
+} from './image-store.service';
+import * as uploadsServiceExports from '../uploads/uploads.service';
 import { CodedHttpException } from '../common/errors/coded-http.exception';
 import { Role } from '../generated/prisma/client';
-import type { PrismaService } from '../prisma/prisma.service';
 import type { StorageService } from '../common/storage/storage.service';
 import type { MinioService } from '../common/storage/minio.service';
-import type { VideosService } from '../videos/videos.service';
-import type { VideoDurationService } from '../videos/video-duration.service';
-import type { ProcessingService } from '../processing/processing.service';
-import type { SubtitlesService } from '../subtitles/subtitles.service';
 import type { AuditService } from '../audit/audit.service';
-import type { ResourceUploadTypeRegistry } from './resource-upload-type.registry';
 
 /**
- * POST /uploads/image decides what a file is from its magic bytes — before
- * the key is built, before anything is stored under the public images/
- * folder and before sharp opens it (SEC-008 / SEC-019). sharp is mocked
- * here so the one thing the resizing specs in uploads.service.spec.ts
- * cannot show is pinned: refused bytes never reach it.
+ * The image store (POST /uploads/image, and every picture fetched from TMDB)
+ * decides what a file is from its magic bytes — before the key is built,
+ * before anything is stored under the public images/ folder and before
+ * sharp opens it (SEC-008 / SEC-019). sharp is mocked here so the one thing
+ * the resizing specs in image-store.service.spec.ts cannot show is pinned:
+ * refused bytes never reach it.
  */
 jest.mock('sharp', () => jest.fn());
 
@@ -49,8 +45,8 @@ const JPEG_HEADER = Buffer.from([
 const WEBP_HEADER = Buffer.from('RIFF\x24\x00\x00\x00WEBPVP8 ', 'latin1');
 const GIF_HEADER = Buffer.from('GIF89a\x01\x00\x01\x00', 'latin1');
 
-describe('UploadsService.saveImage — the magic bytes decide, before sharp and before storage', () => {
-  let service: UploadsService;
+describe('ImageStoreService.save — the magic bytes decide, before sharp and before storage', () => {
+  let service: ImageStoreService;
   let imageObjectKey: jest.Mock;
   let uploadBuffer: jest.Mock;
   let record: jest.Mock;
@@ -71,19 +67,13 @@ describe('UploadsService.saveImage — the magic bytes decide, before sharp and 
     );
     uploadBuffer = jest.fn().mockResolvedValue(undefined);
     record = jest.fn().mockResolvedValue(undefined);
-    service = new UploadsService(
-      {} as PrismaService,
+    service = new ImageStoreService(
       { imageObjectKey } as unknown as StorageService,
       {
         uploadBuffer,
         publicUrl: (key: string) => `https://cdn.example/${key}`,
       } as unknown as MinioService,
-      {} as VideosService,
-      {} as VideoDurationService,
-      {} as ProcessingService,
-      {} as SubtitlesService,
       { record } as unknown as AuditService,
-      {} as ResourceUploadTypeRegistry,
     );
   });
 
@@ -118,7 +108,7 @@ describe('UploadsService.saveImage — the magic bytes decide, before sharp and 
     });
 
     it('refuses a poster one byte over 10 MB before sniffing, sharp, a key, storage or an audit row', async () => {
-      const attempt = service.saveImage(
+      const attempt = service.save(
         'movie',
         'poster.png',
         pngOf(IMAGE_UPLOAD_MAX_BYTES + 1),
@@ -144,7 +134,7 @@ describe('UploadsService.saveImage — the magic bytes decide, before sharp and 
 
     it('stores a ticket frame of the same size — its cap is 25 MB — and refuses one over that', async () => {
       const frame = pngOf(IMAGE_UPLOAD_MAX_BYTES + 1);
-      const url = await service.saveImage(
+      const url = await service.save(
         'lottery_frame',
         'frame.png',
         frame,
@@ -154,7 +144,7 @@ describe('UploadsService.saveImage — the magic bytes decide, before sharp and 
       expect(uploadBuffer).toHaveBeenCalledWith(expect.any(String), frame);
 
       uploadBuffer.mockClear();
-      const attempt = service.saveImage(
+      const attempt = service.save(
         'lottery_frame',
         'frame.png',
         pngOf(FRAME_IMAGE_UPLOAD_MAX_BYTES + 1),
@@ -168,7 +158,7 @@ describe('UploadsService.saveImage — the magic bytes decide, before sharp and 
     });
 
     it('checks the cap before the byte sniff: an over-size non-image is a 413, not a 400', async () => {
-      const attempt = service.saveImage(
+      const attempt = service.save(
         'movie',
         'poster.jpg',
         Buffer.alloc(IMAGE_UPLOAD_MAX_BYTES + 1, 'x'),
@@ -210,7 +200,7 @@ describe('UploadsService.saveImage — the magic bytes decide, before sharp and 
       ['an empty file', 'poster.jpg', Buffer.alloc(0)],
       ['plain text', 'poster.jpg', Buffer.from('bytes')],
     ])('%s', async (_label, filename, bytes) => {
-      const attempt = service.saveImage('movie', filename, bytes, ACTOR);
+      const attempt = service.save('movie', filename, bytes, ACTOR);
 
       await expect(attempt).rejects.toBeInstanceOf(CodedHttpException);
       await expect(attempt).rejects.toMatchObject({
@@ -234,7 +224,7 @@ describe('UploadsService.saveImage — the magic bytes decide, before sharp and 
 
     it("refuses the same bytes for a purpose that is never resized — the check is not sharp's", async () => {
       await expect(
-        service.saveImage('payment', 'logo.png', Buffer.from('<svg/>'), ACTOR),
+        service.save('payment', 'logo.png', Buffer.from('<svg/>'), ACTOR),
       ).rejects.toMatchObject({ code: IMAGE_UPLOAD_UNSUPPORTED_TYPE_CODE });
 
       expect(sharpMock).not.toHaveBeenCalled();
@@ -254,7 +244,7 @@ describe('UploadsService.saveImage — the magic bytes decide, before sharp and 
     ])(
       '%s named %s is stored as %s',
       async (_label, filename, bytes, extension) => {
-        const url = await service.saveImage('movie', filename, bytes, ACTOR);
+        const url = await service.save('movie', filename, bytes, ACTOR);
 
         expect(imageObjectKey).toHaveBeenCalledWith(
           'movie',
@@ -280,7 +270,7 @@ describe('UploadsService.saveImage — the magic bytes decide, before sharp and 
     );
 
     it('opens an artwork JPEG / PNG / WebP with sharp only AFTER the byte check, and keeps the bytes when sharp cannot resize them', async () => {
-      await service.saveImage('movie', 'poster.jpg', JPEG_HEADER, ACTOR);
+      await service.save('movie', 'poster.jpg', JPEG_HEADER, ACTOR);
 
       expect(sharpMock).toHaveBeenCalledTimes(1);
       expect(sharpMock).toHaveBeenCalledWith(JPEG_HEADER);
@@ -291,19 +281,45 @@ describe('UploadsService.saveImage — the magic bytes decide, before sharp and 
     });
 
     it('never opens a GIF with sharp — it is stored as uploaded, every frame kept', async () => {
-      await service.saveImage('movie', 'poster.gif', GIF_HEADER, ACTOR);
+      await service.save('movie', 'poster.gif', GIF_HEADER, ACTOR);
 
       expect(sharpMock).not.toHaveBeenCalled();
       expect(uploadBuffer).toHaveBeenCalledWith(expect.any(String), GIF_HEADER);
     });
 
     it('never opens a purpose that is not artwork with sharp (payment logos keep every pixel)', async () => {
-      await service.saveImage('payment', 'logo.png', PNG_SIGNATURE, ACTOR);
+      await service.save('payment', 'logo.png', PNG_SIGNATURE, ACTOR);
 
       expect(sharpMock).not.toHaveBeenCalled();
       expect(uploadBuffer).toHaveBeenCalledWith(
         expect.stringMatching(/^images\/payment\/[0-9a-f-]{36}\.png$/),
         PNG_SIGNATURE,
+      );
+    });
+  });
+
+  describe('the import path the caps had before they moved here', () => {
+    it('uploads.service still exports the very same caps, codes and helpers (the upload controller reads its multer limit there)', () => {
+      expect(uploadsServiceExports.IMAGE_UPLOAD_MAX_BYTES).toBe(
+        IMAGE_UPLOAD_MAX_BYTES,
+      );
+      expect(uploadsServiceExports.FRAME_IMAGE_UPLOAD_MAX_BYTES).toBe(
+        FRAME_IMAGE_UPLOAD_MAX_BYTES,
+      );
+      expect(uploadsServiceExports.IMAGE_UPLOAD_TOO_LARGE_CODE).toBe(
+        IMAGE_UPLOAD_TOO_LARGE_CODE,
+      );
+      expect(uploadsServiceExports.IMAGE_UPLOAD_UNSUPPORTED_TYPE_CODE).toBe(
+        IMAGE_UPLOAD_UNSUPPORTED_TYPE_CODE,
+      );
+      expect(uploadsServiceExports.IMAGE_UPLOAD_UNSUPPORTED_TYPE_MESSAGE).toBe(
+        IMAGE_UPLOAD_UNSUPPORTED_TYPE_MESSAGE,
+      );
+      expect(uploadsServiceExports.imageUploadByteLimit).toBe(
+        imageUploadByteLimit,
+      );
+      expect(uploadsServiceExports.imageUploadTooLargeMessage).toBe(
+        imageUploadTooLargeMessage,
       );
     });
   });

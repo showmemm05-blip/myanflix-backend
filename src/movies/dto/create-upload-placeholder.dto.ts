@@ -18,6 +18,19 @@ export class CreateUploadPlaceholderDto {
   @MaxLength(200)
   title!: string;
 
+  /**
+   * The raw name of the folder being uploaded
+   * (`Inception.2010.1080p.BluRay.x264-YIFY`), sent next to the `title` the
+   * admin derived from it. For a standalone movie the server keeps it
+   * (staff-only), reads the title and year the row is born with out of it
+   * (parseSourceName) and later searches TMDB with it. Ignored for an
+   * episode. Optional: an admin build that predates it sends only `title`.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(255)
+  sourceName?: string;
+
   /** Set for an episode upload — the placeholder becomes an episode of this series instead of a standalone movie. */
   @IsOptional()
   @IsUUID('4')

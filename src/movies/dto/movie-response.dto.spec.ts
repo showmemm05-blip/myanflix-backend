@@ -3,7 +3,11 @@ import {
   maxQualityOf,
   type MovieQualitySource,
 } from './movie-response.dto';
-import type { Category, Movie } from '../../generated/prisma/client';
+import {
+  Prisma,
+  type Category,
+  type Movie,
+} from '../../generated/prisma/client';
 
 /**
  * The mapper every movie/episode response goes through (movies list/detail/
@@ -151,6 +155,141 @@ describe('MovieResponseDto.fromEntity', () => {
     expect(MovieResponseDto.fromEntity(movie, resolveImageUrl).maxQuality).toBe(
       null,
     );
+  });
+
+  describe('the description in each language', () => {
+    it('sends the Burmese description beside the English one', () => {
+      const result = MovieResponseDto.fromEntity(
+        { ...movie, descriptionMm: 'ဖော်ပြချက်' } as typeof movie,
+        resolveImageUrl,
+      );
+
+      expect(result.description).toBe('A description');
+      expect(result.descriptionMm).toBe('ဖော်ပြချက်');
+    });
+
+    it('sends null — never undefined — when there is no Burmese text, so the field is always there for the clients to read', () => {
+      const none = MovieResponseDto.fromEntity(
+        { ...movie, descriptionMm: null } as typeof movie,
+        resolveImageUrl,
+      );
+      // A row that predates the column (as this fixture does).
+      const missing = MovieResponseDto.fromEntity(movie, resolveImageUrl);
+
+      expect(none).toHaveProperty('descriptionMm', null);
+      expect(missing).toHaveProperty('descriptionMm', null);
+    });
+  });
+
+  /**
+   * This is the shape guests receive. The folder name a title was uploaded
+   * from and the TMDB bookkeeping are for staff only (they read them
+   * through the /tmdb routes), and because the mapper is a whitelist a new
+   * Movie column stays out until someone lists it — this pins that.
+   */
+  describe('staff-only columns never leave', () => {
+    /** A row carrying EVERY scalar column Movie has, read off the generated client. */
+    const everyColumn = Object.fromEntries(
+      Object.keys(Prisma.MovieScalarFieldEnum).map((column) => [
+        column,
+        `value-of-${column}`,
+      ]),
+    ) as unknown as Movie;
+
+    const STAFF_ONLY = [
+      'sourceName',
+      'tmdbId',
+      'tmdbStatus',
+      'tmdbError',
+      'tmdbFetchedAt',
+      'tmdbAuto',
+    ];
+
+    it('the fixture really carries them (or this spec would prove nothing)', () => {
+      for (const column of STAFF_ONLY) {
+        expect(everyColumn).toHaveProperty(column);
+      }
+    });
+
+    it('drops sourceName and every tmdb column, whatever they hold', () => {
+      const result = MovieResponseDto.fromEntity(
+        {
+          ...everyColumn,
+          sourceName: 'Inception.2010.1080p.BluRay.x264-YIFY',
+          tmdbId: 27205,
+          tmdbStatus: 'MATCHED',
+          tmdbError: 'unreachable',
+          tmdbFetchedAt: new Date('2026-11-06T00:00:00.000Z'),
+          tmdbAuto: { v: 1, title: 'Inception', releaseYear: 2010 },
+        } as Movie,
+        resolveImageUrl,
+      );
+
+      for (const column of STAFF_ONLY) {
+        expect(result).not.toHaveProperty(column);
+      }
+      expect(Object.keys(result).filter((key) => /tmdb/i.test(key))).toEqual(
+        [],
+      );
+      expect(JSON.stringify(result)).not.toContain('YIFY');
+    });
+
+    it('sends exactly the fields a client knows — a new Movie column reaches nobody by accident', () => {
+      const result = MovieResponseDto.fromEntity(everyColumn, resolveImageUrl);
+
+      expect(Object.keys(result).sort()).toEqual(
+        [
+          'id',
+          'title',
+          'description',
+          'descriptionMm',
+          'posterUrl',
+          'coverUrl',
+          'thumbnailUrl',
+          'genre',
+          'language',
+          'releaseYear',
+          'duration',
+          'rating',
+          'director',
+          'country',
+          'ageRating',
+          'accessType',
+          'status',
+          'maxQuality',
+          'seriesId',
+          'seasonNumber',
+          'episodeNumber',
+          'categories',
+          'actors',
+          'createdAt',
+          'updatedAt',
+        ].sort(),
+      );
+    });
+
+    it('trims each cast member to id, name and photo — an actor never carries its TMDB person id out', () => {
+      const result = MovieResponseDto.fromEntity(
+        {
+          ...movie,
+          actors: [
+            {
+              id: 'actor-1',
+              name: 'Leonardo DiCaprio',
+              imageUrl: null,
+              tmdbPersonId: 6193,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            },
+          ],
+        },
+        resolveImageUrl,
+      );
+
+      expect(result.actors).toEqual([
+        { id: 'actor-1', name: 'Leonardo DiCaprio', imageUrl: null },
+      ]);
+    });
   });
 });
 

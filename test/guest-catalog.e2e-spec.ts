@@ -18,8 +18,13 @@ import {
  * Anything that would let a guest reach playback data. Image URLs
  * (posterUrl/coverUrl/thumbnailUrl) are deliberately NOT in here — they are
  * the whole point of a browsable catalogue.
+ *
+ * Also the staff-only TMDB bookkeeping (2026-11-06): the folder name a
+ * movie was uploaded from (`sourceName`) and every `tmdb*` column of a
+ * movie, a series or an actor. Staff read those through the /tmdb routes;
+ * no catalogue response carries them, for a guest or anyone else.
  */
-const FORBIDDEN_KEY = /hls|playlist|objectKey|stream|video/i;
+const FORBIDDEN_KEY = /hls|playlist|objectKey|stream|video|sourceName|tmdb/i;
 
 /** Every key at every depth of a JSON value. */
 function collectKeys(value: unknown, out = new Set<string>()): Set<string> {

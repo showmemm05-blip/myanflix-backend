@@ -103,10 +103,18 @@ export type MovieSnapshotInput = Partial<Movie> & {
   actors?: readonly NamedRow[] | null;
 };
 
+/**
+ * `descriptionMm` is listed so a Burmese-only edit still produces a row (a
+ * diff with nothing in it is dropped). `tmdbId` shows which TMDB entry a
+ * title was linked to, or re-linked to, by a fill; the rest of the TMDB
+ * bookkeeping (status, fetch time, the automatic-value record, the folder
+ * name) is not catalogue content and stays out.
+ */
 export function movieSnapshot(movie: MovieSnapshotInput): Snapshot {
   return {
     title: nullIfUndefined(movie.title),
     description: nullIfUndefined(movie.description),
+    descriptionMm: nullIfUndefined(movie.descriptionMm),
     genre: nullIfUndefined(movie.genre),
     language: nullIfUndefined(movie.language),
     releaseYear: nullIfUndefined(movie.releaseYear),
@@ -123,6 +131,7 @@ export function movieSnapshot(movie: MovieSnapshotInput): Snapshot {
     posterUrl: nullIfUndefined(movie.posterUrl),
     coverUrl: nullIfUndefined(movie.coverUrl),
     thumbnailUrl: nullIfUndefined(movie.thumbnailUrl),
+    tmdbId: nullIfUndefined(movie.tmdbId),
     categories: refs(movie.categories),
     actors: refs(movie.actors),
   };
@@ -133,10 +142,12 @@ export type SeriesSnapshotInput = Partial<Series> & {
   actors?: readonly NamedRow[] | null;
 };
 
+/** `descriptionMm` and `tmdbId` for the same reasons as movieSnapshot. */
 export function seriesSnapshot(series: SeriesSnapshotInput): Snapshot {
   return {
     title: nullIfUndefined(series.title),
     description: nullIfUndefined(series.description),
+    descriptionMm: nullIfUndefined(series.descriptionMm),
     genre: nullIfUndefined(series.genre),
     language: nullIfUndefined(series.language),
     country: nullIfUndefined(series.country),
@@ -146,6 +157,7 @@ export function seriesSnapshot(series: SeriesSnapshotInput): Snapshot {
     status: nullIfUndefined(series.status),
     posterUrl: nullIfUndefined(series.posterUrl),
     coverUrl: nullIfUndefined(series.coverUrl),
+    tmdbId: nullIfUndefined(series.tmdbId),
     categories: refs(series.categories),
     actors: refs(series.actors),
   };
@@ -240,10 +252,12 @@ export function bookCategorySnapshot(
   };
 }
 
+/** `tmdbPersonId` shows when a TMDB fill tied an existing actor to a TMDB person. */
 export function actorSnapshot(actor: Partial<Actor>): Snapshot {
   return {
     name: nullIfUndefined(actor.name),
     imageUrl: nullIfUndefined(actor.imageUrl),
+    tmdbPersonId: nullIfUndefined(actor.tmdbPersonId),
   };
 }
 

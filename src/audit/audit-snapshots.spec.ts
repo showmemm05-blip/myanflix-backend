@@ -18,6 +18,7 @@ import {
   UserStatus,
 } from '../generated/prisma/client';
 import {
+  actorSnapshot,
   bookChapterSnapshot,
   bookSectionSnapshot,
   bookSnapshot,
@@ -71,6 +72,7 @@ describe('audit snapshot pickers', () => {
     ).toEqual({
       title: 'Alpha',
       description: 'd',
+      descriptionMm: null,
       genre: 'Action',
       language: 'en',
       releaseYear: 2020,
@@ -87,9 +89,40 @@ describe('audit snapshot pickers', () => {
       posterUrl: 'p',
       coverUrl: null,
       thumbnailUrl: null,
+      tmdbId: null,
       categories: [{ id: 'c1', name: 'Action' }],
       actors: [{ id: 'a1', name: 'Someone' }],
     });
+  });
+
+  it('movieSnapshot carries the Burmese description and the TMDB link, and none of the other TMDB bookkeeping', () => {
+    const snapshot = movieSnapshot({
+      title: 'Inception',
+      description: 'A thief who steals secrets.',
+      descriptionMm: 'အိပ်မက်ထဲက သူခိုး',
+      sourceName: 'Inception.2010.1080p.BluRay.x264-YIFY',
+      tmdbId: 27205,
+      tmdbStatus: 'MATCHED',
+      tmdbError: null,
+      tmdbFetchedAt: new Date('2026-11-06T00:00:00.000Z'),
+      tmdbAuto: { v: 1, title: 'Inception', releaseYear: 2010 },
+    });
+
+    // Without descriptionMm a Burmese-only edit would diff as nothing and
+    // leave no audit row at all.
+    expect(snapshot).toMatchObject({
+      descriptionMm: 'အိပ်မက်ထဲက သူခိုး',
+      tmdbId: 27205,
+    });
+    for (const key of [
+      'sourceName',
+      'tmdbStatus',
+      'tmdbError',
+      'tmdbFetchedAt',
+      'tmdbAuto',
+    ]) {
+      expect(snapshot).not.toHaveProperty(key);
+    }
   });
 
   it('tolerates a partial row: missing fields become null, missing relations []', () => {
@@ -124,6 +157,51 @@ describe('audit snapshot pickers', () => {
       rating: 7.5,
     });
     expect(seriesSnapshot({ title: 'Bare' })).toMatchObject({ rating: null });
+  });
+
+  it('seriesSnapshot carries the Burmese description and the TMDB link, and none of the other TMDB bookkeeping', () => {
+    const snapshot = seriesSnapshot({
+      title: 'Stranger Things',
+      descriptionMm: 'ထူးဆန်းသော အရာများ',
+      tmdbId: 66732,
+      tmdbFetchedAt: new Date('2026-11-06T00:00:00.000Z'),
+      tmdbAuto: { v: 1, title: 'Stranger Things' },
+    });
+
+    expect(snapshot).toMatchObject({
+      descriptionMm: 'ထူးဆန်းသော အရာများ',
+      tmdbId: 66732,
+    });
+    expect(snapshot).not.toHaveProperty('tmdbFetchedAt');
+    expect(snapshot).not.toHaveProperty('tmdbAuto');
+    expect(seriesSnapshot({ title: 'Bare' })).toMatchObject({
+      descriptionMm: null,
+      tmdbId: null,
+    });
+  });
+
+  it('actorSnapshot carries the TMDB person an actor is tied to', () => {
+    expect(
+      actorSnapshot({
+        id: 'a1',
+        name: 'Leonardo DiCaprio',
+        imageUrl: 'p',
+        tmdbPersonId: 6193,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }),
+    ).toEqual({
+      name: 'Leonardo DiCaprio',
+      imageUrl: 'p',
+      tmdbPersonId: 6193,
+    });
+    // An actor typed by hand has none; the key is still there so a later
+    // link shows up as a change.
+    expect(actorSnapshot({ name: 'By Hand', imageUrl: null })).toEqual({
+      name: 'By Hand',
+      imageUrl: null,
+      tmdbPersonId: null,
+    });
   });
 
   it('bookSnapshot / bookChapterSnapshot never carry the TipTap document', () => {
