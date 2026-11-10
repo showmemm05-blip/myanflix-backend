@@ -3,7 +3,7 @@ import type { TmdbFailureReason } from './tmdb-errors';
 import { TmdbClient } from './tmdb.client';
 import type { TmdbConnectionState, TmdbStatus } from './tmdb.types';
 
-/** How long one connection check is reused. "Check again" (`?fresh=1`) skips it. */
+/** How long one connection check is reused before a new one is started. "Check again" (`?fresh=1`) skips it. */
 export const TMDB_STATUS_TTL_MS = 60_000;
 
 function stateOf(reason: TmdbFailureReason): TmdbConnectionState {
@@ -28,6 +28,10 @@ function stateOf(reason: TmdbFailureReason): TmdbConnectionState {
  * TMDB is asked once (GET /configuration, 5 s) and the answer is kept for
  * a minute, so a page of staff opening the admin does not become a page of
  * calls to TMDB; callers that arrive while a check is running share it.
+ * Once the minute is over the last answer is still handed out at once and
+ * the new check runs behind it: the admin asks this before it draws the
+ * Edit movie form, and a slow TMDB must never make staff wait for that.
+ * Only the first read after a start and "Check again" wait for TMDB.
  * The key itself is never part of the answer.
  */
 @Injectable()
@@ -47,6 +51,11 @@ export class TmdbStatusService {
     this.inFlight ??= this.check().finally(() => {
       this.inFlight = null;
     });
+    if (!fresh && this.cached) {
+      // Nobody waits for this check, so nobody would catch it either.
+      this.inFlight.catch(() => undefined);
+      return this.cached.status;
+    }
     return this.inFlight;
   }
 

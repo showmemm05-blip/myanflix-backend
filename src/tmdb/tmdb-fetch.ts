@@ -78,6 +78,18 @@ export async function discardBody(response: TmdbFetchResponse): Promise<void> {
 }
 
 /**
+ * True when a fetch ended because its deadline passed (what
+ * AbortSignal.timeout() makes fetch, or the read of its body, reject with)
+ * — as opposed to a host that could not be reached at all.
+ */
+export function isFetchTimeout(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === 'TimeoutError' || error.name === 'AbortError')
+  );
+}
+
+/**
  * What went wrong with a fetch, for a log line: the error's class and the
  * system code behind it (`TimeoutError`, `TypeError ENOTFOUND`) and never
  * its message. Node puts the request URL into some fetch messages, and a
@@ -85,9 +97,7 @@ export async function discardBody(response: TmdbFetchResponse): Promise<void> {
  */
 export function describeFetchError(error: unknown): string {
   if (!(error instanceof Error)) return 'unknown error';
-  if (error.name === 'TimeoutError' || error.name === 'AbortError') {
-    return 'timed out';
-  }
+  if (isFetchTimeout(error)) return 'timed out';
   const cause = (error as { cause?: unknown }).cause;
   const code =
     typeof cause === 'object' && cause !== null

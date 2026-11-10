@@ -1,5 +1,8 @@
 import { cutText, nameKey, wordKey } from './tmdb-keys';
 
+/** A text spelled out by code point, so the order of its marks can be seen. */
+const typed = (...codes: number[]) => String.fromCharCode(...codes);
+
 describe('wordKey — the "same title / same genre?" key', () => {
   it.each([
     ['Sci-Fi', 'scifi'],
@@ -40,6 +43,25 @@ describe('wordKey — the "same title / same genre?" key', () => {
     expect(wordKey(' မိုး! ')).toBe(wordKey('မိုး'));
     expect(wordKey('バード')).toBe(wordKey('バ ー ド'));
   });
+
+  it('one Burmese word typed with its marks in another order is one key', () => {
+    // "ko": ka, then the vowel signs i and u — and the same two signs the
+    // other way round. Both look alike on screen; Unicode gives these marks
+    // no fixed order, so NFKD leaves them as typed.
+    const usual = typed(0x1000, 0x102d, 0x102f);
+    const swapped = typed(0x1000, 0x102f, 0x102d);
+    expect(swapped).not.toBe(usual);
+    expect(wordKey(swapped)).toBe(wordKey(usual));
+    // Two medials (ya, wa), and a vowel sign with the dot above.
+    expect(wordKey(typed(0x1000, 0x103d, 0x103b))).toBe(
+      wordKey(typed(0x1000, 0x103b, 0x103d)),
+    );
+    expect(wordKey(typed(0x1000, 0x1036, 0x102f))).toBe(
+      wordKey(typed(0x1000, 0x102f, 0x1036)),
+    );
+    // A hidden character between two marks does not keep them apart.
+    expect(wordKey(typed(0x1000, 0x102f, 0x200b, 0x102d))).toBe(wordKey(usual));
+  });
 });
 
 describe('nameKey — the "same person?" key', () => {
@@ -66,6 +88,22 @@ describe('nameKey — the "same person?" key', () => {
     expect(nameKey('မောင်မောင်')).not.toBe(nameKey('မင်းမင်း'));
     // One name written with and without a space is still one person.
     expect(nameKey('ကျော် ကျော်')).toBe(nameKey('ကျော်ကျော်'));
+  });
+
+  it('one Burmese name typed with its marks in another order is one person', () => {
+    // Ko Ko with i before u in both syllables, and with u before i: the
+    // two look the same, and an actor typed by hand may be either.
+    const usual = typed(0x1000, 0x102d, 0x102f, 0x1000, 0x102d, 0x102f);
+    const swapped = typed(0x1000, 0x102f, 0x102d, 0x1000, 0x102f, 0x102d);
+    expect(swapped).not.toBe(usual);
+    expect(nameKey(swapped)).toBe(nameKey(usual));
+    expect(nameKey(typed(0x1000, 0x103d, 0x103b))).toBe(
+      nameKey(typed(0x1000, 0x103b, 0x103d)),
+    );
+    // Still not Kyaw Kyaw: the marks themselves differ, not their order.
+    expect(nameKey(swapped)).not.toBe(
+      nameKey(typed(0x1000, 0x103b, 0x1031, 0x102c, 0x103a).repeat(2)),
+    );
   });
 });
 

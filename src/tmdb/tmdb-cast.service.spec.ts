@@ -108,6 +108,24 @@ describe('planCast — who each person of a TMDB cast is among our actors', () =
     expect(same.actor?.id).toBe('a-1');
   });
 
+  it('2. a Burmese name typed with its marks in another order is the actor we have', () => {
+    // Ko Ko typed by hand with u before i in each syllable; TMDB lists the
+    // same name with i before u. The two look alike on screen.
+    const syllable = (...marks: number[]) =>
+      String.fromCharCode(0x1000, ...marks);
+    const ours = syllable(0x102f, 0x102d).repeat(2);
+    const theirs = syllable(0x102d, 0x102f).repeat(2);
+    expect(ours).not.toBe(theirs);
+
+    const [entry] = planCast([person(77, theirs)], [actor('a-1', ours)], true);
+
+    // Reused and given the person id: never a second, look-alike actor.
+    expect(entry).toEqual(
+      expect.objectContaining({ action: 'reuse', link: true }),
+    );
+    expect(entry.actor?.id).toBe('a-1');
+  });
+
   it('2. among several actors of that name, the oldest one without a person id is taken', () => {
     const [entry] = planCast(
       [person(77, 'Lee Byung-hun')],

@@ -1,0 +1,204 @@
+{
+  "id": 66732,
+  "name": "Stranger Things",
+  "original_name": "Stranger Things",
+  "overview": "When a young boy vanishes, a small town uncovers a mystery involving secret experiments, terrifying supernatural forces, and one strange little girl.",
+  "first_air_date": "2016-07-15",
+  "episode_run_time": [],
+  "genres": [
+    {
+      "id": 10759,
+      "name": "Action & Adventure"
+    },
+    {
+      "id": 9648,
+      "name": "Mystery"
+    },
+    {
+      "id": 10765,
+      "name": "Sci-Fi & Fantasy"
+    }
+  ],
+  "original_language": "en",
+  "origin_country": [
+    "US"
+  ],
+  "poster_path": "/uOOtwVbSr4QDjAGIifLDwpb2Pdl.jpg",
+  "backdrop_path": "/9P4IIMYY3HifqeruZq0ZZ9g7YUi.jpg",
+  "number_of_seasons": 5,
+  "number_of_episodes": 42,
+  "created_by": [
+    {
+      "id": 1179422,
+      "name": "Ross Duffer"
+    },
+    {
+      "id": 1179419,
+      "name": "Matt Duffer"
+    }
+  ],
+  "aggregate_credits": {
+    "cast": [
+      {
+        "id": 1920,
+        "name": "Winona Ryder",
+        "order": 0,
+        "profile_path": "/8RVrlgtua8b53wmK7oZAAkm0N5O.jpg",
+        "total_episode_count": 42,
+        "roles": [
+          {
+            "character": "Joyce Byers",
+            "episode_count": 42
+          }
+        ]
+      },
+      {
+        "id": 35029,
+        "name": "David Harbour",
+        "order": 1,
+        "profile_path": "/qMFtMWlYVtFVyBoBhX5IoA5sN5a.jpg",
+        "total_episode_count": 42,
+        "roles": [
+          {
+            "character": "Jim Hopper",
+            "episode_count": 42
+          }
+        ]
+      },
+      {
+        "id": 1356210,
+        "name": "Millie Bobby Brown",
+        "order": 3,
+        "profile_path": "/kHO7hdNEVuTnQ0OjjrxP1RcAa0e.jpg",
+        "total_episode_count": 42,
+        "roles": [
+          {
+            "character": "Eleven",
+            "episode_count": 17
+          },
+          {
+            "character": "Eleven / Jane Hopper",
+            "episode_count": 25
+          }
+        ]
+      },
+      {
+        "id": 1442069,
+        "name": "Finn Wolfhard",
+        "order": 3,
+        "profile_path": "/vgjd34eWfVL6GsLHwiwcAsjWLmo.jpg",
+        "total_episode_count": 42,
+        "roles": [
+          {
+            "character": "Mike Wheeler",
+            "episode_count": 42
+          }
+        ]
+      },
+      {
+        "id": 1653291,
+        "name": "Gaten Matarazzo",
+        "order": 4,
+        "profile_path": "/alVT7oDp8N5G9WLIApI9jqeuqHq.jpg",
+        "total_episode_count": 42,
+        "roles": [
+          {
+            "character": "Dustin Henderson",
+            "episode_count": 42
+          }
+        ]
+      },
+      {
+        "id": 1474123,
+        "name": "Caleb McLaughlin",
+        "order": 6,
+        "profile_path": "/4jVS3EziBn7bf97ErxkW7jsdiLM.jpg",
+        "total_episode_count": 42,
+        "roles": [
+          {
+            "character": "Lucas Sinclair",
+            "episode_count": 42
+          }
+        ]
+      },
+      {
+        "id": 1039011,
+        "name": "Natalia Dyer",
+        "order": 9,
+        "profile_path": "/cQaa3XEiUTgJxp85VeFYFyblJIH.jpg",
+        "total_episode_count": 42,
+        "roles": [
+          {
+            "character": "Nancy Wheeler",
+            "episode_count": 42
+          }
+        ]
+      },
+      {
+        "id": 1448222,
+        "name": "Charlie Heaton",
+        "order": 10,
+        "profile_path": "/8Se6WZuvRmoB990bT29OPgVAyBo.jpg",
+        "total_episode_count": 42,
+        "roles": [
+          {
+            "character": "Jonathan Byers",
+            "episode_count": 42
+          }
+        ]
+      },
+      {
+        "id": 1467219,
+        "name": "Joe Keery",
+        "order": 11,
+        "profile_path": "/ayIAVLMfZGEGIFwAo3pPnY7p59.jpg",
+        "total_episode_count": 42,
+        "roles": [
+          {
+            "character": "Steve Harrington",
+            "episode_count": 42
+          }
+        ]
+      },
+      {
+        "id": 1393177,
+        "name": "Noah Schnapp",
+        "order": 7,
+        "profile_path": "/f8Gk3MUuz3xDNtcaErYB2RLgyPO.jpg",
+        "total_episode_count": 40,
+        "roles": [
+          {
+            "character": "Will Byers",
+            "episode_count": 40
+          }
+        ]
+      },
+      {
+        "id": 20047,
+        "name": "Cara Buono",
+        "order": 16,
+        "profile_path": "/QQv5pitEXvrGR4sgECvNDLwhTG.jpg",
+        "total_episode_count": 38,
+        "roles": [
+          {
+            "character": "Karen Wheeler",
+            "episode_count": 38
+          }
+        ]
+      },
+      {
+        "id": 1590797,
+        "name": "Sadie Sink",
+        "order": 8,
+        "profile_path": "/92FddzBfK50XOUbtwjqHPraoGHy.jpg",
+        "total_episode_count": 34,
+        "roles": [
+          {
+            "character": "Max Mayfield",
+            "episode_count": 34
+          }
+        ]
+      }
+    ]
+  }
+}

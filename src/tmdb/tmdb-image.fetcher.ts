@@ -3,6 +3,7 @@ import { ConversionSlots } from '../common/concurrency/slots';
 import {
   describeFetchError,
   discardBody,
+  isFetchTimeout,
   readBodyCapped,
   type TmdbFetch,
 } from './tmdb-fetch';
@@ -65,8 +66,11 @@ export class TmdbImageFetcher {
 
   /**
    * The picture at `path`, at the first size of its kind that fits under
-   * `maxBytes`. Only "too large" moves on to the next size; a picture that
-   * is missing or cannot be reached is not retried smaller.
+   * `maxBytes` and arrives within the deadline. "Too large" and "ran out of
+   * time" both move on to the next size down: a full-size poster is one or
+   * two megabytes, the next size a few hundred KB, so a slow line still
+   * gets a picture instead of none. A picture that is missing, or a host
+   * that cannot be reached at all, is not retried smaller.
    */
   async fetch(
     kind: TmdbImageKind,
@@ -76,8 +80,10 @@ export class TmdbImageFetcher {
     if (!isTmdbImagePath(path)) return { ok: false, reason: 'invalid_path' };
     let last: TmdbImageResult = { ok: false, reason: 'too_large' };
     for (const size of TMDB_IMAGE_SIZES[kind]) {
-      last = await this.fetchSize(size, path, maxBytes);
-      if (last.ok || last.reason !== 'too_large') return last;
+      const attempt = await this.fetchSize(size, path, maxBytes);
+      last = attempt.result;
+      if (last.ok) return last;
+      if (last.reason !== 'too_large' && !attempt.timedOut) return last;
     }
     return last;
   }
@@ -86,10 +92,14 @@ export class TmdbImageFetcher {
     size: string,
     path: string,
     maxBytes: number,
-  ): Promise<TmdbImageResult> {
+  ): Promise<{ result: TmdbImageResult; timedOut: boolean }> {
+    const done = (result: TmdbImageResult, timedOut = false) => ({
+      result,
+      timedOut,
+    });
     const url = tmdbImageUrl(size, path);
     if (url === null || !isTmdbImageAddress(url)) {
-      return { ok: false, reason: 'invalid_path' };
+      return done({ ok: false, reason: 'invalid_path' });
     }
     await this.slots.acquire();
     try {
@@ -103,19 +113,19 @@ export class TmdbImageFetcher {
         this.logger.warn(
           `TMDB image ${size}${path}: answered ${response.status}`,
         );
-        return {
+        return done({
           ok: false,
           reason: response.status === 404 ? 'not_found' : 'unreachable',
-        };
+        });
       }
       const buffer = await readBodyCapped(response, maxBytes);
-      if (buffer === null) return { ok: false, reason: 'too_large' };
-      return { ok: true, buffer, size };
+      if (buffer === null) return done({ ok: false, reason: 'too_large' });
+      return done({ ok: true, buffer, size });
     } catch (error) {
       this.logger.warn(
         `TMDB image ${size}${path}: ${describeFetchError(error)}`,
       );
-      return { ok: false, reason: 'unreachable' };
+      return done({ ok: false, reason: 'unreachable' }, isFetchTimeout(error));
     } finally {
       this.slots.release();
     }

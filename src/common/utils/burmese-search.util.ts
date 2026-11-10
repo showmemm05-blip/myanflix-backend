@@ -77,7 +77,12 @@ function nfc(text: string): string {
   }
 }
 
-function orderMarks(run: string): string {
+/**
+ * One run of marks put in the fixed order of MARK_RANK. Exported for the
+ * TMDB name keys (src/tmdb/tmdb-keys.ts), which must read one name typed
+ * two ways as one name too.
+ */
+export function orderMarks(run: string): string {
   return Array.from(run)
     .map((mark, index) => ({ mark, index, rank: MARK_RANK[mark] ?? 99 }))
     .sort((a, b) => a.rank - b.rank || a.index - b.index)

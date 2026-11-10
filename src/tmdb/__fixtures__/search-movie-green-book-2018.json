@@ -1,0 +1,27 @@
+{
+  "page": 1,
+  "total_pages": 1,
+  "total_results": 2,
+  "results": [
+    {
+      "id": 490132,
+      "title": "Green Book",
+      "original_title": "Green Book",
+      "release_date": "2018-11-16",
+      "overview": "Tony Lip, a bouncer in 1962, is hired to drive pianist Don Shirley on a tour through the Deep South in the days when African Americans, forced to find alternate accommodations and services due to segregation laws below the Mason-Dixon Line, relied on a guide called The Negro Motorist Green Book.",
+      "poster_path": "/7BsvSuDQuoqhWmU2fL7W2GOcZHU.jpg",
+      "original_language": "en",
+      "adult": false
+    },
+    {
+      "id": 444539,
+      "title": "The Bookshop",
+      "original_title": "The Bookshop",
+      "release_date": "2017-11-10",
+      "overview": "Set in a small English town in 1959, a woman decides, against polite but ruthless local opposition, to open a bookshop, a decision which becomes a political minefield.",
+      "poster_path": "/nh2ZpwuTKjY0tTGcsGu7TwOpT4p.jpg",
+      "original_language": "en",
+      "adult": false
+    }
+  ]
+}

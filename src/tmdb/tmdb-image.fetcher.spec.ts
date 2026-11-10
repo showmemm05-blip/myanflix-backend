@@ -356,19 +356,96 @@ describe('TmdbImageFetcher', () => {
       ).resolves.toEqual({ ok: false, reason: 'unreachable' });
     });
 
-    it('a timeout is unreachable', async () => {
-      const { fetchImpl } = fakeFetch({
-        // What AbortSignal.timeout() makes fetch reject with.
-        original: Object.assign(new Error('timed out'), {
-          name: 'TimeoutError',
+    it('a network error that is not a timeout is not retried at a smaller size', async () => {
+      const { fetchImpl, urls } = fakeFetch({
+        original: Object.assign(new TypeError('fetch failed'), {
+          cause: { code: 'ENOTFOUND' },
         }),
+        w780: { bytes: 300 },
       });
 
       await expect(
         fetcherWith(fetchImpl).fetch('poster', '/p.jpg', MAX),
       ).resolves.toEqual({ ok: false, reason: 'unreachable' });
+      expect(urls).toHaveLength(1);
+    });
+  });
+
+  describe('a download that runs out of time (a slow line)', () => {
+    // What AbortSignal.timeout() makes fetch, or the read of its body, reject with.
+    const timeout = () =>
+      Object.assign(new Error('timed out'), { name: 'TimeoutError' });
+
+    it.each([
+      ['poster', 'w780'],
+      ['backdrop', 'w1280'],
+    ] as const)(
+      'a %s that times out at original is taken at %s instead',
+      async (kind, smaller) => {
+        const { fetchImpl, urls } = fakeFetch({
+          original: timeout(),
+          [smaller]: { bytes: 300 },
+        });
+
+        const result = await fetcherWith(fetchImpl).fetch(kind, '/p.jpg', MAX);
+
+        expect(result).toEqual({
+          ok: true,
+          buffer: expect.any(Buffer),
+          size: smaller,
+        });
+        expect(urls).toEqual([
+          'https://image.tmdb.org/t/p/original/p.jpg',
+          `https://image.tmdb.org/t/p/${smaller}/p.jpg`,
+        ]);
+      },
+    );
+
+    it('an aborted body read counts as a timeout too', async () => {
+      const { fetchImpl } = fakeFetch({
+        original: Object.assign(new Error('aborted'), { name: 'AbortError' }),
+        w780: { bytes: 300 },
+      });
+
+      await expect(
+        fetcherWith(fetchImpl).fetch('poster', '/p.jpg', MAX),
+      ).resolves.toMatchObject({ ok: true, size: 'w780' });
     });
 
+    it('is unreachable when every size times out — two requests, no more', async () => {
+      const { fetchImpl, urls } = fakeFetch({
+        original: timeout(),
+        w780: timeout(),
+      });
+
+      await expect(
+        fetcherWith(fetchImpl).fetch('poster', '/p.jpg', MAX),
+      ).resolves.toEqual({ ok: false, reason: 'unreachable' });
+      expect(urls).toHaveLength(2);
+    });
+
+    it('the smaller size answering 404 is not_found', async () => {
+      const { fetchImpl } = fakeFetch({
+        original: timeout(),
+        w780: { status: 404 },
+      });
+
+      await expect(
+        fetcherWith(fetchImpl).fetch('poster', '/p.jpg', MAX),
+      ).resolves.toEqual({ ok: false, reason: 'not_found' });
+    });
+
+    it("an actor's photo has one size, so its timeout is unreachable after one request", async () => {
+      const { fetchImpl, urls } = fakeFetch({ h632: timeout() });
+
+      await expect(
+        fetcherWith(fetchImpl).fetch('profile', '/a.jpg', MAX),
+      ).resolves.toEqual({ ok: false, reason: 'unreachable' });
+      expect(urls).toHaveLength(1);
+    });
+  });
+
+  describe('a broken fetch', () => {
     it('never throws, whatever the fetch does', async () => {
       const broken = [
         jest.fn(() => {

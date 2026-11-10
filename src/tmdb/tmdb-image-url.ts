@@ -21,8 +21,9 @@ export type TmdbImageKind = 'poster' | 'backdrop' | 'profile';
 
 /**
  * The sizes asked for, in order. A poster or backdrop is taken at
- * `original` and only when that is over the byte cap at the next size down;
- * an actor's photo is small on every screen, so it is taken at h632 only.
+ * `original`, and at the next size down only when that is over the byte cap
+ * or does not arrive within the download deadline (a slow line); an actor's
+ * photo is small on every screen, so it is taken at h632 only.
  */
 export const TMDB_IMAGE_SIZES: Record<TmdbImageKind, readonly string[]> = {
   poster: ['original', 'w780'],

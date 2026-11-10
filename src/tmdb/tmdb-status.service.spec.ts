@@ -18,6 +18,11 @@ describe('TmdbStatusService — is TMDB connected?', () => {
     jest.useRealTimers();
   });
 
+  /** Lets a check nobody is waiting for run to its end (the clock is faked; promises are not). */
+  const settled = async () => {
+    for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+  };
+
   it('without TMDB_API_KEY: off, and TMDB is never asked', async () => {
     client.isEnabled = false;
 
@@ -69,17 +74,71 @@ describe('TmdbStatusService — is TMDB connected?', () => {
     ]);
   });
 
-  it('reuses one check for a minute, then asks again', async () => {
+  it('reuses one check for a minute, then asks again behind the last answer', async () => {
     const first = await service.get();
     jest.setSystemTime(Date.now() + TMDB_STATUS_TTL_MS - 1);
     await expect(service.get()).resolves.toBe(first);
     expect(client.checkConnection).toHaveBeenCalledTimes(1);
 
+    // The minute is over, and this time TMDB takes its time.
     jest.setSystemTime(Date.now() + 2);
-    const later = await service.get();
+    let answer: (value: unknown) => void = () => undefined;
+    client.checkConnection.mockReturnValue(
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    );
 
+    // Nobody waits for it: the last answer comes at once, and the readers
+    // that arrive meanwhile share the one check that is running.
+    await expect(service.get()).resolves.toBe(first);
+    await expect(service.get()).resolves.toBe(first);
     expect(client.checkConnection).toHaveBeenCalledTimes(2);
+
+    answer({ ok: false, reason: 'unreachable' });
+    await settled();
+
+    // The next read has the new answer, without another call.
+    const later = await service.get();
+    expect(later.state).toBe('unreachable');
     expect(later.checkedAt).not.toBe(first.checkedAt);
+    expect(client.checkConnection).toHaveBeenCalledTimes(2);
+  });
+
+  it('the first read after a start has no answer to hand out: it waits for TMDB', async () => {
+    let answer: (value: unknown) => void = () => undefined;
+    client.checkConnection.mockReturnValue(
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    );
+    let done = false;
+    const reading = service.get().then((status) => {
+      done = true;
+      return status;
+    });
+
+    await settled();
+    expect(done).toBe(false);
+
+    answer({ ok: true, data: true });
+    await expect(reading).resolves.toEqual(
+      expect.objectContaining({ state: 'connected' }),
+    );
+  });
+
+  it('a check behind the last answer that breaks leaves that answer in place', async () => {
+    const first = await service.get();
+    jest.setSystemTime(Date.now() + TMDB_STATUS_TTL_MS + 1);
+    client.checkConnection.mockRejectedValue(new Error('boom'));
+
+    await expect(service.get()).resolves.toBe(first);
+    await settled();
+
+    // Nothing was left unhandled, and the next read starts a new check.
+    client.checkConnection.mockResolvedValue({ ok: true, data: true });
+    await expect(service.get()).resolves.toBe(first);
+    expect(client.checkConnection).toHaveBeenCalledTimes(3);
   });
 
   it('a failure is remembered for the minute too — a page of staff is not a page of calls', async () => {

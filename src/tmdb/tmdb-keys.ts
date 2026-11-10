@@ -5,6 +5,7 @@
  * `Fast & Furious` / `Fast and Furious`), so every comparison goes through
  * a key that keeps only what a reader would call the same.
  */
+import { orderMarks } from '../common/utils/burmese-search.util';
 
 function decompose(text: string): string {
   try {
@@ -25,33 +26,46 @@ function decompose(text: string): string {
 const LATIN_ACCENTS = /[\u0300-\u036f]/g;
 
 /**
+ * A run of two or more Burmese marks (U+102B to U+103E: vowel signs, medials,
+ * asat, virama). Most of them have no fixed order in Unicode, so NFKD leaves
+ * them as typed, and one name typed with its marks in another order looks
+ * the same on screen yet is another text. Every run is put in the one order
+ * the dream search uses (common/utils/burmese-search.util.ts), so both
+ * spellings are one key and the actor we already have is found.
+ */
+const BURMESE_MARK_RUN = /[\u102b-\u103e]{2,}/g;
+
+/**
  * The key of a title, a genre or a category name: accents and case gone,
  * `&` read as "and", then only letters, digits and the marks that belong
- * to them kept. `Sci-Fi` and `sci fi` are `scifi`; `War & Politics` is
- * `warandpolitics`. This is the `norm()` of the one-clear-match rule and
- * the `key()` of the category rule (PLAN.md 2.5 and 2.7 of
- * docs/movie-details-tmdb-2026-11-06) — with one difference from the
- * plan's formula: it says "remove \p{M}", which is right for accents only.
+ * to them kept, Burmese marks in one order. `Sci-Fi` and `sci fi` are
+ * `scifi`; `War & Politics` is `warandpolitics`. This is the `norm()` of
+ * the one-clear-match rule and the `key()` of the category rule (PLAN.md
+ * 2.5 and 2.7 of docs/movie-details-tmdb-2026-11-06) — with one
+ * difference from the plan's formula: it says "remove \p{M}", which is
+ * right for accents only.
  */
 export function wordKey(text: string): string {
   return decompose(text)
     .replace(LATIN_ACCENTS, '')
     .toLowerCase()
     .replace(/&/g, 'and')
-    .replace(/[^\p{L}\p{N}\p{M}]/gu, '');
+    .replace(/[^\p{L}\p{N}\p{M}]/gu, '')
+    .replace(BURMESE_MARK_RUN, orderMarks);
 }
 
 /**
  * The key of a person's name: accents and case gone, only letters, digits
- * and the marks that belong to them kept — `Lee Byung-hun` and
- * `Lee Byung Hun` are one person. No `&` rule: a name has none
- * (PLAN.md 2.10, with the same difference as wordKey).
+ * and the marks that belong to them kept, Burmese marks in one order —
+ * `Lee Byung-hun` and `Lee Byung Hun` are one person. No `&` rule: a name
+ * has none (PLAN.md 2.10, with the same difference as wordKey).
  */
 export function nameKey(text: string): string {
   return decompose(text)
     .replace(LATIN_ACCENTS, '')
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\p{M}]/gu, '');
+    .replace(/[^\p{L}\p{N}\p{M}]/gu, '')
+    .replace(BURMESE_MARK_RUN, orderMarks);
 }
 
 /** The first `max` characters of a trimmed text, never ending on half of a two-unit character. */
